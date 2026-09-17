@@ -1,0 +1,116 @@
+{
+  "case_id": "TC001_receipt_split_example_restaurant_example_tea",
+  "currency": "SGD",
+  "status": "calculated_pending_confirmation",
+  "participants": [
+    "person_owner",
+    "person_member_a",
+    "person_member_b",
+    "person_member_c",
+    "person_member_d",
+    "person_member_e"
+  ],
+  "participant_display_names": {
+    "person_owner": "Owner",
+    "person_member_a": "MemberA",
+    "person_member_b": "MemberB",
+    "person_member_c": "MemberC",
+    "person_member_d": "MemberD",
+    "person_member_e": "MemberE"
+  },
+  "payer": "person_owner",
+  "receipts": [
+    {
+      "merchant": "Example Restaurant",
+      "paid_by": "person_owner",
+      "currency": "SGD",
+      "subtotal": "66.60",
+      "gross_bill": "73.26",
+      "service_charge_rate": "0.10",
+      "service_charge_amount": "6.66",
+      "discount": "26.33",
+      "net_paid": "46.93",
+      "service_charge_allocation_method": "proportional_by_item_amount",
+      "discount_allocation_method": "equal_per_participant",
+      "rounding_policy": "payer",
+      "items": [
+        {
+          "description": "Chicken Pot",
+          "quantity": "6",
+          "unit_price": "10.90",
+          "amount": "65.40",
+          "participants": [
+            "person_owner",
+            "person_member_a",
+            "person_member_b",
+            "person_member_c",
+            "person_member_d",
+            "person_member_e"
+          ]
+        },
+        {
+          "description": "Water Chestnut",
+          "quantity": "1",
+          "unit_price": "1.20",
+          "amount": "1.20",
+          "participants": [
+            "person_member_c"
+          ]
+        }
+      ]
+    },
+    {
+      "merchant": "Example Tea",
+      "paid_by": "person_owner",
+      "currency": "SGD",
+      "subtotal": "23.80",
+      "discount": "0.61",
+      "net_paid": "23.19",
+      "discount_allocation_method": "proportional_by_item_amount",
+      "rounding_policy": "payer",
+      "items": [
+        {
+          "description": "Grapefruit Honey Slush",
+          "amount": "7.50",
+          "participants": [
+            "person_member_a"
+          ]
+        },
+        {
+          "description": "Grape Yakult Green Tea x 2",
+          "amount": "10.20",
+          "participants": [
+            "person_member_b"
+          ]
+        },
+        {
+          "description": "Chrysanthemum Tea",
+          "amount": "6.10",
+          "participants": [
+            "person_owner"
+          ]
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "participant_shares": {
+      "person_owner": "13.55",
+      "person_member_a": "14.91",
+      "person_member_b": "17.54",
+      "person_member_c": "8.92",
+      "person_member_d": "7.60",
+      "person_member_e": "7.60"
+    },
+    "obligations": {
+      "person_member_a": "14.91",
+      "person_member_b": "17.54",
+      "person_member_c": "8.92",
+      "person_member_d": "7.60",
+      "person_member_e": "7.60"
+    },
+    "payer_own_share": "13.55",
+    "total_paid_by_payer": "70.12",
+    "total_to_collect": "56.57"
+  }
+}

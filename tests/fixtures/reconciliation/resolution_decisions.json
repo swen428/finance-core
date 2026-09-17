@@ -1,0 +1,54 @@
+{
+  "description": "Sample resolution decisions for testing the resolution runtime",
+  "decisions": [
+    {
+      "decision_id": "dec-001",
+      "queue_item_id": "resolve-test-q-000",
+      "action": "confirm_match",
+      "note": "Exact match — Apple.com/bill 29.90 SGD on 2024-12-01",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-002",
+      "queue_item_id": "resolve-test-q-001",
+      "action": "create_missing_app_transaction",
+      "note": "Giant Supermarket 45.50 SGD — no app record exists, need to create one",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-003",
+      "queue_item_id": "resolve-test-q-002",
+      "action": "adjust_app_transaction",
+      "note": "Netflix amount mismatch: statement 19.90 vs app 21.90 — verify which is correct",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-004",
+      "queue_item_id": "resolve-test-q-003",
+      "action": "adjust_app_transaction",
+      "note": "Spotify date mismatch: statement 2024-12-07 vs app 2024-12-08 — one day off, adjust app date",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-005a",
+      "queue_item_id": "resolve-test-q-004",
+      "action": "mark_duplicate",
+      "note": "Grab 8.50 SGD — duplicate app records (app-004a and app-004b), keep app-004a",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-006",
+      "queue_item_id": "resolve-test-q-005",
+      "action": "mark_statement_only",
+      "note": "Amazon 55.00 SGD — only on statement, no app transaction to match",
+      "reviewer": "human"
+    },
+    {
+      "decision_id": "dec-007",
+      "queue_item_id": "resolve-test-q-006",
+      "action": "mark_statement_only",
+      "note": "Foodpanda SG 22.30 SGD — in app but not on statement, statement-only for now",
+      "reviewer": "human"
+    }
+  ]
+}

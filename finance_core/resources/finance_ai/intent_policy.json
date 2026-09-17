@@ -1,0 +1,69 @@
+{
+  "schema_version": "finance-ai-intent-policy-v1",
+  "version": "finance-ai-intent-policy-v4",
+  "positive_personal_intent_tokens": [
+    "expense",
+    "spent",
+    "purchase",
+    "bought",
+    "paid",
+    "personal",
+    "消费",
+    "买",
+    "购买",
+    "支出",
+    "付款"
+  ],
+  "deny_intent_tokens": [
+    "reimbursement",
+    "reimburse",
+    "chargeback",
+    "charge back",
+    "adjustment",
+    "correction",
+    "third-party",
+    "third party",
+    "payer",
+    "shared",
+    "split",
+    "transfer",
+    "repay",
+    "income",
+    "refund",
+    "settlement",
+    "共享",
+    "分摊",
+    "转账",
+    "还款",
+    "收入",
+    "退款",
+    "报销",
+    "代付",
+    "第三方",
+    "冲正",
+    "更正",
+    "调整"
+  ],
+  "controlled_payer_patterns": [
+    "(?<![\\w])paid\\s+by\\s+(?P<payer>[A-Za-z][A-Za-z0-9_-]{0,63})(?![\\w])",
+    "(?<![\\w])payer\\s*[:=]\\s*(?P<payer>[A-Za-z][A-Za-z0-9_-]{0,63})(?![\\w])"
+  ],
+  "payer_prefix_patterns": [
+    "(?<![\\w])paid\\s+by(?:\\s|$)",
+    "(?<![\\w])payer\\s*[:=](?:\\s|$)"
+  ],
+  "payer_clause_follow_patterns": [
+    "^\\s*$",
+    "^\\s+(?:(?:paid\\s+by|payer\\s*[:=])\\s+)",
+    "^\\s+and\\s+(?:(?:paid\\s+by|payer\\s*[:=])\\s+)",
+    "^\\s+(?:[A-Z]{3}\\s+)?[+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)\\b",
+    "^\\s+(?:at|for|on)\\b"
+  ],
+  "self_payer_names": [
+    "owner",
+    "me",
+    "myself",
+    "self"
+  ],
+  "classification_only_without_positive_intent": true
+}

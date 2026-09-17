@@ -1,0 +1,24 @@
+{
+  "schema_version": "finance-ai-asset-registry-v2",
+  "registry_version": "finance-ai-asset-registry-v2",
+  "assets": {
+    "agent_projection_policy": {
+      "path": "finance_core/resources/finance_ai/agent_projection_policy_v2.json",
+      "version": "finance-openclaw-agent-projection-policy-v2",
+      "sha256": "08ec7d514067f0e250e0d6e6efeafd817f1e5765c322f2709cce31d3fbab1d08",
+      "byte_count": 446
+    },
+    "model_compatibility_fixtures": {
+      "path": "finance_core/resources/finance_ai/model_compatibility_fixture_set_v1.json",
+      "version": "finance-ai-model-compatibility-fixtures-v6",
+      "sha256": "5964e0465428ac9fece2177544410a1ad4777acc3330a60a79ed1badd7d1b6b3",
+      "byte_count": 11758
+    },
+    "prompt": {
+      "path": "finance_core/resources/finance_ai/prompt_v1.txt",
+      "version": "finance-ai-prompt-v5",
+      "sha256": "48f4d53ba802569bfe929b24d9b83e309851f8bfc18e324e8f0f5e2bd09f4644",
+      "byte_count": 2149
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "schema_version": "finance-ai-sqlite-money-policy-v1",
+  "version": "finance-ai-sqlite-money-policy-v1",
+  "amount_storage_type": "NUMERIC",
+  "roundtrip_rule": "canonical_decimal_string_must_equal_sqlite_numeric_roundtrip",
+  "requires_positive_amount": true,
+  "requires_supported_currency": true,
+  "arbitrary_product_amount_cap": null
+}

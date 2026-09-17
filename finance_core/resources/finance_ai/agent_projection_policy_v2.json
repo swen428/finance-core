@@ -1,0 +1,15 @@
+{
+  "version": "finance-openclaw-agent-projection-policy-v2",
+  "schema_version": "finance-openclaw-agent-config-projection-v2",
+  "agent_id": "finance",
+  "allowed_execution_classes": [
+    "cloud_projection",
+    "local_model"
+  ],
+  "display_alias_max_utf8_bytes": 64,
+  "fallbacks": [],
+  "effective_max_retries": 0,
+  "audit_caller_kind": "plugin",
+  "audit_caller_id": "finance-bridge",
+  "audit_purpose": "finance-bridge.ai-proposal-v2"
+}

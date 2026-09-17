@@ -1,0 +1,78 @@
+{
+  "id": "finance-bridge",
+  "name": "Finance Staging Bridge",
+  "description": "Orchestrates the bounded Finance staging bridge CLI",
+  "requiresPlugins": ["codex", "openai"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "repoRoot",
+      "coreDistributionRoot",
+      "pythonExecutable",
+      "workspaceRoot",
+      "agentProfileV2"
+    ],
+    "properties": {
+      "repoRoot": { "type": "string", "minLength": 1 },
+      "coreDistributionRoot": { "type": "string", "minLength": 1 },
+      "pythonExecutable": { "type": "string", "minLength": 1 },
+      "workspaceRoot": { "type": "string", "minLength": 1 },
+      "agentProfileV2": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "openclawPackageSha256",
+          "financeCommit",
+          "coreVersion",
+          "coreManifestSha256",
+          "coreWheelSha256",
+          "coreApiContractVersion",
+          "coreMigrationLedgerDigest",
+          "pluginBuildSha256",
+          "executionClass"
+        ],
+        "properties": {
+          "openclawPackageSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "financeCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+          "coreVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+          "coreManifestSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "coreWheelSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "coreApiContractVersion": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+          },
+          "coreMigrationLedgerDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "pluginBuildSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "executionClass": { "enum": ["local_model", "cloud_projection"] }
+        }
+      }
+    }
+  },
+  "contracts": {
+    "tools": [
+      "finance_propose",
+      "finance_get_review",
+      "finance_confirm",
+      "finance_edit",
+      "finance_reject",
+      "finance_finalize",
+      "finance_get_status",
+      "finance_health"
+    ]
+  },
+  "toolMetadata": {
+    "finance_propose": { "optional": true },
+    "finance_get_review": { "optional": true },
+    "finance_confirm": { "optional": true },
+    "finance_edit": { "optional": true },
+    "finance_reject": { "optional": true },
+    "finance_finalize": { "optional": true },
+    "finance_get_status": { "optional": true },
+    "finance_health": { "optional": true }
+  },
+  "activation": { "onStartup": true }
+}

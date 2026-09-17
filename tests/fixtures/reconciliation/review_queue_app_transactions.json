@@ -1,0 +1,65 @@
+{
+  "description": "Sample app-side transactions for review queue matching demo",
+  "app_transactions": [
+    {
+      "app_txn_id": "app-001",
+      "transaction_date": "2024-12-01",
+      "merchant": "Apple.com/bill",
+      "amount": "29.90",
+      "currency": "SGD",
+      "source_type": "card_payment",
+      "source_channel": "manual",
+      "normalized_merchant": "apple"
+    },
+    {
+      "app_txn_id": "app-002",
+      "transaction_date": "2024-12-04",
+      "merchant": "Netflix",
+      "amount": "21.90",
+      "currency": "SGD",
+      "source_type": "subscription",
+      "source_channel": "telegram",
+      "normalized_merchant": "netflix"
+    },
+    {
+      "app_txn_id": "app-003",
+      "transaction_date": "2024-12-08",
+      "merchant": "Spotify",
+      "amount": "12.90",
+      "currency": "SGD",
+      "source_type": "subscription",
+      "source_channel": "telegram",
+      "normalized_merchant": "spotify"
+    },
+    {
+      "app_txn_id": "app-004a",
+      "transaction_date": "2024-12-05",
+      "merchant": "Grab",
+      "amount": "8.50",
+      "currency": "SGD",
+      "source_type": "transport",
+      "source_channel": "telegram",
+      "normalized_merchant": "grab"
+    },
+    {
+      "app_txn_id": "app-004b",
+      "transaction_date": "2024-12-05",
+      "merchant": "Grab",
+      "amount": "8.50",
+      "currency": "SGD",
+      "source_type": "transport",
+      "source_channel": "manual",
+      "normalized_merchant": "grab"
+    },
+    {
+      "app_txn_id": "app-005",
+      "transaction_date": "2024-12-15",
+      "merchant": "Foodpanda SG",
+      "amount": "22.30",
+      "currency": "SGD",
+      "source_type": "food",
+      "source_channel": "telegram",
+      "normalized_merchant": "foodpanda"
+    }
+  ]
+}

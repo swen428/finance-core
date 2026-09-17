@@ -1,0 +1,7 @@
+Txn Date,Posted Date,Merchant/Description,Amount,Currency,Transaction ID
+01 Dec 2025,03 Dec 2025,TransferWise Fee USD,12.34,USD,WISE-001
+05 Dec 2025,,Airbnb Amsterdam,EUR 89.50,EUR,WISE-002
+10 Dec 2025,12 Dec 2025,Google Ads,25.00,USD,WISE-003
+15 Dec 2025,16 Dec 2025,Amazon.co.uk,GBP 9.99,GBP,WISE-004
+20 Dec 2025,,Grab Singapore,$15.50,SGD,WISE-005
+,25 Dec 2025,Booking.com,SGD 120.00,SGD,WISE-006

@@ -1,0 +1,8 @@
+{
+  "schema_version": "finance-ai-deadline-policy-v1",
+  "version": "finance-ai-deadline-policy-v1",
+  "invoke_window_ms": 5000,
+  "model_window_ms": 30000,
+  "result_window_ms": 5000,
+  "result_guard_ms": 5000
+}

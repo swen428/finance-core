@@ -1,0 +1,35 @@
+{
+  "schema_version": "finance-ai-sensitive-text-policy-v1",
+  "version": "finance-ai-sensitive-text-policy-v3",
+  "reject_if_any_pattern_matches": [
+    "api[_ -]?key",
+    "access[_ -]?token",
+    "(?<![A-Za-z0-9])\\d{6,12}:[A-Za-z0-9_-]{30,}(?![A-Za-z0-9_-])",
+    "(?<![A-Za-z0-9.-])https://api\\.telegram\\.org/bot\\d{6,12}:[A-Za-z0-9_-]{30,}(?:/|$)",
+    "(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?|sk-ant-|xox[baprs]-|gh[pousr]_)[A-Za-z0-9_-]{16,}",
+    "authorization\\s*:\\s*(?:basic|bearer)(?:\\s+[A-Za-z0-9+/=_\\.-]+)?",
+    "(?<![A-Za-z0-9_-])(?:basic|bearer)\\s+[A-Za-z0-9+/=_\\.-]{16,}(?![A-Za-z0-9+/=_\\.-])",
+    "-----BEGIN(?: [A-Z0-9]+)* (?:PRIVATE KEY|CERTIFICATE|OPENSSH PRIVATE KEY)-----",
+    "\\b(?:https?|ftp)://[^\\s/@:]+:[^\\s/@]*@",
+    "\\b(?:https?|ftp)://[^\\s?#]+[?&](?:api[_ -]?key|access[_ -]?token|password|passwd|secret|credential)=",
+    "(?<![A-Za-z0-9])/(?:Users|home|private|tmp|var|etc|opt|mnt|Volumes|workspace|root)(?:/|$)[^\\s]*",
+    "(?<![A-Za-z0-9])[A-Za-z]:[\\\\/][^\\s]+",
+    "(?<![A-Za-z0-9])(?:\\.\\.?[\\\\/])+(?:[^\\s]+)",
+    "(?<![A-Za-z0-9])(?:database|config|backups?|workspace|\\.codex|\\.git)[\\\\/][^\\s]+",
+    "(?<![A-Za-z0-9_.-])[^\\s/]+\\.(?:db|sqlite|sqlite3|bak|backup|dump|sql)(?![A-Za-z0-9_.-])",
+    "password",
+    "passwd",
+    "secret",
+    "私钥",
+    "密码",
+    "验证码"
+  ],
+  "configured_finance_secret_markers": [
+    "finance-bridge-staging",
+    "finance-bridge.ai-proposal-v1",
+    "OPENAI_API_KEY",
+    "TELEGRAM_BOT_TOKEN"
+  ],
+  "reject_reason": "sensitive_text_detected",
+  "zero_model_call_on_rejection": true
+}

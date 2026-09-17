@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "finance-core"
+version = "0.1.0"
+description = "Deterministic, auditable personal-finance core"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.12"
+dependencies = [
+    "pypdf==6.14.2",
+    "typing-extensions==4.16.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["finance_core*"]
+exclude = ["tests*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"finance_core.resources" = [
+    "migrations/*.sql",
+    "preflight/*.py",
+    "finance_ai/*.json",
+    "finance_ai/*.txt",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [
+    ".codex/skills",
+]
+# Markdown files are documentation, not Python source. Newer Ruff versions
+# format fenced code blocks inside Markdown; keep them out of scope so
+# ruff format --check only governs Python sources.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+ignore_missing_imports = true
+explicit_package_bases = true
+check_untyped_defs = false
+disallow_untyped_defs = false
+no_implicit_optional = false

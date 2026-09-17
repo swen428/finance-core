@@ -1,0 +1,43 @@
+{
+  "contract_version": "synthetic-pdf-golden-v1",
+  "fixtures": [
+    {
+      "expected_failure": null,
+      "expected_page_count": 1,
+      "expected_parsed_rows": 3,
+      "filename": "sample_bank_statement.pdf",
+      "purpose": "Valid single-page debit and credit statement",
+      "sha256": "ee0eff10fc9e5760c5fd30dddd8d5d5a752647c3697a9914900faa1cd794a556",
+      "synthetic_and_sanitized": true
+    },
+    {
+      "expected_failure": null,
+      "expected_page_count": 2,
+      "expected_parsed_rows": 4,
+      "filename": "multi_page_bank_statement.pdf",
+      "purpose": "Valid multi-page statement with page and row evidence",
+      "sha256": "710014f86dc68fe8469a0f1c8edb78ef405e9f7b60e5010ae2f33011b927e828",
+      "synthetic_and_sanitized": true
+    },
+    {
+      "controlled_boundary_chars": 512,
+      "expected_failure": null,
+      "expected_page_count": 1,
+      "expected_parsed_rows": 1,
+      "filename": "near_text_boundary_statement.pdf",
+      "purpose": "Valid one-page statement at a controlled 512-character test limit",
+      "sha256": "26d4a13be06272cba343972c2cf3829742ee1b9008ece8f19e76d342753a5bf5",
+      "synthetic_and_sanitized": true
+    },
+    {
+      "expected_failure": "pdf_encrypted_document",
+      "expected_page_count": 1,
+      "expected_parsed_rows": null,
+      "filename": "encrypted_bank_statement.pdf",
+      "purpose": "Valid encrypted PDF rejected by the untrusted import boundary",
+      "sha256": "fc1627306d80d0f0b3f41c1ec52d60f96d57cef86c089ac463bfa80b3365b1e5",
+      "synthetic_and_sanitized": true
+    }
+  ],
+  "sanitization": "All fixture content is synthetic and contains no real account, employee, personal financial, production transaction, identifying, or secret data."
+}

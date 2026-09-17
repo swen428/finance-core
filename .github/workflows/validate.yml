@@ -1,0 +1,267 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: finance-core-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      bridge: ${{ steps.scope.outputs.bridge }}
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify Bridge scope
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if test "$EVENT_NAME" = "workflow_dispatch" || test -z "$BASE_SHA" || \
+             printf '%s' "$BASE_SHA" | grep -Eq '^0+$'; then
+            echo 'bridge=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/finance-core-changed-paths.txt
+          if grep -Eq '^(plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|intake/macos_vision_receipt_ocr|parser_proposals/ai_))' /tmp/finance-core-changed-paths.txt; then
+            echo 'bridge=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'bridge=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install locked development dependencies
+        run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
+
+      - name: Run Python quality checks
+        run: |
+          ruff check --exclude finance_core/resources/preflight/migration_029_preflight.py finance_core tests
+          ruff format --check --exclude finance_core/resources/preflight/migration_029_preflight.py finance_core tests
+          mypy finance_core
+
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install locked development dependencies
+        run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
+
+      - name: Plan exact test inventory
+        run: |
+          python .github/scripts/plan_pytest_shards.py plan \
+            --baseline .github/scripts/pytest-shard-weights-v2.json \
+            --repository-root . \
+            --output-dir /tmp/finance-core-shards \
+            --shard-count 4
+
+      - name: Run shard
+        id: pytest
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          set +e
+          xargs python -I -m pytest -q \
+            --junitxml="/tmp/pytest-results-shard-${SHARD_INDEX}.xml" \
+            --durations=25 --durations-min=1.0 \
+            < "/tmp/finance-core-shards/shard-${SHARD_INDEX}.txt"
+          rc=$?
+          echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: Report shard timing
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          PYTEST_EXIT_CODE: ${{ steps.pytest.outputs.exit_code }}
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          mkdir -p /tmp/finance-core-timing
+          python .github/scripts/report_pytest_timing.py \
+            --xml "/tmp/pytest-results-shard-${SHARD_INDEX}.xml" \
+            --output "/tmp/finance-core-timing/shard-${SHARD_INDEX}.json" \
+            --exit-code "${PYTEST_EXIT_CODE:-1}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload shard timing
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pytest-timing-shard-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/finance-core-timing/
+          retention-days: 90
+          if-no-files-found: ignore
+
+  bridge:
+    needs: classify
+    if: ${{ needs.classify.outputs.bridge == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install locked Python dependencies
+        run: |
+          python -I -m venv .venv
+          .venv/bin/python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt
+
+      - name: Set up exact Node runtime
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24.15.0"
+          package-manager-cache: false
+
+      - name: Install Bridge dependencies
+        working-directory: plugins/finance-bridge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build Bridge
+        working-directory: plugins/finance-bridge
+        run: |
+          npm rebuild fs-ext --foreground-scripts
+          npm run build
+
+      - name: Require exact reviewed Bridge build output
+        env:
+          REVIEWED_CHECKOUT_SHA: ${{ github.sha }}
+        run: |
+          git diff --exit-code "$REVIEWED_CHECKOUT_SHA" -- \
+            plugins/finance-bridge/dist/src \
+            plugins/finance-bridge/dist/build-provenance-v1.json
+          test -z "$(git ls-files --others --exclude-standard -- \
+            plugins/finance-bridge/dist/src \
+            plugins/finance-bridge/dist/build-provenance-v1.json)"
+
+      - name: Test Bridge
+        working-directory: plugins/finance-bridge
+        env:
+          PYTHON_EXECUTABLE: ${{ github.workspace }}/.venv/bin/python
+        run: npm test
+
+  pytest-report:
+    needs: pytest
+    if: ${{ always() }}
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Recreate deterministic shard plan
+        run: |
+          python .github/scripts/plan_pytest_shards.py plan \
+            --baseline .github/scripts/pytest-shard-weights-v2.json \
+            --repository-root . \
+            --output-dir /tmp/finance-core-shards \
+            --shard-count 4
+
+      - name: Download shard timings
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: pytest-timing-shard-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/finance-core-shard-timings
+          merge-multiple: true
+
+      - name: Aggregate timing report
+        run: |
+          python .github/scripts/aggregate_pytest_timing.py \
+            --shard-dir /tmp/finance-core-shard-timings \
+            --plan /tmp/finance-core-shards/plan.json \
+            --output /tmp/pytest-timing-v1.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload aggregate timing
+        if: ${{ always() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pytest-timing-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/pytest-timing-v1.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+  validate:
+    if: ${{ always() }}
+    needs: [classify, quality, pytest, bridge]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all applicable validation
+        env:
+          BRIDGE_RESULT: ${{ needs.bridge.result }}
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          PYTEST_RESULT: ${{ needs.pytest.result }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: |
+          set -euo pipefail
+          test "$CLASSIFY_RESULT" = success
+          test "$QUALITY_RESULT" = success
+          test "$PYTEST_RESULT" = success
+          test "$BRIDGE_RESULT" = success || test "$BRIDGE_RESULT" = skipped

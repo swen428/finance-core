@@ -1,0 +1,1482 @@
+{
+  "aggregation": "available_test_median_then_sum_by_file",
+  "baseline_at": "2026-09-16T14:00:16Z",
+  "file_sample_coverage": {
+    "tests/test_ai_fallback_provenance_foundation_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 18
+    },
+    "tests/test_ai_fallback_service_v1.py": {
+      "sample_count": 507,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 169
+    },
+    "tests/test_ai_model_compatibility_receipts_v2.py": {
+      "sample_count": 465,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 155
+    },
+    "tests/test_ai_ocr_conflict_adjudication.py": {
+      "sample_count": 420,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 140
+    },
+    "tests/test_api_agent_proposal_payload.py": {
+      "sample_count": 114,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 38
+    },
+    "tests/test_approved_protected_merge_v1.py": {
+      "sample_count": 1164,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 388
+    },
+    "tests/test_authoritative_calculation_snapshot_v1.py": {
+      "sample_count": 147,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 49
+    },
+    "tests/test_bench_b_reconciliation_review_queue_export_v1.py": {
+      "sample_count": 186,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 62
+    },
+    "tests/test_calculation_audit_layer.py": {
+      "sample_count": 210,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 70
+    },
+    "tests/test_calculation_audit_query_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_calculation_run_persistence_v1.py": {
+      "sample_count": 63,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 21
+    },
+    "tests/test_calculation_snapshot_persistence_v1.py": {
+      "sample_count": 72,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 24
+    },
+    "tests/test_canonical_telegram_text_finance_workflow_v1.py": {
+      "sample_count": 141,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 47
+    },
+    "tests/test_concurrency_crash_replay_safety_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_database_conflict_fingerprint_migration_v1.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_fin_rem_04_foreign_key_fail_closed_writers_v1.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_financial_audit_chain_v1.py": {
+      "sample_count": 84,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 28
+    },
+    "tests/test_full_validation_receipt_v1.py": {
+      "sample_count": 51,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 17
+    },
+    "tests/test_full_validation_workflow_contract_v1.py": {
+      "sample_count": 303,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 101
+    },
+    "tests/test_gate7_artifact_archive_v1.py": {
+      "sample_count": 21,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 7
+    },
+    "tests/test_governance_compatibility_v1.py": {
+      "sample_count": 33,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 11
+    },
+    "tests/test_high_risk_financial_gate_v1.py": {
+      "sample_count": 351,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 117
+    },
+    "tests/test_high_risk_governance_v1.py": {
+      "sample_count": 363,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 121
+    },
+    "tests/test_high_risk_main_sanity_context_v1.py": {
+      "sample_count": 198,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 66
+    },
+    "tests/test_high_risk_pre_v2_v1.py": {
+      "sample_count": 180,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 60
+    },
+    "tests/test_iaf_finalization_invariants_v1.py": {
+      "sample_count": 33,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 11
+    },
+    "tests/test_iaf_finalization_invariants_v2.py": {
+      "sample_count": 81,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 27
+    },
+    "tests/test_markdown_internal_links_v1.py": {
+      "sample_count": 126,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 42
+    },
+    "tests/test_metabase_readonly_sql_pack_v1.py": {
+      "sample_count": 96,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 32
+    },
+    "tests/test_metabase_reporting_preparation_contract_v1.py": {
+      "sample_count": 192,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 64
+    },
+    "tests/test_migration_029_authoritative_upgrade_integrity_v1.py": {
+      "sample_count": 129,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 43
+    },
+    "tests/test_migration_039_receipt_scoped_membership_evidence_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_migration_041_openclaw_human_action_references_v1.py": {
+      "sample_count": 9,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 3
+    },
+    "tests/test_migration_042_s5e_ai_fallback_provenance_foundation_v1.py": {
+      "sample_count": 153,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 51
+    },
+    "tests/test_migration_043_s5e_ai_fallback_lineage_sealing_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_migration_044_nomi_ai_model_compatibility_receipts_v2.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_migration_045_nomi_ai_model_admission_decisions_v2.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_migration_execution_boundary.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_migration_ledger_v1.py": {
+      "sample_count": 231,
+      "sample_coverage": 0.974684,
+      "source_run_count": 3,
+      "test_count": 79
+    },
+    "tests/test_migration_manifest_drift.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_migration_safety_v1.py": {
+      "sample_count": 72,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 24
+    },
+    "tests/test_money_contract.py": {
+      "sample_count": 600,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 200
+    },
+    "tests/test_native_merge_v1.py": {
+      "sample_count": 306,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 102
+    },
+    "tests/test_openclaw_staging_bridge_acceptance_fixes_v1.py": {
+      "sample_count": 126,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 42
+    },
+    "tests/test_openclaw_staging_bridge_cli_contract_v1.py": {
+      "sample_count": 132,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 44
+    },
+    "tests/test_openclaw_staging_bridge_decisions_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_openclaw_staging_bridge_finalize_readers_v1.py": {
+      "sample_count": 27,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 9
+    },
+    "tests/test_openclaw_staging_bridge_finalize_status_v1.py": {
+      "sample_count": 171,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 57
+    },
+    "tests/test_openclaw_staging_bridge_guided_edit_v1.py": {
+      "sample_count": 66,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 22
+    },
+    "tests/test_openclaw_staging_bridge_human_actions_v1.py": {
+      "sample_count": 47,
+      "sample_coverage": 0.921569,
+      "source_run_count": 3,
+      "test_count": 17
+    },
+    "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py": {
+      "sample_count": 45,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 15
+    },
+    "tests/test_openclaw_staging_bridge_propose_review_v1.py": {
+      "sample_count": 126,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 42
+    },
+    "tests/test_openclaw_staging_bridge_publication_seam_v1.py": {
+      "sample_count": 60,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 20
+    },
+    "tests/test_openclaw_staging_bridge_receipt_handoff_v1.py": {
+      "sample_count": 153,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 51
+    },
+    "tests/test_parser_human_draft_delivery_v1.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_parser_human_drafts_v1.py": {
+      "sample_count": 399,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 133
+    },
+    "tests/test_parser_human_revision_v1.py": {
+      "sample_count": 26,
+      "sample_coverage": 0.666667,
+      "source_run_count": 2,
+      "test_count": 13
+    },
+    "tests/test_parser_proposal_authorization_uow.py": {
+      "sample_count": 104,
+      "sample_coverage": 0.825397,
+      "source_run_count": 3,
+      "test_count": 42
+    },
+    "tests/test_parser_proposal_completion.py": {
+      "sample_count": 318,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 106
+    },
+    "tests/test_parser_proposal_confirmation_cli.py": {
+      "sample_count": 51,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 17
+    },
+    "tests/test_parser_proposal_confirmation_migration.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_parser_proposal_conversion.py": {
+      "sample_count": 159,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 53
+    },
+    "tests/test_parser_proposal_lifecycle.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_pdf_explicit_direction_evidence_v1.py": {
+      "sample_count": 1134,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 378
+    },
+    "tests/test_pdf_import_run_report_argparse_cli_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_pdf_import_run_report_cli_v1.py": {
+      "sample_count": 66,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 22
+    },
+    "tests/test_pdf_import_run_report_production_adapter_v1.py": {
+      "sample_count": 147,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 49
+    },
+    "tests/test_pdf_import_run_report_v1.py": {
+      "sample_count": 123,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 41
+    },
+    "tests/test_pdf_resource_limits_golden_fixtures_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_pdf_statement_bridge_helper_v1.py": {
+      "sample_count": 270,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 90
+    },
+    "tests/test_pdf_statement_import_bridge_contract_v1.py": {
+      "sample_count": 180,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 60
+    },
+    "tests/test_pdf_statement_import_review_fixture_v1.py": {
+      "sample_count": 129,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 43
+    },
+    "tests/test_pdf_statement_import_run_persistence_integration_v1.py": {
+      "sample_count": 93,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 31
+    },
+    "tests/test_pdf_statement_import_run_persistence_runtime_v1.py": {
+      "sample_count": 141,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 47
+    },
+    "tests/test_pdf_statement_import_run_persistence_schema_v1.py": {
+      "sample_count": 129,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 43
+    },
+    "tests/test_pdf_statement_import_run_reporting_v1.py": {
+      "sample_count": 84,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 28
+    },
+    "tests/test_pdf_statement_import_run_review_cli_v1.py": {
+      "sample_count": 105,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 35
+    },
+    "tests/test_pdf_statement_import_run_review_summary_v1.py": {
+      "sample_count": 237,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 79
+    },
+    "tests/test_pdf_statement_parser_adapter_contract_v1.py": {
+      "sample_count": 249,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 83
+    },
+    "tests/test_pdf_statement_parser_template_fixture_v1.py": {
+      "sample_count": 288,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 96
+    },
+    "tests/test_pdf_statement_review_cli_v1.py": {
+      "sample_count": 330,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 110
+    },
+    "tests/test_pdf_statement_review_queue_bridge_v1.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_pdf_statement_review_queue_demo_cli_v1.py": {
+      "sample_count": 66,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 22
+    },
+    "tests/test_pdf_statement_review_queue_fixture_v1.py": {
+      "sample_count": 225,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 75
+    },
+    "tests/test_pdf_statement_temp_db_import_fixture_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_pdf_statement_template_adapter_v1.py": {
+      "sample_count": 246,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 82
+    },
+    "tests/test_pdf_statement_template_cli_v1.py": {
+      "sample_count": 291,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 97
+    },
+    "tests/test_pdf_statement_text_extraction_adapter_v1.py": {
+      "sample_count": 81,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 27
+    },
+    "tests/test_persisted_final_mutation_authorization_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_persistence_fingerprint.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_pr249_receipt_scoped_membership_v1.py": {
+      "sample_count": 75,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 25
+    },
+    "tests/test_pr249_replay_graph_v1.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_pr_v2_attestation_v1.py": {
+      "sample_count": 318,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 106
+    },
+    "tests/test_pytest_canary_evaluator_v1.py": {
+      "sample_count": 93,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 31
+    },
+    "tests/test_pytest_canary_workflow_v1.py": {
+      "sample_count": 36,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 12
+    },
+    "tests/test_pytest_shard_planner_v1.py": {
+      "sample_count": 135,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 45
+    },
+    "tests/test_pytest_timing_aggregation_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_pytest_timing_report_v1.py": {
+      "sample_count": 123,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 41
+    },
+    "tests/test_raw_intake_persistence.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_raw_intake_review_cli.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_raw_intake_source_evidence_schema.py": {
+      "sample_count": 42,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 14
+    },
+    "tests/test_raw_text_intake_source_evidence_runtime.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_raw_text_logging.py": {
+      "sample_count": 24,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 8
+    },
+    "tests/test_raw_text_staging_guard_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_receipt_b5_staging_e2e_v1.py": {
+      "sample_count": 30,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 10
+    },
+    "tests/test_receipt_calculator_input_projection_v1.py": {
+      "sample_count": 93,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 31
+    },
+    "tests/test_receipt_calculator_persistence.py": {
+      "sample_count": 33,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 11
+    },
+    "tests/test_receipt_calculator_readiness_v1.py": {
+      "sample_count": 228,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 76
+    },
+    "tests/test_receipt_calculator_reconciliation.py": {
+      "sample_count": 255,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 85
+    },
+    "tests/test_receipt_conversion_exclusion_v1.py": {
+      "sample_count": 82,
+      "sample_coverage": 0.738739,
+      "source_run_count": 3,
+      "test_count": 37
+    },
+    "tests/test_receipt_fact_set_binding_evidence_v1.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_receipt_fact_set_calculation_bridge_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 18
+    },
+    "tests/test_receipt_fact_set_finalization_authorization_v1.py": {
+      "sample_count": 39,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 13
+    },
+    "tests/test_receipt_facts_conversion_cli_v1.py": {
+      "sample_count": 60,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 20
+    },
+    "tests/test_receipt_facts_conversion_concurrency_v1.py": {
+      "sample_count": 99,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 33
+    },
+    "tests/test_receipt_facts_conversion_migration_constraints_v1.py": {
+      "sample_count": 432,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 144
+    },
+    "tests/test_receipt_facts_conversion_v1.py": {
+      "sample_count": 402,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 134
+    },
+    "tests/test_receipt_finalization_settlement_runtime.py": {
+      "sample_count": 480,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 160
+    },
+    "tests/test_receipt_human_draft_publication_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 0.666667,
+      "source_run_count": 2,
+      "test_count": 27
+    },
+    "tests/test_receipt_item_allocation_facts_cli_v1.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_receipt_item_allocation_facts_migration_v1.py": {
+      "sample_count": 354,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 118
+    },
+    "tests/test_receipt_item_allocation_facts_service_v1.py": {
+      "sample_count": 246,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 82
+    },
+    "tests/test_receipt_item_allocation_facts_supersession_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 18
+    },
+    "tests/test_receipt_ocr_evidence.py": {
+      "sample_count": 267,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 89
+    },
+    "tests/test_receipt_ocr_macos_vision.py": {
+      "sample_count": 288,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 96
+    },
+    "tests/test_receipt_ocr_proposal_ingestion_v1.py": {
+      "sample_count": 141,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 47
+    },
+    "tests/test_receipt_proposal_revision_v1.py": {
+      "sample_count": 192,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 64
+    },
+    "tests/test_receipt_split_generic.py": {
+      "sample_count": 27,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 9
+    },
+    "tests/test_receipt_split_tc001.py": {
+      "sample_count": 9,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 3
+    },
+    "tests/test_receipt_staging_runner_foundation_v1.py": {
+      "sample_count": 105,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 35
+    },
+    "tests/test_receipt_staging_runner_local_intake_v1.py": {
+      "sample_count": 162,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 54
+    },
+    "tests/test_receipt_staging_runner_resume_finalize_v1.py": {
+      "sample_count": 84,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 28
+    },
+    "tests/test_reconciliation_adapter_v1.py": {
+      "sample_count": 63,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 21
+    },
+    "tests/test_reconciliation_apply_audit_snapshot_v1.py": {
+      "sample_count": 183,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 61
+    },
+    "tests/test_reconciliation_apply_execution_review_queue_cli_v1.py": {
+      "sample_count": 114,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 38
+    },
+    "tests/test_reconciliation_apply_execution_review_queue_v1.py": {
+      "sample_count": 114,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 38
+    },
+    "tests/test_reconciliation_apply_idempotency_v1.py": {
+      "sample_count": 117,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 39
+    },
+    "tests/test_reconciliation_apply_orchestrator_v1.py": {
+      "sample_count": 120,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 40
+    },
+    "tests/test_reconciliation_apply_persistence_v1.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_reconciliation_apply_plan_v1.py": {
+      "sample_count": 111,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 37
+    },
+    "tests/test_reconciliation_apply_run_summary_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_reconciliation_apply_runtime_guarded_v1.py": {
+      "sample_count": 66,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 22
+    },
+    "tests/test_reconciliation_apply_state_adapter_v1.py": {
+      "sample_count": 21,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 7
+    },
+    "tests/test_reconciliation_apply_state_persistence_schema_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_batch_apply_state_control_v1.py": {
+      "sample_count": 81,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 27
+    },
+    "tests/test_reconciliation_create_money_contract_v1.py": {
+      "sample_count": 174,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 58
+    },
+    "tests/test_reconciliation_demo_apply_persistence_v1.py": {
+      "sample_count": 27,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 9
+    },
+    "tests/test_reconciliation_demo_cli_fixture.py": {
+      "sample_count": 78,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 26
+    },
+    "tests/test_reconciliation_direction_decision_hashes_v1.py": {
+      "sample_count": 201,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 67
+    },
+    "tests/test_reconciliation_final_mutation_decision_persistence_v1.py": {
+      "sample_count": 111,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 37
+    },
+    "tests/test_reconciliation_final_mutation_proposal_v1.py": {
+      "sample_count": 132,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 44
+    },
+    "tests/test_reconciliation_final_transaction_adapter_v1.py": {
+      "sample_count": 117,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 39
+    },
+    "tests/test_reconciliation_foundation_v1.py": {
+      "sample_count": 63,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 21
+    },
+    "tests/test_reconciliation_guarded_apply_execution_persistence_v1.py": {
+      "sample_count": 117,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 39
+    },
+    "tests/test_reconciliation_guarded_apply_execution_review_summary_v1.py": {
+      "sample_count": 129,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 43
+    },
+    "tests/test_reconciliation_guarded_final_mutation_workflow_v1.py": {
+      "sample_count": 396,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 132
+    },
+    "tests/test_reconciliation_matching_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_persist_review_cli_v1.py": {
+      "sample_count": 24,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 8
+    },
+    "tests/test_reconciliation_persistence_schema_v1.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_reconciliation_public_api_v1.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_reconciliation_reporting_constants_v1.py": {
+      "sample_count": 222,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 74
+    },
+    "tests/test_reconciliation_reporting_export_fixture_v1.py": {
+      "sample_count": 138,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 46
+    },
+    "tests/test_reconciliation_reporting_queries_v1.py": {
+      "sample_count": 36,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 12
+    },
+    "tests/test_reconciliation_reporting_query_helpers_v1.py": {
+      "sample_count": 216,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 72
+    },
+    "tests/test_reconciliation_reporting_views_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_repository_v1.py": {
+      "sample_count": 60,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 20
+    },
+    "tests/test_reconciliation_resolution_apply_v1.py": {
+      "sample_count": 135,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 45
+    },
+    "tests/test_reconciliation_resolution_persistence_v1.py": {
+      "sample_count": 39,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 13
+    },
+    "tests/test_reconciliation_resolution_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_reconciliation_resolve_review_cli_v1.py": {
+      "sample_count": 24,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 8
+    },
+    "tests/test_reconciliation_review_cli_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_reconciliation_review_evidence_bundle_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 18
+    },
+    "tests/test_reconciliation_review_persistence_v1.py": {
+      "sample_count": 27,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 9
+    },
+    "tests/test_reconciliation_review_queue_enhanced_v1.py": {
+      "sample_count": 36,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 12
+    },
+    "tests/test_reconciliation_review_queue_gen_v1.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_reconciliation_review_queue_preview_v1.py": {
+      "sample_count": 69,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 23
+    },
+    "tests/test_reconciliation_review_queue_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_review_workflow_audit_v1.py": {
+      "sample_count": 45,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 15
+    },
+    "tests/test_reconciliation_runtime_cli.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_service_v1.py": {
+      "sample_count": 48,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 16
+    },
+    "tests/test_reconciliation_statement_amount_direction_v1.py": {
+      "sample_count": 168,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 56
+    },
+    "tests/test_reconciliation_statement_content_identity_v1.py": {
+      "sample_count": 237,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 79
+    },
+    "tests/test_reconciliation_statement_csv_hardening_v1.py": {
+      "sample_count": 198,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 66
+    },
+    "tests/test_reconciliation_statement_csv_v1.py": {
+      "sample_count": 42,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 14
+    },
+    "tests/test_reconciliation_statement_date_semantics_v1.py": {
+      "sample_count": 45,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 15
+    },
+    "tests/test_reconciliation_statement_import_fingerprint_dedup_v1.py": {
+      "sample_count": 54,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 18
+    },
+    "tests/test_reconciliation_statement_import_integration_v1.py": {
+      "sample_count": 15,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 5
+    },
+    "tests/test_reconciliation_statement_import_uow_v1.py": {
+      "sample_count": 96,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 32
+    },
+    "tests/test_reconciliation_statement_import_v1.py": {
+      "sample_count": 108,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 36
+    },
+    "tests/test_reconciliation_statement_matching_window_v1.py": {
+      "sample_count": 72,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 24
+    },
+    "tests/test_reconciliation_structured_evidence_boundary_v1.py": {
+      "sample_count": 45,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 15
+    },
+    "tests/test_reconciliation_structured_evidence_persistence_v1.py": {
+      "sample_count": 87,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 29
+    },
+    "tests/test_reconciliation_structured_evidence_query_v1.py": {
+      "sample_count": 51,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 17
+    },
+    "tests/test_reconciliation_transaction_posted_date_priority_v1.py": {
+      "sample_count": 45,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 15
+    },
+    "tests/test_runtime_ddl_guard.py": {
+      "sample_count": 18,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 6
+    },
+    "tests/test_settlement_runtime_v1.py": {
+      "sample_count": 108,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 36
+    },
+    "tests/test_sqlite_connection.py": {
+      "sample_count": 57,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 19
+    },
+    "tests/test_staging_guard.py": {
+      "sample_count": 135,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 45
+    },
+    "tests/test_telegram_attachment_acquisition.py": {
+      "sample_count": 435,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 145
+    },
+    "tests/test_telegram_attachment_evidence.py": {
+      "sample_count": 309,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 103
+    },
+    "tests/test_telegram_text_update_intake_adapter_v1.py": {
+      "sample_count": 285,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 95
+    },
+    "tests/test_temp_db_fixture.py": {
+      "sample_count": 6,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 2
+    },
+    "tests/test_validation_aggregation_v1.py": {
+      "sample_count": 225,
+      "sample_coverage": 1.0,
+      "source_run_count": 3,
+      "test_count": 75
+    }
+  },
+  "file_weights_seconds": {
+    "tests/test_ai_fallback_provenance_foundation_v1.py": 0.027,
+    "tests/test_ai_fallback_service_v1.py": 209.184,
+    "tests/test_ai_model_compatibility_receipts_v2.py": 76.741,
+    "tests/test_ai_ocr_conflict_adjudication.py": 6.563,
+    "tests/test_api_agent_proposal_payload.py": 0.001,
+    "tests/test_approved_protected_merge_v1.py": 31.599,
+    "tests/test_authoritative_calculation_snapshot_v1.py": 29.611,
+    "tests/test_bench_b_reconciliation_review_queue_export_v1.py": 0.004,
+    "tests/test_calculation_audit_layer.py": 0.053,
+    "tests/test_calculation_audit_query_v1.py": 0.016,
+    "tests/test_calculation_run_persistence_v1.py": 0.013,
+    "tests/test_calculation_snapshot_persistence_v1.py": 0.016,
+    "tests/test_canonical_telegram_text_finance_workflow_v1.py": 65.189,
+    "tests/test_concurrency_crash_replay_safety_v1.py": 23.201,
+    "tests/test_database_conflict_fingerprint_migration_v1.py": 2.836,
+    "tests/test_fin_rem_04_foreign_key_fail_closed_writers_v1.py": 7.138,
+    "tests/test_financial_audit_chain_v1.py": 40.174,
+    "tests/test_full_validation_receipt_v1.py": 0.054,
+    "tests/test_full_validation_workflow_contract_v1.py": 3.078,
+    "tests/test_gate7_artifact_archive_v1.py": 0.31,
+    "tests/test_governance_compatibility_v1.py": 10.179,
+    "tests/test_high_risk_financial_gate_v1.py": 0.78,
+    "tests/test_high_risk_governance_v1.py": 0.666,
+    "tests/test_high_risk_main_sanity_context_v1.py": 0.204,
+    "tests/test_high_risk_pre_v2_v1.py": 6.122,
+    "tests/test_iaf_finalization_invariants_v1.py": 16.251,
+    "tests/test_iaf_finalization_invariants_v2.py": 40.81,
+    "tests/test_markdown_internal_links_v1.py": 0.66,
+    "tests/test_metabase_readonly_sql_pack_v1.py": 34.345,
+    "tests/test_metabase_reporting_preparation_contract_v1.py": 0.0,
+    "tests/test_migration_029_authoritative_upgrade_integrity_v1.py": 29.235,
+    "tests/test_migration_039_receipt_scoped_membership_evidence_v1.py": 5.458,
+    "tests/test_migration_041_openclaw_human_action_references_v1.py": 3.777,
+    "tests/test_migration_042_s5e_ai_fallback_provenance_foundation_v1.py": 50.412,
+    "tests/test_migration_043_s5e_ai_fallback_lineage_sealing_v1.py": 8.032,
+    "tests/test_migration_044_nomi_ai_model_compatibility_receipts_v2.py": 2.792,
+    "tests/test_migration_045_nomi_ai_model_admission_decisions_v2.py": 2.791,
+    "tests/test_migration_execution_boundary.py": 0.003,
+    "tests/test_migration_ledger_v1.py": 56.841,
+    "tests/test_migration_manifest_drift.py": 0.002,
+    "tests/test_migration_safety_v1.py": 29.294,
+    "tests/test_money_contract.py": 0.01,
+    "tests/test_native_merge_v1.py": 0.248,
+    "tests/test_openclaw_staging_bridge_acceptance_fixes_v1.py": 61.053,
+    "tests/test_openclaw_staging_bridge_cli_contract_v1.py": 43.528,
+    "tests/test_openclaw_staging_bridge_decisions_v1.py": 53.987,
+    "tests/test_openclaw_staging_bridge_finalize_readers_v1.py": 13.083,
+    "tests/test_openclaw_staging_bridge_finalize_status_v1.py": 114.652,
+    "tests/test_openclaw_staging_bridge_guided_edit_v1.py": 41.092,
+    "tests/test_openclaw_staging_bridge_human_actions_v1.py": 30.572,
+    "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py": 20.403,
+    "tests/test_openclaw_staging_bridge_propose_review_v1.py": 67.366,
+    "tests/test_openclaw_staging_bridge_publication_seam_v1.py": 0.028,
+    "tests/test_openclaw_staging_bridge_receipt_handoff_v1.py": 73.821,
+    "tests/test_parser_human_draft_delivery_v1.py": 30.463,
+    "tests/test_parser_human_drafts_v1.py": 80.258,
+    "tests/test_parser_human_revision_v1.py": 18.305,
+    "tests/test_parser_proposal_authorization_uow.py": 59.379,
+    "tests/test_parser_proposal_completion.py": 144.398,
+    "tests/test_parser_proposal_confirmation_cli.py": 24.652,
+    "tests/test_parser_proposal_confirmation_migration.py": 33.325,
+    "tests/test_parser_proposal_conversion.py": 75.129,
+    "tests/test_parser_proposal_lifecycle.py": 0.004,
+    "tests/test_pdf_explicit_direction_evidence_v1.py": 362.787,
+    "tests/test_pdf_import_run_report_argparse_cli_v1.py": 20.741,
+    "tests/test_pdf_import_run_report_cli_v1.py": 22.962,
+    "tests/test_pdf_import_run_report_production_adapter_v1.py": 5.373,
+    "tests/test_pdf_import_run_report_v1.py": 36.875,
+    "tests/test_pdf_resource_limits_golden_fixtures_v1.py": 10.665,
+    "tests/test_pdf_statement_bridge_helper_v1.py": 0.049,
+    "tests/test_pdf_statement_import_bridge_contract_v1.py": 0.002,
+    "tests/test_pdf_statement_import_review_fixture_v1.py": 0.018,
+    "tests/test_pdf_statement_import_run_persistence_integration_v1.py": 42.594,
+    "tests/test_pdf_statement_import_run_persistence_runtime_v1.py": 51.764,
+    "tests/test_pdf_statement_import_run_persistence_schema_v1.py": 0.048,
+    "tests/test_pdf_statement_import_run_reporting_v1.py": 0.128,
+    "tests/test_pdf_statement_import_run_review_cli_v1.py": 36.647,
+    "tests/test_pdf_statement_import_run_review_summary_v1.py": 8.163,
+    "tests/test_pdf_statement_parser_adapter_contract_v1.py": 0.023,
+    "tests/test_pdf_statement_parser_template_fixture_v1.py": 0.164,
+    "tests/test_pdf_statement_review_cli_v1.py": 0.239,
+    "tests/test_pdf_statement_review_queue_bridge_v1.py": 26.68,
+    "tests/test_pdf_statement_review_queue_demo_cli_v1.py": 19.147,
+    "tests/test_pdf_statement_review_queue_fixture_v1.py": 0.004,
+    "tests/test_pdf_statement_temp_db_import_fixture_v1.py": 5.583,
+    "tests/test_pdf_statement_template_adapter_v1.py": 0.005,
+    "tests/test_pdf_statement_template_cli_v1.py": 1.207,
+    "tests/test_pdf_statement_text_extraction_adapter_v1.py": 16.434,
+    "tests/test_persisted_final_mutation_authorization_v1.py": 0.065,
+    "tests/test_persistence_fingerprint.py": 0.001,
+    "tests/test_pr249_receipt_scoped_membership_v1.py": 35.583,
+    "tests/test_pr249_replay_graph_v1.py": 32.534,
+    "tests/test_pr_v2_attestation_v1.py": 0.046,
+    "tests/test_pytest_canary_evaluator_v1.py": 0.027,
+    "tests/test_pytest_canary_workflow_v1.py": 0.001,
+    "tests/test_pytest_shard_planner_v1.py": 0.42,
+    "tests/test_pytest_timing_aggregation_v1.py": 0.043,
+    "tests/test_pytest_timing_report_v1.py": 0.037,
+    "tests/test_raw_intake_persistence.py": 26.576,
+    "tests/test_raw_intake_review_cli.py": 6.861,
+    "tests/test_raw_intake_source_evidence_schema.py": 18.956,
+    "tests/test_raw_text_intake_source_evidence_runtime.py": 6.734,
+    "tests/test_raw_text_logging.py": 0.003,
+    "tests/test_raw_text_staging_guard_v1.py": 8.186,
+    "tests/test_receipt_b5_staging_e2e_v1.py": 14.843,
+    "tests/test_receipt_calculator_input_projection_v1.py": 37.313,
+    "tests/test_receipt_calculator_persistence.py": 15.336,
+    "tests/test_receipt_calculator_readiness_v1.py": 94.143,
+    "tests/test_receipt_calculator_reconciliation.py": 0.025,
+    "tests/test_receipt_conversion_exclusion_v1.py": 34.734,
+    "tests/test_receipt_fact_set_binding_evidence_v1.py": 27.934,
+    "tests/test_receipt_fact_set_calculation_bridge_v1.py": 20.178,
+    "tests/test_receipt_fact_set_finalization_authorization_v1.py": 17.876,
+    "tests/test_receipt_facts_conversion_cli_v1.py": 25.278,
+    "tests/test_receipt_facts_conversion_concurrency_v1.py": 49.728,
+    "tests/test_receipt_facts_conversion_migration_constraints_v1.py": 207.427,
+    "tests/test_receipt_facts_conversion_v1.py": 177.537,
+    "tests/test_receipt_finalization_settlement_runtime.py": 164.126,
+    "tests/test_receipt_human_draft_publication_v1.py": 35.347,
+    "tests/test_receipt_item_allocation_facts_cli_v1.py": 24.539,
+    "tests/test_receipt_item_allocation_facts_migration_v1.py": 168.63,
+    "tests/test_receipt_item_allocation_facts_service_v1.py": 112.44,
+    "tests/test_receipt_item_allocation_facts_supersession_v1.py": 23.648,
+    "tests/test_receipt_ocr_evidence.py": 112.255,
+    "tests/test_receipt_ocr_macos_vision.py": 17.509,
+    "tests/test_receipt_ocr_proposal_ingestion_v1.py": 67.298,
+    "tests/test_receipt_proposal_revision_v1.py": 86.893,
+    "tests/test_receipt_split_generic.py": 0.001,
+    "tests/test_receipt_split_tc001.py": 4.162,
+    "tests/test_receipt_staging_runner_foundation_v1.py": 13.966,
+    "tests/test_receipt_staging_runner_local_intake_v1.py": 63.111,
+    "tests/test_receipt_staging_runner_resume_finalize_v1.py": 54.063,
+    "tests/test_reconciliation_adapter_v1.py": 28.851,
+    "tests/test_reconciliation_apply_audit_snapshot_v1.py": 0.222,
+    "tests/test_reconciliation_apply_execution_review_queue_cli_v1.py": 0.492,
+    "tests/test_reconciliation_apply_execution_review_queue_v1.py": 0.582,
+    "tests/test_reconciliation_apply_idempotency_v1.py": 0.473,
+    "tests/test_reconciliation_apply_orchestrator_v1.py": 0.172,
+    "tests/test_reconciliation_apply_persistence_v1.py": 23.821,
+    "tests/test_reconciliation_apply_plan_v1.py": 0.033,
+    "tests/test_reconciliation_apply_run_summary_v1.py": 7.476,
+    "tests/test_reconciliation_apply_runtime_guarded_v1.py": 0.019,
+    "tests/test_reconciliation_apply_state_adapter_v1.py": 8.111,
+    "tests/test_reconciliation_apply_state_persistence_schema_v1.py": 0.202,
+    "tests/test_reconciliation_batch_apply_state_control_v1.py": 0.024,
+    "tests/test_reconciliation_create_money_contract_v1.py": 0.01,
+    "tests/test_reconciliation_demo_apply_persistence_v1.py": 36.968,
+    "tests/test_reconciliation_demo_cli_fixture.py": 74.31,
+    "tests/test_reconciliation_direction_decision_hashes_v1.py": 46.292,
+    "tests/test_reconciliation_final_mutation_decision_persistence_v1.py": 0.654,
+    "tests/test_reconciliation_final_mutation_proposal_v1.py": 0.001,
+    "tests/test_reconciliation_final_transaction_adapter_v1.py": 0.032,
+    "tests/test_reconciliation_foundation_v1.py": 0.013,
+    "tests/test_reconciliation_guarded_apply_execution_persistence_v1.py": 0.479,
+    "tests/test_reconciliation_guarded_apply_execution_review_summary_v1.py": 0.216,
+    "tests/test_reconciliation_guarded_final_mutation_workflow_v1.py": 2.295,
+    "tests/test_reconciliation_matching_v1.py": 0.014,
+    "tests/test_reconciliation_persist_review_cli_v1.py": 28.375,
+    "tests/test_reconciliation_persistence_schema_v1.py": 26.856,
+    "tests/test_reconciliation_public_api_v1.py": 0.004,
+    "tests/test_reconciliation_reporting_constants_v1.py": 0.0,
+    "tests/test_reconciliation_reporting_export_fixture_v1.py": 0.0,
+    "tests/test_reconciliation_reporting_queries_v1.py": 16.646,
+    "tests/test_reconciliation_reporting_query_helpers_v1.py": 0.016,
+    "tests/test_reconciliation_reporting_views_v1.py": 21.293,
+    "tests/test_reconciliation_repository_v1.py": 27.266,
+    "tests/test_reconciliation_resolution_apply_v1.py": 0.029,
+    "tests/test_reconciliation_resolution_persistence_v1.py": 0.048,
+    "tests/test_reconciliation_resolution_v1.py": 0.005,
+    "tests/test_reconciliation_resolve_review_cli_v1.py": 19.276,
+    "tests/test_reconciliation_review_cli_v1.py": 1.453,
+    "tests/test_reconciliation_review_evidence_bundle_v1.py": 25.09,
+    "tests/test_reconciliation_review_persistence_v1.py": 0.026,
+    "tests/test_reconciliation_review_queue_enhanced_v1.py": 0.248,
+    "tests/test_reconciliation_review_queue_gen_v1.py": 0.005,
+    "tests/test_reconciliation_review_queue_preview_v1.py": 27.231,
+    "tests/test_reconciliation_review_queue_v1.py": 22.496,
+    "tests/test_reconciliation_review_workflow_audit_v1.py": 0.012,
+    "tests/test_reconciliation_runtime_cli.py": 12.857,
+    "tests/test_reconciliation_service_v1.py": 22.286,
+    "tests/test_reconciliation_statement_amount_direction_v1.py": 2.525,
+    "tests/test_reconciliation_statement_content_identity_v1.py": 107.335,
+    "tests/test_reconciliation_statement_csv_hardening_v1.py": 0.037,
+    "tests/test_reconciliation_statement_csv_v1.py": 0.01,
+    "tests/test_reconciliation_statement_date_semantics_v1.py": 0.513,
+    "tests/test_reconciliation_statement_import_fingerprint_dedup_v1.py": 19.398,
+    "tests/test_reconciliation_statement_import_integration_v1.py": 7.511,
+    "tests/test_reconciliation_statement_import_uow_v1.py": 39.413,
+    "tests/test_reconciliation_statement_import_v1.py": 39.441,
+    "tests/test_reconciliation_statement_matching_window_v1.py": 0.015,
+    "tests/test_reconciliation_structured_evidence_boundary_v1.py": 0.015,
+    "tests/test_reconciliation_structured_evidence_persistence_v1.py": 28.658,
+    "tests/test_reconciliation_structured_evidence_query_v1.py": 23.107,
+    "tests/test_reconciliation_transaction_posted_date_priority_v1.py": 0.015,
+    "tests/test_runtime_ddl_guard.py": 0.944,
+    "tests/test_settlement_runtime_v1.py": 0.002,
+    "tests/test_sqlite_connection.py": 0.033,
+    "tests/test_staging_guard.py": 1.988,
+    "tests/test_telegram_attachment_acquisition.py": 159.001,
+    "tests/test_telegram_attachment_evidence.py": 130.375,
+    "tests/test_telegram_text_update_intake_adapter_v1.py": 47.578,
+    "tests/test_temp_db_fixture.py": 2.693,
+    "tests/test_validation_aggregation_v1.py": 0.055
+  },
+  "ignored_historical_file_count": 0,
+  "ignored_historical_files": [],
+  "ignored_historical_test_count": 0,
+  "ignored_historical_test_sample_count": 0,
+  "schema": "pytest-shard-weights-v2",
+  "source_runs": [
+    {
+      "artifact_id": 1,
+      "artifact_name": "pytest-timing-v1-1-1",
+      "artifact_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "conclusion": "success",
+      "created_at": "2026-09-14T15:38:55Z",
+      "event": "workflow_dispatch",
+      "head_sha": "0000000000000000000000000000000000000000",
+      "repository": "private-source-redacted",
+      "run_attempt": 1,
+      "run_id": 1,
+      "status": "completed",
+      "workflow_path": "private-workflow-redacted"
+    },
+    {
+      "artifact_id": 2,
+      "artifact_name": "pytest-timing-v1-2-1",
+      "artifact_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "conclusion": "success",
+      "created_at": "2026-09-16T06:46:23Z",
+      "event": "workflow_dispatch",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "repository": "private-source-redacted",
+      "run_attempt": 1,
+      "run_id": 2,
+      "status": "completed",
+      "workflow_path": "private-workflow-redacted"
+    },
+    {
+      "artifact_id": 3,
+      "artifact_name": "pytest-timing-v1-3-1",
+      "artifact_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "conclusion": "success",
+      "created_at": "2026-09-16T14:00:16Z",
+      "event": "workflow_dispatch",
+      "head_sha": "2222222222222222222222222222222222222222",
+      "repository": "private-source-redacted",
+      "run_attempt": 1,
+      "run_id": 3,
+      "status": "completed",
+      "workflow_path": "private-workflow-redacted"
+    }
+  ],
+  "total_files": 203,
+  "total_test_samples": 27154,
+  "total_tests": 9085,
+  "unknown_file_weight_seconds": 112.421
+}

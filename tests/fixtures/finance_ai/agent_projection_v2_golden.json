@@ -1,0 +1,53 @@
+{
+  "source": {
+    "openclawVersion": "2026.7.1",
+    "openclawPackageSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "financeCommit": "75864b2dd9dc078de386844873a96b931a5d9477",
+    "pluginBuildSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "agents": {
+      "list": [
+        {
+          "id": "finance",
+          "displayAlias": "Nomi \u4e91\u7aef \ud83d\ude80",
+          "executionClass": "cloud_projection",
+          "model": {
+            "primary": "openai/example-model",
+            "fallbacks": []
+          }
+        }
+      ]
+    },
+    "policies": {
+      "toolPolicySha256": "4444444444444444444444444444444444444444444444444444444444444444",
+      "memoryPolicySha256": "5555555555555555555555555555555555555555555555555555555555555555",
+      "pluginBindingPolicySha256": "6666666666666666666666666666666666666666666666666666666666666666",
+      "projectionPolicyVersion": "finance-openclaw-agent-projection-policy-v2",
+      "projectionPolicySha256": "08ec7d514067f0e250e0d6e6efeafd817f1e5765c322f2709cce31d3fbab1d08",
+      "promptVersion": "finance-ai-prompt-v5",
+      "promptSha256": "48f4d53ba802569bfe929b24d9b83e309851f8bfc18e324e8f0f5e2bd09f4644",
+      "effectiveMaxRetries": 0
+    }
+  },
+  "projection_sha256": "436c2069a78e99b0eeaf29771f2ff102ce3a30a30b882ddc10eeefcf56b6da49",
+  "projection": {
+    "schema_version": "finance-openclaw-agent-config-projection-v2",
+    "openclaw_version": "2026.7.1",
+    "openclaw_package_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "finance_commit": "75864b2dd9dc078de386844873a96b931a5d9477",
+    "plugin_build_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "agent_id": "finance",
+    "canonical_provider": "openai",
+    "canonical_model": "example-model",
+    "display_alias": "Nomi \u4e91\u7aef \ud83d\ude80",
+    "execution_class": "cloud_projection",
+    "fallbacks": [],
+    "effective_max_retries": 0,
+    "tool_policy_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+    "memory_policy_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "plugin_binding_policy_sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+    "projection_policy_version": "finance-openclaw-agent-projection-policy-v2",
+    "projection_policy_sha256": "08ec7d514067f0e250e0d6e6efeafd817f1e5765c322f2709cce31d3fbab1d08",
+    "prompt_version": "finance-ai-prompt-v5",
+    "prompt_sha256": "48f4d53ba802569bfe929b24d9b83e309851f8bfc18e324e8f0f5e2bd09f4644"
+  }
+}

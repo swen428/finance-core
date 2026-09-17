@@ -1,0 +1,65 @@
+{
+  "name": "@finance-codex/finance-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "files": [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "binding.gyp",
+    "dist/build-provenance-v1.json",
+    "dist/src/**",
+    "native/**",
+    "openclaw.plugin.json",
+    "npm-shrinkwrap.json",
+    "scripts/build-native.mjs",
+    "scripts/check-native-reproducibility.mjs",
+    "scripts/verify-core-distribution.py",
+    "src/**",
+    "tsconfig.json",
+    "types/**"
+  ],
+  "gypfile": true,
+  "type": "module",
+  "engines": {
+    "node": "24.15.0"
+  },
+  "peerDependencies": {
+    "openclaw": "2026.7.1-2"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "fs-ext": "2.1.1",
+    "typebox": "1.3.3"
+  },
+  "devDependencies": {
+    "@openclaw/ai": "2026.7.2-beta.6",
+    "@types/node": "26.1.0",
+    "openclaw-sdk": "npm:openclaw@2026.7.2-beta.6",
+    "typescript": "6.0.3"
+  },
+  "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "build": "node scripts/check-native-reproducibility.mjs",
+    "rehearse:gate5": "GATE5_OS_NETWORK_SANDBOX=1 /usr/bin/sandbox-exec -f scripts/gate5-loopback-only.sb node scripts/run-gate5-local-rehearsal.mjs",
+    "test": "node --test 'dist/test/**/*.test.js'"
+  },
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "runtimeExtensions": [
+      "./dist/src/index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.7.1"
+    },
+    "install": {
+      "minHostVersion": ">=2026.7.1"
+    }
+  }
+}

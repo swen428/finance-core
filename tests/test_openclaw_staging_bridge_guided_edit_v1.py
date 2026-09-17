@@ -1,0 +1,1181 @@
+"""Durable structured Telegram guided-edit acceptance tests."""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import openclaw_staging_bridge_support_v1 as support
+import pytest
+
+from finance_core.openclaw_staging_bridge import errors as bridge_errors
+from finance_core.openclaw_staging_bridge import guided_edit, human_actions, identity, ocr_boundary
+from finance_core.parser_proposals.completion import complete_proposal
+from tests.test_receipt_ocr_proposal_ingestion_v1 import _sgd_blocks
+
+ACTOR = "111"
+ACCOUNT = "finance-account"
+CONVERSATION = "111"
+BINDING = "binding-1"
+
+
+@pytest.fixture()
+def workspace(tmp_path: Path) -> support.BridgeWorkspace:
+    return support.create_bridge_workspace(tmp_path)
+
+
+def _context(workspace: support.BridgeWorkspace) -> dict[str, object]:
+    return {
+        "workspace_path": str(workspace.workspace_path),
+        "operator_actor_id": ACTOR,
+        "telegram_account_id": ACCOUNT,
+        "telegram_conversation_id": CONVERSATION,
+        "conversation_binding_id": BINDING,
+    }
+
+
+def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, object]]:
+    capture = support.run_cli(
+        support.make_request(
+            "capture",
+            support.capture_text_arguments(workspace, support.telegram_text_update("lunch 12.50")),
+            idempotency_key=support.canonical_capture_key(message_id=10),
+        )
+    )
+    proposal = str(capture.response["result"]["proposal_public_id"])
+    review = support.run_cli(
+        support.make_request(
+            "get_review",
+            {"workspace_path": str(workspace.workspace_path), "proposal_public_id": proposal},
+        )
+    ).response["result"]
+    batch = "d" * 32
+    issued = support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": proposal,
+                "reference_batch_id": batch,
+                "token_ttl_seconds": 600,
+                "expected_proposal_version": review["proposal_version"],
+                "expected_content_hash": review["effective_content_hash"],
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(batch),
+        )
+    )
+    reference = issued.response["result"]["actions"]["edit"]["reference"]
+    callback_id = "guided-edit-callback"
+    redemption_request = support.make_request(
+        "redeem_human_action",
+        {
+            **_context(workspace),
+            "short_reference": reference,
+            "action": "edit",
+            "callback_id": callback_id,
+            "callback_message_id": 20,
+        },
+        idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+    )
+    redeemed = support.run_cli(redemption_request)
+    assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
+    session = str(redeemed.response["result"]["guided_edit_session_public_id"])
+    return proposal, session, redemption_request
+
+
+def _apply(
+    workspace: support.BridgeWorkspace,
+    session: str,
+    message_id: int,
+    field: str,
+    value: str,
+) -> support.CliOutcome:
+    return support.run_cli(
+        support.make_request(
+            "apply_guided_edit_update",
+            {
+                **_context(workspace),
+                "session_public_id": session,
+                "telegram_message_id": message_id,
+                "field_name": field,
+                "field_value": value,
+            },
+            idempotency_key=f"bridge-guided-edit-update:{session}:{message_id}",
+        )
+    )
+
+
+def _get(workspace: support.BridgeWorkspace, message_id: int | None = None) -> support.CliOutcome:
+    return support.run_cli(
+        support.make_request(
+            "get_guided_edit_session",
+            {
+                **_context(workspace),
+                **({} if message_id is None else {"telegram_message_id": message_id}),
+            },
+        )
+    )
+
+
+def _complete(
+    workspace: support.BridgeWorkspace, session: str, message_id: int
+) -> support.CliOutcome:
+    return support.run_cli(
+        support.make_request(
+            "complete_guided_edit",
+            {
+                **_context(workspace),
+                "session_public_id": session,
+                "telegram_message_id": message_id,
+            },
+            idempotency_key=f"bridge-guided-edit-complete:{session}:{message_id}",
+        )
+    )
+
+
+def test_edit_redemption_atomically_starts_durable_session(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace)
+    assert active.exit_code == bridge_errors.EXIT_OK
+    assert active.response["result"] == {
+        "active": True,
+        "session_status": "active",
+        "session_public_id": session,
+        "proposal_public_id": proposal,
+        "proposal_version": 0,
+        "effective_content_hash": active.response["result"]["effective_content_hash"],
+        "expires_at": active.response["result"]["expires_at"],
+        "recovery_required": False,
+        "final_transaction_created": False,
+    }
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM openclaw_guided_edit_sessions").fetchone()[0] == 1
+        assert conn.execute("SELECT event_type FROM openclaw_guided_edit_events").fetchone()[0] == (
+            "started"
+        )
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_multiple_updates_survive_process_boundaries_and_complete_for_fresh_review(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, redemption = _begin(workspace)
+    first = _apply(workspace, session, 30, "merchant", "Example Cafe")
+    assert first.exit_code == bridge_errors.EXIT_OK, first.response
+    assert first.response["result"]["proposal_version"] == 1
+    assert first.response["result"]["final_transaction_created"] is False
+
+    # Every CLI call reopens the same staging database, exercising restart-safe state.
+    active = _get(workspace)
+    assert active.response["result"]["proposal_version"] == 1
+    second = _apply(workspace, session, 31, "transaction_date", "2026-09-03")
+    assert second.exit_code == bridge_errors.EXIT_OK, second.response
+    assert second.response["result"]["proposal_version"] == 2
+
+    complete = _complete(workspace, session, 32)
+    assert complete.exit_code == bridge_errors.EXIT_OK, complete.response
+    assert complete.response["result"]["active"] is False
+    assert complete.response["result"]["proposal_version"] == 2
+    assert _get(workspace).response["result"] == {
+        "active": False,
+        "session_status": "inactive",
+        "final_transaction_created": False,
+    }
+    review = support.run_cli(
+        support.make_request(
+            "get_review",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": complete.response["result"]["proposal_public_id"],
+            },
+        )
+    )
+    assert review.response["result"]["merchant"] == "Example Cafe"
+    assert review.response["result"]["transaction_date"] == "2026-09-03"
+    assert review.response["result"]["confirm_available"] is True
+    stale_card = support.run_cli(redemption)
+    assert stale_card.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert stale_card.response["error"]["code"] == bridge_errors.PROPOSAL_TERMINAL_STATE
+
+
+def test_same_message_replays_but_conflicting_material_fails_closed(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    first = _apply(workspace, session, 30, "description", "Lunch")
+    replay = _apply(workspace, session, 30, "description", "Lunch")
+    conflict = _apply(workspace, session, 30, "description", "Dinner")
+    assert first.exit_code == bridge_errors.EXIT_OK
+    assert replay.exit_code == bridge_errors.EXIT_OK
+    assert replay.response["idempotent_replay"] is True
+    assert conflict.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert conflict.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+
+
+def test_message_claims_are_ordered_and_one_operation_per_message(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    applied = _apply(workspace, session, 31, "merchant", "Newest")
+    stale = _apply(workspace, session, 30, "merchant", "Older")
+    reused_for_completion = _complete(workspace, session, 31)
+
+    assert applied.exit_code == bridge_errors.EXIT_OK
+    assert stale.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert stale.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    assert reused_for_completion.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert reused_for_completion.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    assert _get(workspace).response["result"]["proposal_version"] == 1
+
+
+def test_completion_replay_is_discoverable_only_by_exact_message(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    completed = _complete(workspace, session, 30)
+    replay_lookup = _get(workspace, 30)
+    other_lookup = _get(workspace, 31)
+    replay = _complete(workspace, session, 30)
+
+    assert completed.exit_code == bridge_errors.EXIT_OK
+    assert len(completed.response["result"]["review_batch_id"]) == 32
+    assert replay_lookup.response["result"]["session_status"] == "completed_replay"
+    assert replay_lookup.response["result"]["session_public_id"] == session
+    assert other_lookup.response["result"]["session_status"] == "inactive"
+    assert replay.exit_code == bridge_errors.EXIT_OK
+    assert replay.response["idempotent_replay"] is True
+    assert (
+        replay.response["result"]["review_batch_id"]
+        == completed.response["result"]["review_batch_id"]
+    )
+
+
+def test_expired_review_replay_claims_one_new_redeemable_generation(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    completed = _complete(workspace, session, 30)
+    result = completed.response["result"]
+    first_batch = str(result["review_batch_id"])
+    context = human_actions.HumanActionContext(
+        actor_id=ACTOR,
+        account_id=ACCOUNT,
+        conversation_id=CONVERSATION,
+        binding_id=BINDING,
+    )
+    key = (workspace.workspace_path / "runtime" / "callback_signing.key").read_bytes()
+    conn = support.open_database(workspace)
+    try:
+        first_refs, _ = human_actions.issue_human_action_references(
+            conn,
+            key=key,
+            issuance_idempotency_key=support.canonical_human_action_issuance_key(first_batch),
+            proposal_public_id=str(result["proposal_public_id"]),
+            expected_proposal_version=int(result["proposal_version"]),
+            expected_proposal_content_hash=str(result["effective_content_hash"]),
+            context=context,
+            ttl_seconds=600,
+            clock=lambda: 1_000,
+        )
+        with pytest.raises(human_actions.HumanActionReferenceError) as expiring:
+            human_actions.issue_human_action_references(
+                conn,
+                key=key,
+                issuance_idempotency_key=(support.canonical_human_action_issuance_key(first_batch)),
+                proposal_public_id=str(result["proposal_public_id"]),
+                expected_proposal_version=int(result["proposal_version"]),
+                expected_proposal_content_hash=str(result["effective_content_hash"]),
+                context=context,
+                ttl_seconds=600,
+                minimum_remaining_seconds=60,
+                clock=lambda: 1_540,
+            )
+        assert expiring.value.reason == "reference_expiring"
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: 1_601)
+    original_begin = guided_edit._begin
+    claim_barrier = threading.Barrier(2)
+
+    def concurrent_begin(conn: sqlite3.Connection) -> None:
+        claim_barrier.wait(timeout=5)
+        original_begin(conn)
+
+    monkeypatch.setattr(guided_edit, "_begin", concurrent_begin)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(_complete, workspace, session, 30) for _ in range(2)]
+        renewed, concurrent_replay = [future.result(timeout=10) for future in futures]
+    monkeypatch.setattr(guided_edit, "_begin", original_begin)
+    second_batch = str(renewed.response["result"]["review_batch_id"])
+    assert second_batch != first_batch
+    assert concurrent_replay.response["result"]["review_batch_id"] == second_batch
+
+    conn = support.open_database(workspace)
+    try:
+        second_refs, _ = human_actions.issue_human_action_references(
+            conn,
+            key=key,
+            issuance_idempotency_key=support.canonical_human_action_issuance_key(second_batch),
+            proposal_public_id=str(result["proposal_public_id"]),
+            expected_proposal_version=int(result["proposal_version"]),
+            expected_proposal_content_hash=str(result["effective_content_hash"]),
+            context=context,
+            ttl_seconds=600,
+            clock=lambda: 1_601,
+        )
+        old_reject = next(item for item in first_refs if item.action == "reject")
+        new_reject = next(item for item in second_refs if item.action == "reject")
+        with pytest.raises(human_actions.HumanActionReferenceError) as expired:
+            human_actions.redeem_human_action_reference(
+                conn,
+                key=key,
+                reference=old_reject.reference,
+                action="reject",
+                context=context,
+                callback_id="expired-review-generation",
+                callback_message_id=31,
+                clock=lambda: 1_601,
+            )
+        assert expired.value.reason == "reference_expired"
+        redeemed = human_actions.redeem_human_action_reference(
+            conn,
+            key=key,
+            reference=new_reject.reference,
+            action="reject",
+            context=context,
+            callback_id="current-review-generation",
+            callback_message_id=31,
+            clock=lambda: 1_601,
+        )
+        assert redeemed.action == "reject"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_guided_edit_review_generations").fetchone()[
+                0
+            ]
+            == 2
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE openclaw_guided_edit_review_generations SET generation = generation + 1"
+            )
+        conn.rollback()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM openclaw_guided_edit_review_generations")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_consumed_edit_reference_forces_fresh_review_generation(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    completed = _complete(workspace, session, 30).response["result"]
+
+    def issue_batch(batch_id: str) -> support.CliOutcome:
+        return support.run_cli(
+            support.make_request(
+                "issue_human_actions",
+                {
+                    **_context(workspace),
+                    "proposal_public_id": proposal,
+                    "reference_batch_id": batch_id,
+                    "token_ttl_seconds": 600,
+                    "minimum_remaining_seconds": 60,
+                    "require_unconsumed_replay": True,
+                    "expected_proposal_version": completed["proposal_version"],
+                    "expected_content_hash": completed["effective_content_hash"],
+                },
+                idempotency_key=support.canonical_human_action_issuance_key(batch_id),
+            )
+        )
+
+    def issue_edit_reference(batch_id: str) -> str:
+        issued = issue_batch(batch_id)
+        assert issued.exit_code == bridge_errors.EXIT_OK, issued.response
+        return str(issued.response["result"]["actions"]["edit"]["reference"])
+
+    first_batch = str(completed["review_batch_id"])
+    first_reference = issue_edit_reference(first_batch)
+    claimed_before_consumption = _complete(workspace, session, 30).response["result"]
+    assert claimed_before_consumption["review_batch_id"] == first_batch
+    first_callback_id = "consume-first-guided-review-edit"
+    first_redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": first_reference,
+                "action": "edit",
+                "callback_id": first_callback_id,
+                "callback_message_id": 31,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(first_callback_id),
+        )
+    )
+    assert first_redeemed.exit_code == bridge_errors.EXIT_OK, first_redeemed.response
+
+    refused_consumed_batch = issue_batch(first_batch)
+    assert refused_consumed_batch.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused_consumed_batch.response["error"]["code"] == (bridge_errors.CALLBACK_EXPIRED)
+
+    replayed_completion = _complete(workspace, session, 30).response["result"]
+    second_batch = str(replayed_completion["review_batch_id"])
+    assert second_batch != first_batch
+    second_reference = issue_edit_reference(second_batch)
+    second_callback_id = "consume-renewed-guided-review-edit"
+    second_redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": second_reference,
+                "action": "edit",
+                "callback_id": second_callback_id,
+                "callback_message_id": 32,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(second_callback_id),
+        )
+    )
+    assert second_redeemed.exit_code == bridge_errors.EXIT_OK, second_redeemed.response
+
+
+def test_new_session_inherits_context_high_water_and_old_completion_wins_lookup(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, first_session, _redemption = _begin(workspace)
+    assert _complete(workspace, first_session, 200).exit_code == bridge_errors.EXIT_OK
+    review = support.run_cli(
+        support.make_request(
+            "get_review",
+            {"workspace_path": str(workspace.workspace_path), "proposal_public_id": proposal},
+        )
+    ).response["result"]
+    batch = "a" * 32
+    issued = support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": proposal,
+                "reference_batch_id": batch,
+                "token_ttl_seconds": 600,
+                "expected_proposal_version": review["proposal_version"],
+                "expected_content_hash": review["effective_content_hash"],
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(batch),
+        )
+    )
+    callback_id = "older-card-new-session"
+    redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": issued.response["result"]["actions"]["edit"]["reference"],
+                "action": "edit",
+                "callback_id": callback_id,
+                "callback_message_id": 150,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+        )
+    )
+    second_session = str(redeemed.response["result"]["guided_edit_session_public_id"])
+    assert second_session != first_session
+
+    old_completion_lookup = _get(workspace, 200)
+    late_update = _apply(workspace, second_session, 200, "merchant", "Wrong Proposal")
+    late_completion = _complete(workspace, second_session, 200)
+    assert old_completion_lookup.response["result"]["session_public_id"] == first_session
+    assert old_completion_lookup.response["result"]["session_status"] == "completed_replay"
+    assert late_update.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert late_update.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    assert late_completion.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert late_completion.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    active = _get(workspace).response["result"]
+    assert active["session_public_id"] == second_session
+    assert active["proposal_version"] == 0
+
+
+def test_core_replay_crossing_expiry_is_settled_as_applied(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace).response["result"]
+    operation_key = support.canonical_edit_key(
+        proposal_public_id=proposal,
+        version=int(active["proposal_version"]),
+        content_hash=str(active["effective_content_hash"]),
+    )
+    conn = support.open_database(workspace)
+    try:
+        row = conn.execute(
+            "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        pending = guided_edit.request_update(
+            conn,
+            dict(row),
+            message_id=30,
+            operation_key=operation_key,
+            field_name="merchant",
+            field_value="Committed During Race",
+        )
+    finally:
+        conn.close()
+
+    missed = threading.Event()
+    core_committed = threading.Event()
+    original_pending_core_state = guided_edit.pending_core_state
+    first_lookup = True
+
+    def delayed_first_lookup(
+        conn: object, current: dict[str, object]
+    ) -> tuple[int, int, str] | None:
+        nonlocal first_lookup
+        if first_lookup:
+            first_lookup = False
+            result = original_pending_core_state(conn, current)  # type: ignore[arg-type]
+            assert result is None
+            missed.set()
+            assert core_committed.wait(timeout=5)
+            return None
+        return original_pending_core_state(conn, current)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(guided_edit, "pending_core_state", delayed_first_lookup)
+    monkeypatch.setattr(
+        guided_edit,
+        "_now_epoch",
+        lambda: int(active["expires_at"]) + 1,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        replay_future = executor.submit(
+            _apply, workspace, session, 30, "merchant", "Committed During Race"
+        )
+        assert missed.wait(timeout=5)
+        writer = support.open_database(workspace)
+        try:
+            complete_proposal(
+                writer,
+                int(pending["current_parser_output_id"]),
+                actor=ACTOR,
+                expected_content_hash=str(pending["current_content_hash"]),
+                field_updates={"merchant": "Committed During Race"},
+                completion_public_id=identity.completion_public_id(operation_key),
+                completion_channel="openclaw_staging_bridge",
+            )
+        finally:
+            writer.close()
+        core_committed.set()
+        replay = replay_future.result(timeout=5)
+
+    assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
+    conn = support.open_database(workspace)
+    try:
+        state = conn.execute(
+            "SELECT current_proposal_version, pending_message_id "
+            "FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        assert tuple(state) == (1, None)
+        assert (
+            conn.execute(
+                "SELECT event_type FROM openclaw_guided_edit_events "
+                "WHERE telegram_message_id = 30 ORDER BY sequence_number DESC LIMIT 1"
+            ).fetchone()[0]
+            == "update_applied"
+        )
+    finally:
+        conn.close()
+
+
+def test_refusal_settlement_rechecks_core_result_under_write_lock(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace).response["result"]
+    operation_key = support.canonical_edit_key(
+        proposal_public_id=proposal,
+        version=0,
+        content_hash=str(active["effective_content_hash"]),
+    )
+    conn = support.open_database(workspace)
+    try:
+        session_row = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session,),
+            ).fetchone()
+        )
+        pending = guided_edit.request_update(
+            conn,
+            session_row,
+            message_id=30,
+            operation_key=operation_key,
+            field_name="category",
+            field_value="Meals",
+        )
+        assert guided_edit.pending_core_state(conn, pending) is None
+        complete_proposal(
+            conn,
+            int(pending["current_parser_output_id"]),
+            actor=ACTOR,
+            expected_content_hash=str(pending["current_content_hash"]),
+            field_updates={"category": "Meals"},
+            completion_public_id=identity.completion_public_id(operation_key),
+            completion_channel="openclaw_staging_bridge",
+        )
+        guided_edit.record_update_refused(conn, pending, bridge_errors.CALLBACK_EXPIRED)
+        event = conn.execute(
+            "SELECT event_type, refusal_code FROM openclaw_guided_edit_events "
+            "WHERE telegram_message_id = 30 ORDER BY sequence_number DESC LIMIT 1"
+        ).fetchone()
+        assert tuple(event) == ("update_applied", None)
+    finally:
+        conn.close()
+
+
+def test_stale_refusal_settler_cannot_clear_a_later_pending_message(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace).response["result"]
+    first_operation_key = support.canonical_edit_key(
+        proposal_public_id=proposal,
+        version=0,
+        content_hash=str(active["effective_content_hash"]),
+    )
+    conn = support.open_database(workspace)
+    try:
+        session_row = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session,),
+            ).fetchone()
+        )
+        first_pending = guided_edit.request_update(
+            conn,
+            session_row,
+            message_id=30,
+            operation_key=first_operation_key,
+            field_name="category",
+            field_value="Invalid First",
+        )
+        guided_edit.record_update_refused(conn, first_pending, bridge_errors.ARGUMENTS_REFUSED)
+        current = dict(
+            conn.execute(
+                "SELECT sessions.*, proposals.public_id AS proposal_public_id "
+                "FROM openclaw_guided_edit_sessions AS sessions "
+                "JOIN parser_outputs AS proposals "
+                "ON proposals.id = sessions.current_parser_output_id "
+                "WHERE sessions.session_public_id = ?",
+                (session,),
+            ).fetchone()
+        )
+        second_pending = guided_edit.request_update(
+            conn,
+            current,
+            message_id=31,
+            operation_key=first_operation_key,
+            field_name="merchant",
+            field_value="Valid Second",
+        )
+
+        guided_edit.record_update_refused(conn, first_pending, bridge_errors.ARGUMENTS_REFUSED)
+        after = conn.execute(
+            "SELECT pending_message_id, pending_field_name, pending_field_value_json "
+            "FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        assert tuple(after) == (
+            31,
+            "merchant",
+            second_pending["pending_field_value_json"],
+        )
+        events = conn.execute(
+            "SELECT telegram_message_id, event_type FROM openclaw_guided_edit_events "
+            "WHERE telegram_message_id IN (30, 31) ORDER BY sequence_number"
+        ).fetchall()
+        assert [tuple(row) for row in events] == [
+            (30, "update_requested"),
+            (30, "update_refused"),
+            (31, "update_requested"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_stale_applied_settler_cannot_clear_a_later_pending_message(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace).response["result"]
+    first_operation_key = support.canonical_edit_key(
+        proposal_public_id=proposal,
+        version=0,
+        content_hash=str(active["effective_content_hash"]),
+    )
+    conn = support.open_database(workspace)
+    try:
+        session_row = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session,),
+            ).fetchone()
+        )
+        first_pending = guided_edit.request_update(
+            conn,
+            session_row,
+            message_id=30,
+            operation_key=first_operation_key,
+            field_name="category",
+            field_value="Meals",
+        )
+        complete_proposal(
+            conn,
+            int(first_pending["current_parser_output_id"]),
+            actor=ACTOR,
+            expected_content_hash=str(first_pending["current_content_hash"]),
+            field_updates={"category": "Meals"},
+            completion_public_id=identity.completion_public_id(first_operation_key),
+            completion_channel="openclaw_staging_bridge",
+        )
+        first_state = guided_edit.pending_core_state(conn, first_pending)
+        assert first_state is not None
+        guided_edit.record_update_applied(
+            conn,
+            first_pending,
+            parser_output_id=first_state[0],
+            proposal_version=first_state[1],
+            content_hash=first_state[2],
+        )
+        current = dict(
+            conn.execute(
+                "SELECT sessions.*, proposals.public_id AS proposal_public_id "
+                "FROM openclaw_guided_edit_sessions AS sessions "
+                "JOIN parser_outputs AS proposals "
+                "ON proposals.id = sessions.current_parser_output_id "
+                "WHERE sessions.session_public_id = ?",
+                (session,),
+            ).fetchone()
+        )
+        second_operation_key = support.canonical_edit_key(
+            proposal_public_id=proposal,
+            version=int(current["current_proposal_version"]),
+            content_hash=str(current["current_content_hash"]),
+        )
+        second_pending = guided_edit.request_update(
+            conn,
+            current,
+            message_id=31,
+            operation_key=second_operation_key,
+            field_name="merchant",
+            field_value="Valid Second",
+        )
+
+        guided_edit.record_update_applied(
+            conn,
+            first_pending,
+            parser_output_id=first_state[0],
+            proposal_version=first_state[1],
+            content_hash=first_state[2],
+        )
+        after = conn.execute(
+            "SELECT pending_message_id, pending_operation_key, pending_field_name, "
+            "pending_field_value_json FROM openclaw_guided_edit_sessions "
+            "WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        assert tuple(after) == (
+            31,
+            second_operation_key,
+            "merchant",
+            second_pending["pending_field_value_json"],
+        )
+        events = conn.execute(
+            "SELECT telegram_message_id, event_type FROM openclaw_guided_edit_events "
+            "WHERE telegram_message_id IN (30, 31) ORDER BY sequence_number"
+        ).fetchall()
+        assert [tuple(row) for row in events] == [
+            (30, "update_requested"),
+            (30, "update_applied"),
+            (31, "update_requested"),
+        ]
+    finally:
+        conn.close()
+
+
+def test_committed_edit_with_lost_session_ack_is_recovered_idempotently(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    original = guided_edit.record_update_applied
+    calls = 0
+
+    def lose_first_ack(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic crash after authoritative edit commit")
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(guided_edit, "record_update_applied", lose_first_ack)
+    unknown = _apply(workspace, session, 30, "category", "Meals")
+    assert unknown.exit_code == bridge_errors.EXIT_INTERNAL
+    assert _get(workspace).response["result"]["recovery_required"] is True
+
+    recovered = _apply(workspace, session, 30, "category", "Meals")
+    assert recovered.exit_code == bridge_errors.EXIT_OK, recovered.response
+    assert recovered.response["idempotent_replay"] is True
+    assert _get(workspace).response["result"]["recovery_required"] is False
+
+
+def test_committed_edit_recovery_remains_available_after_expiry(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    expires_at = int(_get(workspace).response["result"]["expires_at"])
+    original = guided_edit.record_update_applied
+    calls = 0
+
+    def lose_first_ack(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic lost session acknowledgement")
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(guided_edit, "record_update_applied", lose_first_ack)
+    unknown = _apply(workspace, session, 30, "category", "Meals")
+    assert unknown.exit_code == bridge_errors.EXIT_INTERNAL
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: expires_at + 1)
+
+    recovered = _apply(workspace, session, 30, "category", "Meals")
+    different = _apply(workspace, session, 31, "category", "Travel")
+    assert recovered.exit_code == bridge_errors.EXIT_OK, recovered.response
+    assert recovered.response["idempotent_replay"] is True
+    assert different.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert different.response["error"]["code"] == bridge_errors.CALLBACK_EXPIRED
+
+
+def test_expiry_between_claim_and_core_write_refuses_without_financial_mutation(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    expires_at = int(_get(workspace).response["result"]["expires_at"])
+    times = iter((expires_at - 1, expires_at))
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: next(times))
+
+    refused = _apply(workspace, session, 30, "merchant", "Too Late")
+    assert refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.CALLBACK_EXPIRED
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM parser_proposal_completions").fetchone()[0] == 0
+        event = conn.execute(
+            "SELECT event_type, refusal_code FROM openclaw_guided_edit_events "
+            "WHERE telegram_message_id = 30 ORDER BY sequence_number DESC LIMIT 1"
+        ).fetchone()
+        assert tuple(event) == ("update_refused", bridge_errors.CALLBACK_EXPIRED)
+    finally:
+        conn.close()
+
+
+def test_direct_guided_command_rejects_control_characters(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    refused = _apply(workspace, session, 30, "merchant", "Safe\nForged")
+    assert refused.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.ARGUMENTS_REFUSED
+    assert _get(workspace).response["result"]["proposal_version"] == 0
+
+
+def test_completion_rechecks_proposal_snapshot_inside_transaction(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    conn = support.open_database(workspace)
+    try:
+        row = conn.execute(
+            "SELECT current_parser_output_id, current_content_hash "
+            "FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        complete_proposal(
+            conn,
+            int(row[0]),
+            actor=ACTOR,
+            expected_content_hash=str(row[1]),
+            field_updates={"merchant": "External Change"},
+            completion_public_id="pco_external_guided_edit_test",
+            completion_channel="test",
+        )
+    finally:
+        conn.close()
+
+    refused = _complete(workspace, session, 30)
+    assert refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.STALE_CONTENT_HASH
+
+
+def test_expired_uncommitted_pending_is_audited_and_fresh_session_can_start(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposal, session, _redemption = _begin(workspace)
+    active = _get(workspace).response["result"]
+    expires_at = int(active["expires_at"])
+    conn = support.open_database(workspace)
+    try:
+        row = conn.execute(
+            "SELECT sessions.*, proposals.public_id AS proposal_public_id "
+            "FROM openclaw_guided_edit_sessions AS sessions "
+            "JOIN parser_outputs AS proposals ON proposals.id = sessions.current_parser_output_id "
+            "WHERE sessions.session_public_id = ?",
+            (session,),
+        ).fetchone()
+        guided_edit.request_update(
+            conn,
+            dict(row),
+            message_id=30,
+            operation_key=(
+                f"bridge-edit:{proposal}:v{active['proposal_version']}:"
+                f"{active['effective_content_hash']}"
+            ),
+            field_name="merchant",
+            field_value="Never Committed",
+        )
+    finally:
+        conn.close()
+
+    review = support.run_cli(
+        support.make_request(
+            "get_review",
+            {"workspace_path": str(workspace.workspace_path), "proposal_public_id": proposal},
+        )
+    ).response["result"]
+    batch = "f" * 32
+    issued = support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": proposal,
+                "reference_batch_id": batch,
+                "token_ttl_seconds": 1200,
+                "expected_proposal_version": review["proposal_version"],
+                "expected_content_hash": review["effective_content_hash"],
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(batch),
+        )
+    )
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: expires_at + 1)
+    callback_id = "fresh-guided-edit-callback"
+    redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": issued.response["result"]["actions"]["edit"]["reference"],
+                "action": "edit",
+                "callback_id": callback_id,
+                "callback_message_id": 40,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+        )
+    )
+    assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
+    fresh_session = str(redeemed.response["result"]["guided_edit_session_public_id"])
+    assert fresh_session != session
+    stale_old_message = _apply(workspace, fresh_session, 30, "merchant", "Late Old Edit")
+    assert stale_old_message.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert stale_old_message.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+
+    conn = support.open_database(workspace)
+    try:
+        old = conn.execute(
+            "SELECT status, pending_message_id FROM openclaw_guided_edit_sessions "
+            "WHERE session_public_id = ?",
+            (session,),
+        ).fetchone()
+        assert tuple(old) == ("abandoned", None)
+        refused = conn.execute(
+            "SELECT refusal_code FROM openclaw_guided_edit_events "
+            "WHERE session_id = (SELECT id FROM openclaw_guided_edit_sessions "
+            "WHERE session_public_id = ?) AND event_type = 'update_refused'",
+            (session,),
+        ).fetchone()
+        assert refused[0] == bridge_errors.CALLBACK_EXPIRED
+    finally:
+        conn.close()
+
+
+def test_text_monetary_edit_is_refused_without_ending_session(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    refused = _apply(workspace, session, 30, "amount", "321.89")
+    replay = _apply(workspace, session, 30, "amount", "321.89")
+    assert refused.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.UNSUPPORTED_EDIT
+    assert replay.exit_code == refused.exit_code
+    assert replay.response["error"]["code"] == refused.response["error"]["code"]
+    active = _get(workspace)
+    assert active.response["result"]["active"] is True
+    assert active.response["result"]["proposal_version"] == 0
+    assert active.response["result"]["recovery_required"] is False
+
+
+def _begin_receipt_session(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[str, str]:
+    support.write_handoff_file(workspace, "guided-receipt.jpg", support.JPEG_BYTES)
+    capture = support.run_cli(
+        support.make_request(
+            "capture",
+            support.capture_receipt_arguments(workspace, handoff_filename="guided-receipt.jpg"),
+            idempotency_key=support.canonical_capture_key(message_id=20),
+        )
+    )
+    engine = support.FakeOcrEngine(blocks=_sgd_blocks())
+    monkeypatch.setattr(ocr_boundary, "engine_factory", lambda _workspace: engine)
+    proposed = support.run_cli(
+        support.make_request(
+            "propose",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "intake_public_id": capture.response["result"]["intake_public_id"],
+            },
+            idempotency_key=support.canonical_propose_key(
+                capture.response["result"]["intake_public_id"]
+            ),
+        )
+    )
+    original = str(proposed.response["result"]["proposal_public_id"])
+
+    # Start a session for the receipt proposal using the same durable action boundary.
+    review = support.run_cli(
+        support.make_request(
+            "get_review",
+            {"workspace_path": str(workspace.workspace_path), "proposal_public_id": original},
+        )
+    ).response["result"]
+    batch = "e" * 32
+    issued = support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": original,
+                "reference_batch_id": batch,
+                "token_ttl_seconds": 600,
+                "expected_proposal_version": review["proposal_version"],
+                "expected_content_hash": review["effective_content_hash"],
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(batch),
+        )
+    )
+    callback_id = "guided-receipt-callback"
+    redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": issued.response["result"]["actions"]["edit"]["reference"],
+                "action": "edit",
+                "callback_id": callback_id,
+                "callback_message_id": 21,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+        )
+    )
+    session = str(redeemed.response["result"]["guided_edit_session_public_id"])
+    return original, session
+
+
+def test_receipt_amount_edit_uses_supersession_and_keeps_session_on_replacement(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original, session = _begin_receipt_session(workspace, monkeypatch)
+    corrected = _apply(workspace, session, 30, "amount", "56.78")
+    assert corrected.exit_code == bridge_errors.EXIT_OK, corrected.response
+    replacement = corrected.response["result"]["proposal_public_id"]
+    assert corrected.response["result"]["edit_kind"] == "receipt_monetary_correction"
+    assert replacement != original
+    active = _get(workspace).response["result"]
+    assert active["proposal_public_id"] == replacement
+    assert active["proposal_version"] == 0
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute(
+                "SELECT parse_status FROM parser_outputs WHERE public_id = ?", (original,)
+            ).fetchone()[0]
+            == "superseded"
+        )
+        assert all(count == 0 for count in support.count_final_facts(conn).values())
+    finally:
+        conn.close()
+
+
+def test_receipt_edit_expiry_guard_runs_under_authoritative_write_lock(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original, session = _begin_receipt_session(workspace, monkeypatch)
+    expires_at = int(_get(workspace).response["result"]["expires_at"])
+    times = iter((expires_at - 1, expires_at))
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: next(times))
+
+    refused = _apply(workspace, session, 30, "amount", "56.78")
+    assert refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.CALLBACK_EXPIRED
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM receipt_proposal_revisions").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT parse_status FROM parser_outputs WHERE public_id = ?", (original,)
+            ).fetchone()[0]
+            != "superseded"
+        )
+    finally:
+        conn.close()
+
+
+def test_session_is_bound_to_exact_private_conversation_context(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    wrong = support.run_cli(
+        support.make_request(
+            "apply_guided_edit_update",
+            {
+                **_context(workspace),
+                "conversation_binding_id": "binding-other",
+                "session_public_id": session,
+                "telegram_message_id": 30,
+                "field_name": "merchant",
+                "field_value": "Nope",
+            },
+            idempotency_key=f"bridge-guided-edit-update:{session}:30",
+        )
+    )
+    assert wrong.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert _get(workspace).response["result"]["proposal_version"] == 0

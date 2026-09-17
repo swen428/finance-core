@@ -1,0 +1,5 @@
+# Deterministic extracted text for sample_bank_statement.pdf.
+# CI uses this fixture text rather than direct PDF extraction.
+01/07/2026 CoffeeShop 12.50 D
+02/07/2026 Salary (1000.00) C
+03/07/2026 Grocer 45.67 DEBIT

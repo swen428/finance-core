@@ -1,0 +1,50 @@
+{
+  "description": "Sample app-side transactions for reconciliation demo",
+  "candidates": [
+    {
+      "internal_id": "cand-001",
+      "transaction_date": "2024-12-01",
+      "merchant": "Apple.com/bill",
+      "amount": "29.90",
+      "currency": "SGD",
+      "source_type": "card_payment",
+      "source_channel": "manual"
+    },
+    {
+      "internal_id": "cand-002",
+      "transaction_date": "2024-12-04",
+      "merchant": "Netflix",
+      "amount": "21.90",
+      "currency": "SGD",
+      "source_type": "subscription",
+      "source_channel": "telegram"
+    },
+    {
+      "internal_id": "cand-003",
+      "transaction_date": "2024-12-08",
+      "merchant": "Spotify",
+      "amount": "12.90",
+      "currency": "SGD",
+      "source_type": "subscription",
+      "source_channel": "telegram"
+    },
+    {
+      "internal_id": "cand-004a",
+      "transaction_date": "2024-12-05",
+      "merchant": "Grab",
+      "amount": "8.50",
+      "currency": "SGD",
+      "source_type": "transport",
+      "source_channel": "telegram"
+    },
+    {
+      "internal_id": "cand-004b",
+      "transaction_date": "2024-12-05",
+      "merchant": "Grab",
+      "amount": "8.50",
+      "currency": "SGD",
+      "source_type": "transport",
+      "source_channel": "manual"
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "schema_version": "finance-ai-asset-registry-v1",
+  "registry_version": "finance-ai-assets-v2",
+  "assets": [
+    {
+      "name": "runtime_policy",
+      "kind": "json",
+      "path": "runtime_policy.json",
+      "version": "finance-ai-runtime-policy-v1",
+      "sha256": "5fddb92c0a119feeed32fb2b4bdec132256a234912ab043b17825f57b2030b4d",
+      "byte_count": 373
+    },
+    {
+      "name": "prompt",
+      "kind": "text",
+      "path": "prompt_v1.txt",
+      "version": "finance-ai-prompt-v5",
+      "sha256": "48f4d53ba802569bfe929b24d9b83e309851f8bfc18e324e8f0f5e2bd09f4644",
+      "byte_count": 2149
+    },
+    {
+      "name": "intent_policy",
+      "kind": "json",
+      "path": "intent_policy.json",
+      "version": "finance-ai-intent-policy-v4",
+      "sha256": "6afec498b19ce660b5976c63851fcb1253064dc042da49138439912159fcb482",
+      "byte_count": 1453
+    },
+    {
+      "name": "default_policy",
+      "kind": "json",
+      "path": "default_policy.json",
+      "version": "finance-ai-default-policy-v1",
+      "sha256": "f14534d34345ab30fe430b0016ff6650e911b8aa368bd7e8f0e10ccc4a1a34be",
+      "byte_count": 221
+    },
+    {
+      "name": "deadline_policy",
+      "kind": "json",
+      "path": "deadline_policy.json",
+      "version": "finance-ai-deadline-policy-v1",
+      "sha256": "f75f247f0958d500a162c0e89f809ab45fc306314c09291338a4099d4ad30fda",
+      "byte_count": 213
+    },
+    {
+      "name": "sqlite_money_policy",
+      "kind": "json",
+      "path": "sqlite_money_policy.json",
+      "version": "finance-ai-sqlite-money-policy-v1",
+      "sha256": "f1aafbab628974110d154ecdfcc6ab4b5026e7ffc502b2819cdc8a3923004224",
+      "byte_count": 345
+    },
+    {
+      "name": "sensitive_text_policy",
+      "kind": "json",
+      "path": "sensitive_text_policy.json",
+      "version": "finance-ai-sensitive-text-policy-v3",
+      "sha256": "a846eebbe4983ba15f694613c60776bd4cef41286eafd175c7c5e771da15c36f",
+      "byte_count": 1596
+    }
+  ]
+}

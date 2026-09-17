@@ -1,0 +1,9 @@
+Date,Value Date,Merchant,Debit,Credit,Currency,Narrative
+01/12/2024,03/12/2024,APPLE.COM/BILL,29.90,,SGD,Monthly subscription
+02/12/2024,,NETFLIX,19.90,,SGD,Streaming
+03/12/2024,04/12/2024,GIANT HYPERMART,45.50,,SGD,Groceries
+,10/12/2024,PAYPAL *SPOTIFY,12.90,,SGD,Music
+05/12/2024,,GRAB HOLDINGS,,8.50,SGD,Refund
+06/12/2024,07/12/2024,SHOPEE SG,35.00,,SGD,Online shopping
+07/12/2024,,AMAZON,25.00,25.00,SGD,Both debit and credit
+08/12/2024,,,50.00,,SGD,No merchant

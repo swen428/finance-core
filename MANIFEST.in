@@ -1,0 +1,8 @@
+include LICENSE
+include NOTICE
+include README.md
+include THIRD_PARTY_NOTICES.md
+include pyproject.toml
+recursive-include finance_core *.json *.py *.sql *.txt
+prune tests
+global-exclude __pycache__ *.py[cod]

@@ -1,0 +1,6 @@
+transaction_date,posted_date,merchant_raw,amount,currency,statement_row_reference
+2024-12-01,2024-12-02,Apple,29.90,SGD,stmt-apple-match
+2024-12-03,,Giant Supermarket,45.50,SGD,stmt-giant-unmatched
+2024-12-04,2024-12-04,Netflix,19.90,SGD,stmt-netflix-amount-mismatch
+2024-12-07,2024-12-09,Spotify,12.90,SGD,stmt-spotify-date-mismatch
+2024-12-05,2024-12-05,Grab,8.50,SGD,stmt-grab-possible-duplicate
