@@ -3,10 +3,16 @@ import type { PluginConversationBinding } from "openclaw-sdk/plugin-sdk/plugin-e
 import type { BridgeRunner } from "./controller.js";
 import {
   createBridgeRequest,
+  framedDigest,
+  humanDraftDeliveryAttemptId,
+  humanDraftDeliveryKey,
+  humanDraftObservationId,
+  humanDraftObservationKey,
   humanActionRedemptionKey,
   type BridgeResponse,
   type JsonObject,
 } from "./protocol.js";
+import { renderWholeCard, type WholeCardFields } from "./whole-card.js";
 
 export const DISABLED_REPLY = "Current action is not enabled.";
 export const DISABLED_ACTIONS = [
@@ -190,6 +196,54 @@ function requireInteger(result: JsonObject, field: string): number {
   return value;
 }
 
+function renderRedeemedDraftCard(value: JsonObject): {cardReference: string; text: string} {
+  const card = value.human_draft_card;
+  if (!isRecord(card) || typeof card.card_generation_public_id !== "string" ||
+      !/^d1card_[0-9a-f]{32}$/u.test(card.card_generation_public_id) ||
+      card.current_card_generation_public_id !== card.card_generation_public_id ||
+      (card.completeness !== "complete" && card.completeness !== "incomplete") ||
+      typeof card.confirm_available !== "boolean" || card.reject_available !== true ||
+      card.confirm_available !== (card.completeness === "complete") ||
+      card.final_transaction_created !== false || !isRecord(card.field_values) ||
+      Object.keys(card.field_values).sort().join(",") !==
+        "amount,category,currency,description,merchant,transaction_date" ||
+      !Object.values(card.field_values).every((field) => typeof field === "string") ||
+      !Array.isArray(card.unresolved_flags) || card.unresolved_flags.length > 32 ||
+      !card.unresolved_flags.every((flag) => typeof flag === "string" &&
+        /^[a-z0-9_]{1,100}$/u.test(flag))) {
+    throw new Error("Redeemed D1 card is invalid.");
+  }
+  return { cardReference: card.card_generation_public_id, text: renderWholeCard({
+    cardReference: card.card_generation_public_id,
+    fields: card.field_values as WholeCardFields,
+    language: "en",
+    status: card.completeness === "complete" ? "publishable" : "incomplete",
+    unresolvedReasons: card.unresolved_flags as string[],
+  }) };
+}
+
+function redeemedD1Reference(
+  material: JsonObject,
+  context: ActiveContext,
+  binding: PluginConversationBinding,
+): string | undefined {
+  const value = material.d1_decision_binding;
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || Object.keys(value).sort().join(",") !==
+      "authenticated_actor_id,card_generation_public_id,conversation_binding_id,reference_public_id,telegram_account_id,telegram_conversation_id" ||
+      typeof value.reference_public_id !== "string" ||
+      !/^haref_[0-9a-f]{32}$/u.test(value.reference_public_id) ||
+      typeof value.card_generation_public_id !== "string" ||
+      !/^d1card_[0-9a-f]{32}$/u.test(value.card_generation_public_id) ||
+      value.authenticated_actor_id !== context.senderId ||
+      value.telegram_account_id !== context.accountId ||
+      value.telegram_conversation_id !== context.conversationId ||
+      value.conversation_binding_id !== binding.bindingId) {
+    throw new Error("Redeemed D1 decision binding is invalid.");
+  }
+  return value.reference_public_id;
+}
+
 export function createHumanActionInteractiveHandler(
   runtime: () => HumanActionRuntime | undefined,
 ) {
@@ -208,6 +262,8 @@ export function createHumanActionInteractiveHandler(
     let material: JsonObject;
     let proposal: string;
     let decisionKey: string;
+    let durableD1Reference: string | undefined;
+    let bindingId: string;
     try {
       const binding = await context.currentBinding();
       const available = runtime();
@@ -252,30 +308,69 @@ export function createHumanActionInteractiveHandler(
       if (decisionKey !== expectedDecisionKey) {
         throw new Error("Human action decision identity mismatch.");
       }
+      durableD1Reference = redeemedD1Reference(material, context, bindingAfterRedemption);
+      bindingId = bindingAfterRedemption.bindingId;
     } catch {
       await context.reply(ACTION_FAILURE_REPLY).catch(() => undefined);
       return { handled: true };
     }
 
     if (context.action === "edit") {
-      let session: string;
+      let card: {cardReference: string; text: string};
       try {
-        session = requireString(material, "guided_edit_session_public_id");
-        if (!/^gedit_[0-9a-f]{32}$/u.test(session)) {
-          throw new Error("Guided edit session identity is invalid.");
+        card = renderRedeemedDraftCard(material);
+        const attemptPublicId = humanDraftDeliveryAttemptId(card.cardReference, "replace");
+        const commandContext = {
+          workspace_path: current.workspaceRoot,
+          operator_actor_id: context.senderId,
+          telegram_account_id: context.accountId,
+          telegram_conversation_id: context.conversationId,
+          conversation_binding_id: bindingId,
+        };
+        const begun = await current.runner.run(createBridgeRequest(
+          "begin_human_draft_card_delivery",
+          {
+            ...commandContext,
+            card_generation_public_id: card.cardReference,
+            attempt_public_id: attemptPublicId,
+            delivery_material_hash: framedDigest(
+              "d1-card-delivery-material-v1",
+              card.text,
+            ),
+            transport_mode: "replace",
+            outbound_target_message_id: String(context.callbackMessageId),
+          },
+          humanDraftDeliveryKey(attemptPublicId),
+        ), 30_000);
+        if (begun.status !== "ok" || begun.result.attempt_public_id !== attemptPublicId) {
+          throw new Error("Human draft replacement attempt was not persisted.");
+        }
+        const observationPublicId = humanDraftObservationId(attemptPublicId, "initial");
+        const observed = await current.runner.run(createBridgeRequest(
+          "record_human_draft_card_delivery_outcome",
+          {
+            ...commandContext,
+            attempt_public_id: attemptPublicId,
+            observation_public_id: observationPublicId,
+            outcome: "unknown",
+            error_code: null,
+            outbound_message_id: null,
+            trusted_receipt_hash: null,
+          },
+          humanDraftObservationKey(observationPublicId),
+        ), 30_000);
+        if (observed.status !== "ok" ||
+            observed.result.observation_public_id !== observationPublicId) {
+          throw new Error("Human draft replacement observation was not persisted.");
         }
       } catch {
         await context.reply(ACTION_FAILURE_REPLY).catch(() => undefined);
         return { handled: true };
       }
-      const prompt =
-        "Finance edit session started. Reply with one field per message, for example:\n" +
-        "金额=321.89\n币种=SGD\n日期=2026-09-03\n商户=Example\n描述=Lunch\n分类=Meals\n" +
-        "Reply 完成 when finished. Account and natural-language recalculation are not enabled.";
       try {
-        await context.replace(prompt);
+        await context.replace(card.text);
       } catch {
-        await context.reply(prompt).catch(() => undefined);
+        await context.reply(card.text).catch(() => undefined);
       }
       return { handled: true };
     }
@@ -292,6 +387,9 @@ export function createHumanActionInteractiveHandler(
           content_hash: requireString(material, "content_hash"),
           callback_token: requireString(material, "callback_token"),
           callback_expiry: requireInteger(material, "callback_expiry"),
+          ...(durableD1Reference === undefined
+            ? {}
+            : { d1_reference_public_id: durableD1Reference }),
         },
         decisionKey,
       ), 30_000);

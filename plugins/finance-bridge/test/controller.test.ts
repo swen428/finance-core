@@ -106,6 +106,94 @@ function issuedActions(request: BridgeRequest, proposalPublicId: string): Bridge
   });
 }
 
+const D1_CARD_G0 = `d1card_${"a".repeat(32)}`;
+const D1_CARD_G1 = `d1card_${"b".repeat(32)}`;
+const D1_CARD_G2 = `d1card_${"c".repeat(32)}`;
+
+function wholeCardText(cardReference = D1_CARD_G0): string {
+  return [
+    `Card Ref: ${cardReference}`,
+    "Amount: 12.50",
+    "Currency: SGD",
+    "Date: 2026-09-19",
+    "Merchant: Example Cafe",
+    "Description: Lunch",
+    "Category: Food",
+  ].join("\n");
+}
+
+function humanDraftCard(
+  request: BridgeRequest,
+  overrides: JsonObject = {},
+): BridgeResponse {
+  return ok(request, {
+    draft_public_id: `d1draft_${"1".repeat(32)}`,
+    draft_version: 1,
+    draft_content_hash: "2".repeat(64),
+    completeness: "complete",
+    reason_contributors: [],
+    unresolved_flags: [],
+    human_reply_evidence_public_id: `d1evidence_${"3".repeat(32)}`,
+    delivery_state: "not_attempted",
+    delivery_state_hash: "4".repeat(64),
+    delivery_attempts: [],
+    delivery_outcomes: [],
+    action_issue_batch_id: "5".repeat(64),
+    operation_outcome: "accepted",
+    refusal_code: null,
+    idempotent_replay: false,
+    action_issuance_state: "not_issued",
+    proposal_public_id: `po_d1_${"6".repeat(32)}`,
+    proposal_version: 0,
+    proposal_content_hash: "7".repeat(64),
+    card_generation_public_id: D1_CARD_G1,
+    current_card_generation_public_id: D1_CARD_G1,
+    original_operation_or_start_public_id: `d1op_${"8".repeat(32)}`,
+    field_values: {
+      amount: "12.50",
+      currency: "SGD",
+      transaction_date: "2026-09-19",
+      merchant: "Example Cafe",
+      description: "Lunch",
+      category: "Food",
+    },
+    decision_target_proposal_public_id: `po_d1_${"6".repeat(32)}`,
+    decision_target_proposal_version: 0,
+    decision_target_proposal_content_hash: "7".repeat(64),
+    confirm_available: true,
+    reject_available: true,
+    final_transaction_created: false,
+    ...overrides,
+  });
+}
+
+function issuedD1Actions(request: BridgeRequest, confirmAvailable: boolean): BridgeResponse {
+  const proposal = request.arguments.proposal_public_id;
+  const version = request.arguments.expected_proposal_version;
+  const contentHash = request.arguments.expected_content_hash;
+  const generation = request.arguments.card_generation_public_id;
+  assert.equal(typeof proposal, "string");
+  assert.equal(typeof version, "number");
+  assert.equal(typeof contentHash, "string");
+  assert.equal(typeof generation, "string");
+  return ok(request, {
+    proposal_public_id: proposal,
+    proposal_version: version,
+    content_hash: contentHash,
+    card_generation_public_id: generation,
+    actions: confirmAvailable
+      ? {
+          confirm: { reference: `fha1_${"A".repeat(24)}`, expiry: 2_000_000_000 },
+          edit: { reference: `fha1_${"C".repeat(24)}`, expiry: 2_000_000_000 },
+          reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
+        }
+      : {
+          reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
+        },
+    final_transaction_created: false,
+  });
+}
+
 const REVIEW_HASH = "1".repeat(64);
 const TEST_PROJECTION = {
   schema_version: "finance-openclaw-agent-config-projection-v2" as const,
@@ -881,6 +969,186 @@ test("bound private text is captured, proposed, reviewed, and claimed without mo
     from: { id: 111 },
     text: "taxi to airport 35.50",
   });
+});
+
+test("whole-card reply uses one atomic D1 command and returns generation-bound actions", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "apply_human_draft_card") return humanDraftCard(request);
+      if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
+      if (request.command === "begin_human_draft_card_delivery") {
+        return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
+      }
+      if (request.command === "record_human_draft_card_delivery_outcome") {
+        return ok(request, { observation_public_id: request.arguments.observation_public_id });
+      }
+      throw new Error(`Unexpected command ${request.command}`);
+    },
+  });
+  const cardEvent = {
+    ...event,
+    content: wholeCardText(),
+    messageId: "30",
+    replyToId: "20",
+    replyToIdFull: "telegram:111:20",
+  };
+  const cardContext = {
+    ...context,
+    messageId: "30",
+    replyToId: "20",
+    replyToIdFull: "telegram:111:20",
+  };
+  const result = await controller.handle(cardEvent, cardContext);
+  assert.deepEqual(requests.map((request) => request.command), [
+    "apply_human_draft_card",
+    "issue_human_actions",
+    "begin_human_draft_card_delivery",
+    "record_human_draft_card_delivery_outcome",
+  ]);
+  const applied = requests[0]!;
+  assert.equal(applied.arguments.card_generation_public_id, D1_CARD_G0);
+  assert.equal(applied.arguments.telegram_message_id, 30);
+  assert.equal(applied.arguments.raw_card_text, wholeCardText());
+  assert.deepEqual(applied.arguments.field_values, {
+    amount: "12.50", currency: "SGD", transaction_date: "2026-09-19",
+    merchant: "Example Cafe", description: "Lunch", category: "Food",
+  });
+  assert.match(String(applied.arguments.operation_public_id), /^d1op_[0-9a-f]{32}$/u);
+  assert.equal(
+    applied.idempotency_key,
+    `bridge-human-draft-apply:${String(applied.arguments.operation_public_id)}`,
+  );
+  assert.equal(requests[1]?.arguments.card_generation_public_id, D1_CARD_G1);
+  assert.equal(requests[1]?.arguments.reference_batch_id, "5".repeat(64));
+  assert.equal(requests[2]?.arguments.outbound_target_message_id, "20");
+  assert.equal(requests[3]?.arguments.outcome, "unknown");
+  assert.equal(requests.some((request) => request.command === "capture"), false);
+  assert.match(replyText(result), new RegExp(`Card Ref: ${D1_CARD_G1}`, "u"));
+  const buttons = result.reply?.presentation?.blocks.find((block) => block.type === "buttons");
+  assert.equal(buttons?.type, "buttons");
+  if (buttons?.type !== "buttons") throw new Error("D1 buttons missing");
+  assert.deepEqual(buttons.buttons.map((button) => button.label), ["Confirm", "Edit", "Reject"]);
+});
+
+test("incomplete D1 cards expose Reject only and reply identity mismatches fail closed", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "apply_human_draft_card") {
+        return humanDraftCard(request, {
+          completeness: "incomplete",
+          proposal_public_id: null,
+          proposal_version: null,
+          proposal_content_hash: null,
+          unresolved_flags: ["missing_amount"],
+          confirm_available: false,
+        });
+      }
+      if (request.command === "issue_human_actions") return issuedD1Actions(request, false);
+      if (request.command === "begin_human_draft_card_delivery") {
+        return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
+      }
+      if (request.command === "record_human_draft_card_delivery_outcome") {
+        return ok(request, { observation_public_id: request.arguments.observation_public_id });
+      }
+      throw new Error(`Unexpected command ${request.command}`);
+    },
+  });
+  const result = await controller.handle(
+    { ...event, content: wholeCardText(), messageId: "31", replyToId: "20" },
+    { ...context, messageId: "31", replyToId: "20" },
+  );
+  const buttons = result.reply?.presentation?.blocks.find((block) => block.type === "buttons");
+  if (buttons?.type !== "buttons") throw new Error("D1 buttons missing");
+  assert.deepEqual(buttons.buttons.map((button) => button.label), ["Reject"]);
+  assert.match(replyText(result), /Status: incomplete/u);
+  assert.match(replyText(result), /Unresolved: missing_amount/u);
+
+  requests.length = 0;
+  const mismatch = await controller.handle(
+    { ...event, content: wholeCardText(), messageId: "32", replyToId: "20" },
+    { ...context, messageId: "32", replyToId: "21" },
+  );
+  assert.deepEqual(mismatch, { handled: true });
+  assert.equal(requests.length, 0);
+});
+
+test("malformed card with a valid D1 reference reaches Python refusal evidence path", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      return {
+        envelopeVersion: "v1",
+        requestId: request.request_id,
+        operationId: "op_0123456789abcdef0123456789abcdef",
+        status: "error",
+        error: { code: "HUMAN_DRAFT_ARGUMENTS_REFUSED", message: "refused", retryable: false },
+      };
+    },
+  });
+  const malformed = `${wholeCardText()}\nAccount: Cash`;
+  const result = await controller.handle(
+    { ...event, content: malformed, messageId: "33" },
+    { ...context, messageId: "33" },
+  );
+  assert.deepEqual(requests.map((request) => request.command), ["apply_human_draft_card"]);
+  assert.equal(requests[0]?.arguments.raw_card_text, malformed);
+  assert.equal(requests[0]?.arguments.card_generation_public_id, D1_CARD_G0);
+  assert.match(replyText(result), /card edit was refused/u);
+});
+
+test("unknown delivery replay queries first and returns only the bounded successor generation", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "apply_human_draft_card" ||
+          request.command === "get_human_draft_card") {
+        return humanDraftCard(request, {
+          delivery_state: "unknown",
+          idempotent_replay: true,
+        });
+      }
+      if (request.command === "reissue_human_draft_card") {
+        return humanDraftCard(request, {
+          card_generation_public_id: D1_CARD_G2,
+          current_card_generation_public_id: D1_CARD_G2,
+          action_issue_batch_id: "9".repeat(64),
+          delivery_state: "not_attempted",
+          idempotent_replay: false,
+        });
+      }
+      if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
+      if (request.command === "begin_human_draft_card_delivery") {
+        return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
+      }
+      if (request.command === "record_human_draft_card_delivery_outcome") {
+        return ok(request, { observation_public_id: request.arguments.observation_public_id });
+      }
+      throw new Error(`Unexpected command ${request.command}`);
+    },
+  });
+  const result = await controller.handle(
+    { ...event, content: wholeCardText(), messageId: "34" },
+    { ...context, messageId: "34" },
+  );
+  assert.deepEqual(requests.map((request) => request.command), [
+    "apply_human_draft_card",
+    "get_human_draft_card",
+    "reissue_human_draft_card",
+    "issue_human_actions",
+    "begin_human_draft_card_delivery",
+    "record_human_draft_card_delivery_outcome",
+  ]);
+  assert.equal(requests[2]?.arguments.expected_current_generation_public_id, D1_CARD_G1);
+  assert.equal(requests[2]?.arguments.reason, "unknown_after_query");
+  assert.equal(requests[3]?.arguments.card_generation_public_id, D1_CARD_G2);
+  assert.match(replyText(result), new RegExp(`Card Ref: ${D1_CARD_G2}`, "u"));
+  assert.doesNotMatch(replyText(result), new RegExp(D1_CARD_G1, "u"));
 });
 
 test("structured guided edits bypass intake and completion emits a fresh review card", async () => {
