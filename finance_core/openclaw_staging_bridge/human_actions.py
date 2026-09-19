@@ -58,6 +58,7 @@ class IssuedHumanActionReference:
 
 @dataclass(frozen=True)
 class RedeemedHumanAction:
+    reference_public_id: str
     action: str
     proposal_public_id: str
     proposal_version: int
@@ -568,6 +569,7 @@ def _decision_material(row: dict, key: bytes, *, replay: bool) -> RedeemedHumanA
             conversation_binding_id=str(row["conversation_binding_id"]),
         )
     return RedeemedHumanAction(
+        reference_public_id=str(row["reference_public_id"]),
         action=str(row["action"]),
         proposal_public_id=str(row["proposal_public_id"]),
         proposal_version=int(row["proposal_version"]),
@@ -587,6 +589,58 @@ def _decision_material(row: dict, key: bytes, *, replay: bool) -> RedeemedHumanA
     )
 
 
+def load_redeemed_human_action_binding(
+    conn: sqlite3.Connection,
+    *,
+    reference_public_id: str,
+    action: str,
+    proposal_public_id: str,
+    proposal_version: int,
+    proposal_content_hash: str,
+    context: HumanActionContext,
+) -> HumanDraftDecisionBinding:
+    """Reload one redeemed D1 authority from append-only persisted evidence."""
+    cursor = conn.execute(
+        """
+        SELECT refs.action, refs.proposal_version, refs.proposal_content_hash,
+               refs.authenticated_actor_id, refs.channel_account_id,
+               refs.channel_conversation_id, refs.conversation_binding_id,
+               proposals.public_id AS proposal_public_id,
+               bindings.card_generation_public_id,
+               redemptions.id AS redemption_id
+        FROM openclaw_human_action_references AS refs
+        JOIN parser_outputs AS proposals ON proposals.id = refs.parser_output_id
+        LEFT JOIN openclaw_human_action_redemptions AS redemptions
+          ON redemptions.reference_id = refs.id
+        LEFT JOIN parser_human_draft_action_bindings AS bindings
+          ON bindings.reference_id = refs.id
+        WHERE refs.reference_public_id = ?
+        """,
+        (reference_public_id,),
+    )
+    row = cursor.fetchone()
+    material = None if row is None else row_to_dict(row, cursor.description)
+    if (
+        material is None
+        or material["redemption_id"] is None
+        or material["card_generation_public_id"] is None
+        or material["action"] != action
+        or material["proposal_public_id"] != proposal_public_id
+        or int(material["proposal_version"]) != proposal_version
+        or material["proposal_content_hash"] != proposal_content_hash
+        or _row_context(material) != context
+    ):
+        raise HumanActionReferenceError("decision_binding_invalid")
+    return HumanDraftDecisionBinding(
+        reference_public_id=reference_public_id,
+        card_generation_public_id=str(material["card_generation_public_id"]),
+        authenticated_actor_id=context.actor_id,
+        telegram_account_id=context.account_id,
+        telegram_conversation_id=context.conversation_id,
+        conversation_binding_id=context.binding_id,
+    )
+
+
 def redeem_human_action_reference(
     conn: sqlite3.Connection,
     *,
@@ -597,6 +651,7 @@ def redeem_human_action_reference(
     callback_id: str,
     callback_message_id: int,
     action_validator: Callable[[sqlite3.Connection, dict, str], None] | None = None,
+    redemption_effect: Callable[[sqlite3.Connection, dict, str, int], None] | None = None,
     clock: Callable[[], int] = lambda: int(datetime.now(UTC).timestamp()),
 ) -> RedeemedHumanAction:
     """Atomically redeem one reference, allowing only the same callback replay."""
@@ -637,6 +692,8 @@ def redeem_human_action_reference(
                 or int(row["callback_message_id"]) != callback_message_id
             ):
                 raise HumanActionReferenceError("reference_replayed")
+            if redemption_effect is not None:
+                redemption_effect(conn, row, action, now)
             result = _decision_material(row, key, replay=True)
             conn.commit()
             return result
@@ -657,7 +714,6 @@ def redeem_human_action_reference(
             raise HumanActionReferenceError("stale_content_hash")
         if action_validator is not None:
             action_validator(conn, row, action)
-
         conn.execute(
             """
             INSERT INTO openclaw_human_action_redemptions (
@@ -666,6 +722,8 @@ def redeem_human_action_reference(
             """,
             (row["id"], callback_hash, callback_message_id, _utc_text(now)),
         )
+        if redemption_effect is not None:
+            redemption_effect(conn, row, action, now)
         result = _decision_material(row, key, replay=False)
         conn.commit()
         return result
@@ -682,6 +740,7 @@ __all__ = [
     "REFERENCE_PREFIX",
     "RedeemedHumanAction",
     "issue_human_action_references",
+    "load_redeemed_human_action_binding",
     "redeem_human_action_reference",
     "reference_is_well_formed",
 ]

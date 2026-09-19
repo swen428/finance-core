@@ -365,7 +365,10 @@ def _read_reference(conn: sqlite3.Connection, reference_id: int) -> sqlite3.Row 
     ).fetchone()
 
 
-def _same_locked_reference(locked: sqlite3.Row, current: sqlite3.Row) -> bool:
+def _same_locked_reference(
+    locked: sqlite3.Row | Mapping[str, Any],
+    current: sqlite3.Row | Mapping[str, Any],
+) -> bool:
     keys = (
         "id",
         "reference_public_id",
@@ -449,7 +452,7 @@ def _verified_ai_observations(
 def begin_human_draft_in_transaction(
     conn: sqlite3.Connection,
     *,
-    locked_edit_reference_row: sqlite3.Row,
+    locked_edit_reference_row: sqlite3.Row | Mapping[str, Any],
     source_edit_reference_id: int,
     reference_public_id: str,
     reference_integrity_material: bytes,
@@ -1097,6 +1100,7 @@ def apply_human_draft_card(
     command: HumanDraftCommand,
     *,
     publish: Callable[[sqlite3.Connection, dict[str, object], dict[str, object]], PublishedDraft],
+    authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> HumanDraftResult:
     """Validate and append one whole-card operation under one owned write UOW."""
     try:
@@ -1115,6 +1119,8 @@ def apply_human_draft_card(
         if replay is not None:
             conn.commit()
             return replay
+        if authority_validator is not None:
+            authority_validator(conn)
         card = conn.execute(
             "SELECT * FROM parser_human_draft_cards WHERE card_generation_public_id = ?",
             (command.card_generation_public_id,),

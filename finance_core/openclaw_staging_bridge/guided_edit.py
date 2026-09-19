@@ -73,6 +73,37 @@ def _review_batch_id(session_public_id: str, completed_message_id: int, generati
     )[:32]
 
 
+def d1_compatibility_operation_public_id(session_public_id: str, message_id: int) -> str:
+    digest = _digest("d1-guided-edit-compatibility-v1", session_public_id, str(message_id))
+    return f"d1op_{digest[:32]}"
+
+
+def active_d1_card_for_session(conn: sqlite3.Connection, session: dict[str, Any]) -> str | None:
+    rows = conn.execute(
+        """
+        SELECT current_card_generation_public_id
+        FROM parser_human_drafts
+        WHERE state = 'active' AND authenticated_actor_id = ?
+          AND telegram_account_id = ? AND telegram_conversation_id = ?
+          AND conversation_binding_id = ?
+          AND (source_parser_output_id = ? OR current_parser_output_id = ?
+               OR decision_target_parser_output_id = ?)
+        """,
+        (
+            session["authenticated_actor_id"],
+            session["channel_account_id"],
+            session["channel_conversation_id"],
+            session["conversation_binding_id"],
+            session["current_parser_output_id"],
+            session["current_parser_output_id"],
+            session["current_parser_output_id"],
+        ),
+    ).fetchall()
+    if len(rows) > 1:
+        raise GuidedEditError("pending_recovery")
+    return None if not rows else str(rows[0][0])
+
+
 def _begin(conn: sqlite3.Connection) -> None:
     if conn.in_transaction:
         raise GuidedEditError("transaction_conflict")
@@ -224,6 +255,51 @@ def pending_core_state(
     """Return an exact persisted core result without creating a new edit."""
     if session["pending_message_id"] is None:
         return None
+    d1_operation_id = d1_compatibility_operation_public_id(
+        str(session["session_public_id"]), int(session["pending_message_id"])
+    )
+    d1 = conn.execute(
+        """
+        SELECT operations.*, cards.parser_output_id AS card_parser_output_id,
+               cards.proposal_version AS card_proposal_version,
+               cards.proposal_content_hash AS card_proposal_content_hash
+        FROM parser_human_draft_operations AS operations
+        JOIN parser_human_draft_cards AS cards
+          ON cards.card_generation_public_id = operations.result_card_generation_public_id
+        WHERE operations.operation_public_id = ?
+        """,
+        (d1_operation_id,),
+    ).fetchone()
+    if d1 is not None:
+        expected_fields = {str(session["pending_field_name"]): _pending_field_value(session)}
+        try:
+            supplied_fields = json.loads(str(d1["canonical_supplied_fields_json"]))
+        except json.JSONDecodeError as exc:
+            raise GuidedEditError("pending_recovery") from exc
+        if (
+            int(d1["telegram_message_id"]) != int(session["pending_message_id"])
+            or d1["authenticated_actor_id"] != session["authenticated_actor_id"]
+            or d1["telegram_account_id"] != session["channel_account_id"]
+            or d1["telegram_conversation_id"] != session["channel_conversation_id"]
+            or d1["conversation_binding_id"] != session["conversation_binding_id"]
+            or supplied_fields != expected_fields
+        ):
+            raise GuidedEditError("pending_recovery")
+        if d1["operation_outcome"] == "refused":
+            return None
+        if d1["operation_outcome"] not in {"accepted", "noop"}:
+            raise GuidedEditError("pending_recovery")
+        if d1["card_parser_output_id"] is None:
+            return (
+                int(session["current_parser_output_id"]),
+                int(session["current_proposal_version"]),
+                str(session["current_content_hash"]),
+            )
+        return (
+            int(d1["card_parser_output_id"]),
+            int(d1["card_proposal_version"]),
+            str(d1["card_proposal_content_hash"]),
+        )
     operation_key = str(session["pending_operation_key"])
     if str(session["pending_field_name"]) in {"amount", "currency"}:
         row = get_receipt_proposal_revision_by_correction_id(
@@ -933,9 +1009,11 @@ def claim_review_batch(
 __all__ = [
     "ALLOWED_FIELDS",
     "GuidedEditError",
+    "active_d1_card_for_session",
     "begin_session_in_transaction",
     "claim_review_batch",
     "complete_session",
+    "d1_compatibility_operation_public_id",
     "find_applied_replay",
     "find_refused_replay",
     "get_active_session",
