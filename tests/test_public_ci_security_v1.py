@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import textwrap
 from pathlib import Path
+
+import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "validate.yml"
@@ -98,7 +102,96 @@ def test_candidate_sha_diff_detects_staged_bridge_drift(tmp_path: Path) -> None:
 def test_validate_aggregates_required_and_optional_jobs() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "needs: [classify, quality, pytest, bridge]" in source
+    assert "needs: [classify, quality, pytest, bridge, pytest-report]" in source
     assert 'test "$PYTEST_RESULT" = success' in source
     assert 'test "$QUALITY_RESULT" = success' in source
-    assert 'test "$BRIDGE_RESULT" = success || test "$BRIDGE_RESULT" = skipped' in source
+    assert 'test "$REPORT_RESULT" = success' in source
+    assert "REPORT_RESULT: ${{ needs.pytest-report.result }}" in source
+    assert "BRIDGE_SCOPE: ${{ needs.classify.outputs.bridge }}" in source
+    assert "EVENT_NAME: ${{ github.event_name }}" in source.split("\n  validate:", 1)[1]
+    report = source.split("\n  pytest-report:\n", 1)[1].split("\n  validate:", 1)[0]
+    assert "    continue-on-error: true" not in report.split("    steps:", 1)[0]
+
+
+def _step_script(name: str) -> str:
+    section = WORKFLOW.read_text(encoding="utf-8").split(f"- name: {name}\n", 1)[1]
+    match = re.search(r"^        run: \|\n((?:          .*\n|[ \t]*\n)+)", section, re.MULTILINE)
+    assert match is not None
+    return textwrap.dedent(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("event", "path", "expected"),
+    [
+        ("push", "finance_core/money.py", "true"),
+        ("push", "README.md", "true"),
+        ("push", "finance_core/resources/migrations/049_example.sql", "true"),
+        ("workflow_dispatch", "README.md", "true"),
+        ("pull_request", "README.md", "false"),
+        ("pull_request", "finance_core/money.py", "false"),
+        ("pull_request", "plugins/finance-bridge/src/index.ts", "true"),
+        ("pull_request", "requirements-dev.txt", "true"),
+        ("pull_request", "pyproject.toml", "true"),
+        ("pull_request", ".github/workflows/validate.yml", "true"),
+    ],
+)
+def test_actual_scope_script_produces_release_compatible_evidence(
+    tmp_path: Path, event: str, path: str, expected: str
+) -> None:
+    fake_git = tmp_path / "git"
+    fake_git.write_text('#!/bin/sh\nprintf "%s\\n" "$CHANGED_PATH"\n', encoding="utf-8")
+    fake_git.chmod(0o755)
+    output = tmp_path / "output"
+    completed = subprocess.run(
+        ["bash", "-c", _step_script("Classify Bridge scope")],
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            "BASE_SHA": "a" * 40,
+            "HEAD_SHA": "b" * 40,
+            "EVENT_NAME": event,
+            "CHANGED_PATH": path,
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert output.read_text(encoding="utf-8") == f"bridge={expected}\n"
+
+
+@pytest.mark.parametrize(
+    ("event", "scope", "bridge", "report", "accepted"),
+    [
+        ("push", "true", "success", "success", True),
+        ("push", "false", "skipped", "success", False),
+        ("workflow_dispatch", "false", "skipped", "success", False),
+        ("pull_request", "false", "skipped", "success", True),
+        ("pull_request", "true", "skipped", "success", False),
+        ("pull_request", "true", "failure", "success", False),
+        ("push", "true", "success", "failure", False),
+        ("push", "true", "success", "cancelled", False),
+        ("pull_request", "false", "skipped", "failure", False),
+        ("pull_request", "unknown", "skipped", "success", False),
+    ],
+)
+def test_actual_validation_gate_rejects_missing_release_evidence(
+    event: str, scope: str, bridge: str, report: str, accepted: bool
+) -> None:
+    completed = subprocess.run(
+        ["bash", "-c", _step_script("Require all applicable validation")],
+        env={
+            **os.environ,
+            "EVENT_NAME": event,
+            "BRIDGE_SCOPE": scope,
+            "BRIDGE_RESULT": bridge,
+            "REPORT_RESULT": report,
+            "CLASSIFY_RESULT": "success",
+            "PYTEST_RESULT": "success",
+            "QUALITY_RESULT": "success",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert (completed.returncode == 0) is accepted, completed.stderr

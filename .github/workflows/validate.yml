@@ -34,13 +34,15 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          if test "$EVENT_NAME" = "workflow_dispatch" || test -z "$BASE_SHA" || \
+          if test "$EVENT_NAME" = "push" || test "$EVENT_NAME" = "workflow_dispatch" || \
+             test -z "$BASE_SHA" || \
              printf '%s' "$BASE_SHA" | grep -Eq '^0+$'; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > /tmp/finance-core-changed-paths.txt
-          if grep -Eq '^(plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|intake/macos_vision_receipt_ocr|parser_proposals/ai_))' /tmp/finance-core-changed-paths.txt; then
+          changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
+          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|intake/macos_vision_receipt_ocr|parser_proposals/ai_))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
@@ -198,7 +200,6 @@ jobs:
   pytest-report:
     needs: pytest
     if: ${{ always() }}
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -222,7 +223,6 @@ jobs:
             --shard-count 4
 
       - name: Download shard timings
-        continue-on-error: true
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: pytest-timing-shard-*-${{ github.run_id }}-${{ github.run_attempt }}
@@ -239,29 +239,37 @@ jobs:
 
       - name: Upload aggregate timing
         if: ${{ always() }}
-        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: pytest-timing-v1-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/pytest-timing-v1.json
           retention-days: 90
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   validate:
     if: ${{ always() }}
-    needs: [classify, quality, pytest, bridge]
+    needs: [classify, quality, pytest, bridge, pytest-report]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Require all applicable validation
         env:
+          EVENT_NAME: ${{ github.event_name }}
+          BRIDGE_SCOPE: ${{ needs.classify.outputs.bridge }}
           BRIDGE_RESULT: ${{ needs.bridge.result }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           PYTEST_RESULT: ${{ needs.pytest.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          REPORT_RESULT: ${{ needs.pytest-report.result }}
         run: |
           set -euo pipefail
           test "$CLASSIFY_RESULT" = success
           test "$QUALITY_RESULT" = success
           test "$PYTEST_RESULT" = success
-          test "$BRIDGE_RESULT" = success || test "$BRIDGE_RESULT" = skipped
+          test "$REPORT_RESULT" = success
+          if test "$EVENT_NAME" = "pull_request" && test "$BRIDGE_SCOPE" = false; then
+            test "$BRIDGE_RESULT" = skipped
+          else
+            test "$BRIDGE_SCOPE" = true
+            test "$BRIDGE_RESULT" = success
+          fi
