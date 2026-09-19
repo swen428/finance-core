@@ -671,6 +671,8 @@ interface ValidatedHumanDraftCard {
   deliveryStateHash: string;
   deliveryState: string;
   idempotentReplay: boolean;
+  operationOutcome: string;
+  refusalCode: string | null;
 }
 
 const D1_PROPOSAL_ID = new RegExp(
@@ -781,6 +783,9 @@ function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
       (typeof result.refusal_code !== "string" || !/^[A-Z0-9_]{1,100}$/u.test(result.refusal_code))) {
     throw new Error("Human draft refusal is invalid.");
   }
+  if ((result.operation_outcome === "refused") !== (result.refusal_code !== null)) {
+    throw new Error("Human draft refusal outcome is inconsistent.");
+  }
   if (result.human_reply_evidence_public_id !== null &&
       (typeof result.human_reply_evidence_public_id !== "string" ||
        !/^d1evidence_[0-9a-f]{32}$/u.test(result.human_reply_evidence_public_id))) {
@@ -833,7 +838,17 @@ function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
     deliveryStateHash,
     deliveryState: result.delivery_state as string,
     idempotentReplay: result.idempotent_replay,
+    operationOutcome: result.operation_outcome as string,
+    refusalCode: result.refusal_code as string | null,
   };
+}
+
+function requireActionableHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
+  const card = requireHumanDraftCard(result);
+  if (card.operationOutcome === "refused") {
+    throw new Error("Refused D1 result is not actionable.");
+  }
+  return card;
 }
 
 function looksLikeWholeCard(text: string): boolean {
@@ -976,8 +991,16 @@ export class FinanceInboundController {
       };
     }
     let card = requireHumanDraftCard(appliedResponse.result);
+    if (card.operationOutcome === "refused") {
+      return {
+        handled: true,
+        reply: {
+          text: "Finance card edit was refused. The previous authoritative card remains current.",
+        },
+      };
+    }
     if (card.cardReference !== card.currentCardReference) {
-      const current = requireHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+      const current = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
         "get_human_draft_card",
         { ...commandContext, card_generation_public_id: card.currentCardReference },
       ), deadline())));
@@ -990,7 +1013,7 @@ export class FinanceInboundController {
       card = current;
     }
     if (card.idempotentReplay && card.deliveryState === "unknown") {
-      const queried = requireHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+      const queried = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
         "get_human_draft_card",
         { ...commandContext, operation_public_id: operationPublicId },
       ), deadline())));
@@ -1005,7 +1028,7 @@ export class FinanceInboundController {
         queried.originalOperationOrStartPublicId,
         queried.cardReference,
       );
-      const reissued = requireHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+      const reissued = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
         "reissue_human_draft_card",
         {
           ...commandContext,

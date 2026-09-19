@@ -1078,9 +1078,24 @@ test("incomplete D1 cards expose Reject only and reply identity mismatches fail 
 
 test("malformed card with a valid D1 reference reaches Python refusal evidence path", async () => {
   const requests: BridgeRequest[] = [];
+  let recordedRefusals = 0;
   const controller = new FinanceInboundController("/tmp/workspace", {
     async run(request) {
       requests.push(request);
+      if (String(request.arguments.raw_card_text).includes("Account: Cash")) {
+        recordedRefusals += 1;
+        return humanDraftCard(request, {
+          completeness: "incomplete",
+          proposal_public_id: null,
+          proposal_version: null,
+          proposal_content_hash: null,
+          unresolved_flags: ["missing_amount"],
+          operation_outcome: "refused",
+          refusal_code: "D1_UNKNOWN_FIELD",
+          confirm_available: false,
+          idempotent_replay: recordedRefusals > 1,
+        });
+      }
       return {
         envelopeVersion: "v1",
         requestId: request.request_id,
@@ -1105,10 +1120,19 @@ test("malformed card with a valid D1 reference reaches Python refusal evidence p
     assert.equal(requests.at(-1)?.arguments.card_generation_public_id, D1_CARD_G0);
     assert.match(replyText(result), /card edit was refused/u);
   }
+  const exactReplay = await controller.handle(
+    { ...event, content: malformedCards[0]!, messageId: "33" },
+    { ...context, messageId: "33" },
+  );
+  assert.match(replyText(exactReplay), /card edit was refused/u);
   assert.deepEqual(
     requests.map((request) => request.command),
-    ["apply_human_draft_card", "apply_human_draft_card", "apply_human_draft_card"],
+    [
+      "apply_human_draft_card", "apply_human_draft_card",
+      "apply_human_draft_card", "apply_human_draft_card",
+    ],
   );
+  assert.equal(requests.some((request) => request.command === "issue_human_actions"), false);
 });
 
 test("unknown delivery replay queries first and returns only the bounded successor generation", async () => {

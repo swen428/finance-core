@@ -12,12 +12,18 @@ import {
   ACTIVE_ACTIONS,
   DISABLED_ACTIONS,
   DISABLED_REPLY,
+  EDIT_PRESENTATION_FAILURE_REPLY,
   createHumanActionInteractiveHandler,
   createDisabledInteractiveHandler,
   disabledCallbackData,
   humanActionCallbackData,
 } from "../src/interactive.js";
-import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.js";
+import {
+  framedDigest,
+  type BridgeRequest,
+  type BridgeResponse,
+  type JsonObject,
+} from "../src/protocol.js";
 
 const binding: PluginConversationBinding = {
   bindingId: "binding-1",
@@ -377,7 +383,10 @@ test("generation-bound decisions carry only the redeemed durable D1 reference", 
 test("edit callback renders the atomically started D1 card without a second begin command", async () => {
   const reference = `fha1_${"G".repeat(24)}`;
   const requests: BridgeRequest[] = [];
-  const edits: string[] = [];
+  const edits: Array<{
+    text: string;
+    buttons: Array<Array<{text: string; callback_data: string; style?: string}>>;
+  }> = [];
   const proposal = "prop_bridge_0123456789abcdef0123456789abcdef";
   const cardReference = `d1card_${"2".repeat(32)}`;
   const handler = createHumanActionInteractiveHandler(() => ({
@@ -390,6 +399,18 @@ test("edit callback renders the atomically started D1 card without a second begi
         }
         if (request.command === "record_human_draft_card_delivery_outcome") {
           return ok(request, { observation_public_id: request.arguments.observation_public_id! });
+        }
+        if (request.command === "issue_human_actions") {
+          return ok(request, {
+            proposal_public_id: proposal,
+            proposal_version: 0,
+            content_hash: "1".repeat(64),
+            card_generation_public_id: cardReference,
+            actions: {
+              reject: { reference: `fha1_${"R".repeat(24)}`, expiry: 2_000_000_000 },
+            },
+            final_transaction_created: false,
+          });
         }
         return ok(request, {
           action: "edit",
@@ -458,19 +479,175 @@ test("edit callback renders the atomically started D1 card without a second begi
     },
     respond: {
       async reply() { throw new Error("replacement should succeed"); },
-      async editMessage({ text }: {text: string}) { edits.push(text); },
+      async editMessage(params: {
+        text: string;
+        buttons: Array<Array<{text: string; callback_data: string; style?: string}>>;
+      }) { edits.push(params); },
     },
     async getCurrentConversationBinding() { return binding; },
   });
   assert.deepEqual(requests.map((request) => request.command), [
     "redeem_human_action",
+    "issue_human_actions",
     "begin_human_draft_card_delivery",
     "record_human_draft_card_delivery_outcome",
   ]);
-  assert.match(edits[0] ?? "", new RegExp(`Card Ref: ${cardReference}`, "u"));
-  assert.match(edits[0] ?? "", /Status: incomplete/u);
-  assert.match(edits[0] ?? "", /Amount: \n/u);
-  assert.doesNotMatch(edits[0] ?? "", /Reply 完成|field=/u);
+  assert.match(edits[0]?.text ?? "", new RegExp(`Card Ref: ${cardReference}`, "u"));
+  assert.match(edits[0]?.text ?? "", /Status: incomplete/u);
+  assert.match(edits[0]?.text ?? "", /Amount: \n/u);
+  assert.doesNotMatch(edits[0]?.text ?? "", /Reply 完成|field=/u);
+  assert.deepEqual(edits[0]?.buttons, [[{
+    text: "Reject",
+    callback_data: humanActionCallbackData("reject", `fha1_${"R".repeat(24)}`),
+    style: "danger",
+  }]]);
+  const firstDelivery = requests.find(
+    (request) => request.command === "begin_human_draft_card_delivery",
+  );
+  assert.equal(firstDelivery?.arguments.delivery_material_hash, framedDigest(
+    "d1-card-delivery-material-v1",
+    edits[0]?.text ?? "",
+    humanActionCallbackData("reject", `fha1_${"R".repeat(24)}`),
+  ));
+  assert.notEqual(firstDelivery?.arguments.delivery_material_hash, framedDigest(
+    "d1-card-delivery-material-v1",
+    edits[0]?.text ?? "",
+  ));
+
+  const failureReplies: string[] = [];
+  await handler({
+    channel: "telegram",
+    accountId: "finance-account",
+    callbackId: "callback-guided-edit-replacement-failure",
+    conversationId: "111",
+    parentConversationId: "111",
+    senderId: "111",
+    isGroup: false,
+    isForum: false,
+    auth: { isAuthorizedSender: true },
+    callback: {
+      data: humanActionCallbackData("edit", reference),
+      namespace: "finance-bridge",
+      payload: `edit:${reference}`,
+      messageId: 20,
+      chatId: "111",
+    },
+    respond: {
+      async reply({ text }: {text: string}) { failureReplies.push(text); },
+      async editMessage() { throw new Error("synthetic D1 replacement failure"); },
+    },
+    async getCurrentConversationBinding() { return binding; },
+  });
+  assert.deepEqual(requests.slice(-4).map((request) => request.command), [
+    "redeem_human_action",
+    "issue_human_actions",
+    "begin_human_draft_card_delivery",
+    "record_human_draft_card_delivery_outcome",
+  ]);
+  assert.deepEqual(failureReplies, [EDIT_PRESENTATION_FAILURE_REPLY]);
+  assert.doesNotMatch(failureReplies[0] ?? "", new RegExp(cardReference, "u"));
+});
+
+test("editing a current complete D1 card removes the consumed Edit control", async () => {
+  const reference = `fha1_${"E".repeat(24)}`;
+  const proposal = `po_d1_${"1".repeat(32)}`;
+  const cardReference = `d1card_${"2".repeat(32)}`;
+  const actionReferences = {
+    confirm: `fha1_${"C".repeat(24)}`,
+    edit: reference,
+    reject: `fha1_${"R".repeat(24)}`,
+  };
+  const edits: Array<Array<Array<{text: string; callback_data: string}>>> = [];
+  const handler = createHumanActionInteractiveHandler(() => ({
+    workspaceRoot: "/tmp/workspace",
+    runner: {
+      async run(request: BridgeRequest): Promise<BridgeResponse> {
+        if (request.command === "issue_human_actions") {
+          return ok(request, {
+            proposal_public_id: proposal,
+            proposal_version: 0,
+            content_hash: "3".repeat(64),
+            card_generation_public_id: cardReference,
+            actions: {
+              confirm: { reference: actionReferences.confirm, expiry: 2_000_000_000 },
+              edit: { reference: actionReferences.edit, expiry: 2_000_000_000 },
+              reject: { reference: actionReferences.reject, expiry: 2_000_000_000 },
+            },
+            final_transaction_created: false,
+          });
+        }
+        if (request.command === "begin_human_draft_card_delivery") {
+          return ok(request, { attempt_public_id: request.arguments.attempt_public_id! });
+        }
+        if (request.command === "record_human_draft_card_delivery_outcome") {
+          return ok(request, { observation_public_id: request.arguments.observation_public_id! });
+        }
+        return ok(request, {
+          action: "edit",
+          proposal_public_id: proposal,
+          operator_actor_id: "111",
+          proposal_version: 0,
+          content_hash: "3".repeat(64),
+          callback_token: `fcb_v1_${"A".repeat(32)}`,
+          callback_expiry: 2_000_000_000,
+          decision_idempotency_key: `bridge-edit:${proposal}:v0:${"3".repeat(64)}`,
+          d1_decision_binding: {
+            reference_public_id: `haref_${"4".repeat(32)}`,
+            card_generation_public_id: cardReference,
+            authenticated_actor_id: "111",
+            telegram_account_id: "finance-account",
+            telegram_conversation_id: "111",
+            conversation_binding_id: "binding-1",
+          },
+          human_draft_card: {
+            card_generation_public_id: cardReference,
+            current_card_generation_public_id: cardReference,
+            completeness: "complete",
+            confirm_available: true,
+            reject_available: true,
+            action_issue_batch_id: "5".repeat(64),
+            operation_outcome: "accepted",
+            refusal_code: null,
+            action_issuance_state: "issued",
+            proposal_public_id: proposal,
+            proposal_version: 0,
+            proposal_content_hash: "3".repeat(64),
+            decision_target_proposal_public_id: proposal,
+            decision_target_proposal_version: 0,
+            decision_target_proposal_content_hash: "3".repeat(64),
+            field_values: {
+              amount: "12.50", currency: "SGD", transaction_date: "2026-09-19",
+              merchant: "Example", description: "Lunch", category: "Meals",
+            },
+            unresolved_flags: [],
+            final_transaction_created: false,
+          },
+          final_transaction_created: false,
+        });
+      },
+    },
+  }));
+  await handler({
+    channel: "telegram", accountId: "finance-account", callbackId: "callback-d1-edit",
+    conversationId: "111", parentConversationId: "111", senderId: "111",
+    isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
+    callback: {
+      data: humanActionCallbackData("edit", reference), namespace: "finance-bridge",
+      payload: `edit:${reference}`, messageId: 20, chatId: "111",
+    },
+    respond: {
+      async reply() { throw new Error("replacement should succeed"); },
+      async editMessage({ buttons }: {
+        buttons: Array<Array<{text: string; callback_data: string}>>;
+      }) { edits.push(buttons); },
+    },
+    async getCurrentConversationBinding() { return binding; },
+  });
+  assert.deepEqual(edits[0]?.[0]?.map((button) => button.text), ["Confirm", "Reject"]);
+  assert.equal(
+    edits[0]?.flat().some((button) => button.callback_data.includes(actionReferences.edit)),
+    false,
+  );
 });
 
 test("persisted decision remains truthful when Telegram card replacement fails", async () => {
