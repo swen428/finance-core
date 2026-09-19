@@ -292,6 +292,30 @@ def _decide_d1(
     )
 
 
+def _decide_without_d1_binding(
+    workspace: support.BridgeWorkspace,
+    redeemed: support.CliOutcome,
+    *,
+    action: str,
+) -> support.CliOutcome:
+    material = redeemed.response["result"]
+    return support.run_cli(
+        support.make_request(
+            action,
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": material["proposal_public_id"],
+                "operator_actor_id": ACTOR,
+                "proposal_version": material["proposal_version"],
+                "content_hash": material["content_hash"],
+                "callback_token": material["callback_token"],
+                "callback_expiry": material["callback_expiry"],
+            },
+            idempotency_key=material["decision_idempotency_key"],
+        )
+    )
+
+
 def _complete(
     workspace: support.BridgeWorkspace, session: str, message_id: int
 ) -> support.CliOutcome:
@@ -359,6 +383,7 @@ def test_edit_redemption_atomically_starts_durable_session(
         assert start == operation_id
         assert start.startswith("d1start_")
         assert start != "guided-edit-callback"
+        assert draft["original_operation_or_start_public_id"] == start
     finally:
         conn.close()
 
@@ -673,6 +698,109 @@ def test_delivery_unknown_query_and_reissue_are_restart_safe(
     assert confirmed.exit_code == bridge_errors.EXIT_OK, confirmed.response
 
 
+@pytest.mark.parametrize(
+    ("reason", "outcome"),
+    (
+        ("failure", "failure"),
+        ("unknown_after_query", "unknown"),
+        ("expiry", None),
+    ),
+)
+def test_initial_card_reissue_uses_only_public_bridge_identity(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    outcome: str | None,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    card_id = str(card["card_generation_public_id"])
+    original_id = str(card["original_operation_or_start_public_id"])
+    assert original_id.startswith("d1start_")
+    assert original_id != "guided-edit-callback"
+
+    attempt_id = _framed_hash("d1-card-delivery-v1", card_id, "reply")
+    attempt = support.run_cli(
+        support.make_request(
+            "begin_human_draft_card_delivery",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_id,
+                "attempt_public_id": attempt_id,
+                "delivery_material_hash": "c" * 64,
+                "transport_mode": "reply",
+            },
+            idempotency_key=f"bridge-human-draft-delivery:{attempt_id}",
+        )
+    )
+    assert attempt.exit_code == bridge_errors.EXIT_OK, attempt.response
+    if outcome is not None:
+        observation_id = _framed_hash("d1-card-observation-v1", attempt_id, "initial")
+        observed = support.run_cli(
+            support.make_request(
+                "record_human_draft_card_delivery_outcome",
+                {
+                    **_context(workspace),
+                    "attempt_public_id": attempt_id,
+                    "observation_public_id": observation_id,
+                    "outcome": outcome,
+                    "error_code": "transport_failure" if outcome == "failure" else None,
+                    "outbound_message_id": None,
+                    "trusted_receipt_hash": None,
+                },
+                idempotency_key=f"bridge-human-draft-observation:{observation_id}",
+            )
+        )
+        assert observed.exit_code == bridge_errors.EXIT_OK, observed.response
+
+    queried = _get_human_draft_card(workspace, attempt_public_id=attempt_id)
+    assert queried.exit_code == bridge_errors.EXIT_OK, queried.response
+    assert queried.response["result"]["original_operation_or_start_public_id"] == original_id
+    if reason == "expiry":
+        conn = support.open_database(workspace)
+        try:
+            expires_at = int(
+                conn.execute(
+                    "SELECT expires_at FROM parser_human_draft_cards "
+                    "WHERE card_generation_public_id = ?",
+                    (card_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+
+        class _AfterCardExpiry(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:
+                return datetime.fromtimestamp(expires_at + 1, tz=UTC)
+
+        monkeypatch.setattr(commands, "datetime", _AfterCardExpiry)
+
+    recovery_id = _framed_hash(
+        "d1-card-recovery-v1",
+        str(card["draft_public_id"]),
+        original_id,
+        card_id,
+    )
+    reissued = support.run_cli(
+        support.make_request(
+            "reissue_human_draft_card",
+            {
+                **_context(workspace),
+                "expected_current_generation_public_id": card_id,
+                "original_operation_or_start_public_id": original_id,
+                "recovery_public_id": recovery_id,
+                "recovery_material_hash": "d" * 64,
+                "queried_delivery_state_hash": queried.response["result"]["delivery_state_hash"],
+                "reason": reason,
+            },
+            idempotency_key=f"bridge-human-draft-reissue:{recovery_id}",
+        )
+    )
+    assert reissued.exit_code == bridge_errors.EXIT_OK, reissued.response
+    assert reissued.response["result"]["card_generation_public_id"] != card_id
+
+
 def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
     workspace: support.BridgeWorkspace,
 ) -> None:
@@ -748,6 +876,9 @@ def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
     replayed_decision = _decide_d1(workspace, redeemed, action="confirm")
     assert replayed_decision.exit_code == bridge_errors.EXIT_OK, replayed_decision.response
     assert replayed_decision.response["idempotent_replay"] is True
+    unbound_replay = _decide_without_d1_binding(workspace, redeemed, action="confirm")
+    assert unbound_replay.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert unbound_replay.response["error"]["code"] == bridge_errors.LIFECYCLE_CONFLICT
     conn = support.open_database(workspace)
     try:
         assert conn.execute("SELECT state FROM parser_human_drafts").fetchone()[0] == "confirmed"
@@ -762,6 +893,65 @@ def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
             == 1
         )
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("first_mode", ("legacy", "d1"))
+def test_legacy_and_d1_issuance_resolve_private_key_collisions(
+    workspace: support.BridgeWorkspace,
+    first_mode: str,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    d1_batch = str(card["action_issue_batch_id"])
+    callback_key = commands._load_callback_key(workspace.workspace_path)
+    first_private_key = commands._persisted_human_action_issuance_keys(d1_batch, key=callback_key)[
+        0
+    ]
+    legacy_batch = first_private_key.removeprefix("bridge-human-action-issue:")
+    assert len(legacy_batch) == 32
+
+    legacy_request = support.make_request(
+        "issue_human_actions",
+        {
+            **_context(workspace),
+            "proposal_public_id": card["decision_target_proposal_public_id"],
+            "reference_batch_id": legacy_batch,
+            "token_ttl_seconds": 300,
+            "expected_proposal_version": card["decision_target_proposal_version"],
+            "expected_content_hash": card["decision_target_proposal_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key(legacy_batch),
+    )
+
+    def issue(mode: str) -> support.CliOutcome:
+        if mode == "legacy":
+            return support.run_cli(legacy_request)
+        return _issue_d1_actions(workspace, card)
+
+    second_mode = "d1" if first_mode == "legacy" else "legacy"
+    first = issue(first_mode)
+    second = issue(second_mode)
+    assert first.exit_code == bridge_errors.EXIT_OK, first.response
+    assert second.exit_code == bridge_errors.EXIT_OK, second.response
+    assert issue(first_mode).response["idempotent_replay"] is True
+    assert issue(second_mode).response["idempotent_replay"] is True
+
+    conn = support.open_database(workspace)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT refs.issuance_idempotency_key, "
+            "bindings.card_generation_public_id "
+            "FROM openclaw_human_action_references AS refs "
+            "LEFT JOIN parser_human_draft_action_bindings AS bindings "
+            "ON bindings.reference_id = refs.id"
+        ).fetchall()
+        legacy_keys = {row[0] for row in rows if row[1] is None}
+        d1_keys = {row[0] for row in rows if row[1] == card["card_generation_public_id"]}
+        assert len(legacy_keys) == 2
+        assert len(d1_keys) == 1
+        assert legacy_keys.isdisjoint(d1_keys)
     finally:
         conn.close()
 
@@ -847,6 +1037,9 @@ def test_incomplete_d1_card_issues_no_confirm_and_rejects_atomically(
     replayed_reject = _decide_d1(workspace, redeemed, action="reject")
     assert replayed_reject.exit_code == bridge_errors.EXIT_OK, replayed_reject.response
     assert replayed_reject.response["idempotent_replay"] is True
+    unbound_replay = _decide_without_d1_binding(workspace, redeemed, action="reject")
+    assert unbound_replay.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert unbound_replay.response["error"]["code"] == bridge_errors.LIFECYCLE_CONFLICT
     conn = support.open_database(workspace)
     try:
         authorization = conn.execute(

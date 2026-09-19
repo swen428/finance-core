@@ -14,6 +14,7 @@ finalization boundaries while carrying no monetary material in envelopes.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import time
@@ -273,17 +274,33 @@ def canonical_human_action_issuance_key(reference_batch_id: str) -> str:
     return f"bridge-human-action-issue:{reference_batch_id}"
 
 
-def _persisted_human_action_issuance_key(reference_batch_id: str) -> str:
-    if len(reference_batch_id) == 64 and all(
+def _persisted_human_action_issuance_keys(
+    reference_batch_id: str, *, key: bytes
+) -> tuple[str, ...]:
+    # Migration 041 fixes the persisted suffix at 32 hex characters while D1
+    # publishes a 64-hex batch.  Secret-derived alternatives keep that legacy
+    # column compatible without exposing a deterministic key that another
+    # public issuance can pre-claim.
+    is_d1 = len(reference_batch_id) == 64 and all(
         character in "0123456789abcdef" for character in reference_batch_id
-    ):
-        parts = ("d1-human-action-issuance-v1", reference_batch_id)
+    )
+    candidates = [] if is_d1 else [canonical_human_action_issuance_key(reference_batch_id)]
+    domain = (
+        "d1-human-action-issuance-private-v2"
+        if is_d1
+        else "legacy-human-action-issuance-fallback-v1"
+    )
+    for slot in range(16 - len(candidates)):
+        parts = (domain, reference_batch_id, str(slot))
         material = b"".join(
             len(encoded).to_bytes(4, "big") + encoded
             for encoded in (part.encode("utf-8") for part in parts)
         )
-        reference_batch_id = hashlib.sha256(material).hexdigest()[:32]
-    return canonical_human_action_issuance_key(reference_batch_id)
+        suffix = hmac.new(key, material, hashlib.sha256).hexdigest()[:32]
+        candidate = canonical_human_action_issuance_key(suffix)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
 
 
 def canonical_human_action_redemption_key(callback_id: str) -> str:
@@ -2583,12 +2600,14 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                     if action != human_actions.callback_tokens.ACTION_CONFIRM
                 )
         key = _load_callback_key(workspace)
+        persisted_issuance_keys = _persisted_human_action_issuance_keys(reference_batch_id, key=key)
         deadline.check("human action reference issuance")
         try:
             issued, replay = human_actions.issue_human_action_references(
                 conn,
                 key=key,
-                issuance_idempotency_key=_persisted_human_action_issuance_key(reference_batch_id),
+                issuance_idempotency_key=persisted_issuance_keys[0],
+                fallback_issuance_idempotency_keys=persisted_issuance_keys[1:],
                 proposal_public_id=proposal_public_id,
                 expected_proposal_version=expected_proposal_version,
                 expected_proposal_content_hash=expected_content_hash,
@@ -2900,7 +2919,12 @@ def _human_draft_result_payload(
         (result.draft_public_id,),
     ).fetchone()
     card = conn.execute(
-        "SELECT expires_at FROM parser_human_draft_cards WHERE card_generation_public_id = ?",
+        "SELECT cards.expires_at, operations.operation_public_id "
+        "AS original_operation_or_start_public_id "
+        "FROM parser_human_draft_cards AS cards "
+        "JOIN parser_human_draft_operations AS operations "
+        "ON operations.id = cards.original_operation_id "
+        "WHERE cards.card_generation_public_id = ?",
         (result.card_generation_public_id,),
     ).fetchone()
     active = (
@@ -2932,6 +2956,9 @@ def _human_draft_result_payload(
         "proposal_content_hash": result.proposal_content_hash,
         "card_generation_public_id": result.card_generation_public_id,
         "current_card_generation_public_id": result.current_card_generation_public_id,
+        "original_operation_or_start_public_id": (
+            None if card is None else str(card["original_operation_or_start_public_id"])
+        ),
         "field_values": dict(result.field_values),
         "decision_target_proposal_public_id": result.decision_target_proposal_public_id,
         "decision_target_proposal_version": result.decision_target_proposal_version,
@@ -3035,15 +3062,6 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
                 deadline=deadline,
                 terminal_guard=False,
             )
-            if d1_decision_binding is None:
-                return {
-                    "decision": decision,
-                    "confirmation_id": existing["confirmation_public_id"],
-                    "proposal_public_id": proposal["public_id"],
-                    "to_status": str(proposal["parse_status"]),
-                    "final_transaction_created": False,
-                }, True
-
         if existing is None:
             proposal = _verify_callback_context(
                 conn, workspace, validated, action=action, deadline=deadline

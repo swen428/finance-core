@@ -209,6 +209,37 @@ def _issued_from_row(row: dict, key: bytes) -> IssuedHumanActionReference:
     )
 
 
+def _issuance_rows_match(
+    rows: list[dict],
+    *,
+    allowed_actions: tuple[str, ...],
+    proposal_public_id: str,
+    expected_proposal_version: int,
+    expected_proposal_content_hash: str,
+    context: HumanActionContext,
+    ttl_seconds: int,
+    card_generation_public_id: str | None,
+) -> bool:
+    expected_actions = set(allowed_actions)
+    return (
+        len(rows) == len(expected_actions)
+        and {str(row["action"]) for row in rows} == expected_actions
+        and len({str(row["issuance_idempotency_key"]) for row in rows}) == 1
+        and all(
+            row["proposal_public_id"] == proposal_public_id
+            and int(row["proposal_version"]) == expected_proposal_version
+            and hmac.compare_digest(
+                str(row["proposal_content_hash"]), expected_proposal_content_hash
+            )
+            and _row_context(row) == context
+            and row["channel"] == "telegram"
+            and int(row["ttl_seconds"]) == ttl_seconds
+            and row["card_generation_public_id"] == card_generation_public_id
+            for row in rows
+        )
+    )
+
+
 def _require_d1_card_for_issuance(
     conn: sqlite3.Connection,
     *,
@@ -355,6 +386,7 @@ def issue_human_action_references(
     require_unconsumed_replay: bool = False,
     allowed_actions: tuple[str, ...] = REFERENCE_ACTIONS,
     card_generation_public_id: str | None = None,
+    fallback_issuance_idempotency_keys: tuple[str, ...] = (),
     clock: Callable[[], int] = lambda: int(datetime.now(UTC).timestamp()),
 ) -> tuple[tuple[IssuedHumanActionReference, ...], bool]:
     """Issue or reconstruct the allowed direct-human references atomically."""
@@ -363,6 +395,9 @@ def issue_human_action_references(
     if any(action not in REFERENCE_ACTIONS for action in allowed_actions):
         raise HumanActionReferenceError("issuance_conflict")
     if minimum_remaining_seconds < 0 or minimum_remaining_seconds >= ttl_seconds:
+        raise HumanActionReferenceError("issuance_conflict")
+    issuance_keys = (issuance_idempotency_key, *fallback_issuance_idempotency_keys)
+    if len(issuance_keys) > 16 or len(set(issuance_keys)) != len(issuance_keys):
         raise HumanActionReferenceError("issuance_conflict")
     _begin_immediate(conn)
     try:
@@ -379,28 +414,38 @@ def issue_human_action_references(
                 allowed_actions=allowed_actions,
                 now=now,
             )
-        existing = _reference_rows_for_issuance(conn, issuance_idempotency_key)
-        if existing:
-            expected_actions = set(allowed_actions)
-            if (
-                len(existing) != len(expected_actions)
-                or {str(row["action"]) for row in existing} != expected_actions
+        existing: list[dict] = []
+        for candidate_key in issuance_keys:
+            candidate_rows = _reference_rows_for_issuance(conn, candidate_key)
+            if not candidate_rows:
+                issuance_idempotency_key = candidate_key
+                break
+            if not _issuance_rows_match(
+                candidate_rows,
+                allowed_actions=allowed_actions,
+                proposal_public_id=proposal_public_id,
+                expected_proposal_version=expected_proposal_version,
+                expected_proposal_content_hash=expected_proposal_content_hash,
+                context=context,
+                ttl_seconds=ttl_seconds,
+                card_generation_public_id=card_generation_public_id,
             ):
-                raise HumanActionReferenceError("issuance_conflict")
-            for row in existing:
-                if (
-                    row["proposal_public_id"] != proposal_public_id
-                    or int(row["proposal_version"]) != expected_proposal_version
-                    or not hmac.compare_digest(
-                        str(row["proposal_content_hash"]),
-                        expected_proposal_content_hash,
-                    )
-                    or _row_context(row) != context
-                    or row["channel"] != "telegram"
-                    or int(row["ttl_seconds"]) != ttl_seconds
-                    or row["card_generation_public_id"] != card_generation_public_id
-                ):
+                occupied_generations = {row["card_generation_public_id"] for row in candidate_rows}
+                same_issuance_identity = (
+                    card_generation_public_id is None and occupied_generations == {None}
+                ) or (
+                    card_generation_public_id is not None
+                    and occupied_generations == {card_generation_public_id}
+                )
+                if same_issuance_identity:
                     raise HumanActionReferenceError("issuance_conflict")
+                continue
+            issuance_idempotency_key = candidate_key
+            existing = candidate_rows
+            break
+        else:
+            raise HumanActionReferenceError("issuance_conflict")
+        if existing:
             current_proposal, version, content_hash = _proposal_state(
                 conn, int(existing[0]["parser_output_id"])
             )
