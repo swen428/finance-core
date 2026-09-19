@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -47,6 +48,17 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"finance-" + b"automation",
 )
 EXPECTED_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+
+
+def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    pin = next(item for item in project["project"]["dependencies"] if item.startswith("pypdf=="))
+    dependency_version = pin.removeprefix("pypdf==")
+    notice = (REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    lock = (REPOSITORY_ROOT / "requirements-dev.txt").read_text()
+    assert f"- `pypdf` {dependency_version} — BSD-3-Clause." in notice
+    assert pin in "\n".join(line for line in lock.splitlines() if line.startswith("##"))
+    assert any(line.startswith(f"{pin} ") for line in lock.splitlines())
 
 
 def _ledger_digest(paths: tuple[Path, ...]) -> str:

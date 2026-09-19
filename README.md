@@ -47,6 +47,12 @@ python scripts/build_release_manifest.py \
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
 
+Version 0.1.1 pins pypdf 6.16.1. Its corrected character mappings can change
+extracted PDF text, so new PDF evidence uses
+`pypdf-6.16.1-text-extraction-v3`, propagated from the actual extractor rather
+than a template's saved label. Historical evidence and fingerprints remain
+unchanged; the upgrade performs no automatic reimport or database migration.
+
 ## Data boundary
 
 Never commit real financial data or credentials. Runtime databases, receipts,

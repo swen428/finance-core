@@ -1,6 +1,6 @@
 ## Fully resolved Python 3.12 validation/PDF dependency lock.
 ## Direct pins: build==1.6.1, setuptools==84.0.0, pytest==9.0.3,
-## pytest-xdist==3.8.0, ruff==0.16.0, mypy==2.1.0, pypdf==6.14.2.
+## pytest-xdist==3.8.0, ruff==0.16.0, mypy==2.1.0, pypdf==6.16.1.
 ## Regenerate with pip-tools 7.5.2 and pip 25.3 using --generate-hashes,
 ## --allow-unsafe, and --pip-args='--only-binary=:all:'.
 
