@@ -14,10 +14,12 @@ finalization boundaries while carrying no monetary material in envelopes.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import time
 import unicodedata
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -116,6 +118,28 @@ from finance_core.parser_proposals.conversion_state import (
     has_receipt_registry_conversion,
 )
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
+from finance_core.parser_proposals.human_draft_delivery import (
+    active_human_draft_exists,
+    begin_human_draft_card_delivery,
+    find_active_human_draft_card_generation,
+    get_human_draft_action_authority,
+    get_human_draft_card,
+    get_human_draft_presentation,
+    record_human_draft_card_delivery_outcome,
+    reissue_human_draft_card,
+)
+from finance_core.parser_proposals.human_drafts import (
+    HumanDraftCommand,
+    HumanDraftContext,
+    HumanDraftError,
+    HumanDraftResult,
+    apply_human_draft_card,
+    begin_human_draft_in_transaction,
+)
+from finance_core.parser_proposals.human_revision import (
+    HumanRevisionLineageError,
+    publish_human_revision_in_transaction,
+)
 from finance_core.parser_proposals.lifecycle import (
     CONFIRMED,
     PARSED_PENDING_CONFIRMATION,
@@ -254,6 +278,35 @@ def canonical_human_action_issuance_key(reference_batch_id: str) -> str:
     return f"bridge-human-action-issue:{reference_batch_id}"
 
 
+def _persisted_human_action_issuance_keys(
+    reference_batch_id: str, *, key: bytes
+) -> tuple[str, ...]:
+    # Migration 041 fixes the persisted suffix at 32 hex characters while D1
+    # publishes a 64-hex batch.  Secret-derived alternatives keep that legacy
+    # column compatible without exposing a deterministic key that another
+    # public issuance can pre-claim.
+    is_d1 = len(reference_batch_id) == 64 and all(
+        character in "0123456789abcdef" for character in reference_batch_id
+    )
+    candidates = [] if is_d1 else [canonical_human_action_issuance_key(reference_batch_id)]
+    domain = (
+        "d1-human-action-issuance-private-v2"
+        if is_d1
+        else "legacy-human-action-issuance-fallback-v1"
+    )
+    for slot in range(16 - len(candidates)):
+        parts = (domain, reference_batch_id, str(slot))
+        material = b"".join(
+            len(encoded).to_bytes(4, "big") + encoded
+            for encoded in (part.encode("utf-8") for part in parts)
+        )
+        suffix = hmac.new(key, material, hashlib.sha256).hexdigest()[:32]
+        candidate = canonical_human_action_issuance_key(suffix)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
 def canonical_human_action_redemption_key(callback_id: str) -> str:
     digest = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()[:32]
     return f"bridge-human-action-redeem:{digest}"
@@ -265,6 +318,22 @@ def canonical_guided_edit_update_key(session_public_id: str, message_id: int) ->
 
 def canonical_guided_edit_complete_key(session_public_id: str, message_id: int) -> str:
     return f"bridge-guided-edit-complete:{session_public_id}:{message_id}"
+
+
+def canonical_human_draft_apply_key(operation_public_id: str) -> str:
+    return f"bridge-human-draft-apply:{operation_public_id}"
+
+
+def canonical_human_draft_delivery_key(attempt_public_id: str) -> str:
+    return f"bridge-human-draft-delivery:{attempt_public_id}"
+
+
+def canonical_human_draft_observation_key(observation_public_id: str) -> str:
+    return f"bridge-human-draft-observation:{observation_public_id}"
+
+
+def canonical_human_draft_reissue_key(recovery_public_id: str) -> str:
+    return f"bridge-human-draft-reissue:{recovery_public_id}"
 
 
 def canonical_finalize_key(proposal_public_id: str) -> str:
@@ -2118,6 +2187,15 @@ _DECISION_REQUIRED_FIELDS = frozenset(
     }
 )
 
+_D1_DECISION_FIELDS = frozenset(
+    {
+        "d1_reference_public_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+)
+
 
 def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
     arguments = request.arguments
@@ -2141,7 +2219,7 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
     callback_expiry = _require_positive_int(
         arguments["callback_expiry"], "callback_expiry", maximum=2**40
     )
-    return {
+    validated = {
         "proposal_public_id": proposal_public_id,
         "operator_actor_id": operator_actor_id,
         "proposal_version": proposal_version,
@@ -2149,6 +2227,29 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
         "callback_token": str(callback_token),
         "callback_expiry": callback_expiry,
     }
+    supplied_d1_fields = frozenset(arguments) & _D1_DECISION_FIELDS
+    if supplied_d1_fields and supplied_d1_fields != _D1_DECISION_FIELDS:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "D1 decision authority fields must be supplied together.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    if supplied_d1_fields:
+        context = _require_telegram_human_context(arguments)
+        reference_public_id = _require_string(
+            arguments["d1_reference_public_id"],
+            "d1_reference_public_id",
+            max_length=38,
+        )
+        if len(reference_public_id) != 38 or not reference_public_id.startswith("haref_"):
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "d1_reference_public_id is malformed.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+        validated["d1_reference_public_id"] = reference_public_id
+        validated["d1_context"] = context
+    return validated
 
 
 def _load_callback_key(workspace: Path) -> bytes:
@@ -2371,21 +2472,33 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 "expected_content_hash",
             }
         ),
-        optional=frozenset({"minimum_remaining_seconds", "require_unconsumed_replay"}),
+        optional=frozenset(
+            {
+                "minimum_remaining_seconds",
+                "require_unconsumed_replay",
+                "card_generation_public_id",
+            }
+        ),
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
     )
     context = _require_telegram_human_context(request.arguments)
     reference_batch_id = _require_string(
-        request.arguments["reference_batch_id"], "reference_batch_id", max_length=32
+        request.arguments["reference_batch_id"], "reference_batch_id", max_length=64
     )
-    if len(reference_batch_id) != 32 or any(
+    card_generation_public_id = (
+        None
+        if "card_generation_public_id" not in request.arguments
+        else _require_card_generation_public_id(request.arguments["card_generation_public_id"])
+    )
+    expected_batch_length = 64 if card_generation_public_id is not None else 32
+    if len(reference_batch_id) != expected_batch_length or any(
         character not in "0123456789abcdef" for character in reference_batch_id
     ):
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
-            "reference_batch_id must be 32 lowercase hexadecimal characters.",
+            "reference_batch_id does not match the required lowercase hexadecimal identity.",
             errors.EXIT_VALIDATION_REFUSED,
         )
     token_ttl = _require_positive_int(
@@ -2426,6 +2539,14 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
 
     workspace, conn = _open_context(request.arguments, deadline)
     try:
+        if card_generation_public_id is not None:
+            authority = get_human_draft_action_authority(conn, card_generation_public_id)
+            if authority is None or authority.action_issue_batch_id != reference_batch_id:
+                raise errors.bridge_error(
+                    errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+                    "D1 action issuance identity does not match the durable card.",
+                    errors.EXIT_AUTHORITY_REFUSED,
+                )
         deadline.check("human action reference key load")
         proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
         payload, version, content_hash = _proposal_effective_state(conn, proposal)
@@ -2452,18 +2573,34 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
             )
             if ai_lineage["requires_resolution"]:
                 ambiguity_indicators = sorted(set(ambiguity_indicators) | {"low_confidence"})
-        allowed_actions = (
+        allowed_actions: tuple[str, ...] = (
             human_actions.REFERENCE_ACTIONS
             if ai_lineage is None or not ambiguity_indicators
             else (human_actions.callback_tokens.ACTION_REJECT,)
         )
+        if card_generation_public_id is not None:
+            assert authority is not None
+            if authority.result_completeness is None:
+                raise errors.bridge_error(
+                    errors.HUMAN_DRAFT_NOT_FOUND,
+                    "D1 card generation was not found.",
+                    errors.EXIT_AUTHORITY_REFUSED,
+                )
+            if authority.result_completeness != "complete":
+                allowed_actions = tuple(
+                    action
+                    for action in allowed_actions
+                    if action != human_actions.callback_tokens.ACTION_CONFIRM
+                )
         key = _load_callback_key(workspace)
+        persisted_issuance_keys = _persisted_human_action_issuance_keys(reference_batch_id, key=key)
         deadline.check("human action reference issuance")
         try:
             issued, replay = human_actions.issue_human_action_references(
                 conn,
                 key=key,
-                issuance_idempotency_key=request.idempotency_key or "",
+                issuance_idempotency_key=persisted_issuance_keys[0],
+                fallback_issuance_idempotency_keys=persisted_issuance_keys[1:],
                 proposal_public_id=proposal_public_id,
                 expected_proposal_version=expected_proposal_version,
                 expected_proposal_content_hash=expected_content_hash,
@@ -2472,6 +2609,7 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 minimum_remaining_seconds=minimum_remaining_seconds,
                 require_unconsumed_replay=require_unconsumed_replay,
                 allowed_actions=allowed_actions,
+                card_generation_public_id=card_generation_public_id,
             )
         except human_actions.HumanActionReferenceError as exc:
             _raise_human_action_error(exc)
@@ -2483,6 +2621,11 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 item.action: {"reference": item.reference, "expiry": item.expires_at}
                 for item in issued
             },
+            **(
+                {"card_generation_public_id": card_generation_public_id}
+                if card_generation_public_id is not None
+                else {}
+            ),
             "final_transaction_created": False,
         }, replay
     finally:
@@ -2545,6 +2688,17 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                         callback_message_id=callback_message_id,
                     )
                 ),
+                redemption_effect=lambda locked, row, validated_action, now: (
+                    _begin_human_draft_for_redeemed_edit(
+                        locked,
+                        row,
+                        validated_action,
+                        reference=reference,
+                        callback_id=callback_id,
+                        callback_message_id=callback_message_id,
+                        now_epoch=now,
+                    )
+                ),
             )
         except human_actions.HumanActionReferenceError as exc:
             _raise_human_action_error(exc)
@@ -2574,7 +2728,7 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                 action=redeemed.action, proposal_public_id=redeemed.proposal_public_id
             )
         )
-        return {
+        result: dict[str, Any] = {
             "action": redeemed.action,
             "proposal_public_id": redeemed.proposal_public_id,
             "operator_actor_id": redeemed.actor_id,
@@ -2589,7 +2743,50 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                 else {}
             ),
             "final_transaction_created": False,
-        }, redeemed.idempotent_replay
+        }
+        if redeemed.d1_decision_binding is not None:
+            result["d1_decision_binding"] = asdict(redeemed.d1_decision_binding)
+        if redeemed.action == callback_tokens.ACTION_EDIT:
+            draft_context = HumanDraftContext(
+                authenticated_actor_id=context.actor_id,
+                telegram_account_id=context.account_id,
+                telegram_conversation_id=context.conversation_id,
+                conversation_binding_id=context.binding_id,
+            )
+            try:
+                lookup_identity = (
+                    {
+                        "card_generation_public_id": (
+                            redeemed.d1_decision_binding.card_generation_public_id
+                        )
+                    }
+                    if redeemed.d1_decision_binding is not None
+                    else {"source_edit_reference_public_id": redeemed.reference_public_id}
+                )
+                draft = get_human_draft_card(
+                    conn,
+                    context=draft_context,
+                    **lookup_identity,
+                )
+            except HumanDraftError as exc:
+                active_card = find_active_human_draft_card_generation(
+                    conn,
+                    proposal_public_id=redeemed.proposal_public_id,
+                    context=draft_context,
+                )
+                if active_card is None:
+                    raise errors.bridge_error(
+                        errors.LIFECYCLE_CONFLICT,
+                        "Redeemed Edit reference has no authoritative D1 draft result.",
+                        errors.EXIT_AUTHORITY_REFUSED,
+                    ) from exc
+                draft = get_human_draft_card(
+                    conn,
+                    context=draft_context,
+                    card_generation_public_id=active_card,
+                )
+            result["human_draft_card"] = _human_draft_result_payload(conn, draft)
+        return result, redeemed.idempotent_replay
     finally:
         conn.close()
 
@@ -2633,6 +2830,109 @@ def _validate_redeemed_human_action(
             raise human_actions.HumanActionReferenceError("action_unavailable") from exc
 
 
+def _begin_human_draft_for_redeemed_edit(
+    conn: sqlite3.Connection,
+    reference_row: dict[str, Any],
+    action: str,
+    *,
+    reference: str,
+    callback_id: str,
+    callback_message_id: int,
+    now_epoch: int,
+) -> None:
+    if (
+        action != callback_tokens.ACTION_EDIT
+        or reference_row.get("card_generation_public_id") is not None
+    ):
+        return
+    context = HumanDraftContext(
+        authenticated_actor_id=str(reference_row["authenticated_actor_id"]),
+        telegram_account_id=str(reference_row["channel_account_id"]),
+        telegram_conversation_id=str(reference_row["channel_conversation_id"]),
+        conversation_binding_id=str(reference_row["conversation_binding_id"]),
+    )
+    if active_human_draft_exists(
+        conn,
+        parser_output_id=int(reference_row["parser_output_id"]),
+        context=context,
+    ):
+        return
+    callback_hash = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()
+    start_parts = (
+        "d1-human-draft-start-v1",
+        str(reference_row["reference_public_id"]),
+        callback_hash,
+    )
+    start_material = b"".join(
+        len(encoded).to_bytes(4, "big") + encoded
+        for encoded in (part.encode("utf-8") for part in start_parts)
+    )
+    start_public_id = f"d1start_{hashlib.sha256(start_material).hexdigest()[:32]}"
+    try:
+        begin_human_draft_in_transaction(
+            conn,
+            locked_edit_reference_row=reference_row,
+            source_edit_reference_id=int(reference_row["id"]),
+            reference_public_id=str(reference_row["reference_public_id"]),
+            reference_integrity_material=reference.encode("utf-8"),
+            callback_message_id=callback_message_id,
+            redemption_public_id=start_public_id,
+            redemption_material_hash=callback_hash,
+            now_epoch=now_epoch,
+        )
+    except HumanDraftError as exc:
+        raise human_actions.HumanActionReferenceError("action_unavailable") from exc
+
+
+def _human_draft_result_payload(
+    conn: sqlite3.Connection, result: HumanDraftResult
+) -> dict[str, Any]:
+    now_epoch = int(datetime.now(UTC).timestamp())
+    presentation = get_human_draft_presentation(
+        conn,
+        result=result,
+        now_epoch=now_epoch,
+    )
+    return {
+        "draft_public_id": result.draft_public_id,
+        "draft_version": result.draft_version,
+        "draft_content_hash": result.draft_content_hash,
+        "completeness": result.completeness,
+        "reason_contributors": [asdict(item) for item in result.reason_contributors],
+        "unresolved_flags": list(result.unresolved_flags),
+        "human_reply_evidence_public_id": result.human_reply_evidence_public_id,
+        "delivery_state": result.delivery_state,
+        "delivery_state_hash": result.delivery_state_hash,
+        "delivery_attempts": [dict(item) for item in result.delivery_attempts],
+        "delivery_outcomes": [dict(item) for item in result.delivery_outcomes],
+        "action_issue_batch_id": result.action_issue_batch_id,
+        "operation_outcome": result.operation_outcome,
+        "refusal_code": result.refusal_code,
+        "idempotent_replay": result.idempotent_replay,
+        "action_issuance_state": result.action_issuance_state,
+        "proposal_public_id": result.proposal_public_id,
+        "proposal_version": result.proposal_version,
+        "proposal_content_hash": result.proposal_content_hash,
+        "card_generation_public_id": result.card_generation_public_id,
+        "current_card_generation_public_id": result.current_card_generation_public_id,
+        "original_operation_or_start_public_id": (
+            presentation.original_operation_or_start_public_id
+        ),
+        "field_values": dict(result.field_values),
+        "decision_target_proposal_public_id": result.decision_target_proposal_public_id,
+        "decision_target_proposal_version": result.decision_target_proposal_version,
+        "decision_target_proposal_content_hash": result.decision_target_proposal_content_hash,
+        "confirm_available": (
+            presentation.active
+            and result.completeness == "complete"
+            and result.proposal_public_id is not None
+            and result.card_generation_public_id == result.current_card_generation_public_id
+        ),
+        "reject_available": presentation.active,
+        "final_transaction_created": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # confirm / reject
 # ---------------------------------------------------------------------------
@@ -2647,7 +2947,11 @@ def handle_reject(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
 
 
 def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str) -> HandlerResult:
-    _require_exact_arguments(request.arguments, required=_DECISION_REQUIRED_FIELDS)
+    _require_exact_arguments(
+        request.arguments,
+        required=_DECISION_REQUIRED_FIELDS,
+        optional=_D1_DECISION_FIELDS,
+    )
     validated = _validate_decision_arguments(request)
     # The idempotency key must bind the proposal and action this command
     # authorizes; cross-proposal key reuse is refused before any lookup.
@@ -2660,6 +2964,24 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
     try:
         deadline.check("decision replay reconstruction")
         proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
+        d1_decision_binding = None
+        if "d1_reference_public_id" in validated:
+            try:
+                d1_decision_binding = human_actions.load_redeemed_human_action_binding(
+                    conn,
+                    reference_public_id=validated["d1_reference_public_id"],
+                    action=action,
+                    proposal_public_id=validated["proposal_public_id"],
+                    proposal_version=validated["proposal_version"],
+                    proposal_content_hash=validated["content_hash"],
+                    context=validated["d1_context"],
+                )
+            except human_actions.HumanActionReferenceError as exc:
+                raise errors.bridge_error(
+                    errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+                    f"D1 decision authority refused: {exc.reason}.",
+                    errors.EXIT_AUTHORITY_REFUSED,
+                ) from exc
         existing = ParserAuthorizationRepository(conn).get_for_proposal(int(proposal["id"]))
         decision = "confirmed" if action == callback_tokens.ACTION_CONFIRM else "rejected"
         if existing is not None:
@@ -2699,17 +3021,10 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
                 deadline=deadline,
                 terminal_guard=False,
             )
-            return {
-                "decision": decision,
-                "confirmation_id": existing["confirmation_public_id"],
-                "proposal_public_id": proposal["public_id"],
-                "to_status": str(proposal["parse_status"]),
-                "final_transaction_created": False,
-            }, True
-
-        proposal = _verify_callback_context(
-            conn, workspace, validated, action=action, deadline=deadline
-        )
+        if existing is None:
+            proposal = _verify_callback_context(
+                conn, workspace, validated, action=action, deadline=deadline
+            )
 
         deadline.check("decision persistence")
         assert request.idempotency_key is not None
@@ -2725,6 +3040,7 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
                 confirmation_channel=BRIDGE_CONFIRMATION_CHANNEL,
                 expected_content_hash=validated["content_hash"],
                 expected_version=validated["proposal_version"],
+                d1_decision_binding=d1_decision_binding,
             )
         except StaleProposalDecisionStateError as exc:
             # Authoritative atomic guard: the proposal changed between token
@@ -3358,6 +3674,123 @@ def _pending_guided_update(
             content_hash=persisted_state[2],
         )
         return result, True
+    d1_card_id = guided_edit.active_d1_card_for_session(conn, session)
+    if d1_card_id is not None:
+        operation_id = guided_edit.d1_compatibility_operation_public_id(
+            str(session["session_public_id"]), int(session["pending_message_id"])
+        )
+        field_name = str(session["pending_field_name"])
+        compatibility_label = {
+            "amount": "Amount",
+            "currency": "Currency",
+            "transaction_date": "Date",
+            "merchant": "Merchant",
+            "description": "Description",
+            "category": "Category",
+        }[field_name]
+        raw_card_text = f"Card Ref: {d1_card_id}\n{compatibility_label}: {field_value}"
+
+        def authorize_compatibility_write(locked: sqlite3.Connection) -> None:
+            if guided_edit.pending_core_state(locked, session) is not None:
+                raise guided_edit.GuidedEditError("pending_core_committed")
+            guided_edit.require_pending_authority_in_transaction(locked, int(session["id"]))
+
+        try:
+            d1_result = apply_human_draft_card(
+                conn,
+                HumanDraftCommand(
+                    card_generation_public_id=d1_card_id,
+                    telegram_message_id=int(session["pending_message_id"]),
+                    operation_public_id=operation_id,
+                    authenticated_actor_id=str(session["authenticated_actor_id"]),
+                    telegram_account_id=str(session["channel_account_id"]),
+                    telegram_conversation_id=str(session["channel_conversation_id"]),
+                    conversation_binding_id=str(session["conversation_binding_id"]),
+                    raw_card_text=raw_card_text,
+                    field_values=updates,
+                ),
+                publish=publish_human_revision_in_transaction,
+                authority_validator=authorize_compatibility_write,
+            )
+        except guided_edit.GuidedEditError as exc:
+            if exc.reason == "pending_core_committed":
+                recovered = guided_edit.pending_core_state(conn, session)
+                if recovered is None:
+                    raise errors.bridge_error(
+                        errors.LIFECYCLE_CONFLICT,
+                        "Guided edit recovery state disappeared after the write lock.",
+                        errors.EXIT_AUTHORITY_REFUSED,
+                    ) from exc
+                updated = ParserProposalRepository(conn).get(recovered[0])
+                if updated is None:
+                    raise errors.bridge_error(
+                        errors.PROPOSAL_NOT_FOUND,
+                        "Persisted guided edit result no longer exists.",
+                        errors.EXIT_AUTHORITY_REFUSED,
+                    ) from exc
+                guided_edit.record_update_applied(
+                    conn,
+                    session,
+                    parser_output_id=recovered[0],
+                    proposal_version=recovered[1],
+                    content_hash=recovered[2],
+                )
+                return {
+                    "edit_kind": "guided_replay",
+                    "proposal_public_id": str(updated["public_id"]),
+                    "proposal_version": recovered[1],
+                    "effective_content_hash": recovered[2],
+                    "parse_status": str(updated["parse_status"]),
+                    "final_transaction_created": False,
+                }, True
+            if exc.reason == "session_expired":
+                guided_edit.record_update_refused(conn, session, errors.CALLBACK_EXPIRED)
+            _raise_guided_edit_error(exc)
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        if d1_result.operation_outcome == "refused":
+            refusal_code = d1_result.refusal_code or errors.HUMAN_DRAFT_AUTHORITY_REFUSED
+            guided_edit.record_update_refused(conn, session, refusal_code)
+            raise errors.bridge_error(
+                errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+                f"D1 compatibility update was refused: {refusal_code}.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        if d1_result.proposal_public_id is None:
+            state = (
+                int(session["current_parser_output_id"]),
+                int(session["current_proposal_version"]),
+                str(session["current_content_hash"]),
+            )
+            proposal_public_id = str(proposal["public_id"])
+            parse_status = str(proposal["parse_status"])
+        else:
+            updated = _fetch_proposal_by_public_id(conn, d1_result.proposal_public_id)
+            assert d1_result.proposal_version is not None
+            assert d1_result.proposal_content_hash is not None
+            state = (
+                int(updated["id"]),
+                int(d1_result.proposal_version),
+                str(d1_result.proposal_content_hash),
+            )
+            proposal_public_id = str(updated["public_id"])
+            parse_status = str(updated["parse_status"])
+        guided_edit.record_update_applied(
+            conn,
+            session,
+            parser_output_id=state[0],
+            proposal_version=state[1],
+            content_hash=state[2],
+        )
+        return {
+            "edit_kind": "d1_compatibility",
+            "proposal_public_id": proposal_public_id,
+            "proposal_version": state[1],
+            "effective_content_hash": state[2],
+            "parse_status": parse_status,
+            "human_draft_card": _human_draft_result_payload(conn, d1_result),
+            "final_transaction_created": False,
+        }, d1_result.idempotent_replay
     try:
         result, replay = (
             _edit_receipt_monetary(
@@ -3586,6 +4019,425 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
             **_guided_session_payload(completed),
             "review_batch_id": review_batch_id,
         }, False
+    finally:
+        conn.close()
+
+
+_HUMAN_DRAFT_FIELDS = frozenset(
+    {"amount", "currency", "transaction_date", "merchant", "description", "category"}
+)
+_HUMAN_DRAFT_CONTEXT_FIELDS = frozenset(
+    {
+        "workspace_path",
+        "operator_actor_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+)
+
+
+def _require_card_generation_public_id(value: object) -> str:
+    card_id = _require_string(value, "card_generation_public_id", max_length=39)
+    if (
+        len(card_id) != 39
+        or not card_id.startswith("d1card_")
+        or any(character not in "0123456789abcdef" for character in card_id[7:])
+    ):
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "card_generation_public_id is not a valid D1 card identity.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    return card_id
+
+
+def _require_sha256_identity(value: object, name: str) -> str:
+    identity_value = _require_string(value, name, max_length=64)
+    if len(identity_value) != 64 or any(
+        character not in "0123456789abcdef" for character in identity_value
+    ):
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            f"{name} must be a 64-character lowercase SHA-256 identity.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    return identity_value
+
+
+def _require_human_draft_field_values(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or frozenset(value) != _HUMAN_DRAFT_FIELDS:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "field_values must contain each supported whole-card field exactly once.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    result: dict[str, str] = {}
+    for field in sorted(_HUMAN_DRAFT_FIELDS):
+        field_value = value[field]
+        if not isinstance(field_value, str) or len(field_value) > 16_384:
+            raise errors.bridge_error(
+                errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+                f"field_values.{field} must be a bounded string.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+        try:
+            field_value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise errors.bridge_error(
+                errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+                f"field_values.{field} is not valid UTF-8 material.",
+                errors.EXIT_VALIDATION_REFUSED,
+            ) from exc
+        result[field] = field_value
+    return result
+
+
+def _raise_human_draft_error(exc: HumanDraftError) -> None:
+    if exc.reason in {
+        "card_missing",
+        "draft_missing",
+        "operation_missing",
+        "source_reference_missing",
+    }:
+        code = errors.HUMAN_DRAFT_NOT_FOUND
+    elif exc.reason in {
+        "command_invalid",
+        "durable_identity_required",
+        "delivery_material_invalid",
+        "delivery_outcome_invalid",
+        "failure_code_required",
+        "reply_size_invalid",
+        "reply_utf8_invalid",
+        "recovery_material_invalid",
+        "recovery_reason_invalid",
+        "transport_mode_invalid",
+    }:
+        code = errors.HUMAN_DRAFT_ARGUMENTS_REFUSED
+    elif exc.reason in {
+        "message_conflict",
+        "attempt_conflict",
+        "durable_identity_mismatch",
+        "observation_conflict",
+        "operation_conflict",
+        "recovery_conflict",
+    }:
+        code = errors.HUMAN_DRAFT_CONFLICT
+    else:
+        code = errors.HUMAN_DRAFT_AUTHORITY_REFUSED
+    raise errors.bridge_error(
+        code,
+        "D1 human-draft authority refused the command.",
+        errors.EXIT_VALIDATION_REFUSED
+        if code == errors.HUMAN_DRAFT_ARGUMENTS_REFUSED
+        else errors.EXIT_AUTHORITY_REFUSED,
+        details={"reason": exc.reason},
+    ) from exc
+
+
+def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    required = _HUMAN_DRAFT_CONTEXT_FIELDS | frozenset(
+        {
+            "card_generation_public_id",
+            "telegram_message_id",
+            "operation_public_id",
+            "raw_card_text",
+            "field_values",
+        }
+    )
+    _require_exact_arguments(request.arguments, required=required)
+    context = _require_telegram_human_context(request.arguments)
+    card_id = _require_card_generation_public_id(request.arguments["card_generation_public_id"])
+    message_id = _require_positive_int(
+        request.arguments["telegram_message_id"],
+        "telegram_message_id",
+        maximum=2**63 - 1,
+    )
+    operation_id = _require_string(
+        request.arguments["operation_public_id"], "operation_public_id", max_length=200
+    )
+    raw_card_text = request.arguments["raw_card_text"]
+    if not isinstance(raw_card_text, str) or not raw_card_text:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "raw_card_text must be a non-empty string.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    try:
+        raw_bytes = raw_card_text.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "raw_card_text is not valid UTF-8 material.",
+            errors.EXIT_VALIDATION_REFUSED,
+        ) from exc
+    if len(raw_bytes) > 16_384:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "raw_card_text exceeds the 16,384-byte D1 evidence limit.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    field_values = _require_human_draft_field_values(request.arguments["field_values"])
+    _require_canonical_idempotency_key(request, canonical_human_draft_apply_key(operation_id))
+
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("human draft whole-card apply")
+        try:
+            result = apply_human_draft_card(
+                conn,
+                HumanDraftCommand(
+                    card_generation_public_id=card_id,
+                    telegram_message_id=message_id,
+                    operation_public_id=operation_id,
+                    authenticated_actor_id=context.actor_id,
+                    telegram_account_id=context.account_id,
+                    telegram_conversation_id=context.conversation_id,
+                    conversation_binding_id=context.binding_id,
+                    raw_card_text=raw_card_text,
+                    field_values=field_values,
+                ),
+                publish=publish_human_revision_in_transaction,
+            )
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        except HumanRevisionLineageError as exc:
+            raise errors.bridge_error(
+                errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+                "D1 human revision lineage refused publication.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
+        return _human_draft_result_payload(conn, result), result.idempotent_replay
+    finally:
+        conn.close()
+
+
+def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    identity_fields = frozenset(
+        {
+            "operation_public_id",
+            "source_edit_reference_public_id",
+            "card_generation_public_id",
+            "attempt_public_id",
+        }
+    )
+    _require_exact_arguments(
+        request.arguments,
+        required=_HUMAN_DRAFT_CONTEXT_FIELDS,
+        optional=identity_fields,
+    )
+    context = _require_telegram_human_context(request.arguments)
+    supplied = identity_fields & frozenset(request.arguments)
+    if not supplied:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_ARGUMENTS_REFUSED,
+            "At least one durable D1 card identity is required.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    identities: dict[str, str] = {}
+    for name in sorted(supplied):
+        if name == "card_generation_public_id":
+            identities[name] = _require_card_generation_public_id(request.arguments[name])
+        else:
+            identities[name] = _require_string(request.arguments[name], name, max_length=200)
+
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("human draft card query")
+        try:
+            result = get_human_draft_card(
+                conn,
+                context=HumanDraftContext(
+                    authenticated_actor_id=context.actor_id,
+                    telegram_account_id=context.account_id,
+                    telegram_conversation_id=context.conversation_id,
+                    conversation_binding_id=context.binding_id,
+                ),
+                operation_public_id=identities.get("operation_public_id"),
+                source_edit_reference_public_id=identities.get("source_edit_reference_public_id"),
+                card_generation_public_id=identities.get("card_generation_public_id"),
+                attempt_public_id=identities.get("attempt_public_id"),
+            )
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        return _human_draft_result_payload(conn, result), False
+    finally:
+        conn.close()
+
+
+def _human_draft_context(context: human_actions.HumanActionContext) -> HumanDraftContext:
+    return HumanDraftContext(
+        authenticated_actor_id=context.actor_id,
+        telegram_account_id=context.account_id,
+        telegram_conversation_id=context.conversation_id,
+        conversation_binding_id=context.binding_id,
+    )
+
+
+def handle_begin_human_draft_card_delivery(
+    request: BridgeRequest, deadline: Deadline
+) -> HandlerResult:
+    required = _HUMAN_DRAFT_CONTEXT_FIELDS | frozenset(
+        {
+            "card_generation_public_id",
+            "attempt_public_id",
+            "delivery_material_hash",
+            "transport_mode",
+        }
+    )
+    _require_exact_arguments(
+        request.arguments,
+        required=required,
+        optional=frozenset({"outbound_target_message_id"}),
+    )
+    context = _require_telegram_human_context(request.arguments)
+    card_id = _require_card_generation_public_id(request.arguments["card_generation_public_id"])
+    attempt_id = _require_sha256_identity(
+        request.arguments["attempt_public_id"], "attempt_public_id"
+    )
+    material_hash = _require_sha256_identity(
+        request.arguments["delivery_material_hash"], "delivery_material_hash"
+    )
+    mode = _require_string(request.arguments["transport_mode"], "transport_mode", max_length=16)
+    target = request.arguments.get("outbound_target_message_id")
+    if target is not None:
+        target = _require_string(target, "outbound_target_message_id", max_length=200)
+    _require_canonical_idempotency_key(request, canonical_human_draft_delivery_key(attempt_id))
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("human draft delivery attempt")
+        changes_before = conn.total_changes
+        try:
+            result_id = begin_human_draft_card_delivery(
+                conn,
+                context=_human_draft_context(context),
+                card_generation_public_id=card_id,
+                attempt_public_id=attempt_id,
+                delivery_material_hash=material_hash,
+                transport_mode=mode,
+                outbound_target_message_id=target,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        replay = conn.total_changes == changes_before
+        return {"attempt_public_id": result_id}, replay
+    finally:
+        conn.close()
+
+
+def handle_record_human_draft_card_delivery_outcome(
+    request: BridgeRequest, deadline: Deadline
+) -> HandlerResult:
+    required = _HUMAN_DRAFT_CONTEXT_FIELDS | frozenset(
+        {
+            "attempt_public_id",
+            "observation_public_id",
+            "outcome",
+            "error_code",
+            "outbound_message_id",
+            "trusted_receipt_hash",
+        }
+    )
+    _require_exact_arguments(request.arguments, required=required)
+    context = _require_telegram_human_context(request.arguments)
+    attempt_id = _require_sha256_identity(
+        request.arguments["attempt_public_id"], "attempt_public_id"
+    )
+    observation_id = _require_sha256_identity(
+        request.arguments["observation_public_id"], "observation_public_id"
+    )
+    outcome = _require_string(request.arguments["outcome"], "outcome", max_length=16)
+    error_code = request.arguments["error_code"]
+    if error_code is not None:
+        error_code = _require_string(error_code, "error_code", max_length=100)
+    outbound_message_id = request.arguments["outbound_message_id"]
+    if outbound_message_id is not None:
+        outbound_message_id = _require_string(
+            outbound_message_id, "outbound_message_id", max_length=200
+        )
+    trusted_receipt_hash = request.arguments["trusted_receipt_hash"]
+    if trusted_receipt_hash is not None:
+        trusted_receipt_hash = _require_sha256_identity(
+            trusted_receipt_hash, "trusted_receipt_hash"
+        )
+    _require_canonical_idempotency_key(
+        request, canonical_human_draft_observation_key(observation_id)
+    )
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("human draft delivery outcome")
+        changes_before = conn.total_changes
+        try:
+            result_id = record_human_draft_card_delivery_outcome(
+                conn,
+                context=_human_draft_context(context),
+                attempt_public_id=attempt_id,
+                observation_public_id=observation_id,
+                outcome=outcome,
+                error_code=error_code,
+                outbound_message_id=outbound_message_id,
+                trusted_receipt_hash=trusted_receipt_hash,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        replay = conn.total_changes == changes_before
+        return {"observation_public_id": result_id}, replay
+    finally:
+        conn.close()
+
+
+def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    required = _HUMAN_DRAFT_CONTEXT_FIELDS | frozenset(
+        {
+            "expected_current_generation_public_id",
+            "original_operation_or_start_public_id",
+            "recovery_public_id",
+            "recovery_material_hash",
+            "queried_delivery_state_hash",
+            "reason",
+        }
+    )
+    _require_exact_arguments(request.arguments, required=required)
+    context = _require_telegram_human_context(request.arguments)
+    expected_generation = _require_card_generation_public_id(
+        request.arguments["expected_current_generation_public_id"]
+    )
+    original_id = _require_string(
+        request.arguments["original_operation_or_start_public_id"],
+        "original_operation_or_start_public_id",
+        max_length=200,
+    )
+    recovery_id = _require_sha256_identity(
+        request.arguments["recovery_public_id"], "recovery_public_id"
+    )
+    material_hash = _require_sha256_identity(
+        request.arguments["recovery_material_hash"], "recovery_material_hash"
+    )
+    state_hash = _require_sha256_identity(
+        request.arguments["queried_delivery_state_hash"], "queried_delivery_state_hash"
+    )
+    reason = _require_string(request.arguments["reason"], "reason", max_length=32)
+    _require_canonical_idempotency_key(request, canonical_human_draft_reissue_key(recovery_id))
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("human draft card reissue")
+        try:
+            result = reissue_human_draft_card(
+                conn,
+                context=_human_draft_context(context),
+                expected_current_generation_public_id=expected_generation,
+                original_operation_or_start_public_id=original_id,
+                recovery_public_id=recovery_id,
+                recovery_material_hash=material_hash,
+                queried_delivery_state_hash=state_hash,
+                reason=reason,
+                now_epoch=int(datetime.now(UTC).timestamp()),
+            )
+        except HumanDraftError as exc:
+            _raise_human_draft_error(exc)
+        return _human_draft_result_payload(conn, result), result.idempotent_replay
     finally:
         conn.close()
 
@@ -4686,6 +5538,13 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         envelope.COMMAND_GET_GUIDED_EDIT_SESSION: handle_get_guided_edit_session,
         envelope.COMMAND_APPLY_GUIDED_EDIT_UPDATE: handle_apply_guided_edit_update,
         envelope.COMMAND_COMPLETE_GUIDED_EDIT: handle_complete_guided_edit,
+        envelope.COMMAND_APPLY_HUMAN_DRAFT_CARD: handle_apply_human_draft_card,
+        envelope.COMMAND_GET_HUMAN_DRAFT_CARD: handle_get_human_draft_card,
+        envelope.COMMAND_BEGIN_HUMAN_DRAFT_CARD_DELIVERY: (handle_begin_human_draft_card_delivery),
+        envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME: (
+            handle_record_human_draft_card_delivery_outcome
+        ),
+        envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD: handle_reissue_human_draft_card,
         envelope.COMMAND_FINALIZE: handle_finalize,
         envelope.COMMAND_PREPARE_RECEIPT_COMPLETION: handle_prepare_receipt_completion,
         envelope.COMMAND_GET_FINALIZATION_SNAPSHOT_REVIEW: handle_get_finalization_snapshot_review,
@@ -4728,6 +5587,10 @@ __all__ = [
     "canonical_human_action_redemption_key",
     "canonical_guided_edit_update_key",
     "canonical_guided_edit_complete_key",
+    "canonical_human_draft_apply_key",
+    "canonical_human_draft_delivery_key",
+    "canonical_human_draft_observation_key",
+    "canonical_human_draft_reissue_key",
     "canonical_prepare_ai_fallback_key",
     "canonical_record_ai_fallback_key",
     "canonical_register_ai_model_receipt_v2_key",
@@ -4736,6 +5599,8 @@ __all__ = [
     "canonical_record_ai_fallback_v2_key",
     "dispatch",
     "handle_apply_fact_set",
+    "handle_apply_human_draft_card",
+    "handle_begin_human_draft_card_delivery",
     "handle_authorize_finalization",
     "handle_capture",
     "handle_claim_ai_fallback_invocation",
@@ -4743,6 +5608,9 @@ __all__ = [
     "handle_edit",
     "handle_finalize",
     "handle_get_finalization_snapshot_review",
+    "handle_get_human_draft_card",
+    "handle_record_human_draft_card_delivery_outcome",
+    "handle_reissue_human_draft_card",
     "handle_prepare_receipt_completion",
     "handle_get_review",
     "handle_get_status",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import sqlite3
+from dataclasses import dataclass
 from typing import cast
 
 from finance_core.parser_proposals.human_drafts import (
@@ -18,6 +19,18 @@ from finance_core.parser_proposals.human_drafts import (
     _result_for,
     _valid_hash,
 )
+
+
+@dataclass(frozen=True)
+class HumanDraftActionAuthority:
+    action_issue_batch_id: str
+    result_completeness: str | None
+
+
+@dataclass(frozen=True)
+class HumanDraftPresentation:
+    active: bool
+    original_operation_or_start_public_id: str | None
 
 
 def _framed_hash(domain: str, *fields: str) -> str:
@@ -138,6 +151,114 @@ def get_human_draft_card(
         draft,
         selected_operation,
         card_public_id=str(card["card_generation_public_id"]),
+    )
+
+
+def get_human_draft_action_authority(
+    conn: sqlite3.Connection, card_generation_public_id: str
+) -> HumanDraftActionAuthority | None:
+    row = conn.execute(
+        """
+        SELECT cards.action_issue_batch_id, operations.result_completeness
+        FROM parser_human_draft_cards AS cards
+        LEFT JOIN parser_human_draft_operations AS operations
+          ON operations.id = cards.original_operation_id
+        WHERE cards.card_generation_public_id = ?
+        """,
+        (card_generation_public_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    completeness = row["result_completeness"]
+    return HumanDraftActionAuthority(
+        action_issue_batch_id=str(row["action_issue_batch_id"]),
+        result_completeness=(None if completeness is None else str(completeness)),
+    )
+
+
+def find_active_human_draft_card_generation(
+    conn: sqlite3.Connection,
+    *,
+    proposal_public_id: str,
+    context: HumanDraftContext,
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT drafts.current_card_generation_public_id
+        FROM parser_human_drafts AS drafts
+        JOIN parser_outputs AS proposals ON proposals.id = drafts.source_parser_output_id
+        WHERE proposals.public_id = ? AND drafts.authenticated_actor_id = ?
+          AND drafts.telegram_account_id = ? AND drafts.telegram_conversation_id = ?
+          AND drafts.conversation_binding_id = ? AND drafts.state = 'active'
+        """,
+        (
+            proposal_public_id,
+            context.authenticated_actor_id,
+            context.telegram_account_id,
+            context.telegram_conversation_id,
+            context.conversation_binding_id,
+        ),
+    ).fetchone()
+    return None if row is None else str(row["current_card_generation_public_id"])
+
+
+def active_human_draft_exists(
+    conn: sqlite3.Connection,
+    *,
+    parser_output_id: int,
+    context: HumanDraftContext,
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM parser_human_drafts
+        WHERE source_parser_output_id = ? AND authenticated_actor_id = ?
+          AND telegram_account_id = ? AND telegram_conversation_id = ?
+          AND conversation_binding_id = ? AND state = 'active'
+        """,
+        (
+            parser_output_id,
+            context.authenticated_actor_id,
+            context.telegram_account_id,
+            context.telegram_conversation_id,
+            context.conversation_binding_id,
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def get_human_draft_presentation(
+    conn: sqlite3.Connection,
+    *,
+    result: HumanDraftResult,
+    now_epoch: int,
+) -> HumanDraftPresentation:
+    draft = conn.execute(
+        "SELECT state, expires_at FROM parser_human_drafts WHERE draft_public_id = ?",
+        (result.draft_public_id,),
+    ).fetchone()
+    card = conn.execute(
+        """
+        SELECT cards.expires_at,
+               operations.operation_public_id AS original_operation_or_start_public_id
+        FROM parser_human_draft_cards AS cards
+        JOIN parser_human_draft_operations AS operations
+          ON operations.id = cards.original_operation_id
+        WHERE cards.card_generation_public_id = ?
+        """,
+        (result.card_generation_public_id,),
+    ).fetchone()
+    active = (
+        draft is not None
+        and card is not None
+        and draft["state"] == "active"
+        and int(draft["expires_at"]) > now_epoch
+        and int(card["expires_at"]) > now_epoch
+    )
+    return HumanDraftPresentation(
+        active=active,
+        original_operation_or_start_public_id=(
+            None if card is None else str(card["original_operation_or_start_public_id"])
+        ),
     )
 
 
@@ -505,8 +626,14 @@ def reissue_human_draft_card(
 
 
 __all__ = [
+    "HumanDraftActionAuthority",
+    "HumanDraftPresentation",
+    "active_human_draft_exists",
     "begin_human_draft_card_delivery",
+    "find_active_human_draft_card_generation",
+    "get_human_draft_action_authority",
     "get_human_draft_card",
+    "get_human_draft_presentation",
     "record_human_draft_card_delivery_outcome",
     "reissue_human_draft_card",
 ]

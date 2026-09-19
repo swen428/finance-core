@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import openclaw_staging_bridge_support_v1 as support
 import pytest
 
+from finance_core.openclaw_staging_bridge import (
+    commands,
+    guided_edit,
+    human_actions,
+    identity,
+    ocr_boundary,
+)
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
-from finance_core.openclaw_staging_bridge import guided_edit, human_actions, identity, ocr_boundary
 from finance_core.parser_proposals.completion import complete_proposal
 from tests.test_receipt_ocr_proposal_ingestion_v1 import _sgd_blocks
 
@@ -36,7 +44,11 @@ def _context(workspace: support.BridgeWorkspace) -> dict[str, object]:
     }
 
 
-def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, object]]:
+def _prepare_edit_redemption(
+    workspace: support.BridgeWorkspace,
+    *,
+    callback_id: str = "guided-edit-callback",
+) -> tuple[str, dict[str, object]]:
     capture = support.run_cli(
         support.make_request(
             "capture",
@@ -67,7 +79,6 @@ def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, obje
         )
     )
     reference = issued.response["result"]["actions"]["edit"]["reference"]
-    callback_id = "guided-edit-callback"
     redemption_request = support.make_request(
         "redeem_human_action",
         {
@@ -79,6 +90,11 @@ def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, obje
         },
         idempotency_key=support.canonical_human_action_redemption_key(callback_id),
     )
+    return proposal, redemption_request
+
+
+def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, object]]:
+    proposal, redemption_request = _prepare_edit_redemption(workspace)
     redeemed = support.run_cli(redemption_request)
     assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
     session = str(redeemed.response["result"]["guided_edit_session_public_id"])
@@ -119,6 +135,187 @@ def _get(workspace: support.BridgeWorkspace, message_id: int | None = None) -> s
     )
 
 
+def _draft_from_redemption(
+    workspace: support.BridgeWorkspace, redemption: dict[str, object]
+) -> dict[str, object]:
+    outcome = support.run_cli(redemption)
+    assert outcome.exit_code == bridge_errors.EXIT_OK, outcome.response
+    return dict(outcome.response["result"]["human_draft_card"])
+
+
+def _whole_card_text(card_public_id: str, *, merchant: str = "Example Cafe") -> str:
+    return "\n".join(
+        (
+            f"Card Ref: {card_public_id}",
+            "Amount: 12.50",
+            "Currency: SGD",
+            "Date: 2026-09-19",
+            f"Merchant: {merchant}",
+            "Description: Lunch",
+            "Category: Food",
+        )
+    )
+
+
+def _apply_whole_card(
+    workspace: support.BridgeWorkspace,
+    card_public_id: str,
+    *,
+    message_id: int = 30,
+    merchant: str = "Example Cafe",
+    operation_public_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> support.CliOutcome:
+    operation_id = operation_public_id or f"d1op_message_{message_id}"
+    raw_card_text = _whole_card_text(card_public_id, merchant=merchant)
+    return support.run_cli(
+        support.make_request(
+            "apply_human_draft_card",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_public_id,
+                "telegram_message_id": message_id,
+                "operation_public_id": operation_id,
+                "raw_card_text": raw_card_text,
+                "field_values": {
+                    "amount": "12.50",
+                    "currency": "SGD",
+                    "transaction_date": "2026-09-19",
+                    "merchant": merchant,
+                    "description": "Lunch",
+                    "category": "Food",
+                },
+            },
+            idempotency_key=idempotency_key or f"bridge-human-draft-apply:{operation_id}",
+        )
+    )
+
+
+def _get_human_draft_card(
+    workspace: support.BridgeWorkspace, **identities: object
+) -> support.CliOutcome:
+    return support.run_cli(
+        support.make_request(
+            "get_human_draft_card",
+            {**_context(workspace), **identities},
+        )
+    )
+
+
+def _framed_hash(domain: str, *fields: str) -> str:
+    payload = domain.encode("ascii") + b"\x00" + len(fields).to_bytes(4, "big")
+    for field in fields:
+        encoded = field.encode("utf-8")
+        payload += len(encoded).to_bytes(4, "big") + encoded
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _issue_d1_actions(
+    workspace: support.BridgeWorkspace, card: dict[str, object]
+) -> support.CliOutcome:
+    proposal_public_id = card["proposal_public_id"] or card["decision_target_proposal_public_id"]
+    proposal_version = (
+        card["proposal_version"]
+        if card["proposal_version"] is not None
+        else card["decision_target_proposal_version"]
+    )
+    content_hash = card["proposal_content_hash"] or card["decision_target_proposal_content_hash"]
+    return support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": proposal_public_id,
+                "card_generation_public_id": card["card_generation_public_id"],
+                "reference_batch_id": card["action_issue_batch_id"],
+                "token_ttl_seconds": 300,
+                "expected_proposal_version": proposal_version,
+                "expected_content_hash": content_hash,
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(
+                str(card["action_issue_batch_id"])
+            ),
+        )
+    )
+
+
+def _redeem_d1_action(
+    workspace: support.BridgeWorkspace,
+    issued: support.CliOutcome,
+    *,
+    action: str,
+    callback_id: str,
+) -> support.CliOutcome:
+    return support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": issued.response["result"]["actions"][action]["reference"],
+                "action": action,
+                "callback_id": callback_id,
+                "callback_message_id": 40,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+        )
+    )
+
+
+def _decide_d1(
+    workspace: support.BridgeWorkspace,
+    redeemed: support.CliOutcome,
+    *,
+    action: str,
+    reference_public_id: str | None = None,
+    binding_id: str = BINDING,
+) -> support.CliOutcome:
+    material = redeemed.response["result"]
+    binding = material["d1_decision_binding"]
+    return support.run_cli(
+        support.make_request(
+            action,
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": material["proposal_public_id"],
+                "operator_actor_id": ACTOR,
+                "proposal_version": material["proposal_version"],
+                "content_hash": material["content_hash"],
+                "callback_token": material["callback_token"],
+                "callback_expiry": material["callback_expiry"],
+                "d1_reference_public_id": reference_public_id or binding["reference_public_id"],
+                "telegram_account_id": ACCOUNT,
+                "telegram_conversation_id": CONVERSATION,
+                "conversation_binding_id": binding_id,
+            },
+            idempotency_key=material["decision_idempotency_key"],
+        )
+    )
+
+
+def _decide_without_d1_binding(
+    workspace: support.BridgeWorkspace,
+    redeemed: support.CliOutcome,
+    *,
+    action: str,
+) -> support.CliOutcome:
+    material = redeemed.response["result"]
+    return support.run_cli(
+        support.make_request(
+            action,
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": material["proposal_public_id"],
+                "operator_actor_id": ACTOR,
+                "proposal_version": material["proposal_version"],
+                "content_hash": material["content_hash"],
+                "callback_token": material["callback_token"],
+                "callback_expiry": material["callback_expiry"],
+            },
+            idempotency_key=material["decision_idempotency_key"],
+        )
+    )
+
+
 def _complete(
     workspace: support.BridgeWorkspace, session: str, message_id: int
 ) -> support.CliOutcome:
@@ -138,7 +335,17 @@ def _complete(
 def test_edit_redemption_atomically_starts_durable_session(
     workspace: support.BridgeWorkspace,
 ) -> None:
-    proposal, session, _redemption = _begin(workspace)
+    proposal, session, redemption = _begin(workspace)
+    redeemed = support.run_cli(redemption)
+    draft = redeemed.response["result"]["human_draft_card"]
+    assert draft["draft_version"] == 0
+    assert draft["completeness"] == "incomplete"
+    assert draft["card_generation_public_id"].startswith("d1card_")
+    assert draft["current_card_generation_public_id"] == draft["card_generation_public_id"]
+    assert draft["confirm_available"] is False
+    assert draft["reject_available"] is True
+    assert draft["final_transaction_created"] is False
+    assert redeemed.response["idempotent_replay"] is True
     active = _get(workspace)
     assert active.exit_code == bridge_errors.EXIT_OK
     assert active.response["result"] == {
@@ -158,7 +365,787 @@ def test_edit_redemption_atomically_starts_durable_session(
         assert conn.execute("SELECT event_type FROM openclaw_guided_edit_events").fetchone()[0] == (
             "started"
         )
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_drafts").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_cards").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0]
+            == 1
+        )
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+        start = conn.execute(
+            "SELECT start_redemption_public_id FROM parser_human_drafts"
+        ).fetchone()[0]
+        operation_id = conn.execute(
+            "SELECT operation_public_id FROM parser_human_draft_operations "
+            "WHERE operation_type = 'start'"
+        ).fetchone()[0]
+        assert start == operation_id
+        assert start.startswith("d1start_")
+        assert start != "guided-edit-callback"
+        assert draft["original_operation_or_start_public_id"] == start
+    finally:
+        conn.close()
+
+
+def test_exact_replay_of_pre_d1_redemption_backfills_the_missing_draft(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, redemption = _prepare_edit_redemption(
+        workspace,
+        callback_id="pre-d1-redemption-replay",
+    )
+    original = commands.begin_human_draft_in_transaction
+    monkeypatch.setattr(commands, "begin_human_draft_in_transaction", lambda *args, **kwargs: None)
+    historical = support.run_cli(redemption)
+    assert historical.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0]
+            == 1
+        )
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_drafts").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(commands, "begin_human_draft_in_transaction", original)
+    replay = support.run_cli(redemption)
+    assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
+    assert replay.response["idempotent_replay"] is True
+    assert replay.response["result"]["human_draft_card"]["draft_version"] == 0
+
+
+def test_edit_redemption_and_d1_start_roll_back_together_on_failure(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, redemption = _prepare_edit_redemption(
+        workspace,
+        callback_id="d1-start-rollback",
+    )
+    original = commands.begin_human_draft_in_transaction
+
+    def fail_after_start(*args: object, **kwargs: object) -> object:
+        original(*args, **kwargs)
+        raise RuntimeError("injected post-start failure")
+
+    monkeypatch.setattr(commands, "begin_human_draft_in_transaction", fail_after_start)
+    failed = support.run_cli(redemption)
+    assert failed.exit_code == bridge_errors.EXIT_INTERNAL
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0]
+            == 0
+        )
+        assert conn.execute("SELECT COUNT(*) FROM openclaw_guided_edit_sessions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_drafts").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_cards").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(commands, "begin_human_draft_in_transaction", original)
+    recovered = support.run_cli(redemption)
+    assert recovered.exit_code == bridge_errors.EXIT_OK, recovered.response
+    assert recovered.response["idempotent_replay"] is False
+
+
+def test_whole_card_command_publishes_one_complete_unconfirmed_revision(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    result = _apply_whole_card(workspace, str(initial["card_generation_public_id"]))
+    assert result.exit_code == bridge_errors.EXIT_OK, result.response
+    card = result.response["result"]
+    assert card["draft_version"] == 1
+    assert card["completeness"] == "complete"
+    assert card["operation_outcome"] == "accepted"
+    assert card["proposal_public_id"].startswith("po_d1_")
+    assert card["proposal_version"] == 0
+    assert card["confirm_available"] is True
+    assert card["reject_available"] is True
+    assert card["final_transaction_created"] is False
+    assert card["field_values"] == {
+        "amount": "12.50",
+        "currency": "SGD",
+        "transaction_date": "2026-09-19",
+        "merchant": "Example Cafe",
+        "description": "Lunch",
+        "category": "Food",
+    }
+    assert card["human_reply_evidence_public_id"].startswith("d1evidence_")
+    assert card["card_generation_public_id"] != initial["card_generation_public_id"]
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_human_draft_publications").fetchone()[0] == 1
+        )
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_whole_card_exact_replay_and_read_only_recovery_preserve_one_result(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    card_id = str(initial["card_generation_public_id"])
+    first = _apply_whole_card(workspace, card_id)
+    replay = _apply_whole_card(workspace, card_id)
+    assert first.exit_code == bridge_errors.EXIT_OK, first.response
+    assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
+    assert replay.response["idempotent_replay"] is True
+    assert replay.response["result"] == {
+        **first.response["result"],
+        "idempotent_replay": True,
+    }
+
+    recovered = _get_human_draft_card(
+        workspace,
+        operation_public_id="d1op_message_30",
+        card_generation_public_id=first.response["result"]["card_generation_public_id"],
+    )
+    assert recovered.exit_code == bridge_errors.EXIT_OK, recovered.response
+    assert recovered.response["result"] == first.response["result"]
+
+    conflict = _apply_whole_card(workspace, card_id, merchant="Different Cafe")
+    assert conflict.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert conflict.response["error"]["code"] == bridge_errors.HUMAN_DRAFT_CONFLICT
+
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0] == 2
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_human_draft_publications").fetchone()[0] == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_whole_card_raw_overflow_is_refused_before_d1_evidence(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    operation_id = "d1op_overflow"
+    request = support.make_request(
+        "apply_human_draft_card",
+        {
+            **_context(workspace),
+            "card_generation_public_id": initial["card_generation_public_id"],
+            "telegram_message_id": 30,
+            "operation_public_id": operation_id,
+            "raw_card_text": "x" * 16_385,
+            "field_values": dict(initial["field_values"]),
+        },
+        idempotency_key=f"bridge-human-draft-apply:{operation_id}",
+    )
+    refused = support.run_cli(request)
+    assert refused.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.HUMAN_DRAFT_ARGUMENTS_REFUSED
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_human_draft_reply_evidence").fetchone()[0]
+            == 0
+        )
+        assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_delivery_unknown_query_and_reissue_are_restart_safe(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    accepted = _apply_whole_card(workspace, str(initial["card_generation_public_id"]))
+    assert accepted.exit_code == bridge_errors.EXIT_OK, accepted.response
+    card = accepted.response["result"]
+    card_id = str(card["card_generation_public_id"])
+    generation_1_actions = _issue_d1_actions(workspace, card)
+    assert generation_1_actions.exit_code == bridge_errors.EXIT_OK, generation_1_actions.response
+    attempt_id = _framed_hash("d1-card-delivery-v1", card_id, "reply")
+    attempt = support.run_cli(
+        support.make_request(
+            "begin_human_draft_card_delivery",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_id,
+                "attempt_public_id": attempt_id,
+                "delivery_material_hash": "a" * 64,
+                "transport_mode": "reply",
+            },
+            idempotency_key=f"bridge-human-draft-delivery:{attempt_id}",
+        )
+    )
+    assert attempt.exit_code == bridge_errors.EXIT_OK, attempt.response
+    assert attempt.response["result"] == {"attempt_public_id": attempt_id}
+    attempt_replay = support.run_cli(
+        support.make_request(
+            "begin_human_draft_card_delivery",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_id,
+                "attempt_public_id": attempt_id,
+                "delivery_material_hash": "a" * 64,
+                "transport_mode": "reply",
+            },
+            idempotency_key=f"bridge-human-draft-delivery:{attempt_id}",
+        )
+    )
+    assert attempt_replay.exit_code == bridge_errors.EXIT_OK, attempt_replay.response
+    assert attempt_replay.response["idempotent_replay"] is True
+
+    observation_id = _framed_hash("d1-card-observation-v1", attempt_id, "initial")
+    unknown = support.run_cli(
+        support.make_request(
+            "record_human_draft_card_delivery_outcome",
+            {
+                **_context(workspace),
+                "attempt_public_id": attempt_id,
+                "observation_public_id": observation_id,
+                "outcome": "unknown",
+                "error_code": None,
+                "outbound_message_id": None,
+                "trusted_receipt_hash": None,
+            },
+            idempotency_key=f"bridge-human-draft-observation:{observation_id}",
+        )
+    )
+    assert unknown.exit_code == bridge_errors.EXIT_OK, unknown.response
+    assert unknown.response["result"] == {"observation_public_id": observation_id}
+    unknown_replay = support.run_cli(
+        support.make_request(
+            "record_human_draft_card_delivery_outcome",
+            {
+                **_context(workspace),
+                "attempt_public_id": attempt_id,
+                "observation_public_id": observation_id,
+                "outcome": "unknown",
+                "error_code": None,
+                "outbound_message_id": None,
+                "trusted_receipt_hash": None,
+            },
+            idempotency_key=f"bridge-human-draft-observation:{observation_id}",
+        )
+    )
+    assert unknown_replay.exit_code == bridge_errors.EXIT_OK, unknown_replay.response
+    assert unknown_replay.response["idempotent_replay"] is True
+
+    queried = _get_human_draft_card(workspace, attempt_public_id=attempt_id)
+    assert queried.exit_code == bridge_errors.EXIT_OK, queried.response
+    assert queried.response["result"]["delivery_state"] == "unknown"
+    assert len(queried.response["result"]["delivery_attempts"]) == 1
+    assert len(queried.response["result"]["delivery_outcomes"]) == 1
+
+    recovery_id = _framed_hash(
+        "d1-card-recovery-v1",
+        str(card["draft_public_id"]),
+        "d1op_message_30",
+        card_id,
+    )
+    reissue_request = support.make_request(
+        "reissue_human_draft_card",
+        {
+            **_context(workspace),
+            "expected_current_generation_public_id": card_id,
+            "original_operation_or_start_public_id": "d1op_message_30",
+            "recovery_public_id": recovery_id,
+            "recovery_material_hash": "b" * 64,
+            "queried_delivery_state_hash": queried.response["result"]["delivery_state_hash"],
+            "reason": "unknown_after_query",
+        },
+        idempotency_key=f"bridge-human-draft-reissue:{recovery_id}",
+    )
+    reissued = support.run_cli(reissue_request)
+    replay = support.run_cli(reissue_request)
+    assert reissued.exit_code == bridge_errors.EXIT_OK, reissued.response
+    assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
+    assert replay.response["idempotent_replay"] is True
+    assert reissued.response["result"]["card_generation_public_id"] != card_id
+    assert (
+        reissued.response["result"]["current_card_generation_public_id"]
+        == reissued.response["result"]["card_generation_public_id"]
+    )
+    assert reissued.response["result"]["final_transaction_created"] is False
+
+    stale_generation = _redeem_d1_action(
+        workspace,
+        generation_1_actions,
+        action="confirm",
+        callback_id="d1-stale-generation-confirm",
+    )
+    assert stale_generation.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert stale_generation.response["error"]["code"] == (
+        bridge_errors.HUMAN_ACTION_REFERENCE_INVALID
+    )
+
+    generation_2_actions = _issue_d1_actions(workspace, reissued.response["result"])
+    assert generation_2_actions.exit_code == bridge_errors.EXIT_OK, generation_2_actions.response
+    generation_2_confirm = _redeem_d1_action(
+        workspace,
+        generation_2_actions,
+        action="confirm",
+        callback_id="d1-current-generation-confirm",
+    )
+    assert generation_2_confirm.exit_code == bridge_errors.EXIT_OK, generation_2_confirm.response
+    confirmed = _decide_d1(workspace, generation_2_confirm, action="confirm")
+    assert confirmed.exit_code == bridge_errors.EXIT_OK, confirmed.response
+
+
+@pytest.mark.parametrize(
+    ("reason", "outcome"),
+    (
+        ("failure", "failure"),
+        ("unknown_after_query", "unknown"),
+        ("expiry", None),
+    ),
+)
+def test_initial_card_reissue_uses_only_public_bridge_identity(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+    outcome: str | None,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    card_id = str(card["card_generation_public_id"])
+    original_id = str(card["original_operation_or_start_public_id"])
+    assert original_id.startswith("d1start_")
+    assert original_id != "guided-edit-callback"
+
+    attempt_id = _framed_hash("d1-card-delivery-v1", card_id, "reply")
+    attempt = support.run_cli(
+        support.make_request(
+            "begin_human_draft_card_delivery",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_id,
+                "attempt_public_id": attempt_id,
+                "delivery_material_hash": "c" * 64,
+                "transport_mode": "reply",
+            },
+            idempotency_key=f"bridge-human-draft-delivery:{attempt_id}",
+        )
+    )
+    assert attempt.exit_code == bridge_errors.EXIT_OK, attempt.response
+    if outcome is not None:
+        observation_id = _framed_hash("d1-card-observation-v1", attempt_id, "initial")
+        observed = support.run_cli(
+            support.make_request(
+                "record_human_draft_card_delivery_outcome",
+                {
+                    **_context(workspace),
+                    "attempt_public_id": attempt_id,
+                    "observation_public_id": observation_id,
+                    "outcome": outcome,
+                    "error_code": "transport_failure" if outcome == "failure" else None,
+                    "outbound_message_id": None,
+                    "trusted_receipt_hash": None,
+                },
+                idempotency_key=f"bridge-human-draft-observation:{observation_id}",
+            )
+        )
+        assert observed.exit_code == bridge_errors.EXIT_OK, observed.response
+
+    queried = _get_human_draft_card(workspace, attempt_public_id=attempt_id)
+    assert queried.exit_code == bridge_errors.EXIT_OK, queried.response
+    assert queried.response["result"]["original_operation_or_start_public_id"] == original_id
+    if reason == "expiry":
+        conn = support.open_database(workspace)
+        try:
+            expires_at = int(
+                conn.execute(
+                    "SELECT expires_at FROM parser_human_draft_cards "
+                    "WHERE card_generation_public_id = ?",
+                    (card_id,),
+                ).fetchone()[0]
+            )
+        finally:
+            conn.close()
+
+        class _AfterCardExpiry(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:
+                return datetime.fromtimestamp(expires_at + 1, tz=UTC)
+
+        monkeypatch.setattr(commands, "datetime", _AfterCardExpiry)
+
+    recovery_id = _framed_hash(
+        "d1-card-recovery-v1",
+        str(card["draft_public_id"]),
+        original_id,
+        card_id,
+    )
+    reissued = support.run_cli(
+        support.make_request(
+            "reissue_human_draft_card",
+            {
+                **_context(workspace),
+                "expected_current_generation_public_id": card_id,
+                "original_operation_or_start_public_id": original_id,
+                "recovery_public_id": recovery_id,
+                "recovery_material_hash": "d" * 64,
+                "queried_delivery_state_hash": queried.response["result"]["delivery_state_hash"],
+                "reason": reason,
+            },
+            idempotency_key=f"bridge-human-draft-reissue:{recovery_id}",
+        )
+    )
+    assert reissued.exit_code == bridge_errors.EXIT_OK, reissued.response
+    assert reissued.response["result"]["card_generation_public_id"] != card_id
+
+
+def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    accepted = _apply_whole_card(workspace, str(initial["card_generation_public_id"]))
+    assert accepted.exit_code == bridge_errors.EXIT_OK, accepted.response
+    card = accepted.response["result"]
+    issued = support.run_cli(
+        support.make_request(
+            "issue_human_actions",
+            {
+                **_context(workspace),
+                "proposal_public_id": card["proposal_public_id"],
+                "card_generation_public_id": card["card_generation_public_id"],
+                "reference_batch_id": card["action_issue_batch_id"],
+                "token_ttl_seconds": 300,
+                "expected_proposal_version": card["proposal_version"],
+                "expected_content_hash": card["proposal_content_hash"],
+            },
+            idempotency_key=support.canonical_human_action_issuance_key(
+                card["action_issue_batch_id"]
+            ),
+        )
+    )
+    assert issued.exit_code == bridge_errors.EXIT_OK, issued.response
+    assert set(issued.response["result"]["actions"]) == {"confirm", "edit", "reject"}
+    assert (
+        issued.response["result"]["card_generation_public_id"] == card["card_generation_public_id"]
+    )
+
+    callback_id = "d1-confirm-callback"
+    redeemed = support.run_cli(
+        support.make_request(
+            "redeem_human_action",
+            {
+                **_context(workspace),
+                "short_reference": issued.response["result"]["actions"]["confirm"]["reference"],
+                "action": "confirm",
+                "callback_id": callback_id,
+                "callback_message_id": 40,
+            },
+            idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+        )
+    )
+    assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
+    binding = redeemed.response["result"]["d1_decision_binding"]
+    assert binding["card_generation_public_id"] == card["card_generation_public_id"]
+    assert binding["authenticated_actor_id"] == ACTOR
+
+    decision = support.run_cli(
+        support.make_request(
+            "confirm",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": redeemed.response["result"]["proposal_public_id"],
+                "operator_actor_id": ACTOR,
+                "proposal_version": redeemed.response["result"]["proposal_version"],
+                "content_hash": redeemed.response["result"]["content_hash"],
+                "callback_token": redeemed.response["result"]["callback_token"],
+                "callback_expiry": redeemed.response["result"]["callback_expiry"],
+                "d1_reference_public_id": binding["reference_public_id"],
+                "telegram_account_id": ACCOUNT,
+                "telegram_conversation_id": CONVERSATION,
+                "conversation_binding_id": BINDING,
+            },
+            idempotency_key=redeemed.response["result"]["decision_idempotency_key"],
+        )
+    )
+    assert decision.exit_code == bridge_errors.EXIT_OK, decision.response
+    assert decision.response["result"]["decision"] == "confirmed"
+    assert decision.response["result"]["final_transaction_created"] is False
+    replayed_decision = _decide_d1(workspace, redeemed, action="confirm")
+    assert replayed_decision.exit_code == bridge_errors.EXIT_OK, replayed_decision.response
+    assert replayed_decision.response["idempotent_replay"] is True
+    unbound_replay = _decide_without_d1_binding(workspace, redeemed, action="confirm")
+    assert unbound_replay.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert unbound_replay.response["error"]["code"] == bridge_errors.LIFECYCLE_CONFLICT
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT state FROM parser_human_drafts").fetchone()[0] == "confirmed"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_proposal_authorizations").fetchone()[0] == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM parser_human_draft_operations "
+                "WHERE operation_type = 'confirmed'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("first_mode", ("legacy", "d1"))
+def test_legacy_and_d1_issuance_resolve_private_key_collisions(
+    workspace: support.BridgeWorkspace,
+    first_mode: str,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    d1_batch = str(card["action_issue_batch_id"])
+    callback_key = commands._load_callback_key(workspace.workspace_path)
+    first_private_key = commands._persisted_human_action_issuance_keys(d1_batch, key=callback_key)[
+        0
+    ]
+    legacy_batch = first_private_key.removeprefix("bridge-human-action-issue:")
+    assert len(legacy_batch) == 32
+
+    legacy_request = support.make_request(
+        "issue_human_actions",
+        {
+            **_context(workspace),
+            "proposal_public_id": card["decision_target_proposal_public_id"],
+            "reference_batch_id": legacy_batch,
+            "token_ttl_seconds": 300,
+            "expected_proposal_version": card["decision_target_proposal_version"],
+            "expected_content_hash": card["decision_target_proposal_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key(legacy_batch),
+    )
+
+    def issue(mode: str) -> support.CliOutcome:
+        if mode == "legacy":
+            return support.run_cli(legacy_request)
+        return _issue_d1_actions(workspace, card)
+
+    second_mode = "d1" if first_mode == "legacy" else "legacy"
+    first = issue(first_mode)
+    second = issue(second_mode)
+    assert first.exit_code == bridge_errors.EXIT_OK, first.response
+    assert second.exit_code == bridge_errors.EXIT_OK, second.response
+    assert issue(first_mode).response["idempotent_replay"] is True
+    assert issue(second_mode).response["idempotent_replay"] is True
+
+    conn = support.open_database(workspace)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT refs.issuance_idempotency_key, "
+            "bindings.card_generation_public_id "
+            "FROM openclaw_human_action_references AS refs "
+            "LEFT JOIN parser_human_draft_action_bindings AS bindings "
+            "ON bindings.reference_id = refs.id"
+        ).fetchall()
+        legacy_keys = {row[0] for row in rows if row[1] is None}
+        d1_keys = {row[0] for row in rows if row[1] == card["card_generation_public_id"]}
+        assert len(legacy_keys) == 2
+        assert len(d1_keys) == 1
+        assert legacy_keys.isdisjoint(d1_keys)
+    finally:
+        conn.close()
+
+
+def test_d1_issuance_fails_closed_for_mixed_partial_binding_evidence(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    callback_key = commands._load_callback_key(workspace.workspace_path)
+    first_private_key = commands._persisted_human_action_issuance_keys(
+        str(card["action_issue_batch_id"]), key=callback_key
+    )[0]
+    legacy_batch = first_private_key.removeprefix("bridge-human-action-issue:")
+    legacy_request = support.make_request(
+        "issue_human_actions",
+        {
+            **_context(workspace),
+            "proposal_public_id": card["decision_target_proposal_public_id"],
+            "reference_batch_id": legacy_batch,
+            "token_ttl_seconds": 300,
+            "expected_proposal_version": card["decision_target_proposal_version"],
+            "expected_content_hash": card["decision_target_proposal_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key(legacy_batch),
+    )
+    legacy = support.run_cli(legacy_request)
+    assert legacy.exit_code == bridge_errors.EXIT_OK, legacy.response
+
+    conn = support.open_database(workspace)
+    try:
+        reference_id = int(
+            conn.execute(
+                "SELECT id FROM openclaw_human_action_references "
+                "WHERE issuance_idempotency_key = ? AND action = 'edit'",
+                (first_private_key,),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO parser_human_draft_action_bindings (
+                reference_id, card_generation_public_id, draft_id,
+                parser_output_id, proposal_version, proposal_content_hash,
+                authenticated_actor_id, telegram_account_id,
+                telegram_conversation_id, conversation_binding_id, created_at
+            )
+            SELECT ?, cards.card_generation_public_id, cards.draft_id,
+                   cards.decision_target_parser_output_id,
+                   cards.decision_target_proposal_version,
+                   cards.decision_target_proposal_content_hash,
+                   cards.authenticated_actor_id, cards.telegram_account_id,
+                   cards.telegram_conversation_id, cards.conversation_binding_id,
+                   cards.issued_at
+            FROM parser_human_draft_cards AS cards
+            WHERE cards.card_generation_public_id = ?
+            """,
+            (reference_id, card["card_generation_public_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    refused = _issue_d1_actions(workspace, card)
+    assert refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    legacy_refused = support.run_cli(legacy_request)
+    assert legacy_refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert legacy_refused.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_human_action_references").fetchone()[0] == 6
+        )
+    finally:
+        conn.close()
+
+
+def test_d1_confirm_requires_the_exact_redeemed_durable_binding(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    accepted = _apply_whole_card(workspace, str(initial["card_generation_public_id"]))
+    card = accepted.response["result"]
+    issued = _issue_d1_actions(workspace, card)
+    assert issued.exit_code == bridge_errors.EXIT_OK, issued.response
+    redeemed = _redeem_d1_action(
+        workspace,
+        issued,
+        action="confirm",
+        callback_id="d1-binding-required",
+    )
+    assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
+    material = redeemed.response["result"]
+
+    missing = support.run_cli(
+        support.make_request(
+            "confirm",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "proposal_public_id": material["proposal_public_id"],
+                "operator_actor_id": ACTOR,
+                "proposal_version": material["proposal_version"],
+                "content_hash": material["content_hash"],
+                "callback_token": material["callback_token"],
+                "callback_expiry": material["callback_expiry"],
+            },
+            idempotency_key=material["decision_idempotency_key"],
+        )
+    )
+    assert missing.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert missing.response["error"]["code"] == bridge_errors.LIFECYCLE_CONFLICT
+
+    forged = _decide_d1(
+        workspace,
+        redeemed,
+        action="confirm",
+        reference_public_id="haref_" + "0" * 32,
+    )
+    assert forged.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert forged.response["error"]["code"] == bridge_errors.HUMAN_DRAFT_AUTHORITY_REFUSED
+
+    correct = _decide_d1(workspace, redeemed, action="confirm")
+    assert correct.exit_code == bridge_errors.EXIT_OK, correct.response
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_proposal_authorizations").fetchone()[0] == 1
+        )
+        assert conn.execute("SELECT state FROM parser_human_drafts").fetchone()[0] == "confirmed"
+    finally:
+        conn.close()
+
+
+def test_incomplete_d1_card_issues_no_confirm_and_rejects_atomically(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    assert initial["completeness"] == "incomplete"
+    issued = _issue_d1_actions(workspace, initial)
+    assert issued.exit_code == bridge_errors.EXIT_OK, issued.response
+    assert set(issued.response["result"]["actions"]) == {"edit", "reject"}
+    redeemed = _redeem_d1_action(
+        workspace,
+        issued,
+        action="reject",
+        callback_id="d1-incomplete-reject",
+    )
+    assert redeemed.exit_code == bridge_errors.EXIT_OK, redeemed.response
+    rejected = _decide_d1(workspace, redeemed, action="reject")
+    assert rejected.exit_code == bridge_errors.EXIT_OK, rejected.response
+    assert rejected.response["result"]["decision"] == "rejected"
+    assert rejected.response["result"]["final_transaction_created"] is False
+    replayed_reject = _decide_d1(workspace, redeemed, action="reject")
+    assert replayed_reject.exit_code == bridge_errors.EXIT_OK, replayed_reject.response
+    assert replayed_reject.response["idempotent_replay"] is True
+    unbound_replay = _decide_without_d1_binding(workspace, redeemed, action="reject")
+    assert unbound_replay.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert unbound_replay.response["error"]["code"] == bridge_errors.LIFECYCLE_CONFLICT
+    conn = support.open_database(workspace)
+    try:
+        authorization = conn.execute(
+            "SELECT confirmation_state FROM parser_proposal_authorizations"
+        ).fetchone()
+        assert authorization[0] == "rejected"
+        assert conn.execute("SELECT state FROM parser_human_drafts").fetchone()[0] == "rejected"
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+        before_counts = (
+            conn.execute("SELECT COUNT(*) FROM parser_proposal_authorizations").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+    expiry = int(redeemed.response["result"]["callback_expiry"])
+
+    class _ExpiredDateTime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime.fromtimestamp(expiry + 1, tz=UTC)
+
+    monkeypatch.setattr(commands, "datetime", _ExpiredDateTime)
+    expired_replay = _decide_d1(workspace, redeemed, action="reject")
+    assert expired_replay.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert expired_replay.response["error"]["code"] == bridge_errors.CALLBACK_EXPIRED
+    conn = support.open_database(workspace)
+    try:
+        after_counts = (
+            conn.execute("SELECT COUNT(*) FROM parser_proposal_authorizations").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0],
+        )
+        assert after_counts == before_counts
     finally:
         conn.close()
 
@@ -169,37 +1156,41 @@ def test_multiple_updates_survive_process_boundaries_and_complete_for_fresh_revi
     _proposal, session, redemption = _begin(workspace)
     first = _apply(workspace, session, 30, "merchant", "Example Cafe")
     assert first.exit_code == bridge_errors.EXIT_OK, first.response
-    assert first.response["result"]["proposal_version"] == 1
+    assert first.response["result"]["proposal_version"] == 0
+    assert first.response["result"]["edit_kind"] == "d1_compatibility"
     assert first.response["result"]["final_transaction_created"] is False
 
     # Every CLI call reopens the same staging database, exercising restart-safe state.
     active = _get(workspace)
-    assert active.response["result"]["proposal_version"] == 1
+    assert active.response["result"]["proposal_version"] == 0
     second = _apply(workspace, session, 31, "transaction_date", "2026-09-03")
     assert second.exit_code == bridge_errors.EXIT_OK, second.response
-    assert second.response["result"]["proposal_version"] == 2
+    assert second.response["result"]["proposal_version"] == 0
+    compatibility_card = second.response["result"]["human_draft_card"]
+    assert compatibility_card["field_values"]["merchant"] == "Example Cafe"
+    assert compatibility_card["field_values"]["transaction_date"] == "2026-09-03"
 
     complete = _complete(workspace, session, 32)
     assert complete.exit_code == bridge_errors.EXIT_OK, complete.response
     assert complete.response["result"]["active"] is False
-    assert complete.response["result"]["proposal_version"] == 2
+    assert complete.response["result"]["proposal_version"] == 0
     assert _get(workspace).response["result"] == {
         "active": False,
         "session_status": "inactive",
         "final_transaction_created": False,
     }
-    review = support.run_cli(
-        support.make_request(
-            "get_review",
-            {
-                "workspace_path": str(workspace.workspace_path),
-                "proposal_public_id": complete.response["result"]["proposal_public_id"],
-            },
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM parser_proposal_completions").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM parser_human_draft_operations "
+                "WHERE operation_type = 'accepted'"
+            ).fetchone()[0]
+            == 2
         )
-    )
-    assert review.response["result"]["merchant"] == "Example Cafe"
-    assert review.response["result"]["transaction_date"] == "2026-09-03"
-    assert review.response["result"]["confirm_available"] is True
+    finally:
+        conn.close()
     stale_card = support.run_cli(redemption)
     assert stale_card.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
     assert stale_card.response["error"]["code"] == bridge_errors.PROPOSAL_TERMINAL_STATE
@@ -232,7 +1223,7 @@ def test_message_claims_are_ordered_and_one_operation_per_message(
     assert stale.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
     assert reused_for_completion.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
     assert reused_for_completion.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
-    assert _get(workspace).response["result"]["proposal_version"] == 1
+    assert _get(workspace).response["result"]["proposal_version"] == 0
 
 
 def test_completion_replay_is_discoverable_only_by_exact_message(
@@ -1024,20 +2015,26 @@ def test_expired_uncommitted_pending_is_audited_and_fresh_session_can_start(
         conn.close()
 
 
-def test_text_monetary_edit_is_refused_without_ending_session(
+def test_text_monetary_edit_maps_to_d1_without_legacy_completion_rows(
     workspace: support.BridgeWorkspace,
 ) -> None:
     _proposal, session, _redemption = _begin(workspace)
-    refused = _apply(workspace, session, 30, "amount", "321.89")
+    accepted = _apply(workspace, session, 30, "amount", "321.89")
     replay = _apply(workspace, session, 30, "amount", "321.89")
-    assert refused.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
-    assert refused.response["error"]["code"] == bridge_errors.UNSUPPORTED_EDIT
-    assert replay.exit_code == refused.exit_code
-    assert replay.response["error"]["code"] == refused.response["error"]["code"]
+    assert accepted.exit_code == bridge_errors.EXIT_OK, accepted.response
+    assert accepted.response["result"]["edit_kind"] == "d1_compatibility"
+    assert accepted.response["result"]["human_draft_card"]["field_values"]["amount"] == "321.89"
+    assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
+    assert replay.response["idempotent_replay"] is True
     active = _get(workspace)
     assert active.response["result"]["active"] is True
     assert active.response["result"]["proposal_version"] == 0
     assert active.response["result"]["recovery_required"] is False
+    conn = support.open_database(workspace)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM parser_proposal_completions").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 def _begin_receipt_session(
@@ -1116,7 +2113,7 @@ def test_receipt_amount_edit_uses_supersession_and_keeps_session_on_replacement(
     corrected = _apply(workspace, session, 30, "amount", "56.78")
     assert corrected.exit_code == bridge_errors.EXIT_OK, corrected.response
     replacement = corrected.response["result"]["proposal_public_id"]
-    assert corrected.response["result"]["edit_kind"] == "receipt_monetary_correction"
+    assert corrected.response["result"]["edit_kind"] == "d1_compatibility"
     assert replacement != original
     active = _get(workspace).response["result"]
     assert active["proposal_public_id"] == replacement
@@ -1128,6 +2125,13 @@ def test_receipt_amount_edit_uses_supersession_and_keeps_session_on_replacement(
                 "SELECT parse_status FROM parser_outputs WHERE public_id = ?", (original,)
             ).fetchone()[0]
             == "superseded"
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM parser_human_draft_operations "
+                "WHERE operation_type = 'accepted'"
+            ).fetchone()[0]
+            == 1
         )
         assert all(count == 0 for count in support.count_final_facts(conn).values())
     finally:

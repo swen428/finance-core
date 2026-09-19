@@ -102,6 +102,41 @@ class TestEnvelopeMatrix:
         assert outcome.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
         assert outcome.response["error"]["code"] == bridge_errors.ARGUMENTS_REFUSED
 
+    @pytest.mark.parametrize(
+        ("command", "mutating"),
+        (
+            ("apply_human_draft_card", True),
+            ("get_human_draft_card", False),
+            ("begin_human_draft_card_delivery", True),
+            ("record_human_draft_card_delivery_outcome", True),
+            ("reissue_human_draft_card", True),
+        ),
+    )
+    def test_d1_bridge_commands_are_registered_and_fail_closed_on_missing_arguments(
+        self, command: str, mutating: bool
+    ) -> None:
+        request = support.make_request(
+            command,
+            {},
+            **({"idempotency_key": "test-key"} if mutating else {}),
+        )
+        outcome = support.run_cli(request)
+        assert outcome.exit_code == bridge_errors.EXIT_VALIDATION_REFUSED
+        assert outcome.response["error"]["code"] == bridge_errors.ARGUMENTS_REFUSED
+
+    def test_standalone_human_draft_begin_is_not_registered(self) -> None:
+        outcome = support.run_cli(
+            support.make_request("begin_human_draft", {}, idempotency_key="test-key")
+        )
+        assert outcome.exit_code == bridge_errors.EXIT_UNKNOWN_COMMAND
+        assert outcome.response["error"]["code"] == bridge_errors.UNKNOWN_COMMAND
+
+    def test_d1_action_issuance_keeps_the_public_canonical_batch_key(self) -> None:
+        batch_id = "a" * 64
+        assert bridge_commands.canonical_human_action_issuance_key(batch_id) == (
+            support.canonical_human_action_issuance_key(batch_id)
+        )
+
     def test_mutating_command_requires_idempotency_key(
         self, workspace: support.BridgeWorkspace
     ) -> None:
