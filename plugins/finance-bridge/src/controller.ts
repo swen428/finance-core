@@ -657,6 +657,7 @@ function isJsonObject(value: JsonValue | undefined): value is JsonObject {
 interface ValidatedHumanDraftCard {
   draftPublicId: string;
   cardReference: string;
+  currentCardReference: string;
   fields: WholeCardFields;
   completeness: "complete" | "incomplete";
   unresolvedFlags: string[];
@@ -724,10 +725,10 @@ function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
       !/^d1draft_[0-9a-f]{32}$/u.test(result.draft_public_id) ||
       typeof result.card_generation_public_id !== "string" ||
       !D1_CARD_ID.test(result.card_generation_public_id) ||
-      result.current_card_generation_public_id !== result.card_generation_public_id ||
+      typeof result.current_card_generation_public_id !== "string" ||
+      !D1_CARD_ID.test(result.current_card_generation_public_id) ||
       typeof result.original_operation_or_start_public_id !== "string" ||
-      result.original_operation_or_start_public_id.length === 0 ||
-      result.original_operation_or_start_public_id.length > 200 ||
+      !/^(?:d1op|d1start)_[0-9a-f]{32}$/u.test(result.original_operation_or_start_public_id) ||
       result.final_transaction_created !== false ||
       typeof result.idempotent_replay !== "boolean" ||
       !["started", "accepted", "refused", "noop", "confirmed", "rejected"].includes(
@@ -770,8 +771,10 @@ function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
   if (typeof result.action_issue_batch_id !== "string" ||
       !/^[0-9a-f]{64}$/u.test(result.action_issue_batch_id) ||
       typeof result.confirm_available !== "boolean" ||
-      typeof result.reject_available !== "boolean" || result.reject_available !== true ||
-      result.confirm_available !== (completeness === "complete")) {
+      typeof result.reject_available !== "boolean" ||
+      (result.confirm_available &&
+       (completeness !== "complete" || result.reject_available !== true ||
+        result.card_generation_public_id !== result.current_card_generation_public_id))) {
     throw new Error("Human draft action availability is invalid.");
   }
   if (result.refusal_code !== null &&
@@ -816,6 +819,7 @@ function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
   return {
     draftPublicId: result.draft_public_id,
     cardReference: result.card_generation_public_id,
+    currentCardReference: result.current_card_generation_public_id,
     fields,
     completeness,
     unresolvedFlags: result.unresolved_flags as string[],
@@ -972,12 +976,26 @@ export class FinanceInboundController {
       };
     }
     let card = requireHumanDraftCard(appliedResponse.result);
+    if (card.cardReference !== card.currentCardReference) {
+      const current = requireHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+        "get_human_draft_card",
+        { ...commandContext, card_generation_public_id: card.currentCardReference },
+      ), deadline())));
+      if (current.cardReference !== card.currentCardReference ||
+          current.currentCardReference !== card.currentCardReference ||
+          current.draftPublicId !== card.draftPublicId ||
+          current.originalOperationOrStartPublicId !== card.originalOperationOrStartPublicId) {
+        throw new Error("D1 current-generation query did not return the authoritative winner.");
+      }
+      card = current;
+    }
     if (card.idempotentReplay && card.deliveryState === "unknown") {
       const queried = requireHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
         "get_human_draft_card",
         { ...commandContext, operation_public_id: operationPublicId },
       ), deadline())));
       if (queried.cardReference !== card.cardReference ||
+          queried.currentCardReference !== card.cardReference ||
           queried.originalOperationOrStartPublicId !== card.originalOperationOrStartPublicId ||
           queried.deliveryState !== "unknown") {
         throw new Error("D1 unknown delivery query did not return the exact card.");
@@ -1005,11 +1023,18 @@ export class FinanceInboundController {
         humanDraftRecoveryKey(recoveryPublicId),
       ), deadline())));
       if (reissued.cardReference === queried.cardReference ||
+          reissued.currentCardReference !== reissued.cardReference ||
           reissued.draftPublicId !== queried.draftPublicId ||
           reissued.originalOperationOrStartPublicId !== queried.originalOperationOrStartPublicId) {
         throw new Error("D1 reissue did not return the authoritative successor card.");
       }
       card = reissued;
+    }
+    if (!card.rejectAvailable) {
+      return {
+        handled: true,
+        reply: { text: "Finance card is no longer active. Request the current Finance record." },
+      };
     }
     const language = /(?:资料卡编号|金额|币种|日期|商户|描述|分类)/u.test(turn.text)
       ? "zh" as const

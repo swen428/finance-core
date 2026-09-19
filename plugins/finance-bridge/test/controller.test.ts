@@ -1161,6 +1161,55 @@ test("unknown delivery replay queries first and returns only the bounded success
   assert.doesNotMatch(replyText(result), new RegExp(D1_CARD_G1, "u"));
 });
 
+test("replay after a completed reissue renders the durable current winner without G3", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "apply_human_draft_card") {
+        return humanDraftCard(request, {
+          current_card_generation_public_id: D1_CARD_G2,
+          delivery_state: "unknown",
+          idempotent_replay: true,
+          confirm_available: false,
+          reject_available: false,
+        });
+      }
+      if (request.command === "get_human_draft_card") {
+        return humanDraftCard(request, {
+          card_generation_public_id: D1_CARD_G2,
+          current_card_generation_public_id: D1_CARD_G2,
+          action_issue_batch_id: "9".repeat(64),
+          delivery_state: "not_attempted",
+          idempotent_replay: false,
+        });
+      }
+      if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
+      if (request.command === "begin_human_draft_card_delivery") {
+        return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
+      }
+      if (request.command === "record_human_draft_card_delivery_outcome") {
+        return ok(request, { observation_public_id: request.arguments.observation_public_id });
+      }
+      throw new Error(`Unexpected command ${request.command}`);
+    },
+  });
+  const result = await controller.handle(
+    { ...event, content: wholeCardText(), messageId: "36" },
+    { ...context, messageId: "36" },
+  );
+  assert.deepEqual(requests.map((request) => request.command), [
+    "apply_human_draft_card",
+    "get_human_draft_card",
+    "issue_human_actions",
+    "begin_human_draft_card_delivery",
+    "record_human_draft_card_delivery_outcome",
+  ]);
+  assert.equal(requests[1]?.arguments.card_generation_public_id, D1_CARD_G2);
+  assert.equal(requests.some((request) => request.command === "reissue_human_draft_card"), false);
+  assert.match(replyText(result), new RegExp(`Card Ref: ${D1_CARD_G2}`, "u"));
+});
+
 test("structured guided edits bypass intake and completion emits a fresh review card", async () => {
   const session = `gedit_${"2".repeat(32)}`;
   const proposal = "prop_bridge_0123456789abcdef0123456789abcdef";
