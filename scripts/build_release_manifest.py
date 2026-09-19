@@ -69,6 +69,9 @@ PYTHON_METADATA_SINGLE_FIELDS = {
     "Description-Content-Type",
 }
 PYTHON_METADATA_MULTI_FIELDS = {"Requires-Dist", "License-File", "Dynamic"}
+# This reviewed allowlist is independent of candidate package metadata. Keep
+# wheel and sdist checks bound to the same explicitly approved dependencies.
+APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.16.1", "typing-extensions==4.16.0")
 
 
 def _sha256(path: Path) -> str:
@@ -161,7 +164,7 @@ def _project_metadata(source_files: dict[str, bytes], version: str) -> dict[str,
         "License-Expression": "Apache-2.0",
         "Requires-Python": ">=3.12",
         "Description-Content-Type": "text/markdown",
-        "Requires-Dist": ["pypdf==6.14.2", "typing-extensions==4.16.0"],
+        "Requires-Dist": list(APPROVED_RUNTIME_DEPENDENCIES),
         "License-File": ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"],
         "Dynamic": ["license-file"],
         "body": readme,
@@ -383,7 +386,8 @@ def _inspect_sdist(
     )
     if egg_info_files["dependency_links.txt"] != b"\n":
         raise ValueError("source distribution dependency links are unexpected")
-    if egg_info_files["requires.txt"] != b"pypdf==6.14.2\ntyping-extensions==4.16.0\n":
+    expected_dependencies = "".join(f"{item}\n" for item in APPROVED_RUNTIME_DEPENDENCIES).encode()
+    if egg_info_files["requires.txt"] != expected_dependencies:
         raise ValueError("source distribution dependency metadata is unexpected")
     if egg_info_files["top_level.txt"] != b"finance_core\n":
         raise ValueError("source distribution top-level package declaration is unexpected")

@@ -46,7 +46,7 @@ import argparse
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -545,6 +545,8 @@ def parse_pdf_with_template(
 
     # Step 1: Extract text
     extraction = extract_text_from_pdf(str(path), limits=limits)
+    # A template describes layout, not the engine that produced these bytes.
+    template = replace(template, extraction_version=extraction.extraction_version)
     if not extraction.success:
         return ParseResult(
             pdf_path=str(path),

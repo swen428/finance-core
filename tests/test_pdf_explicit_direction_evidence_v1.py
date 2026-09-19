@@ -24,6 +24,7 @@ from finance_core.reconciliation.pdf_statement_bridge import (
 from finance_core.reconciliation.pdf_statement_evidence import (
     PDF_EVIDENCE_CONTRACT_VERSION,
     PDF_ROW_FINGERPRINT_VERSION,
+    PDF_TEXT_EXTRACTION_VERSION,
     PdfAmountSignConvention,
     PdfDirectionConfidence,
     PdfDirectionSource,
@@ -216,6 +217,7 @@ def test_fingerprint_binds_page_row_sign_dates_versions_and_direction() -> None:
         replace(base, posted_date=date(2026, 7, 15), posted_date_token="15/07/2026"),
         replace(base, parser_version="pdf-template-parser-v3"),
         replace(base, template_version="synthetic-bank-v3"),
+        replace(base, extraction_version=PDF_TEXT_EXTRACTION_VERSION),
         replace(base, amount_direction=StatementAmountDirection.CREDIT),
     )
     assert all(build_pdf_statement_row_fingerprint(row) != base_hash for row in variants)
@@ -637,9 +639,13 @@ def test_parse_result_preserves_multipage_duplicate_text(monkeypatch: pytest.Mon
     assert len({row.row_fingerprint for row in adapted.accepted_rows}) == 3
 
 
+@pytest.mark.parametrize(
+    "extraction_version", ["pypdf-text-extraction-v2", PDF_TEXT_EXTRACTION_VERSION]
+)
 def test_persistence_reload_and_audit_preserve_pdf_evidence(
     migrated_temp_db_connection: sqlite3.Connection,
     tmp_path: Path,
+    extraction_version: str,
 ) -> None:
     pdf_path = tmp_path / "statement.pdf"
     content = b"%PDF-1.7\nsynthetic direction evidence\n%%EOF\n"
@@ -650,6 +656,7 @@ def test_persistence_reload_and_audit_preserve_pdf_evidence(
             attachment_path=str(pdf_path),
             source_content_hash=source_hash,
             source_filename=pdf_path.name,
+            extraction_version=extraction_version,
         )
     )
     batch = StatementImporter(migrated_temp_db_connection).import_rows(
@@ -667,6 +674,7 @@ def test_persistence_reload_and_audit_preserve_pdf_evidence(
     assert payload["source_content_hash"] == source_hash
     assert payload["stable_row_locator"] == "page-1:line-1"
     assert payload["parser_version"] == "pdf-template-parser-v2"
+    assert payload["extraction_version"] == extraction_version
     audit = migrated_temp_db_connection.execute(
         """SELECT event_payload_json FROM financial_audit_events
         WHERE aggregate_public_id = ? AND event_type = 'statement_import_accepted'""",
@@ -675,6 +683,9 @@ def test_persistence_reload_and_audit_preserve_pdf_evidence(
     audit_payload = json.loads(audit["event_payload_json"])["value"]
     assert "pdf_row_evidence" in audit_payload, audit_payload
     assert audit_payload["pdf_row_evidence"][0]["evidence"]["source_page_number"] == 1
+    assert (
+        audit_payload["pdf_row_evidence"][0]["evidence"]["extraction_version"] == extraction_version
+    )
     assert migrated_temp_db_connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     assert migrated_temp_db_connection.execute("PRAGMA foreign_key_check").fetchall() == []
 

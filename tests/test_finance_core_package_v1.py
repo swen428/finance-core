@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
@@ -47,6 +48,17 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"finance-" + b"automation",
 )
 EXPECTED_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+
+
+def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    pin = next(item for item in project["project"]["dependencies"] if item.startswith("pypdf=="))
+    dependency_version = pin.removeprefix("pypdf==")
+    notice = (REPOSITORY_ROOT / "THIRD_PARTY_NOTICES.md").read_text()
+    lock = (REPOSITORY_ROOT / "requirements-dev.txt").read_text()
+    assert f"- `pypdf` {dependency_version} — BSD-3-Clause." in notice
+    assert pin in "\n".join(line for line in lock.splitlines() if line.startswith("##"))
+    assert any(line.startswith(f"{pin} ") for line in lock.splitlines())
 
 
 def _ledger_digest(paths: tuple[Path, ...]) -> str:
@@ -303,7 +315,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["api"] == "finance-core-api-v1"
         assert payload["canonical"] == "12.30"
         assert payload["distribution_name"] == "finance-core"
-        assert payload["distribution_version"] == "0.1.0"
+        assert payload["distribution_version"] == "0.1.1"
         assert payload["money_module"] == "finance_core.money"
         assert payload["migration_count"] == 48
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
@@ -354,7 +366,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert missing_runtime.returncode != 0
         assert "FINANCE_RUNTIME_ROOT is required" in missing_runtime.stderr
 
-    distribution_prefix = "finance_core-0.1.0.dist-info"
+    distribution_prefix = "finance_core-0.1.1.dist-info"
     expected_package_members = {
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in (REPOSITORY_ROOT / "finance_core").rglob("*")
@@ -395,7 +407,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert all(member.isfile() or member.isdir() for member in members)
         member_paths = [PurePosixPath(member.name) for member in members]
         assert all(not path.is_absolute() and ".." not in path.parts for path in member_paths)
-        assert {path.parts[0] for path in member_paths} == {"finance_core-0.1.0"}
+        assert {path.parts[0] for path in member_paths} == {"finance_core-0.1.1"}
         files = [member for member in members if member.isfile()]
         observed_files = {PurePosixPath(member.name).parts[1:] for member in files}
         expected_source_files = {PurePosixPath(path).parts for path in expected_package_members}

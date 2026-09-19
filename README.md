@@ -37,7 +37,7 @@ identity files with:
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.0 \
+  --core-version 0.1.1 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
@@ -46,6 +46,12 @@ python scripts/build_release_manifest.py \
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
+
+Version 0.1.1 pins pypdf 6.16.1. Its corrected character mappings can change
+extracted PDF text, so new PDF evidence uses
+`pypdf-6.16.1-text-extraction-v3`, propagated from the actual extractor rather
+than a template's saved label. Historical evidence and fingerprints remain
+unchanged; the upgrade performs no automatic reimport or database migration.
 
 ## Data boundary
 
