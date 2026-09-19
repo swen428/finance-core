@@ -59,6 +59,7 @@ export declare class FinanceInboundController {
     private queuedTurns;
     constructor(workspaceRoot: string, runner: BridgeRunner, receipt?: ReceiptDependencies | undefined, controllerDeadlineMs?: number, llmRuntime?: FinanceLlmRuntime | undefined);
     handle(event: PluginHookInboundClaimEvent, context: PluginHookInboundClaimContext): Promise<PluginHookInboundClaimResult>;
+    private runWholeCardTurn;
     private runGuidedEditTurn;
     private runReceiptTurn;
     private runTextTurn;
