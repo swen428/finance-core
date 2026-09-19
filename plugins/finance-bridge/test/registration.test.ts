@@ -992,6 +992,119 @@ test("registration injects the typed host runtime into one inbound fallback call
   assert.equal(typeof resultArguments?.response_sha256, "string");
 });
 
+test("registered inbound claim routes one whole card without model or intake fallback", async () => {
+  const fixture = fakeApi();
+  const requests: BridgeRequest[] = [];
+  const card0 = `d1card_${"a".repeat(32)}`;
+  const card1 = `d1card_${"b".repeat(32)}`;
+  const proposal = `po_d1_${"c".repeat(32)}`;
+  const runner: BridgeRunner = {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "health") {
+        return registrationOk(request, {
+          workspace_verified: true,
+          database_verified: true,
+          callback_key_status: "present",
+        });
+      }
+      if (request.command === "apply_human_draft_card") {
+        return registrationOk(request, {
+          draft_public_id: `d1draft_${"1".repeat(32)}`,
+          draft_version: 1,
+          draft_content_hash: "2".repeat(64),
+          completeness: "complete",
+          reason_contributors: [],
+          unresolved_flags: [],
+          human_reply_evidence_public_id: `d1evidence_${"3".repeat(32)}`,
+          delivery_state: "not_attempted",
+          delivery_state_hash: "4".repeat(64),
+          delivery_attempts: [],
+          delivery_outcomes: [],
+          action_issue_batch_id: "5".repeat(64),
+          operation_outcome: "accepted",
+          refusal_code: null,
+          idempotent_replay: false,
+          action_issuance_state: "not_issued",
+          proposal_public_id: proposal,
+          proposal_version: 0,
+          proposal_content_hash: "6".repeat(64),
+          card_generation_public_id: card1,
+          current_card_generation_public_id: card1,
+          original_operation_or_start_public_id: `d1op_${"7".repeat(32)}`,
+          field_values: {
+            amount: "12.50", currency: "SGD", transaction_date: "2026-09-19",
+            merchant: "Cafe", description: "Lunch", category: "Food",
+          },
+          decision_target_proposal_public_id: proposal,
+          decision_target_proposal_version: 0,
+          decision_target_proposal_content_hash: "6".repeat(64),
+          confirm_available: true,
+          reject_available: true,
+          final_transaction_created: false,
+        });
+      }
+      if (request.command === "issue_human_actions") {
+        return registrationOk(request, {
+          proposal_public_id: proposal,
+          proposal_version: 0,
+          content_hash: "6".repeat(64),
+          card_generation_public_id: card1,
+          actions: {
+            confirm: { reference: `fha1_${"A".repeat(24)}`, expiry: 2_000_000_000 },
+            edit: { reference: `fha1_${"C".repeat(24)}`, expiry: 2_000_000_000 },
+            reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
+          },
+          final_transaction_created: false,
+        });
+      }
+      if (request.command === "begin_human_draft_card_delivery") {
+        return registrationOk(request, { attempt_public_id: request.arguments.attempt_public_id! });
+      }
+      if (request.command === "record_human_draft_card_delivery_outcome") {
+        return registrationOk(request, {
+          observation_public_id: request.arguments.observation_public_id!,
+        });
+      }
+      throw new Error(`unexpected command ${request.command}`);
+    },
+  };
+  registerFinanceBridge(fixture.api, { ...dependencies, createRunner() { return runner; } });
+  await new Promise((resolve) => setImmediate(resolve));
+  const claim = fixture.hooks[0]?.handler as (
+    event: PluginHookInboundClaimEvent,
+    context: PluginHookInboundClaimContext,
+  ) => Promise<PluginHookInboundClaimResult>;
+  const content = [
+    `Card Ref: ${card0}`, "Amount: 12.50", "Currency: SGD", "Date: 2026-09-19",
+    "Merchant: Cafe", "Description: Lunch", "Category: Food",
+  ].join("\n");
+  const result = await claim({
+    content, timestamp: 1_750_000_000_000, channel: "telegram",
+    accountId: "finance-account", conversationId: "111", parentConversationId: "111",
+    senderId: "111", messageId: "30", replyToId: "20", isGroup: false,
+    commandAuthorized: true, senderIsOwner: true,
+    metadata: { from: "telegram:111", to: "telegram:111", provider: "telegram", surface: "telegram" },
+  }, {
+    channelId: "telegram", accountId: "finance-account", conversationId: "111",
+    senderId: "111", messageId: "30", replyToId: "20",
+    pluginBinding: {
+      bindingId: "binding-1", pluginId: "finance-bridge", pluginRoot: "/plugin",
+      channel: "telegram", accountId: "finance-account", conversationId: "111",
+      parentConversationId: "111", boundAt: 1_750_000_000, data: { senderId: "111" },
+    },
+  });
+  assert.deepEqual(requests.map((request) => request.command), [
+    "health", "apply_human_draft_card", "issue_human_actions",
+    "begin_human_draft_card_delivery", "record_human_draft_card_delivery_outcome",
+  ]);
+  assert.equal(fixture.completions.length, 0);
+  const textBlock = result.reply?.presentation?.blocks[0];
+  assert.equal(textBlock?.type, "text");
+  if (textBlock?.type !== "text") throw new Error("whole-card text missing");
+  assert.match(textBlock.text, new RegExp(card1, "u"));
+});
+
 test("host policy requires exclusive plugin allowlist and exact root/agent denies", () => {
   assert.doesNotThrow(() => validateHostPolicy(hostConfig()));
   const config = hostConfig();

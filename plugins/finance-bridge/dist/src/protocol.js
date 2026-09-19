@@ -134,12 +134,27 @@ function checkDepth(root) {
 function canonicalDigest(...parts) {
     return createHash("sha256").update(parts.join("\0"), "utf8").digest("hex");
 }
+export function framedDigest(domain, ...fields) {
+    if (!/^[\x21-\x7e]{1,100}$/u.test(domain))
+        throw new Error("Digest domain is invalid.");
+    const count = Buffer.allocUnsafe(4);
+    count.writeUInt32BE(fields.length);
+    const hash = createHash("sha256").update(domain, "ascii").update(Buffer.from([0])).update(count);
+    for (const field of fields) {
+        const encoded = Buffer.from(field, "utf8");
+        const length = Buffer.allocUnsafe(4);
+        length.writeUInt32BE(encoded.length);
+        hash.update(length).update(encoded);
+    }
+    return hash.digest("hex");
+}
 export function createHumanActionBatchId() {
     return randomBytes(16).toString("hex");
 }
 export function humanActionIssuanceKey(batchId) {
-    if (!/^[0-9a-f]{32}$/u.test(batchId))
+    if (!/^(?:[0-9a-f]{32}|[0-9a-f]{64})$/u.test(batchId)) {
         throw new Error("Human action batch ID is invalid.");
+    }
     return `bridge-human-action-issue:${batchId}`;
 }
 export function humanActionRedemptionKey(callbackId) {
@@ -147,6 +162,55 @@ export function humanActionRedemptionKey(callbackId) {
         throw new Error("Telegram callback ID is invalid.");
     }
     return `bridge-human-action-redeem:${canonicalDigest(callbackId).slice(0, 32)}`;
+}
+export function humanDraftOperationId(accountId, conversationId, bindingId, messageId, cardGenerationPublicId) {
+    if (!Number.isSafeInteger(messageId) || messageId <= 0 ||
+        !/^d1card_[0-9a-f]{32}$/u.test(cardGenerationPublicId)) {
+        throw new Error("Human draft operation identity is invalid.");
+    }
+    return `d1op_${framedDigest("d1-plugin-card-operation-v1", accountId, conversationId, bindingId, String(messageId), cardGenerationPublicId).slice(0, 32)}`;
+}
+export function humanDraftApplyKey(operationPublicId) {
+    if (!/^d1op_[0-9a-f]{32}$/u.test(operationPublicId)) {
+        throw new Error("Human draft operation identity is invalid.");
+    }
+    return `bridge-human-draft-apply:${operationPublicId}`;
+}
+export function humanDraftDeliveryAttemptId(cardGenerationPublicId, transportMode) {
+    if (!/^d1card_[0-9a-f]{32}$/u.test(cardGenerationPublicId)) {
+        throw new Error("Human draft card identity is invalid.");
+    }
+    return framedDigest("d1-card-delivery-v1", cardGenerationPublicId, transportMode);
+}
+export function humanDraftDeliveryKey(attemptPublicId) {
+    if (!/^[0-9a-f]{64}$/u.test(attemptPublicId))
+        throw new Error("Delivery identity is invalid.");
+    return `bridge-human-draft-delivery:${attemptPublicId}`;
+}
+export function humanDraftObservationId(attemptPublicId, slot) {
+    if (!/^[0-9a-f]{64}$/u.test(attemptPublicId))
+        throw new Error("Delivery identity is invalid.");
+    return framedDigest("d1-card-observation-v1", attemptPublicId, slot);
+}
+export function humanDraftObservationKey(observationPublicId) {
+    if (!/^[0-9a-f]{64}$/u.test(observationPublicId)) {
+        throw new Error("Delivery observation identity is invalid.");
+    }
+    return `bridge-human-draft-observation:${observationPublicId}`;
+}
+export function humanDraftRecoveryId(draftPublicId, originalOperationOrStartPublicId, cardGenerationPublicId) {
+    if (!/^d1draft_[0-9a-f]{32}$/u.test(draftPublicId) ||
+        originalOperationOrStartPublicId.length === 0 ||
+        originalOperationOrStartPublicId.length > 200 ||
+        !/^d1card_[0-9a-f]{32}$/u.test(cardGenerationPublicId)) {
+        throw new Error("Human draft recovery identity is invalid.");
+    }
+    return framedDigest("d1-card-recovery-v1", draftPublicId, originalOperationOrStartPublicId, cardGenerationPublicId);
+}
+export function humanDraftRecoveryKey(recoveryPublicId) {
+    if (!/^[0-9a-f]{64}$/u.test(recoveryPublicId))
+        throw new Error("Recovery identity is invalid.");
+    return `bridge-human-draft-reissue:${recoveryPublicId}`;
 }
 export function guidedEditUpdateKey(sessionPublicId, messageId) {
     if (!/^gedit_[0-9a-f]{32}$/u.test(sessionPublicId) ||

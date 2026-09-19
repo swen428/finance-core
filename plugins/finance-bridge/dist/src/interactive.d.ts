@@ -4,6 +4,7 @@ export declare const DISABLED_ACTIONS: readonly ["edit-disabled"];
 export declare const ACTIVE_ACTIONS: readonly ["confirm", "edit", "reject"];
 export declare const ACTION_FAILURE_REPLY = "Finance action could not be applied safely. Request a fresh review.";
 export declare const ACTION_OUTCOME_UNKNOWN_REPLY: string;
+export declare const EDIT_PRESENTATION_FAILURE_REPLY: string;
 export type DisabledAction = (typeof DISABLED_ACTIONS)[number];
 export type ActiveAction = (typeof ACTIVE_ACTIONS)[number];
 export interface HumanActionRuntime {
