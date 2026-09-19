@@ -1090,15 +1090,25 @@ test("malformed card with a valid D1 reference reaches Python refusal evidence p
       };
     },
   });
-  const malformed = `${wholeCardText()}\nAccount: Cash`;
-  const result = await controller.handle(
-    { ...event, content: malformed, messageId: "33" },
-    { ...context, messageId: "33" },
+  const malformedCards = [
+    `${wholeCardText()}\nAccount: Cash`,
+    wholeCardText().replace("Example Cafe", "bad\u0000value"),
+    wholeCardText().replace("Example Cafe", "bad\ud800value"),
+  ];
+  for (const [index, malformed] of malformedCards.entries()) {
+    const messageId = String(33 + index);
+    const result = await controller.handle(
+      { ...event, content: malformed, messageId },
+      { ...context, messageId },
+    );
+    assert.equal(requests.at(-1)?.arguments.raw_card_text, malformed);
+    assert.equal(requests.at(-1)?.arguments.card_generation_public_id, D1_CARD_G0);
+    assert.match(replyText(result), /card edit was refused/u);
+  }
+  assert.deepEqual(
+    requests.map((request) => request.command),
+    ["apply_human_draft_card", "apply_human_draft_card", "apply_human_draft_card"],
   );
-  assert.deepEqual(requests.map((request) => request.command), ["apply_human_draft_card"]);
-  assert.equal(requests[0]?.arguments.raw_card_text, malformed);
-  assert.equal(requests[0]?.arguments.card_generation_public_id, D1_CARD_G0);
-  assert.match(replyText(result), /card edit was refused/u);
 });
 
 test("unknown delivery replay queries first and returns only the bounded successor generation", async () => {

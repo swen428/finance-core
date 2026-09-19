@@ -180,8 +180,8 @@ export function renderWholeCard(input: {
 }
 
 export function extractWholeCardReference(text: string): string | undefined {
-  if (typeof text !== "string" || text.length === 0 || hasUnpairedSurrogate(text) ||
-      Buffer.byteLength(text, "utf8") > MAX_CARD_BYTES || containsUnsafeScalar(text, true)) {
+  if (typeof text !== "string" || text.length === 0 ||
+      Buffer.byteLength(text, "utf8") > MAX_CARD_BYTES) {
     return undefined;
   }
   let found: string | undefined;
