@@ -270,13 +270,20 @@ def canonical_edit_key(*, proposal_public_id: str, version: int, content_hash: s
 
 
 def canonical_human_action_issuance_key(reference_batch_id: str) -> str:
+    return f"bridge-human-action-issue:{reference_batch_id}"
+
+
+def _persisted_human_action_issuance_key(reference_batch_id: str) -> str:
     if len(reference_batch_id) == 64 and all(
         character in "0123456789abcdef" for character in reference_batch_id
     ):
-        reference_batch_id = hashlib.sha256(
-            f"d1-human-action-issuance-v1:{reference_batch_id}".encode("utf-8")
-        ).hexdigest()[:32]
-    return f"bridge-human-action-issue:{reference_batch_id}"
+        parts = ("d1-human-action-issuance-v1", reference_batch_id)
+        material = b"".join(
+            len(encoded).to_bytes(4, "big") + encoded
+            for encoded in (part.encode("utf-8") for part in parts)
+        )
+        reference_batch_id = hashlib.sha256(material).hexdigest()[:32]
+    return canonical_human_action_issuance_key(reference_batch_id)
 
 
 def canonical_human_action_redemption_key(callback_id: str) -> str:
@@ -2581,7 +2588,7 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
             issued, replay = human_actions.issue_human_action_references(
                 conn,
                 key=key,
-                issuance_idempotency_key=request.idempotency_key or "",
+                issuance_idempotency_key=_persisted_human_action_issuance_key(reference_batch_id),
                 proposal_public_id=proposal_public_id,
                 expected_proposal_version=expected_proposal_version,
                 expected_proposal_content_hash=expected_content_hash,
@@ -2857,6 +2864,17 @@ def _begin_human_draft_for_redeemed_edit(
     ).fetchone()
     if active is not None:
         return
+    callback_hash = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()
+    start_parts = (
+        "d1-human-draft-start-v1",
+        str(reference_row["reference_public_id"]),
+        callback_hash,
+    )
+    start_material = b"".join(
+        len(encoded).to_bytes(4, "big") + encoded
+        for encoded in (part.encode("utf-8") for part in start_parts)
+    )
+    start_public_id = f"d1start_{hashlib.sha256(start_material).hexdigest()[:32]}"
     try:
         begin_human_draft_in_transaction(
             conn,
@@ -2865,8 +2883,8 @@ def _begin_human_draft_for_redeemed_edit(
             reference_public_id=str(reference_row["reference_public_id"]),
             reference_integrity_material=reference.encode("utf-8"),
             callback_message_id=callback_message_id,
-            redemption_public_id=callback_id,
-            redemption_material_hash=hashlib.sha256(callback_id.encode("utf-8")).hexdigest(),
+            redemption_public_id=start_public_id,
+            redemption_material_hash=callback_hash,
             now_epoch=now_epoch,
         )
     except HumanDraftError as exc:
@@ -3026,9 +3044,10 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
                     "final_transaction_created": False,
                 }, True
 
-        proposal = _verify_callback_context(
-            conn, workspace, validated, action=action, deadline=deadline
-        )
+        if existing is None:
+            proposal = _verify_callback_context(
+                conn, workspace, validated, action=action, deadline=deadline
+            )
 
         deadline.check("decision persistence")
         assert request.idempotency_key is not None

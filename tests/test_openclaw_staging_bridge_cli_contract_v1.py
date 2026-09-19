@@ -131,6 +131,12 @@ class TestEnvelopeMatrix:
         assert outcome.exit_code == bridge_errors.EXIT_UNKNOWN_COMMAND
         assert outcome.response["error"]["code"] == bridge_errors.UNKNOWN_COMMAND
 
+    def test_d1_action_issuance_keeps_the_public_canonical_batch_key(self) -> None:
+        batch_id = "a" * 64
+        assert bridge_commands.canonical_human_action_issuance_key(batch_id) == (
+            support.canonical_human_action_issuance_key(batch_id)
+        )
+
     def test_mutating_command_requires_idempotency_key(
         self, workspace: support.BridgeWorkspace
     ) -> None:

@@ -232,7 +232,7 @@ def _issue_d1_actions(
                 "expected_proposal_version": proposal_version,
                 "expected_content_hash": content_hash,
             },
-            idempotency_key=commands.canonical_human_action_issuance_key(
+            idempotency_key=support.canonical_human_action_issuance_key(
                 str(card["action_issue_batch_id"])
             ),
         )
@@ -349,6 +349,16 @@ def test_edit_redemption_atomically_starts_durable_session(
             == 1
         )
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+        start = conn.execute(
+            "SELECT start_redemption_public_id FROM parser_human_drafts"
+        ).fetchone()[0]
+        operation_id = conn.execute(
+            "SELECT operation_public_id FROM parser_human_draft_operations "
+            "WHERE operation_type = 'start'"
+        ).fetchone()[0]
+        assert start == operation_id
+        assert start.startswith("d1start_")
+        assert start != "guided-edit-callback"
     finally:
         conn.close()
 
@@ -683,7 +693,7 @@ def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
                 "expected_proposal_version": card["proposal_version"],
                 "expected_content_hash": card["proposal_content_hash"],
             },
-            idempotency_key=commands.canonical_human_action_issuance_key(
+            idempotency_key=support.canonical_human_action_issuance_key(
                 card["action_issue_batch_id"]
             ),
         )
@@ -735,9 +745,22 @@ def test_generation_bound_actions_redeem_and_confirm_with_durable_binding(
     assert decision.exit_code == bridge_errors.EXIT_OK, decision.response
     assert decision.response["result"]["decision"] == "confirmed"
     assert decision.response["result"]["final_transaction_created"] is False
+    replayed_decision = _decide_d1(workspace, redeemed, action="confirm")
+    assert replayed_decision.exit_code == bridge_errors.EXIT_OK, replayed_decision.response
+    assert replayed_decision.response["idempotent_replay"] is True
     conn = support.open_database(workspace)
     try:
         assert conn.execute("SELECT state FROM parser_human_drafts").fetchone()[0] == "confirmed"
+        assert (
+            conn.execute("SELECT COUNT(*) FROM parser_proposal_authorizations").fetchone()[0] == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM parser_human_draft_operations "
+                "WHERE operation_type = 'confirmed'"
+            ).fetchone()[0]
+            == 1
+        )
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
     finally:
         conn.close()
@@ -821,6 +844,9 @@ def test_incomplete_d1_card_issues_no_confirm_and_rejects_atomically(
     assert rejected.exit_code == bridge_errors.EXIT_OK, rejected.response
     assert rejected.response["result"]["decision"] == "rejected"
     assert rejected.response["result"]["final_transaction_created"] is False
+    replayed_reject = _decide_d1(workspace, redeemed, action="reject")
+    assert replayed_reject.exit_code == bridge_errors.EXIT_OK, replayed_reject.response
+    assert replayed_reject.response["idempotent_replay"] is True
     conn = support.open_database(workspace)
     try:
         authorization = conn.execute(
