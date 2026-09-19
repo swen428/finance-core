@@ -12,8 +12,17 @@ import {
   captureIdentities,
   createHumanActionBatchId,
   createBridgeRequest,
+  framedDigest,
   guidedEditCompleteKey,
   guidedEditUpdateKey,
+  humanDraftApplyKey,
+  humanDraftDeliveryAttemptId,
+  humanDraftDeliveryKey,
+  humanDraftObservationId,
+  humanDraftObservationKey,
+  humanDraftOperationId,
+  humanDraftRecoveryId,
+  humanDraftRecoveryKey,
   humanActionIssuanceKey,
   type BridgeRequest,
   type BridgeResponse,
@@ -38,6 +47,13 @@ import {
   type ReceiptMediaAdapter,
   type ValidatedMedia,
 } from "./media.js";
+import {
+  EMPTY_WHOLE_CARD_FIELDS,
+  extractWholeCardReference,
+  parseWholeCard,
+  renderWholeCard,
+  type WholeCardFields,
+} from "./whole-card.js";
 
 const COMMAND_DEADLINE_MS = 30_000;
 const CONTROLLER_DEADLINE_MS = 105_000;
@@ -125,6 +141,8 @@ interface ValidatedTextTurn {
   senderId: number;
   date: number;
   text: string;
+  replyToId?: string;
+  replyToIdFull?: string;
 }
 
 interface ReceiptDependencies {
@@ -398,6 +416,23 @@ function validateTextTurn(
       content.trimStart().startsWith("/")) {
     return undefined;
   }
+  if ((event.replyToId !== undefined || context.replyToId !== undefined) &&
+      (event.replyToId === undefined || context.replyToId === undefined ||
+       event.replyToId !== context.replyToId)) {
+    return undefined;
+  }
+  if ((event.replyToIdFull !== undefined || context.replyToIdFull !== undefined) &&
+      (event.replyToIdFull === undefined || context.replyToIdFull === undefined ||
+       event.replyToIdFull !== context.replyToIdFull)) {
+    return undefined;
+  }
+  for (const replyIdentity of [event.replyToId, event.replyToIdFull]) {
+    if (replyIdentity !== undefined &&
+        (replyIdentity.length === 0 || replyIdentity.length > 200 ||
+         !/^[\x21-\x7e]+$/u.test(replyIdentity))) {
+      return undefined;
+    }
+  }
   const chatId = decimalInteger(event.conversationId);
   const senderId = decimalInteger(event.senderId);
   const messageId = decimalInteger(event.messageId);
@@ -417,6 +452,8 @@ function validateTextTurn(
     senderId,
     date: (timestampMs as number) / 1_000,
     text: content,
+    ...(event.replyToId === undefined ? {} : { replyToId: event.replyToId }),
+    ...(event.replyToIdFull === undefined ? {} : { replyToIdFull: event.replyToIdFull }),
   };
 }
 
@@ -617,6 +654,208 @@ function isJsonObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+interface ValidatedHumanDraftCard {
+  draftPublicId: string;
+  cardReference: string;
+  currentCardReference: string;
+  fields: WholeCardFields;
+  completeness: "complete" | "incomplete";
+  unresolvedFlags: string[];
+  actionIssueBatchId: string;
+  proposalPublicId: string;
+  proposalVersion: number;
+  proposalContentHash: string;
+  confirmAvailable: boolean;
+  rejectAvailable: boolean;
+  originalOperationOrStartPublicId: string;
+  deliveryStateHash: string;
+  deliveryState: string;
+  idempotentReplay: boolean;
+  operationOutcome: string;
+  refusalCode: string | null;
+}
+
+const D1_PROPOSAL_ID = new RegExp(
+  `^(?:po_d1_[0-9a-f]{32}|prop_bridge_[0-9a-f]{32}|parser_output_${UUID})$`,
+  "u",
+);
+const D1_CARD_ID = /^d1card_[0-9a-f]{32}$/u;
+const HUMAN_DRAFT_RESULT_FIELDS = new Set([
+  "draft_public_id", "draft_version", "draft_content_hash", "completeness",
+  "reason_contributors", "unresolved_flags", "human_reply_evidence_public_id",
+  "delivery_state", "delivery_state_hash", "delivery_attempts", "delivery_outcomes",
+  "action_issue_batch_id", "operation_outcome", "refusal_code", "idempotent_replay",
+  "action_issuance_state", "proposal_public_id", "proposal_version",
+  "proposal_content_hash", "card_generation_public_id",
+  "current_card_generation_public_id", "original_operation_or_start_public_id",
+  "field_values", "decision_target_proposal_public_id",
+  "decision_target_proposal_version", "decision_target_proposal_content_hash",
+  "confirm_available", "reject_available", "final_transaction_created",
+]);
+
+function requireExactResultFields(result: JsonObject, expected: Set<string>): void {
+  const keys = Object.keys(result);
+  if (keys.length !== expected.size || keys.some((key) => !expected.has(key))) {
+    throw new Error("Human draft result fields are invalid.");
+  }
+}
+
+function requireNonNegativeInteger(value: JsonValue | undefined, field: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Human draft ${field} is invalid.`);
+  }
+  return value;
+}
+
+function requireSha256(value: JsonValue | undefined, field: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/u.test(value)) {
+    throw new Error(`Human draft ${field} is invalid.`);
+  }
+  return value;
+}
+
+function requireD1Proposal(value: JsonValue | undefined, field: string): string {
+  if (typeof value !== "string" || !D1_PROPOSAL_ID.test(value)) {
+    throw new Error(`Human draft ${field} is invalid.`);
+  }
+  return value;
+}
+
+function requireHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
+  requireExactResultFields(result, HUMAN_DRAFT_RESULT_FIELDS);
+  if (typeof result.draft_public_id !== "string" ||
+      !/^d1draft_[0-9a-f]{32}$/u.test(result.draft_public_id) ||
+      typeof result.card_generation_public_id !== "string" ||
+      !D1_CARD_ID.test(result.card_generation_public_id) ||
+      typeof result.current_card_generation_public_id !== "string" ||
+      !D1_CARD_ID.test(result.current_card_generation_public_id) ||
+      typeof result.original_operation_or_start_public_id !== "string" ||
+      !/^(?:d1op|d1start)_[0-9a-f]{32}$/u.test(result.original_operation_or_start_public_id) ||
+      result.final_transaction_created !== false ||
+      typeof result.idempotent_replay !== "boolean" ||
+      !["started", "accepted", "refused", "noop", "confirmed", "rejected"].includes(
+        String(result.operation_outcome),
+      ) ||
+      !["not_issued", "issued"].includes(String(result.action_issuance_state)) ||
+      !["not_attempted", "unknown", "success", "failure"].includes(
+        String(result.delivery_state),
+      )) {
+    throw new Error("Human draft identity or state is invalid.");
+  }
+  requireNonNegativeInteger(result.draft_version, "draft_version");
+  requireSha256(result.draft_content_hash, "draft_content_hash");
+  const deliveryStateHash = requireSha256(result.delivery_state_hash, "delivery_state_hash");
+  if (!Array.isArray(result.reason_contributors) || result.reason_contributors.length > 64 ||
+      !result.reason_contributors.every((item) => isJsonObject(item)) ||
+      !Array.isArray(result.delivery_attempts) || result.delivery_attempts.length > 8 ||
+      !result.delivery_attempts.every((item) => isJsonObject(item)) ||
+      !Array.isArray(result.delivery_outcomes) || result.delivery_outcomes.length > 16 ||
+      !result.delivery_outcomes.every((item) => isJsonObject(item))) {
+    throw new Error("Human draft evidence or delivery history is invalid.");
+  }
+  if (!Array.isArray(result.unresolved_flags) || result.unresolved_flags.length > 32 ||
+      !result.unresolved_flags.every((flag) => typeof flag === "string" &&
+        /^[a-z0-9_]{1,100}$/u.test(flag)) ||
+      new Set(result.unresolved_flags).size !== result.unresolved_flags.length) {
+    throw new Error("Human draft unresolved flags are invalid.");
+  }
+  if (!isJsonObject(result.field_values) ||
+      Object.keys(result.field_values).sort().join(",") !==
+        "amount,category,currency,description,merchant,transaction_date" ||
+      !Object.values(result.field_values).every((value) => typeof value === "string")) {
+    throw new Error("Human draft field values are invalid.");
+  }
+  const fields = result.field_values as WholeCardFields;
+  const completeness = result.completeness;
+  if (completeness !== "complete" && completeness !== "incomplete") {
+    throw new Error("Human draft completeness is invalid.");
+  }
+  if (typeof result.action_issue_batch_id !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(result.action_issue_batch_id) ||
+      typeof result.confirm_available !== "boolean" ||
+      typeof result.reject_available !== "boolean" ||
+      (result.confirm_available &&
+       (completeness !== "complete" || result.reject_available !== true ||
+        result.card_generation_public_id !== result.current_card_generation_public_id))) {
+    throw new Error("Human draft action availability is invalid.");
+  }
+  if (result.refusal_code !== null &&
+      (typeof result.refusal_code !== "string" || !/^[A-Z0-9_]{1,100}$/u.test(result.refusal_code))) {
+    throw new Error("Human draft refusal is invalid.");
+  }
+  if ((result.operation_outcome === "refused") !== (result.refusal_code !== null)) {
+    throw new Error("Human draft refusal outcome is inconsistent.");
+  }
+  if (result.human_reply_evidence_public_id !== null &&
+      (typeof result.human_reply_evidence_public_id !== "string" ||
+       !/^d1evidence_[0-9a-f]{32}$/u.test(result.human_reply_evidence_public_id))) {
+    throw new Error("Human draft evidence identity is invalid.");
+  }
+  const decisionTarget = requireD1Proposal(
+    result.decision_target_proposal_public_id,
+    "decision_target_proposal_public_id",
+  );
+  const decisionTargetVersion = requireNonNegativeInteger(
+    result.decision_target_proposal_version,
+    "decision_target_proposal_version",
+  );
+  const decisionTargetHash = requireSha256(
+    result.decision_target_proposal_content_hash,
+    "decision_target_proposal_content_hash",
+  );
+  let proposalPublicId = decisionTarget;
+  let proposalVersion = decisionTargetVersion;
+  let proposalContentHash = decisionTargetHash;
+  if (completeness === "complete") {
+    proposalPublicId = requireD1Proposal(result.proposal_public_id, "proposal_public_id");
+    proposalVersion = requireNonNegativeInteger(result.proposal_version, "proposal_version");
+    proposalContentHash = requireSha256(result.proposal_content_hash, "proposal_content_hash");
+  } else if (result.proposal_public_id !== null || result.proposal_version !== null ||
+      result.proposal_content_hash !== null) {
+    throw new Error("Incomplete human draft unexpectedly exposes a publication.");
+  }
+  renderWholeCard({
+    cardReference: result.card_generation_public_id,
+    fields,
+    language: "en",
+    status: completeness === "complete" ? "publishable" : "incomplete",
+    unresolvedReasons: result.unresolved_flags as string[],
+  });
+  return {
+    draftPublicId: result.draft_public_id,
+    cardReference: result.card_generation_public_id,
+    currentCardReference: result.current_card_generation_public_id,
+    fields,
+    completeness,
+    unresolvedFlags: result.unresolved_flags as string[],
+    actionIssueBatchId: result.action_issue_batch_id,
+    proposalPublicId,
+    proposalVersion,
+    proposalContentHash,
+    confirmAvailable: result.confirm_available,
+    rejectAvailable: result.reject_available,
+    originalOperationOrStartPublicId: result.original_operation_or_start_public_id,
+    deliveryStateHash,
+    deliveryState: result.delivery_state as string,
+    idempotentReplay: result.idempotent_replay,
+    operationOutcome: result.operation_outcome as string,
+    refusalCode: result.refusal_code as string | null,
+  };
+}
+
+function requireActionableHumanDraftCard(result: JsonObject): ValidatedHumanDraftCard {
+  const card = requireHumanDraftCard(result);
+  if (card.operationOutcome === "refused") {
+    throw new Error("Refused D1 result is not actionable.");
+  }
+  return card;
+}
+
+function looksLikeWholeCard(text: string): boolean {
+  return /^(?:[ \t]*(?:资料卡编号|金额|币种|日期|商户|描述|分类|card[ \t]+ref|amount|currency|date|merchant|description|category)[ \t]*[:：])/imu
+    .test(text);
+}
+
 export class FinanceInboundController {
   private queue: Promise<void> = Promise.resolve();
   private queuedTurns = 0;
@@ -664,6 +903,8 @@ export class FinanceInboundController {
       if (remaining <= 0) throw new Error("Finance controller queue deadline exceeded.");
       const hasMedia = isReceiptMetadata(event.metadata);
       if (hasMedia) receiptCaption(turn.text);
+      const wholeCard = await this.runWholeCardTurn(turn, hasMedia, remaining);
+      if (wholeCard !== undefined) return wholeCard;
       const guided = await this.runGuidedEditTurn(turn, hasMedia, remaining);
       if (guided !== undefined) return guided;
       return hasMedia
@@ -676,6 +917,252 @@ export class FinanceInboundController {
       this.queuedTurns -= 1;
       release();
     }
+  }
+
+  private async runWholeCardTurn(
+    turn: ValidatedTextTurn,
+    hasMedia: boolean,
+    admittedDeadlineMs: number,
+  ): Promise<PluginHookInboundClaimResult | undefined> {
+    const extractedReference = extractWholeCardReference(turn.text);
+    const cardLike = extractedReference !== undefined || looksLikeWholeCard(turn.text);
+    if (!cardLike) return undefined;
+    if (hasMedia) {
+      return {
+        handled: true,
+        reply: { text: "Receipt media cannot be attached to a Finance whole-card edit. Resend the text card only." },
+      };
+    }
+    let cardReference: string;
+    let fields: WholeCardFields;
+    try {
+      const parsed = parseWholeCard(turn.text);
+      cardReference = parsed.cardReference;
+      fields = parsed.fields;
+    } catch {
+      if (extractedReference === undefined) {
+        return {
+          handled: true,
+          reply: {
+            text: "Finance card edit was refused. Use the complete card and keep its Card Ref unchanged.",
+          },
+        };
+      }
+      cardReference = extractedReference;
+      fields = { ...EMPTY_WHOLE_CARD_FIELDS };
+    }
+
+    const startedAt = performance.now();
+    const deadline = (): number => {
+      const remaining = Math.floor(admittedDeadlineMs - (performance.now() - startedAt));
+      if (remaining <= 0) throw new Error("Finance controller deadline exceeded.");
+      return Math.min(COMMAND_DEADLINE_MS, remaining);
+    };
+    const commandContext = {
+      workspace_path: this.workspaceRoot,
+      operator_actor_id: String(turn.senderId),
+      telegram_account_id: turn.accountId,
+      telegram_conversation_id: String(turn.chatId),
+      conversation_binding_id: turn.bindingId,
+    };
+    const operationPublicId = humanDraftOperationId(
+      turn.accountId,
+      String(turn.chatId),
+      turn.bindingId,
+      turn.messageId,
+      cardReference,
+    );
+    const appliedResponse = await this.runner.run(createBridgeRequest(
+      "apply_human_draft_card",
+      {
+        ...commandContext,
+        card_generation_public_id: cardReference,
+        telegram_message_id: turn.messageId,
+        operation_public_id: operationPublicId,
+        raw_card_text: turn.text,
+        field_values: fields,
+      },
+      humanDraftApplyKey(operationPublicId),
+    ), deadline());
+    if (appliedResponse.status !== "ok") {
+      return {
+        handled: true,
+        reply: { text: "Finance card edit was refused. The previous authoritative card remains current." },
+      };
+    }
+    let card = requireHumanDraftCard(appliedResponse.result);
+    if (card.operationOutcome === "refused") {
+      return {
+        handled: true,
+        reply: {
+          text: "Finance card edit was refused. The previous authoritative card remains current.",
+        },
+      };
+    }
+    if (card.cardReference !== card.currentCardReference) {
+      const current = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+        "get_human_draft_card",
+        { ...commandContext, card_generation_public_id: card.currentCardReference },
+      ), deadline())));
+      if (current.cardReference !== card.currentCardReference ||
+          current.currentCardReference !== card.currentCardReference ||
+          current.draftPublicId !== card.draftPublicId ||
+          current.originalOperationOrStartPublicId !== card.originalOperationOrStartPublicId) {
+        throw new Error("D1 current-generation query did not return the authoritative winner.");
+      }
+      card = current;
+    }
+    if (card.idempotentReplay && card.deliveryState === "unknown") {
+      const queried = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+        "get_human_draft_card",
+        { ...commandContext, operation_public_id: operationPublicId },
+      ), deadline())));
+      if (queried.cardReference !== card.cardReference ||
+          queried.currentCardReference !== card.cardReference ||
+          queried.originalOperationOrStartPublicId !== card.originalOperationOrStartPublicId ||
+          queried.deliveryState !== "unknown") {
+        throw new Error("D1 unknown delivery query did not return the exact card.");
+      }
+      const recoveryPublicId = humanDraftRecoveryId(
+        queried.draftPublicId,
+        queried.originalOperationOrStartPublicId,
+        queried.cardReference,
+      );
+      const reissued = requireActionableHumanDraftCard(requireOk(await this.runner.run(createBridgeRequest(
+        "reissue_human_draft_card",
+        {
+          ...commandContext,
+          expected_current_generation_public_id: queried.cardReference,
+          original_operation_or_start_public_id: queried.originalOperationOrStartPublicId,
+          recovery_public_id: recoveryPublicId,
+          recovery_material_hash: framedDigest(
+            "d1-card-recovery-material-v1",
+            recoveryPublicId,
+            queried.deliveryStateHash,
+          ),
+          queried_delivery_state_hash: queried.deliveryStateHash,
+          reason: "unknown_after_query",
+        },
+        humanDraftRecoveryKey(recoveryPublicId),
+      ), deadline())));
+      if (reissued.cardReference === queried.cardReference ||
+          reissued.currentCardReference !== reissued.cardReference ||
+          reissued.draftPublicId !== queried.draftPublicId ||
+          reissued.originalOperationOrStartPublicId !== queried.originalOperationOrStartPublicId) {
+        throw new Error("D1 reissue did not return the authoritative successor card.");
+      }
+      card = reissued;
+    }
+    if (!card.rejectAvailable) {
+      return {
+        handled: true,
+        reply: { text: "Finance card is no longer active. Request the current Finance record." },
+      };
+    }
+    const language = /(?:资料卡编号|金额|币种|日期|商户|描述|分类)/u.test(turn.text)
+      ? "zh" as const
+      : "en" as const;
+    const text = renderWholeCard({
+      cardReference: card.cardReference,
+      fields: card.fields,
+      language,
+      status: card.completeness === "complete" ? "publishable" : "incomplete",
+      unresolvedReasons: card.unresolvedFlags,
+    });
+    const issuedResponse = await this.runner.run(createBridgeRequest(
+      "issue_human_actions",
+      {
+        ...commandContext,
+        proposal_public_id: card.proposalPublicId,
+        operator_actor_id: String(turn.senderId),
+        reference_batch_id: card.actionIssueBatchId,
+        token_ttl_seconds: 600,
+        expected_proposal_version: card.proposalVersion,
+        expected_content_hash: card.proposalContentHash,
+        card_generation_public_id: card.cardReference,
+      },
+      humanActionIssuanceKey(card.actionIssueBatchId),
+    ), deadline());
+    const issued = requireOk(issuedResponse);
+    if (issued.proposal_public_id !== card.proposalPublicId ||
+        issued.proposal_version !== card.proposalVersion ||
+        issued.content_hash !== card.proposalContentHash ||
+        issued.card_generation_public_id !== card.cardReference ||
+        issued.final_transaction_created !== false) {
+      throw new Error("D1 human action issuance identity mismatch.");
+    }
+    const references = requireActionReferences(issued, card.confirmAvailable);
+    if (references.reject === undefined) throw new Error("D1 Reject reference is missing.");
+    const buttons = [];
+    if (card.confirmAvailable) {
+      if (references.confirm === undefined || references.edit === undefined) {
+        throw new Error("D1 complete action references are missing.");
+      }
+      buttons.push({
+        label: "Confirm",
+        style: "success" as const,
+        action: { type: "callback" as const, value: humanActionCallbackData("confirm", references.confirm) },
+      });
+      buttons.push({
+        label: "Edit",
+        action: { type: "callback" as const, value: humanActionCallbackData("edit", references.edit) },
+      });
+    }
+    buttons.push({
+      label: "Reject",
+      style: "danger" as const,
+      action: { type: "callback" as const, value: humanActionCallbackData("reject", references.reject) },
+    });
+
+    const attemptPublicId = humanDraftDeliveryAttemptId(card.cardReference, "reply");
+    const deliveryMaterialHash = framedDigest(
+      "d1-card-delivery-material-v1",
+      text,
+      ...buttons.map((button) => button.action.value),
+    );
+    const begin = requireOk(await this.runner.run(createBridgeRequest(
+      "begin_human_draft_card_delivery",
+      {
+        ...commandContext,
+        card_generation_public_id: card.cardReference,
+        attempt_public_id: attemptPublicId,
+        delivery_material_hash: deliveryMaterialHash,
+        transport_mode: "reply",
+        ...(turn.replyToId === undefined ? {} : { outbound_target_message_id: turn.replyToId }),
+      },
+      humanDraftDeliveryKey(attemptPublicId),
+    ), deadline()));
+    if (begin.attempt_public_id !== attemptPublicId || Object.keys(begin).length !== 1) {
+      throw new Error("D1 delivery attempt identity mismatch.");
+    }
+    const observationPublicId = humanDraftObservationId(attemptPublicId, "initial");
+    const observed = requireOk(await this.runner.run(createBridgeRequest(
+      "record_human_draft_card_delivery_outcome",
+      {
+        ...commandContext,
+        attempt_public_id: attemptPublicId,
+        observation_public_id: observationPublicId,
+        outcome: "unknown",
+        error_code: null,
+        outbound_message_id: null,
+        trusted_receipt_hash: null,
+      },
+      humanDraftObservationKey(observationPublicId),
+    ), deadline()));
+    if (observed.observation_public_id !== observationPublicId || Object.keys(observed).length !== 1) {
+      throw new Error("D1 delivery observation identity mismatch.");
+    }
+    return {
+      handled: true,
+      reply: {
+        presentation: {
+          blocks: [
+            { type: "text", text },
+            { type: "buttons", buttons },
+          ],
+        },
+      },
+    };
   }
 
   private async runGuidedEditTurn(

@@ -488,6 +488,102 @@ def test_whole_card_command_publishes_one_complete_unconfirmed_revision(
         conn.close()
 
 
+def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    initial = _draft_from_redemption(workspace, redemption)
+    card_0 = str(initial["card_generation_public_id"])
+    chinese = "\n".join(
+        (
+            f"资料卡编号：{card_0}",
+            "金额：12.50",
+            "币种：SGD",
+            "日期：2026-09-19",
+            "商户：示例：咖啡店",
+            "描述：午餐",
+            "分类：餐饮",
+        )
+    )
+    fields_1 = {
+        "amount": "12.50",
+        "currency": "SGD",
+        "transaction_date": "2026-09-19",
+        "merchant": "示例：咖啡店",
+        "description": "午餐",
+        "category": "餐饮",
+    }
+    first = support.run_cli(
+        support.make_request(
+            "apply_human_draft_card",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_0,
+                "telegram_message_id": 30,
+                "operation_public_id": "d1op_plugin_zh_30",
+                "raw_card_text": chinese,
+                "field_values": fields_1,
+            },
+            idempotency_key="bridge-human-draft-apply:d1op_plugin_zh_30",
+        )
+    )
+    assert first.exit_code == bridge_errors.EXIT_OK, first.response
+    assert first.response["result"]["field_values"] == fields_1
+
+    card_1 = str(first.response["result"]["card_generation_public_id"])
+    mixed = "\r\n".join(
+        (
+            f"cArD rEf : {card_1}",
+            "金额: 12.50",
+            "CURRENCY：SGD",
+            "日期: 2026-09-20",
+            "Merchant: Branch: Two",
+            "描述：午餐",
+            "CATEGORY: 餐饮",
+        )
+    )
+    fields_2 = {
+        **fields_1,
+        "transaction_date": "2026-09-20",
+        "merchant": "Branch: Two",
+    }
+    second = support.run_cli(
+        support.make_request(
+            "apply_human_draft_card",
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_1,
+                "telegram_message_id": 31,
+                "operation_public_id": "d1op_plugin_mixed_31",
+                "raw_card_text": mixed,
+                "field_values": fields_2,
+            },
+            idempotency_key="bridge-human-draft-apply:d1op_plugin_mixed_31",
+        )
+    )
+    assert second.exit_code == bridge_errors.EXIT_OK, second.response
+    assert second.response["result"]["field_values"] == fields_2
+
+    conn = support.open_database(workspace)
+    try:
+        evidence = conn.execute(
+            "SELECT operations.operation_public_id, evidence.raw_utf8, evidence.sha256 "
+            "FROM parser_human_draft_operations AS operations "
+            "JOIN parser_human_draft_reply_evidence AS evidence "
+            "ON evidence.id = operations.human_reply_evidence_id "
+            "WHERE operations.operation_public_id IN (?, ?) ORDER BY operations.id",
+            ("d1op_plugin_zh_30", "d1op_plugin_mixed_31"),
+        ).fetchall()
+        assert [(row[0], bytes(row[1])) for row in evidence] == [
+            ("d1op_plugin_zh_30", chinese.encode("utf-8")),
+            ("d1op_plugin_mixed_31", mixed.encode("utf-8")),
+        ]
+        assert all(row[2] == hashlib.sha256(bytes(row[1])).hexdigest() for row in evidence)
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_whole_card_exact_replay_and_read_only_recovery_preserve_one_result(
     workspace: support.BridgeWorkspace,
 ) -> None:
@@ -1095,7 +1191,7 @@ def test_incomplete_d1_card_issues_no_confirm_and_rejects_atomically(
     assert initial["completeness"] == "incomplete"
     issued = _issue_d1_actions(workspace, initial)
     assert issued.exit_code == bridge_errors.EXIT_OK, issued.response
-    assert set(issued.response["result"]["actions"]) == {"edit", "reject"}
+    assert set(issued.response["result"]["actions"]) == {"reject"}
     redeemed = _redeem_d1_action(
         workspace,
         issued,

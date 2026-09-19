@@ -2587,11 +2587,7 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
             if authority.result_completeness != "complete":
-                allowed_actions = tuple(
-                    action
-                    for action in allowed_actions
-                    if action != human_actions.callback_tokens.ACTION_CONFIRM
-                )
+                allowed_actions = (human_actions.callback_tokens.ACTION_REJECT,)
         key = _load_callback_key(workspace)
         persisted_issuance_keys = _persisted_human_action_issuance_keys(reference_batch_id, key=key)
         deadline.check("human action reference issuance")
