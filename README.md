@@ -37,7 +37,7 @@ identity files with:
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.1 \
+  --core-version 0.1.2 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
@@ -46,6 +46,10 @@ python scripts/build_release_manifest.py \
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
+
+Version 0.1.2 adds the bounded D1 whole-card Bridge command authority and its
+durable recovery, action-generation and decision bindings. It does not register
+Telegram whole-card routing, create final financial facts or activate a runtime.
 
 Version 0.1.1 pins pypdf 6.16.1. Its corrected character mappings can change
 extracted PDF text, so new PDF evidence uses
