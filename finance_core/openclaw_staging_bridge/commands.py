@@ -119,8 +119,12 @@ from finance_core.parser_proposals.conversion_state import (
 )
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.human_draft_delivery import (
+    active_human_draft_exists,
     begin_human_draft_card_delivery,
+    find_active_human_draft_card_generation,
+    get_human_draft_action_authority,
     get_human_draft_card,
+    get_human_draft_presentation,
     record_human_draft_card_delivery_outcome,
     reissue_human_draft_card,
 )
@@ -2536,12 +2540,8 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
     workspace, conn = _open_context(request.arguments, deadline)
     try:
         if card_generation_public_id is not None:
-            card = conn.execute(
-                "SELECT action_issue_batch_id FROM parser_human_draft_cards "
-                "WHERE card_generation_public_id = ?",
-                (card_generation_public_id,),
-            ).fetchone()
-            if card is None or card["action_issue_batch_id"] != reference_batch_id:
+            authority = get_human_draft_action_authority(conn, card_generation_public_id)
+            if authority is None or authority.action_issue_batch_id != reference_batch_id:
                 raise errors.bridge_error(
                     errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
                     "D1 action issuance identity does not match the durable card.",
@@ -2579,21 +2579,14 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
             else (human_actions.callback_tokens.ACTION_REJECT,)
         )
         if card_generation_public_id is not None:
-            completeness = conn.execute(
-                "SELECT operations.result_completeness "
-                "FROM parser_human_draft_cards AS cards "
-                "JOIN parser_human_draft_operations AS operations "
-                "ON operations.id = cards.original_operation_id "
-                "WHERE cards.card_generation_public_id = ?",
-                (card_generation_public_id,),
-            ).fetchone()
-            if completeness is None:
+            assert authority is not None
+            if authority.result_completeness is None:
                 raise errors.bridge_error(
                     errors.HUMAN_DRAFT_NOT_FOUND,
                     "D1 card generation was not found.",
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
-            if completeness["result_completeness"] != "complete":
+            if authority.result_completeness != "complete":
                 allowed_actions = tuple(
                     action
                     for action in allowed_actions
@@ -2776,26 +2769,12 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                     **lookup_identity,
                 )
             except HumanDraftError as exc:
-                active = conn.execute(
-                    """
-                    SELECT drafts.current_card_generation_public_id
-                    FROM parser_human_drafts AS drafts
-                    JOIN parser_outputs AS proposals
-                      ON proposals.id = drafts.source_parser_output_id
-                    WHERE proposals.public_id = ? AND drafts.authenticated_actor_id = ?
-                      AND drafts.telegram_account_id = ?
-                      AND drafts.telegram_conversation_id = ?
-                      AND drafts.conversation_binding_id = ? AND drafts.state = 'active'
-                    """,
-                    (
-                        redeemed.proposal_public_id,
-                        context.actor_id,
-                        context.account_id,
-                        context.conversation_id,
-                        context.binding_id,
-                    ),
-                ).fetchone()
-                if active is None:
+                active_card = find_active_human_draft_card_generation(
+                    conn,
+                    proposal_public_id=redeemed.proposal_public_id,
+                    context=draft_context,
+                )
+                if active_card is None:
                     raise errors.bridge_error(
                         errors.LIFECYCLE_CONFLICT,
                         "Redeemed Edit reference has no authoritative D1 draft result.",
@@ -2804,7 +2783,7 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                 draft = get_human_draft_card(
                     conn,
                     context=draft_context,
-                    card_generation_public_id=str(active["current_card_generation_public_id"]),
+                    card_generation_public_id=active_card,
                 )
             result["human_draft_card"] = _human_draft_result_payload(conn, draft)
         return result, redeemed.idempotent_replay
@@ -2866,22 +2845,17 @@ def _begin_human_draft_for_redeemed_edit(
         or reference_row.get("card_generation_public_id") is not None
     ):
         return
-    active = conn.execute(
-        """
-        SELECT 1 FROM parser_human_drafts
-        WHERE source_parser_output_id = ? AND authenticated_actor_id = ?
-          AND telegram_account_id = ? AND telegram_conversation_id = ?
-          AND conversation_binding_id = ? AND state = 'active'
-        """,
-        (
-            reference_row["parser_output_id"],
-            reference_row["authenticated_actor_id"],
-            reference_row["channel_account_id"],
-            reference_row["channel_conversation_id"],
-            reference_row["conversation_binding_id"],
-        ),
-    ).fetchone()
-    if active is not None:
+    context = HumanDraftContext(
+        authenticated_actor_id=str(reference_row["authenticated_actor_id"]),
+        telegram_account_id=str(reference_row["channel_account_id"]),
+        telegram_conversation_id=str(reference_row["channel_conversation_id"]),
+        conversation_binding_id=str(reference_row["conversation_binding_id"]),
+    )
+    if active_human_draft_exists(
+        conn,
+        parser_output_id=int(reference_row["parser_output_id"]),
+        context=context,
+    ):
         return
     callback_hash = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()
     start_parts = (
@@ -2914,25 +2888,10 @@ def _human_draft_result_payload(
     conn: sqlite3.Connection, result: HumanDraftResult
 ) -> dict[str, Any]:
     now_epoch = int(datetime.now(UTC).timestamp())
-    draft = conn.execute(
-        "SELECT state, expires_at FROM parser_human_drafts WHERE draft_public_id = ?",
-        (result.draft_public_id,),
-    ).fetchone()
-    card = conn.execute(
-        "SELECT cards.expires_at, operations.operation_public_id "
-        "AS original_operation_or_start_public_id "
-        "FROM parser_human_draft_cards AS cards "
-        "JOIN parser_human_draft_operations AS operations "
-        "ON operations.id = cards.original_operation_id "
-        "WHERE cards.card_generation_public_id = ?",
-        (result.card_generation_public_id,),
-    ).fetchone()
-    active = (
-        draft is not None
-        and card is not None
-        and draft["state"] == "active"
-        and int(draft["expires_at"]) > now_epoch
-        and int(card["expires_at"]) > now_epoch
+    presentation = get_human_draft_presentation(
+        conn,
+        result=result,
+        now_epoch=now_epoch,
     )
     return {
         "draft_public_id": result.draft_public_id,
@@ -2957,19 +2916,19 @@ def _human_draft_result_payload(
         "card_generation_public_id": result.card_generation_public_id,
         "current_card_generation_public_id": result.current_card_generation_public_id,
         "original_operation_or_start_public_id": (
-            None if card is None else str(card["original_operation_or_start_public_id"])
+            presentation.original_operation_or_start_public_id
         ),
         "field_values": dict(result.field_values),
         "decision_target_proposal_public_id": result.decision_target_proposal_public_id,
         "decision_target_proposal_version": result.decision_target_proposal_version,
         "decision_target_proposal_content_hash": result.decision_target_proposal_content_hash,
         "confirm_available": (
-            active
+            presentation.active
             and result.completeness == "complete"
             and result.proposal_public_id is not None
             and result.card_generation_public_id == result.current_card_generation_public_id
         ),
-        "reject_available": active,
+        "reject_available": presentation.active,
         "final_transaction_created": False,
     }
 
