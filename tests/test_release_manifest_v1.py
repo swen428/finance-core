@@ -12,6 +12,8 @@ import tarfile
 import zipfile
 from pathlib import Path
 
+import pytest
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "build_release_manifest.py"
 
@@ -31,7 +33,7 @@ def _manifest_command(
         "--source-root",
         str(source_root),
         "--core-version",
-        "0.1.0",
+        "0.1.1",
         "--core-commit",
         core_commit,
         "--api-contract-version",
@@ -41,10 +43,10 @@ def _manifest_command(
     ]
 
 
-def _write_fake_packages(artifacts: Path, *, bridge_version: str = "0.1.0") -> None:
+def _write_fake_packages(artifacts: Path, *, bridge_version: str = "0.1.1") -> None:
     payloads = {
-        "finance_core-0.1.0-py3-none-any.whl": b"not-a-wheel",
-        "finance_core-0.1.0.tar.gz": b"not-an-sdist",
+        "finance_core-0.1.1-py3-none-any.whl": b"not-a-wheel",
+        "finance_core-0.1.1.tar.gz": b"not-an-sdist",
         f"finance-codex-finance-bridge-{bridge_version}.tgz": b"not-a-bridge",
     }
     for filename, payload in payloads.items():
@@ -94,7 +96,7 @@ def _bridge_provenance(source_files: dict[str, bytes]) -> bytes:
 def _write_bridge_source(source_root: Path) -> dict[str, bytes]:
     bridge_root = source_root / "plugins" / "finance-bridge"
     package_manifest = json.dumps(
-        {"name": "@finance-codex/finance-bridge", "version": "0.1.0"},
+        {"name": "@finance-codex/finance-bridge", "version": "0.1.1"},
         separators=(",", ":"),
     ).encode()
     source_files = {
@@ -175,11 +177,11 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
 
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    wheel = artifacts / "finance_core-0.1.0-py3-none-any.whl"
+    wheel = artifacts / "finance_core-0.1.1-py3-none-any.whl"
     metadata = (
         "Metadata-Version: 2.4\n"
         "Name: finance-core\n"
-        "Version: 0.1.0\n"
+        "Version: 0.1.1\n"
         "Summary: Deterministic, auditable personal-finance core\n"
         "License-Expression: Apache-2.0\n"
         "Requires-Python: >=3.12\n"
@@ -187,7 +189,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
         "License-File: LICENSE\n"
         "License-File: NOTICE\n"
         "License-File: THIRD_PARTY_NOTICES.md\n"
-        "Requires-Dist: pypdf==6.14.2\n"
+        "Requires-Dist: pypdf==6.16.1\n"
         "Requires-Dist: typing-extensions==4.16.0\n"
         "Dynamic: license-file\n\n"
     ).encode() + (source_root / "README.md").read_bytes()
@@ -195,7 +197,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
         b"Wheel-Version: 1.0\nGenerator: setuptools (84.0.0)\n"
         b"Root-Is-Purelib: true\nTag: py3-none-any\n\n"
     )
-    dist_root = "finance_core-0.1.0.dist-info"
+    dist_root = "finance_core-0.1.1.dist-info"
     wheel_payloads = {
         **package_payloads,
         f"{dist_root}/licenses/LICENSE": (source_root / "LICENSE").read_bytes(),
@@ -230,7 +232,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
             "PKG-INFO": metadata,
             "finance_core.egg-info/PKG-INFO": metadata,
             "finance_core.egg-info/dependency_links.txt": b"\n",
-            "finance_core.egg-info/requires.txt": (b"pypdf==6.14.2\ntyping-extensions==4.16.0\n"),
+            "finance_core.egg-info/requires.txt": (b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"),
             "finance_core.egg-info/top_level.txt": b"finance_core\n",
         }
     )
@@ -241,12 +243,12 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     sdist_payloads["finance_core.egg-info/SOURCES.txt"] = "".join(
         f"{name}\n" for name in sources_names
     ).encode()
-    with tarfile.open(artifacts / "finance_core-0.1.0.tar.gz", "w:gz") as archive:
-        _add_tar_directory(archive, "finance_core-0.1.0/finance_core/")
+    with tarfile.open(artifacts / "finance_core-0.1.1.tar.gz", "w:gz") as archive:
+        _add_tar_directory(archive, "finance_core-0.1.1/finance_core/")
         for name, payload in sorted(sdist_payloads.items()):
-            _add_tar_file(archive, f"finance_core-0.1.0/{name}", payload)
+            _add_tar_file(archive, f"finance_core-0.1.1/{name}", payload)
 
-    with tarfile.open(artifacts / "finance-codex-finance-bridge-0.1.0.tgz", "w:gz") as archive:
+    with tarfile.open(artifacts / "finance-codex-finance-bridge-0.1.1.tgz", "w:gz") as archive:
         for name, payload in bridge_files.items():
             _add_tar_file(archive, f"package/{name}", payload)
     return artifacts, source_root, core_commit
@@ -302,14 +304,14 @@ def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None
 
 def test_release_manifest_rejects_modified_build_metadata(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    sdist = artifacts / "finance_core-0.1.0.tar.gz"
+    sdist = artifacts / "finance_core-0.1.1.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         payloads = {
             member.name: archive.extractfile(member).read()
             for member in archive.getmembers()
             if member.isfile() and archive.extractfile(member) is not None
         }
-    pyproject_name = "finance_core-0.1.0/pyproject.toml"
+    pyproject_name = "finance_core-0.1.1/pyproject.toml"
     payloads[pyproject_name] = payloads[pyproject_name].replace(
         b'build-backend = "setuptools.build_meta"',
         b'build-backend = "untrusted.backend"',
@@ -360,6 +362,30 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
     assert "pyproject.toml release metadata is not the approved contract" in completed.stderr
 
 
+@pytest.mark.parametrize(
+    "unapproved_dependency",
+    ["pypdf==6.14.2", "pypdf>=6.16.1", "pypdf @ https://example.invalid/package.whl"],
+)
+def test_release_manifest_rejects_unapproved_runtime_dependency(
+    tmp_path: Path, unapproved_dependency: str
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    project = source_root / "pyproject.toml"
+    project.write_text(
+        project.read_text(encoding="utf-8").replace("pypdf==6.16.1", unapproved_dependency),
+        encoding="utf-8",
+    )
+    completed = subprocess.run(
+        _manifest_command(artifacts, source_root=source_root, core_commit=core_commit),
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "pyproject.toml release metadata is not the approved contract" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
 def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     tool = source_root / "scripts" / "build_release_manifest.py"
@@ -382,10 +408,10 @@ def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path
 
 def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    wheel = artifacts / "finance_core-0.1.0-py3-none-any.whl"
+    wheel = artifacts / "finance_core-0.1.1-py3-none-any.whl"
     with zipfile.ZipFile(wheel, "a") as archive:
         archive.writestr(
-            "finance_core-0.1.0.dist-info/entry_points.txt",
+            "finance_core-0.1.1.dist-info/entry_points.txt",
             "[console_scripts]\nfinance-unsafe = finance_core:unsafe\n",
         )
 
@@ -406,11 +432,11 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
 
 def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    wheel = artifacts / "finance_core-0.1.0-py3-none-any.whl"
+    wheel = artifacts / "finance_core-0.1.1-py3-none-any.whl"
     with zipfile.ZipFile(wheel) as archive:
         payloads = {name: archive.read(name) for name in archive.namelist()}
-    metadata_name = "finance_core-0.1.0.dist-info/METADATA"
-    record_name = "finance_core-0.1.0.dist-info/RECORD"
+    metadata_name = "finance_core-0.1.1.dist-info/METADATA"
+    record_name = "finance_core-0.1.1.dist-info/RECORD"
     payloads[metadata_name] = payloads[metadata_name].replace(
         b"\n\n", b"\nAuthor-Email: private.person@example.invalid\n\n", 1
     )
@@ -444,14 +470,14 @@ def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Pa
 
 def test_release_manifest_rejects_sdist_sources_inventory_drift(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    sdist = artifacts / "finance_core-0.1.0.tar.gz"
+    sdist = artifacts / "finance_core-0.1.1.tar.gz"
     with tarfile.open(sdist, "r:gz") as archive:
         payloads = {
             member.name: archive.extractfile(member).read()
             for member in archive.getmembers()
             if member.isfile() and archive.extractfile(member) is not None
         }
-    sources_name = "finance_core-0.1.0/finance_core.egg-info/SOURCES.txt"
+    sources_name = "finance_core-0.1.1/finance_core.egg-info/SOURCES.txt"
     payloads[sources_name] += b"private-runtime-secret.txt\n"
     with tarfile.open(sdist, "w:gz") as archive:
         for name, payload in payloads.items():
@@ -474,7 +500,7 @@ def test_release_manifest_rejects_sdist_sources_inventory_drift(tmp_path: Path) 
 
 def test_release_manifest_rejects_bridge_payload_not_in_exact_source(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    bridge_path = artifacts / "finance-codex-finance-bridge-0.1.0.tgz"
+    bridge_path = artifacts / "finance-codex-finance-bridge-0.1.1.tgz"
     with tarfile.open(bridge_path, "r:gz") as archive:
         files = {
             member.name: archive.extractfile(member).read()
@@ -505,7 +531,7 @@ def test_release_manifest_rejects_dirty_compiled_bridge_output(tmp_path: Path) -
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     compiled = source_root / "plugins/finance-bridge/dist/src/index.js"
     compiled.write_text("export const unreviewed = true;\n", encoding="utf-8")
-    bridge_path = artifacts / "finance-codex-finance-bridge-0.1.0.tgz"
+    bridge_path = artifacts / "finance-codex-finance-bridge-0.1.1.tgz"
     with tarfile.open(bridge_path, "r:gz") as archive:
         files = {
             member.name: archive.extractfile(member).read()
@@ -573,7 +599,7 @@ def test_release_manifest_rejects_uninspected_package_payloads(tmp_path: Path) -
 def test_release_manifest_rejects_version_or_artifact_ambiguity(tmp_path: Path) -> None:
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    _write_fake_packages(artifacts, bridge_version="0.1.1")
+    _write_fake_packages(artifacts, bridge_version="0.2.0")
 
     completed = subprocess.run(
         _manifest_command(artifacts),
@@ -582,4 +608,4 @@ def test_release_manifest_rejects_version_or_artifact_ambiguity(tmp_path: Path) 
     )
 
     assert completed.returncode != 0
-    assert "expected exactly one Bridge package for version 0.1.0" in completed.stderr
+    assert "expected exactly one Bridge package for version 0.1.1" in completed.stderr
