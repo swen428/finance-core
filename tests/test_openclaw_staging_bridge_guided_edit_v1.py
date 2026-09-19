@@ -956,6 +956,79 @@ def test_legacy_and_d1_issuance_resolve_private_key_collisions(
         conn.close()
 
 
+def test_d1_issuance_fails_closed_for_mixed_partial_binding_evidence(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, _session, redemption = _begin(workspace)
+    card = _draft_from_redemption(workspace, redemption)
+    callback_key = commands._load_callback_key(workspace.workspace_path)
+    first_private_key = commands._persisted_human_action_issuance_keys(
+        str(card["action_issue_batch_id"]), key=callback_key
+    )[0]
+    legacy_batch = first_private_key.removeprefix("bridge-human-action-issue:")
+    legacy_request = support.make_request(
+        "issue_human_actions",
+        {
+            **_context(workspace),
+            "proposal_public_id": card["decision_target_proposal_public_id"],
+            "reference_batch_id": legacy_batch,
+            "token_ttl_seconds": 300,
+            "expected_proposal_version": card["decision_target_proposal_version"],
+            "expected_content_hash": card["decision_target_proposal_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key(legacy_batch),
+    )
+    legacy = support.run_cli(legacy_request)
+    assert legacy.exit_code == bridge_errors.EXIT_OK, legacy.response
+
+    conn = support.open_database(workspace)
+    try:
+        reference_id = int(
+            conn.execute(
+                "SELECT id FROM openclaw_human_action_references "
+                "WHERE issuance_idempotency_key = ? AND action = 'edit'",
+                (first_private_key,),
+            ).fetchone()[0]
+        )
+        conn.execute(
+            """
+            INSERT INTO parser_human_draft_action_bindings (
+                reference_id, card_generation_public_id, draft_id,
+                parser_output_id, proposal_version, proposal_content_hash,
+                authenticated_actor_id, telegram_account_id,
+                telegram_conversation_id, conversation_binding_id, created_at
+            )
+            SELECT ?, cards.card_generation_public_id, cards.draft_id,
+                   cards.decision_target_parser_output_id,
+                   cards.decision_target_proposal_version,
+                   cards.decision_target_proposal_content_hash,
+                   cards.authenticated_actor_id, cards.telegram_account_id,
+                   cards.telegram_conversation_id, cards.conversation_binding_id,
+                   cards.issued_at
+            FROM parser_human_draft_cards AS cards
+            WHERE cards.card_generation_public_id = ?
+            """,
+            (reference_id, card["card_generation_public_id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    refused = _issue_d1_actions(workspace, card)
+    assert refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert refused.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    legacy_refused = support.run_cli(legacy_request)
+    assert legacy_refused.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+    assert legacy_refused.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_human_action_references").fetchone()[0] == 6
+        )
+    finally:
+        conn.close()
+
+
 def test_d1_confirm_requires_the_exact_redeemed_durable_binding(
     workspace: support.BridgeWorkspace,
 ) -> None:

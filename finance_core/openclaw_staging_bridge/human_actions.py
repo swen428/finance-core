@@ -432,10 +432,10 @@ def issue_human_action_references(
             ):
                 occupied_generations = {row["card_generation_public_id"] for row in candidate_rows}
                 same_issuance_identity = (
-                    card_generation_public_id is None and occupied_generations == {None}
+                    card_generation_public_id is None and None in occupied_generations
                 ) or (
                     card_generation_public_id is not None
-                    and occupied_generations == {card_generation_public_id}
+                    and card_generation_public_id in occupied_generations
                 )
                 if same_issuance_identity:
                     raise HumanActionReferenceError("issuance_conflict")
