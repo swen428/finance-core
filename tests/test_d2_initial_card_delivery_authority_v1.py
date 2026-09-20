@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from finance_core import posting_authority as posting_authority_module
+from finance_core.calculation.authoritative_snapshot import canonical_json_text
 from finance_core.openclaw_staging_bridge.human_actions import (
     HumanActionContext,
     HumanActionReferenceError,
@@ -238,16 +239,14 @@ def _migration_049_d1_review(
         ),
     )
     review_public_id = "d2rev_" + "8" * 30
-    projection = json.dumps(
+    projection = canonical_json_text(
         {
             "account": "unspecified",
             "amount": "12.50",
             "currency": "SGD",
-            "merchant": "Kopitiam",
+            "merchant": "Cafe",
             "transaction_date": "2026-09-21",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+        }
     )
     conn.execute(
         """

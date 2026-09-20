@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { extname } from "node:path";
-import { canonicalCaptureKey, captureIdentities, createHumanActionBatchId, createBridgeRequest, framedDigest, guidedEditCompleteKey, guidedEditUpdateKey, humanDraftApplyKey, humanDraftDeliveryAttemptId, humanDraftDeliveryKey, humanDraftObservationId, humanDraftObservationKey, humanDraftOperationId, humanDraftRecoveryId, humanDraftRecoveryKey, humanActionIssuanceKey, } from "./protocol.js";
+import { canonicalCaptureKey, captureIdentities, createHumanActionBatchId, createBridgeRequest, framedDigest, guidedEditCompleteKey, guidedEditUpdateKey, humanDraftApplyKey, humanDraftDeliveryAttemptId, humanDraftDeliveryKey, humanDraftObservationId, humanDraftObservationKey, humanDraftOperationId, humanDraftRecoveryId, humanDraftRecoveryKey, humanActionIssuanceKey, initialPostingReviewPreparationKey, postingActionIssuanceKey, postingReviewPreparationKey, } from "./protocol.js";
 import { humanActionCallbackData, } from "./interactive.js";
 import { parseProcessingStatusV2, renderProcessingFooterV2, } from "./processing-status-v2.js";
 import { ReceiptMediaUnavailableError, } from "./media.js";
@@ -265,6 +265,17 @@ function validateTextTurn(event, context) {
         content.trimStart().startsWith("/")) {
         return undefined;
     }
+    const eventSessionKey = event.sessionKey;
+    const contextSessionKey = context.sessionKey;
+    if ((eventSessionKey !== undefined || contextSessionKey !== undefined) &&
+        (eventSessionKey ?? contextSessionKey) !== (contextSessionKey ?? eventSessionKey)) {
+        return undefined;
+    }
+    const sessionKey = contextSessionKey ?? eventSessionKey;
+    if (sessionKey !== undefined &&
+        (sessionKey.length === 0 || sessionKey.length > 200 || !/^[\x21-\x7e]+$/u.test(sessionKey))) {
+        return undefined;
+    }
     if ((event.replyToId !== undefined || context.replyToId !== undefined) &&
         (event.replyToId === undefined || context.replyToId === undefined ||
             event.replyToId !== context.replyToId)) {
@@ -299,6 +310,7 @@ function validateTextTurn(event, context) {
         chatId,
         messageId,
         senderId,
+        ...(sessionKey === undefined ? {} : { sessionKey }),
         date: timestampMs / 1_000,
         text: content,
         ...(event.replyToId === undefined ? {} : { replyToId: event.replyToId }),
@@ -478,6 +490,178 @@ function requireActionReferences(result, confirmAvailable) {
         output[action] = entry.reference;
     }
     return output;
+}
+function requireInitialPostingReview(result, proposalPublicId, proposalReview, reviewBinding) {
+    const reviewPublicId = result.review_public_id;
+    const initialCardPublicId = result.initial_card_public_id;
+    const projection = result.visible_projection;
+    const postingPath = result.posting_path;
+    if (typeof reviewPublicId !== "string" || !/^d2rev_[0-9a-f]{30}$/u.test(reviewPublicId) ||
+        typeof initialCardPublicId !== "string" || !/^d2card_[0-9a-f]{32}$/u.test(initialCardPublicId) ||
+        result.card_generation_public_id !== null || result.proposal_public_id !== proposalPublicId ||
+        result.proposal_version !== reviewBinding.version ||
+        result.proposal_content_hash !== reviewBinding.contentHash ||
+        (postingPath !== "text" && postingPath !== "personal_receipt") ||
+        typeof result.visible_projection_hash !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(result.visible_projection_hash) ||
+        typeof result.expires_at !== "number" || !Number.isSafeInteger(result.expires_at) ||
+        result.final_transaction_created !== false || !isJsonObject(projection) ||
+        typeof result.presentation_text !== "string") {
+        throw new Error("D2 initial posting review identity is invalid.");
+    }
+    const expected = {
+        amount: proposalReview.amount,
+        currency: proposalReview.currency,
+        transaction_date: proposalReview.transaction_date,
+        merchant: proposalReview.merchant,
+        account: "unspecified",
+    };
+    for (const [field, value] of Object.entries(expected)) {
+        if (projection[field] !== value) {
+            throw new Error(`D2 initial visible projection ${field} differs from the proposal review.`);
+        }
+    }
+    const lines = [
+        `Card Ref: ${initialCardPublicId}`,
+        `Amount: ${projection.amount}`,
+        `Currency: ${projection.currency}`,
+        `Date: ${projection.transaction_date}`,
+        `Merchant: ${projection.merchant ?? "Not specified"}`,
+        `Description: ${proposalReview.description ?? "Not specified"}`,
+        `Category: ${proposalReview.category ?? "Not specified"}`,
+        "Account: Not specified",
+    ];
+    if (postingPath === "personal_receipt") {
+        const calculation = projection.calculation;
+        if (projection.receipt_total !== proposalReview.amount ||
+            projection.personal_share !== proposalReview.amount || !isJsonObject(calculation) ||
+            calculation.total_paid !== proposalReview.amount ||
+            typeof calculation.total_to_collect !== "string" ||
+            !Array.isArray(calculation.settlement_obligations) ||
+            calculation.settlement_obligations.length !== 0) {
+            throw new Error("D2 initial personal receipt projection is invalid.");
+        }
+        lines.push("Source: Receipt", `Receipt total: ${projection.receipt_total}`, "Posting basis: one receipt-total line", `Your share: ${projection.personal_share}`, `Collectible from others: ${calculation.total_to_collect}`, "Settlement obligations: none", "No itemization, tax, fee, or shared allocation will be inferred.");
+    }
+    else {
+        lines.push("No account or shared-expense details will be inferred.");
+    }
+    const text = lines.join("\n");
+    if (result.presentation_text !== text || Buffer.byteLength(text, "utf8") > 4_000) {
+        throw new Error("D2 initial presentation differs from the authoritative review.");
+    }
+    return { reviewPublicId, postingPath, text };
+}
+function requirePostingReview(result, card) {
+    const reviewPublicId = result.review_public_id;
+    const projection = result.visible_projection;
+    const postingPath = result.posting_path;
+    if (typeof reviewPublicId !== "string" || !/^d2rev_[0-9a-f]{30}$/u.test(reviewPublicId) ||
+        result.card_generation_public_id !== card.cardReference ||
+        result.proposal_public_id !== card.proposalPublicId ||
+        result.proposal_version !== card.proposalVersion ||
+        result.proposal_content_hash !== card.proposalContentHash ||
+        (postingPath !== "text" && postingPath !== "personal_receipt") ||
+        typeof result.visible_projection_hash !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(result.visible_projection_hash) ||
+        typeof result.expires_at !== "number" || !Number.isSafeInteger(result.expires_at) ||
+        result.final_transaction_created !== false || !isJsonObject(projection)) {
+        throw new Error("D2 posting review identity is invalid.");
+    }
+    const expected = {
+        amount: card.fields.amount,
+        currency: card.fields.currency,
+        transaction_date: card.fields.transaction_date,
+        merchant: card.fields.merchant,
+        account: "unspecified",
+    };
+    for (const [field, value] of Object.entries(expected)) {
+        if (projection[field] !== value) {
+            throw new Error(`D2 visible projection ${field} differs from the current card.`);
+        }
+    }
+    const lines = [
+        `Card Ref: ${card.cardReference}`,
+        `Amount: ${projection.amount}`,
+        `Currency: ${projection.currency}`,
+        `Date: ${projection.transaction_date}`,
+        `Merchant: ${projection.merchant ?? "Not specified"}`,
+        `Description: ${card.fields.description || "Not specified"}`,
+        `Category: ${card.fields.category || "Not specified"}`,
+        "Account: Not specified",
+    ];
+    if (postingPath === "personal_receipt") {
+        const calculation = projection.calculation;
+        if (projection.receipt_total !== card.fields.amount ||
+            projection.personal_share !== card.fields.amount || !isJsonObject(calculation) ||
+            calculation.total_paid !== card.fields.amount ||
+            typeof calculation.total_to_collect !== "string" ||
+            !Array.isArray(calculation.settlement_obligations) ||
+            calculation.settlement_obligations.length !== 0) {
+            throw new Error("D2 personal receipt projection is invalid.");
+        }
+        lines.push("Source: Receipt", `Receipt total: ${projection.receipt_total}`, "Posting basis: one receipt-total line", `Your share: ${projection.personal_share}`, `Collectible from others: ${calculation.total_to_collect}`, "Settlement obligations: none", "No itemization, tax, fee, or shared allocation will be inferred.");
+    }
+    else if (Object.keys(projection).some((field) => ["receipt_total", "personal_share", "calculation"].includes(field))) {
+        throw new Error("D2 text projection contains receipt-only fields.");
+    }
+    else {
+        lines.push("No account or shared-expense details will be inferred.");
+    }
+    const text = lines.join("\n");
+    if (Buffer.byteLength(text, "utf8") > 4_000) {
+        throw new Error("D2 review card cannot be represented without truncation.");
+    }
+    return { reviewPublicId, postingPath, text };
+}
+function requirePostingDeliveryManifest(result, review) {
+    const controls = result.controls;
+    if (result.posting_review_public_id !== review.reviewPublicId ||
+        typeof result.delivery_attempt_public_id !== "string" ||
+        !/^d2send_[0-9a-f]{32}$/u.test(result.delivery_attempt_public_id) ||
+        result.delivery_manifest_version !== "finance_d2_controls_v1" ||
+        result.text !== review.text ||
+        typeof result.finance_delivery_material_sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(result.finance_delivery_material_sha256) ||
+        typeof result.delivery_attempt_nonce !== "string" ||
+        !/^d2nonce_[0-9a-f]{32}$/u.test(result.delivery_attempt_nonce) ||
+        result.final_transaction_created !== false || !Array.isArray(controls) ||
+        controls.length !== 3) {
+        throw new Error("D2 delivery manifest is invalid.");
+    }
+    const expected = [
+        { action: "confirm", label: "Confirm", row: 0, column: 0, route: "post:" },
+        { action: "edit", label: "Edit", row: 1, column: 0, route: "edit:" },
+        { action: "reject", label: "Reject", row: 1, column: 1, route: "reject:" },
+    ];
+    const buttons = [[], []];
+    for (let index = 0; index < expected.length; index += 1) {
+        const control = controls[index];
+        const contract = expected[index];
+        if (!isJsonObject(control) || control.action !== contract.action ||
+            control.label !== contract.label || control.row_index !== contract.row ||
+            control.column_index !== contract.column ||
+            typeof control.callback_value !== "string" ||
+            !control.callback_value.startsWith(contract.route)) {
+            throw new Error("D2 delivery control is invalid.");
+        }
+        const reference = control.callback_value.slice(contract.route.length);
+        if (!/^fha1_[A-Za-z0-9_-]{24}$/u.test(reference)) {
+            throw new Error("D2 delivery control reference is invalid.");
+        }
+        if (control.callback_value !== `${contract.route}${reference}`) {
+            throw new Error("D2 delivery callback route is invalid.");
+        }
+        buttons[contract.row].push({
+            text: contract.label,
+            callback_data: control.callback_value,
+        });
+    }
+    return {
+        attemptNonce: result.delivery_attempt_nonce,
+        buttons,
+        text: result.text,
+    };
 }
 function isJsonObject(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -819,13 +1003,16 @@ export class FinanceInboundController {
         const language = /(?:资料卡编号|金额|币种|日期|商户|描述|分类)/u.test(turn.text)
             ? "zh"
             : "en";
-        const text = renderWholeCard({
+        let text = renderWholeCard({
             cardReference: card.cardReference,
             fields: card.fields,
             language,
             status: card.completeness === "complete" ? "publishable" : "incomplete",
             unresolvedReasons: card.unresolvedFlags,
         });
+        if (card.confirmAvailable) {
+            return await this.deliverHumanDraftPostingReview(card, turn, deadline);
+        }
         const issuedResponse = await this.runner.run(createBridgeRequest("issue_human_actions", {
             ...commandContext,
             proposal_public_id: card.proposalPublicId,
@@ -844,24 +1031,10 @@ export class FinanceInboundController {
             issued.final_transaction_created !== false) {
             throw new Error("D1 human action issuance identity mismatch.");
         }
-        const references = requireActionReferences(issued, card.confirmAvailable);
+        const references = requireActionReferences(issued, false);
         if (references.reject === undefined)
             throw new Error("D1 Reject reference is missing.");
         const buttons = [];
-        if (card.confirmAvailable) {
-            if (references.confirm === undefined || references.edit === undefined) {
-                throw new Error("D1 complete action references are missing.");
-            }
-            buttons.push({
-                label: "Confirm",
-                style: "success",
-                action: { type: "callback", value: humanActionCallbackData("confirm", references.confirm) },
-            });
-            buttons.push({
-                label: "Edit",
-                action: { type: "callback", value: humanActionCallbackData("edit", references.edit) },
-            });
-        }
         buttons.push({
             label: "Reject",
             style: "danger",
@@ -974,15 +1147,17 @@ export class FinanceInboundController {
                 response.result.effective_content_hash !== lookup.effective_content_hash ||
                 typeof response.result.review_batch_id !== "string" ||
                 !/^[0-9a-f]{32}$/u.test(response.result.review_batch_id) ||
+                !isJsonObject(response.result.human_draft_card) ||
                 response.result.final_transaction_created !== false) {
                 throw new Error("Guided edit completion result is invalid.");
             }
-            const proposalPublicId = requirePublicId(response.result, "proposal_public_id", "proposal");
-            return await this.reviewProposal(proposalPublicId, turn, deadline, undefined, {
-                sessionPublicId,
-                messageId: turn.messageId,
-                batchId: response.result.review_batch_id,
-            });
+            const card = requireActionableHumanDraftCard(response.result.human_draft_card);
+            if (card.proposalPublicId !== response.result.proposal_public_id ||
+                card.proposalVersion !== response.result.proposal_version ||
+                card.proposalContentHash !== response.result.effective_content_hash) {
+                throw new Error("Guided edit D1 card differs from the completed proposal.");
+            }
+            return await this.deliverHumanDraftPostingReview(card, turn, deadline);
         }
         const response = await this.runner.run(createBridgeRequest("apply_guided_edit_update", {
             ...context,
@@ -1040,6 +1215,10 @@ export class FinanceInboundController {
             telegram_chat_id: turn.chatId,
             telegram_message_date: turn.date,
             sender_id: turn.senderId,
+            authenticated_actor_id: String(turn.senderId),
+            telegram_account_id: turn.accountId,
+            telegram_conversation_id: String(turn.chatId),
+            conversation_binding_id: turn.bindingId,
             declared_mime_type: media.detectedMimeType,
             ...(media.originalFilename === undefined
                 ? {}
@@ -1094,6 +1273,10 @@ export class FinanceInboundController {
                 from: { id: turn.senderId },
                 text: turn.text,
             },
+            authenticated_actor_id: String(turn.senderId),
+            telegram_account_id: turn.accountId,
+            telegram_conversation_id: String(turn.chatId),
+            conversation_binding_id: turn.bindingId,
         }, key), deadline()));
         return await this.proposeAndReviewCaptured(capture, turn, deadline);
     }
@@ -1143,6 +1326,44 @@ export class FinanceInboundController {
             : deterministicProposalPublicId;
         return await this.reviewProposal(proposalPublicId, turn, deadline, intakePublicId);
     }
+    async deliverHumanDraftPostingReview(card, turn, deadline) {
+        if (!card.confirmAvailable || card.completeness !== "complete" ||
+            card.cardReference !== card.currentCardReference) {
+            throw new Error("D2 delivery requires the complete current D1 card.");
+        }
+        if (turn.sessionKey !== turn.bindingId) {
+            throw new Error("D2 terminal delivery session does not match the private binding.");
+        }
+        const commandContext = {
+            workspace_path: this.workspaceRoot,
+            operator_actor_id: String(turn.senderId),
+            telegram_account_id: turn.accountId,
+            telegram_conversation_id: String(turn.chatId),
+            conversation_binding_id: turn.bindingId,
+        };
+        const prepared = requireOk(await this.runner.run(createBridgeRequest("prepare_posting_review", {
+            ...commandContext,
+            card_generation_public_id: card.cardReference,
+        }, postingReviewPreparationKey(card.cardReference)), deadline()));
+        const review = requirePostingReview(prepared, card);
+        const postingActions = requireOk(await this.runner.run(createBridgeRequest("issue_posting_review_actions", {
+            ...commandContext,
+            posting_review_public_id: review.reviewPublicId,
+        }, postingActionIssuanceKey(review.reviewPublicId)), deadline()));
+        const delivery = requirePostingDeliveryManifest(postingActions, review);
+        return {
+            handled: true,
+            reply: {
+                text: delivery.text,
+                channelData: {
+                    telegram: {
+                        buttons: delivery.buttons,
+                        financeDeliveryMaterialV1: { attemptNonce: delivery.attemptNonce },
+                    },
+                },
+            },
+        };
+    }
     async reviewProposal(proposalPublicId, turn, deadline, intakePublicId, guidedRecovery) {
         const review = requireOk(await this.runner.run(createBridgeRequest("get_review", { workspace_path: this.workspaceRoot, proposal_public_id: proposalPublicId }), deadline()));
         if (requirePublicId(review, "proposal_public_id", "proposal") !== proposalPublicId) {
@@ -1154,6 +1375,41 @@ export class FinanceInboundController {
         const confirmAvailable = review.confirm_available;
         const reviewBinding = requireReviewBinding(review);
         const renderedReview = renderReview(review, confirmAvailable);
+        if (confirmAvailable) {
+            if (turn.sessionKey !== turn.bindingId) {
+                throw new Error("D2 terminal delivery session does not match the private binding.");
+            }
+            const commandContext = {
+                workspace_path: this.workspaceRoot,
+                operator_actor_id: String(turn.senderId),
+                telegram_account_id: turn.accountId,
+                telegram_conversation_id: String(turn.chatId),
+                conversation_binding_id: turn.bindingId,
+            };
+            const prepared = requireOk(await this.runner.run(createBridgeRequest("prepare_posting_review", {
+                ...commandContext,
+                proposal_public_id: proposalPublicId,
+                admitted_source_message_id: String(turn.messageId),
+            }, initialPostingReviewPreparationKey(proposalPublicId, turn.messageId)), deadline()));
+            const postingReview = requireInitialPostingReview(prepared, proposalPublicId, review, reviewBinding);
+            const postingManifest = requireOk(await this.runner.run(createBridgeRequest("issue_posting_review_actions", {
+                ...commandContext,
+                posting_review_public_id: postingReview.reviewPublicId,
+            }, postingActionIssuanceKey(postingReview.reviewPublicId)), deadline()));
+            const delivery = requirePostingDeliveryManifest(postingManifest, postingReview);
+            return {
+                handled: true,
+                reply: {
+                    text: delivery.text,
+                    channelData: {
+                        telegram: {
+                            buttons: delivery.buttons,
+                            financeDeliveryMaterialV1: { attemptNonce: delivery.attemptNonce },
+                        },
+                    },
+                },
+            };
+        }
         const text = intakePublicId === undefined
             ? renderedReview
             : `${renderedReview}\n\nFinance intake: ${intakePublicId}\n${await this.processingFooter(intakePublicId, deadline)}`;
@@ -1211,28 +1467,11 @@ export class FinanceInboundController {
             issued.final_transaction_created !== false) {
             throw new Error("Human action issuance identity mismatch.");
         }
-        const references = requireActionReferences(issued, confirmAvailable);
+        const references = requireActionReferences(issued, false);
         if (references.reject === undefined) {
             throw new Error("Reject action reference is missing.");
         }
         const buttons = [];
-        if (confirmAvailable) {
-            if (references.confirm === undefined) {
-                throw new Error("Confirm action reference is missing.");
-            }
-            buttons.push({
-                label: "Confirm",
-                style: "success",
-                action: { type: "callback", value: humanActionCallbackData("confirm", references.confirm) },
-            });
-            if (references.edit === undefined) {
-                throw new Error("Edit action reference is missing.");
-            }
-            buttons.push({
-                label: "Edit",
-                action: { type: "callback", value: humanActionCallbackData("edit", references.edit) },
-            });
-        }
         buttons.push({
             label: "Reject",
             style: "danger",

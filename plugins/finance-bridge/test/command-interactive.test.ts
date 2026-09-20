@@ -13,10 +13,12 @@ import {
   DISABLED_ACTIONS,
   DISABLED_REPLY,
   EDIT_PRESENTATION_FAILURE_REPLY,
+  POSTING_OUTCOME_UNKNOWN_REPLY,
   createHumanActionInteractiveHandler,
   createDisabledInteractiveHandler,
   disabledCallbackData,
   humanActionCallbackData,
+  postingActionCallbackData,
 } from "../src/interactive.js";
 import {
   framedDigest,
@@ -249,7 +251,7 @@ function ok(request: BridgeRequest, result: JsonObject): BridgeResponse {
 }
 
 test("active direct-human callbacks redeem durably then decide without submitText or finalization", async () => {
-  assert.deepEqual(ACTIVE_ACTIONS, ["confirm", "edit", "reject"]);
+  assert.deepEqual(ACTIVE_ACTIONS, ["post", "confirm", "edit", "reject"]);
   const reference = `fha1_${"A".repeat(24)}`;
   const requests: BridgeRequest[] = [];
   const edits: string[] = [];
@@ -322,6 +324,94 @@ test("active direct-human callbacks redeem durably then decide without submitTex
   assert.equal(bindingReads, 2);
   assert.deepEqual(edits, ["Finance proposal confirmed. Finalization has not run."]);
   assert.equal("submitText" in result, false);
+});
+
+function finalizedPosting(request: BridgeRequest): BridgeResponse {
+  return ok(request, {
+    review_public_id: `d2rev_${"1".repeat(30)}`,
+    state: "finalized",
+    attempt_public_id: `d2att_${"2".repeat(30)}`,
+    transaction_public_id: `txn_${"3".repeat(32)}`,
+    attention_reason: null,
+    amount: "12.50",
+    currency: "SGD",
+    transaction_date: "2026-09-19",
+    merchant: "Example Cafe",
+    account: "unspecified",
+    final_transaction_created: true,
+  });
+}
+
+test("D2 Confirm posts once and shows Posted only with the canonical transaction", async () => {
+  const reference = `fha1_${"P".repeat(24)}`;
+  const requests: BridgeRequest[] = [];
+  const edits: string[] = [];
+  const handler = createHumanActionInteractiveHandler(() => ({
+    workspaceRoot: "/tmp/workspace",
+    runner: {
+      async run(request: BridgeRequest): Promise<BridgeResponse> {
+        requests.push(request);
+        return finalizedPosting(request);
+      },
+    },
+  }));
+  await handler({
+    channel: "telegram", accountId: "finance-account", callbackId: "callback-d2-post",
+    conversationId: "111", parentConversationId: "111", senderId: "111",
+    isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
+    callback: {
+      data: postingActionCallbackData(reference), namespace: "finance-bridge",
+      payload: `post:${reference}`, messageId: 20, chatId: "111",
+    },
+    respond: {
+      async reply() { throw new Error("reply fallback should not run"); },
+      async editMessage({ text }: {text: string}) { edits.push(text); },
+    },
+    async getCurrentConversationBinding() { return binding; },
+  });
+  assert.deepEqual(requests.map((request) => request.command), ["confirm_and_post"]);
+  assert.match(String(requests[0]?.idempotency_key), /^bridge-d2-confirm:[0-9a-f]{32}$/u);
+  assert.deepEqual(edits, [
+    `Finance posted.\nTransaction ID: txn_${"3".repeat(32)}\n` +
+    "Amount: 12.50 SGD\nDate: 2026-09-19\nMerchant: Example Cafe\nAccount: Not specified",
+  ]);
+});
+
+test("lost D2 response queries durable status and returns the original result", async () => {
+  const reference = `fha1_${"Q".repeat(24)}`;
+  const requests: BridgeRequest[] = [];
+  const edits: string[] = [];
+  let replies = 0;
+  const handler = createHumanActionInteractiveHandler(() => ({
+    workspaceRoot: "/tmp/workspace",
+    runner: {
+      async run(request: BridgeRequest): Promise<BridgeResponse> {
+        requests.push(request);
+        if (request.command === "confirm_and_post") throw new Error("synthetic lost response");
+        return finalizedPosting(request);
+      },
+    },
+  }));
+  await handler({
+    channel: "telegram", accountId: "finance-account", callbackId: "callback-d2-lost",
+    conversationId: "111", parentConversationId: "111", senderId: "111",
+    isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
+    callback: {
+      data: postingActionCallbackData(reference), namespace: "finance-bridge",
+      payload: `post:${reference}`, messageId: 20, chatId: "111",
+    },
+    respond: {
+      async reply({ text }: {text: string}) {
+        replies += 1;
+        assert.notEqual(text, POSTING_OUTCOME_UNKNOWN_REPLY);
+      },
+      async editMessage({ text }: {text: string}) { edits.push(text); },
+    },
+    async getCurrentConversationBinding() { return binding; },
+  });
+  assert.deepEqual(requests.map((request) => request.command), ["confirm_and_post", "get_status"]);
+  assert.equal(replies, 0);
+  assert.match(edits[0] ?? "", new RegExp(`Transaction ID: txn_${"3".repeat(32)}`, "u"));
 });
 
 test("generation-bound decisions carry only the redeemed durable D1 reference", async () => {
@@ -548,7 +638,7 @@ test("edit callback renders the atomically started D1 card without a second begi
   assert.doesNotMatch(failureReplies[0] ?? "", new RegExp(cardReference, "u"));
 });
 
-test("editing a current complete D1 card removes the consumed Edit control", async () => {
+test("editing a current complete D1 card returns one host-attested D2 control manifest", async () => {
   const reference = `fha1_${"E".repeat(24)}`;
   const proposal = `po_d1_${"1".repeat(32)}`;
   const cardReference = `d1card_${"2".repeat(32)}`;
@@ -569,10 +659,56 @@ test("editing a current complete D1 card removes the consumed Edit control", asy
             content_hash: "3".repeat(64),
             card_generation_public_id: cardReference,
             actions: {
-              confirm: { reference: actionReferences.confirm, expiry: 2_000_000_000 },
               edit: { reference: actionReferences.edit, expiry: 2_000_000_000 },
               reject: { reference: actionReferences.reject, expiry: 2_000_000_000 },
             },
+            final_transaction_created: false,
+          });
+        }
+        if (request.command === "prepare_posting_review") {
+          return ok(request, {
+            review_public_id: `d2rev_${"6".repeat(30)}`,
+            card_generation_public_id: cardReference,
+            proposal_public_id: proposal,
+            proposal_version: 0,
+            proposal_content_hash: "3".repeat(64),
+            posting_path: "text",
+            visible_projection: {
+              amount: "12.50", currency: "SGD", transaction_date: "2026-09-19",
+              merchant: "Example", account: "unspecified",
+            },
+            visible_projection_hash: "7".repeat(64),
+            expires_at: 2_000_000_000,
+            final_transaction_created: false,
+          });
+        }
+        if (request.command === "issue_posting_review_actions") {
+          const text = [
+            `Card Ref: ${cardReference}`,
+            "Amount: 12.50",
+            "Currency: SGD",
+            "Date: 2026-09-19",
+            "Merchant: Example",
+            "Description: Lunch",
+            "Category: Meals",
+            "Account: Not specified",
+            "No account or shared-expense details will be inferred.",
+          ].join("\n");
+          return ok(request, {
+            posting_review_public_id: `d2rev_${"6".repeat(30)}`,
+            delivery_attempt_public_id: `d2send_${"1".repeat(32)}`,
+            delivery_manifest_version: "finance_d2_controls_v1",
+            text,
+            controls: [
+              { action: "confirm", label: "Confirm", row_index: 0, column_index: 0,
+                callback_value: `post:${actionReferences.confirm}` },
+              { action: "edit", label: "Edit", row_index: 1, column_index: 0,
+                callback_value: `edit:fha1_${"N".repeat(24)}` },
+              { action: "reject", label: "Reject", row_index: 1, column_index: 1,
+                callback_value: `reject:${actionReferences.reject}` },
+            ],
+            finance_delivery_material_sha256: "2".repeat(64),
+            delivery_attempt_nonce: `d2nonce_${"3".repeat(32)}`,
             final_transaction_created: false,
           });
         }
@@ -630,6 +766,7 @@ test("editing a current complete D1 card removes the consumed Edit control", asy
   await handler({
     channel: "telegram", accountId: "finance-account", callbackId: "callback-d1-edit",
     conversationId: "111", parentConversationId: "111", senderId: "111",
+    sessionKey: "binding-1",
     isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
     callback: {
       data: humanActionCallbackData("edit", reference), namespace: "finance-bridge",
@@ -643,7 +780,9 @@ test("editing a current complete D1 card removes the consumed Edit control", asy
     },
     async getCurrentConversationBinding() { return binding; },
   });
-  assert.deepEqual(edits[0]?.[0]?.map((button) => button.text), ["Confirm", "Reject"]);
+  assert.deepEqual(edits[0]?.map((row) => row.map((button) => button.text)), [
+    ["Confirm"], ["Edit", "Reject"],
+  ]);
   assert.equal(
     edits[0]?.flat().some((button) => button.callback_data.includes(actionReferences.edit)),
     false,

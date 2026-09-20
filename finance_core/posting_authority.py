@@ -177,6 +177,11 @@ class PostingStatus:
     attempt_public_id: str | None
     transaction_public_id: str | None
     attention_reason: str | None
+    amount: str | None = None
+    currency: str | None = None
+    transaction_date: str | None = None
+    merchant: str | None = None
+    account: str | None = None
 
 
 def _now_epoch() -> int:
@@ -344,9 +349,22 @@ def _projection_for_review(
         return "text", base_projection, None
     if not isinstance(merchant, str) or not merchant.strip():
         raise PostingAuthorityError("personal receipt proposal requires merchant")
-    if not receipt_payer_participant_public_id or not receipt_payer_participant_public_id.strip():
-        raise PostingAuthorityError("personal receipt requires the authenticated payer participant")
-    payer = receipt_payer_participant_public_id.strip()
+    if receipt_payer_participant_public_id is None:
+        participants = conn.execute(
+            "SELECT public_id FROM participants "
+            "WHERE is_self = 1 AND is_active = 1 ORDER BY public_id"
+        ).fetchall()
+        if len(participants) != 1:
+            raise PostingAuthorityError(
+                "personal receipt requires exactly one active self participant"
+            )
+        payer = str(participants[0]["public_id"])
+    else:
+        payer = receipt_payer_participant_public_id.strip()
+        if not payer:
+            raise PostingAuthorityError(
+                "personal receipt payer participant must not be empty"
+            )
     _require_active_self_participant(conn, payer)
     candidate: dict[str, object] = {
         "payer_participant_public_id": payer,
@@ -2697,7 +2715,7 @@ def get_status(
         "WHERE active_drafts.decision_target_parser_output_id = reviews.parser_output_id "
         "AND active_drafts.state = 'active') AS initial_replaced_by_edit, "
         "reviews.posting_path, reviews.parser_output_id, reviews.proposal_content_hash, "
-        "reviews.authenticated_actor_id "
+        "reviews.authenticated_actor_id, reviews.visible_projection_json "
         "FROM d2_posting_reviews AS reviews "
         "JOIN parser_outputs AS proposals ON proposals.id = reviews.parser_output_id "
         "LEFT JOIN d2_posting_attempts AS attempts "
@@ -2845,13 +2863,49 @@ def get_status(
             if row["transaction_public_id"] not in {None, authoritative_transaction}:
                 integrity_error = True
             else:
-                return PostingStatus(
-                    review_public_id=review_public_id,
-                    state="finalized",
-                    attempt_public_id=str(row["attempt_public_id"]),
-                    transaction_public_id=authoritative_transaction,
-                    attention_reason=None,
-                )
+                transaction = conn.execute(
+                    "SELECT amount, currency, transaction_date, merchant, account_id "
+                    "FROM transactions WHERE public_id = ?",
+                    (authoritative_transaction,),
+                ).fetchone()
+                try:
+                    projection = canonical_json_value(
+                        str(row["visible_projection_json"]),
+                        label="D2 visible projection",
+                    )
+                    if not isinstance(projection, dict) or transaction is None:
+                        raise ValueError("missing D2 result projection")
+                    currency = normalize_currency(str(transaction["currency"] or ""))
+                    amount = canonical_money_str(
+                        money_decimal(str(transaction["amount"]), label="D2 result amount"),
+                        currency,
+                    )
+                    transaction_date = str(transaction["transaction_date"] or "")[:10]
+                    merchant = str(transaction["merchant"] or "")
+                    if (
+                        projection.get("amount") != amount
+                        or projection.get("currency") != currency
+                        or projection.get("transaction_date") != transaction_date
+                        or projection.get("merchant") != merchant
+                        or projection.get("account") != "unspecified"
+                        or transaction["account_id"] is not None
+                    ):
+                        raise ValueError("D2 result differs from confirmed projection")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    integrity_error = True
+                else:
+                    return PostingStatus(
+                        review_public_id=review_public_id,
+                        state="finalized",
+                        attempt_public_id=str(row["attempt_public_id"]),
+                        transaction_public_id=authoritative_transaction,
+                        attention_reason=None,
+                        amount=amount,
+                        currency=currency,
+                        transaction_date=transaction_date,
+                        merchant=merchant,
+                        account="unspecified",
+                    )
         if integrity_error or stage == "finalized":
             return PostingStatus(
                 review_public_id=review_public_id,
@@ -2880,6 +2934,49 @@ def get_status(
     )
 
 
+def get_status_by_reference(
+    conn: sqlite3.Connection,
+    *,
+    reference: str,
+    context: HumanActionContext,
+) -> PostingStatus:
+    """Resolve a D2 review from its opaque Confirm capability using SELECTs only."""
+    require_staging_database(conn)
+    _require_d2_schema(conn)
+    _require_context(context)
+    if not isinstance(reference, str) or not reference.strip():
+        raise PostingAuthorityError("posting authority unavailable")
+    row = conn.execute(
+        "SELECT bindings.review_public_id "
+        "FROM openclaw_human_action_references AS refs "
+        "JOIN d2_posting_review_action_bindings AS bindings "
+        "ON bindings.reference_id = refs.id "
+        "JOIN d2_posting_reviews AS reviews "
+        "ON reviews.review_public_id = bindings.review_public_id "
+        "WHERE refs.reference_sha256 = ? AND refs.action = 'confirm' "
+        "AND refs.authenticated_actor_id = ? AND refs.channel_account_id = ? "
+        "AND refs.channel_conversation_id = ? AND refs.conversation_binding_id = ? "
+        "AND reviews.authenticated_actor_id = refs.authenticated_actor_id "
+        "AND reviews.telegram_account_id = refs.channel_account_id "
+        "AND reviews.telegram_conversation_id = refs.channel_conversation_id "
+        "AND reviews.conversation_binding_id = refs.conversation_binding_id",
+        (
+            _sha256_text(reference),
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise PostingAuthorityError("posting authority unavailable")
+    return get_status(
+        conn,
+        review_public_id=str(row["review_public_id"]),
+        context=context,
+    )
+
+
 __all__ = [
     "CALLBACK_VALUE_VERSION",
     "DELIVERY_MANIFEST_VERSION",
@@ -2894,6 +2991,7 @@ __all__ = [
     "confirm_and_post",
     "finance_delivery_material_digest",
     "get_status",
+    "get_status_by_reference",
     "issue_posting_review_actions",
     "prepare_posting_review",
     "record_posting_review_delivery",

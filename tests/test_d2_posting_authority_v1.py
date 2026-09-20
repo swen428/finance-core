@@ -26,6 +26,7 @@ from finance_core.posting_authority import (
     begin_posting_review_delivery,
     confirm_and_post,
     get_status,
+    get_status_by_reference,
     issue_posting_review_actions,
     prepare_posting_review,
     record_posting_review_delivery,
@@ -235,6 +236,20 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
     )
     assert status.state == "finalized"
     assert status.transaction_public_id is not None
+    assert (
+        status.amount,
+        status.currency,
+        status.transaction_date,
+        status.merchant,
+        status.account,
+    ) == (
+        "12.50",
+        "SGD",
+        "2026-09-13",
+        "Cafe",
+        "unspecified",
+    )
+    assert get_status_by_reference(conn, reference=issued.reference, context=context) == status
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM d2_posting_decisions").fetchone()[0] == 1
 
@@ -1028,7 +1043,6 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
         review_idempotency_key="d2-personal-receipt-review",
         card_generation_public_id=published.card_generation_public_id,
         context=context,
-        receipt_payer_participant_public_id="person_owner",
         clock=lambda: 1002,
     )
     assert review.posting_path == "personal_receipt"

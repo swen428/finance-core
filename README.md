@@ -37,7 +37,7 @@ identity files with:
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.3 \
+  --core-version 0.1.4 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
@@ -46,6 +46,12 @@ python scripts/build_release_manifest.py \
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
+
+Version 0.1.4 adds D2 one-confirmation guarded posting for complete text and
+personal-total receipt cards. The Bridge renders Python-owned projections,
+uses one Confirm action, reports Posted only with a verified canonical
+transaction ID, and recovers lost responses without creating a second
+authorization or transaction. It does not activate or upgrade a runtime.
 
 Version 0.1.3 completes the bounded D1 whole-card Bridge routing flow. It
 parses and renders bilingual whole cards, routes reply-bound edits through the

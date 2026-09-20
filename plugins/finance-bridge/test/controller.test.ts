@@ -43,6 +43,7 @@ const event: PluginHookInboundClaimEvent = {
   parentConversationId: "111",
   senderId: "111",
   messageId: "20",
+  sessionKey: "binding-1",
   isGroup: false,
   commandAuthorized: true,
   senderIsOwner: true,
@@ -66,6 +67,7 @@ const context: PluginHookInboundClaimContext = {
   conversationId: "111",
   senderId: "111",
   messageId: "20",
+  sessionKey: "binding-1",
   pluginBinding: binding,
 };
 
@@ -106,6 +108,22 @@ function issuedActions(request: BridgeRequest, proposalPublicId: string): Bridge
   });
 }
 
+function issuedRejectAction(request: BridgeRequest, proposalPublicId: string): BridgeResponse {
+  const proposalVersion = request.arguments.expected_proposal_version;
+  const contentHash = request.arguments.expected_content_hash;
+  assert.equal(typeof proposalVersion, "number");
+  assert.equal(typeof contentHash, "string");
+  return ok(request, {
+    proposal_public_id: proposalPublicId,
+    proposal_version: proposalVersion,
+    content_hash: contentHash,
+    actions: {
+      reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
+    },
+    final_transaction_created: false,
+  });
+}
+
 const D1_CARD_G0 = `d1card_${"a".repeat(32)}`;
 const D1_CARD_G1 = `d1card_${"b".repeat(32)}`;
 const D1_CARD_G2 = `d1card_${"c".repeat(32)}`;
@@ -119,6 +137,41 @@ function wholeCardText(cardReference = D1_CARD_G0): string {
     "Merchant: Example Cafe",
     "Description: Lunch",
     "Category: Food",
+  ].join("\n");
+}
+
+interface D2CardFields {
+  amount: string;
+  currency: string;
+  transactionDate: string;
+  merchant: string;
+  description: string;
+  category: string;
+}
+
+const DEFAULT_D2_CARD_FIELDS: D2CardFields = {
+  amount: "12.50",
+  currency: "SGD",
+  transactionDate: "2026-09-19",
+  merchant: "Example Cafe",
+  description: "Lunch",
+  category: "Food",
+};
+
+function d2DeliveryText(
+  cardReference = D1_CARD_G1,
+  fields: D2CardFields = DEFAULT_D2_CARD_FIELDS,
+): string {
+  return [
+    `Card Ref: ${cardReference}`,
+    `Amount: ${fields.amount}`,
+    `Currency: ${fields.currency}`,
+    `Date: ${fields.transactionDate}`,
+    `Merchant: ${fields.merchant}`,
+    `Description: ${fields.description}`,
+    `Category: ${fields.category}`,
+    "Account: Not specified",
+    "No account or shared-expense details will be inferred.",
   ].join("\n");
 }
 
@@ -167,6 +220,33 @@ function humanDraftCard(
   });
 }
 
+function guidedHumanDraftResult(
+  request: BridgeRequest,
+  proposalPublicId: string,
+  proposalVersion: number,
+  proposalContentHash: string,
+  merchant = "taxi",
+): JsonObject {
+  const response = humanDraftCard(request, {
+    proposal_public_id: proposalPublicId,
+    proposal_version: proposalVersion,
+    proposal_content_hash: proposalContentHash,
+    decision_target_proposal_public_id: proposalPublicId,
+    decision_target_proposal_version: proposalVersion,
+    decision_target_proposal_content_hash: proposalContentHash,
+    field_values: {
+      amount: "35.50",
+      currency: "SGD",
+      transaction_date: "2026-08-13",
+      merchant,
+      description: "",
+      category: "",
+    },
+  });
+  if (response.status !== "ok") throw new Error("Guided D1 fixture failed.");
+  return response.result;
+}
+
 function issuedD1Actions(request: BridgeRequest, confirmAvailable: boolean): BridgeResponse {
   const proposal = request.arguments.proposal_public_id;
   const version = request.arguments.expected_proposal_version;
@@ -181,7 +261,12 @@ function issuedD1Actions(request: BridgeRequest, confirmAvailable: boolean): Bri
     proposal_version: version,
     content_hash: contentHash,
     card_generation_public_id: generation,
-    actions: confirmAvailable
+    actions: Array.isArray(request.arguments.requested_actions)
+      ? {
+          edit: { reference: `fha1_${"C".repeat(24)}`, expiry: 2_000_000_000 },
+          reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
+        }
+      : confirmAvailable
       ? {
           confirm: { reference: `fha1_${"A".repeat(24)}`, expiry: 2_000_000_000 },
           edit: { reference: `fha1_${"C".repeat(24)}`, expiry: 2_000_000_000 },
@@ -190,6 +275,81 @@ function issuedD1Actions(request: BridgeRequest, confirmAvailable: boolean): Bri
       : {
           reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
         },
+    final_transaction_created: false,
+  });
+}
+
+const D2_REVIEW = `d2rev_${"9".repeat(30)}`;
+
+function preparedD2Review(request: BridgeRequest, cardReference = D1_CARD_G1): BridgeResponse {
+  return ok(request, {
+    review_public_id: D2_REVIEW,
+    card_generation_public_id: cardReference,
+    proposal_public_id: `po_d1_${"6".repeat(32)}`,
+    proposal_version: 0,
+    proposal_content_hash: "7".repeat(64),
+    posting_path: "text",
+    visible_projection: {
+      amount: "12.50",
+      currency: "SGD",
+      transaction_date: "2026-09-19",
+      merchant: "Example Cafe",
+      account: "unspecified",
+    },
+    visible_projection_hash: "8".repeat(64),
+    expires_at: 2_000_000_000,
+    final_transaction_created: false,
+  });
+}
+
+function preparedGuidedD2Review(
+  request: BridgeRequest,
+  proposalPublicId: string,
+  proposalVersion: number,
+  proposalContentHash: string,
+  merchant = "taxi",
+): BridgeResponse {
+  return ok(request, {
+    review_public_id: D2_REVIEW,
+    card_generation_public_id: D1_CARD_G1,
+    proposal_public_id: proposalPublicId,
+    proposal_version: proposalVersion,
+    proposal_content_hash: proposalContentHash,
+    posting_path: "text",
+    visible_projection: {
+      amount: "35.50",
+      currency: "SGD",
+      transaction_date: "2026-08-13",
+      merchant,
+      account: "unspecified",
+    },
+    visible_projection_hash: "8".repeat(64),
+    expires_at: 2_000_000_000,
+    final_transaction_created: false,
+  });
+}
+
+function issuedD2Action(
+  request: BridgeRequest,
+  cardReference = D1_CARD_G1,
+  fields: D2CardFields = DEFAULT_D2_CARD_FIELDS,
+): BridgeResponse {
+  const text = d2DeliveryText(cardReference, fields);
+  return ok(request, {
+    posting_review_public_id: D2_REVIEW,
+    delivery_attempt_public_id: `d2send_${"1".repeat(32)}`,
+    delivery_manifest_version: "finance_d2_controls_v1",
+    text,
+    controls: [
+      { action: "confirm", label: "Confirm", row_index: 0, column_index: 0,
+        callback_value: `post:fha1_${"A".repeat(24)}` },
+      { action: "edit", label: "Edit", row_index: 1, column_index: 0,
+        callback_value: `edit:fha1_${"C".repeat(24)}` },
+      { action: "reject", label: "Reject", row_index: 1, column_index: 1,
+        callback_value: `reject:fha1_${"B".repeat(24)}` },
+    ],
+    finance_delivery_material_sha256: "2".repeat(64),
+    delivery_attempt_nonce: `d2nonce_${"3".repeat(32)}`,
     final_transaction_created: false,
   });
 }
@@ -246,6 +406,70 @@ function reviewResult(
     confirm_available: true,
     final_transaction_created: false,
     ...overrides,
+  });
+}
+
+const INITIAL_D2_CARD = `d2card_${"d".repeat(32)}`;
+const INITIAL_D2_REVIEW = `d2rev_${"e".repeat(30)}`;
+
+function initialD2Text(overrides: {
+  amount?: string;
+  currency?: string;
+  transactionDate?: string;
+  merchant?: string | null;
+  description?: string | null;
+  category?: string | null;
+} = {}): string {
+  return [
+    `Card Ref: ${INITIAL_D2_CARD}`,
+    `Amount: ${overrides.amount ?? "35.50"}`,
+    `Currency: ${overrides.currency ?? "SGD"}`,
+    `Date: ${overrides.transactionDate ?? "2026-08-13"}`,
+    `Merchant: ${overrides.merchant ?? "taxi"}`,
+    `Description: ${overrides.description ?? "Not specified"}`,
+    `Category: ${overrides.category ?? "Not specified"}`,
+    "Account: Not specified",
+    "No account or shared-expense details will be inferred.",
+  ].join("\n");
+}
+
+function initialD2Prepared(request: BridgeRequest): BridgeResponse {
+  return ok(request, {
+    review_public_id: INITIAL_D2_REVIEW,
+    card_generation_public_id: null,
+    initial_card_public_id: INITIAL_D2_CARD,
+    proposal_public_id: request.arguments.proposal_public_id,
+    proposal_version: 0,
+    proposal_content_hash: REVIEW_HASH,
+    posting_path: "text",
+    visible_projection: {
+      amount: "35.50", currency: "SGD", transaction_date: "2026-08-13",
+      merchant: "taxi", account: "unspecified",
+    },
+    visible_projection_hash: "8".repeat(64),
+    presentation_text: initialD2Text(),
+    expires_at: 2_000_000_000,
+    final_transaction_created: false,
+  });
+}
+
+function initialD2Manifest(request: BridgeRequest): BridgeResponse {
+  return ok(request, {
+    posting_review_public_id: INITIAL_D2_REVIEW,
+    delivery_attempt_public_id: `d2send_${"1".repeat(32)}`,
+    delivery_manifest_version: "finance_d2_controls_v1",
+    text: initialD2Text(),
+    controls: [
+      { action: "confirm", label: "Confirm", row_index: 0, column_index: 0,
+        callback_value: `post:fha1_${"A".repeat(24)}` },
+      { action: "edit", label: "Edit", row_index: 1, column_index: 0,
+        callback_value: `edit:fha1_${"C".repeat(24)}` },
+      { action: "reject", label: "Reject", row_index: 1, column_index: 1,
+        callback_value: `reject:fha1_${"B".repeat(24)}` },
+    ],
+    finance_delivery_material_sha256: "2".repeat(64),
+    delivery_attempt_nonce: `d2nonce_${"3".repeat(32)}`,
+    final_transaction_created: false,
   });
 }
 
@@ -323,6 +547,8 @@ function aiReview(request: BridgeRequest): BridgeResponse {
       ai_source_kind: "telegram_raw_text",
     });
   }
+  if (request.command === "prepare_posting_review") return initialD2Prepared(request);
+  if (request.command === "issue_posting_review_actions") return initialD2Manifest(request);
   if (request.command === "issue_human_actions") {
     return issuedActions(request, "prop_bridge_686d5e5cd838efaa6565a084118bb81d");
   }
@@ -468,7 +694,8 @@ test("injected host LLM completes one exact fallback request and records one res
     "host_completion",
     "result_persistence",
   ]);
-  assert.match(replyText(result), /Source: AI-assisted text/u);
+  assert.match(replyText(result), new RegExp(`Card Ref: ${INITIAL_D2_CARD}`, "u"));
+  assert.match(replyText(result), /No account or shared-expense details will be inferred\./u);
   assert.equal(
     requests.filter((request) => request.command === "record_ai_fallback_result_v2").length,
     1,
@@ -928,7 +1155,10 @@ test("bound private text is captured, proposed, reviewed, and claimed without mo
         });
       }
       if (request.command === "issue_human_actions") {
-        return issuedActions(request, "parser_output_12345678-1234-1234-1234-123456789abc");
+        return issuedRejectAction(
+          request,
+          "parser_output_12345678-1234-1234-1234-123456789abc",
+        );
       }
       return reviewResult(request, "parser_output_12345678-1234-1234-1234-123456789abc", {
         currency: null,
@@ -937,6 +1167,7 @@ test("bound private text is captured, proposed, reviewed, and claimed without mo
         account: "travel-wallet",
         account_status: "present",
         ambiguity_indicators: ["missing_currency", "missing_date"],
+        confirm_available: false,
       });
     },
   };
@@ -950,7 +1181,7 @@ test("bound private text is captured, proposed, reviewed, and claimed without mo
   assert.match(replyText(result), /Classification: personal/u);
   assert.match(replyText(result), /Source: text/u);
   assert.match(replyText(result), /Ambiguity: missing_currency, missing_date/u);
-  assert.match(replyText(result), /explicit field=value/u);
+  assert.match(replyText(result), /remains unresolved and cannot be confirmed/u);
   assert.deepEqual(requests.map((request) => request.command), [
     "capture", "propose", "get_review", "get_ai_processing_status_v2", "issue_human_actions",
   ]);
@@ -969,6 +1200,10 @@ test("bound private text is captured, proposed, reviewed, and claimed without mo
     from: { id: 111 },
     text: "taxi to airport 35.50",
   });
+  assert.equal(requests[0]?.arguments.authenticated_actor_id, "111");
+  assert.equal(requests[0]?.arguments.telegram_account_id, "finance-account");
+  assert.equal(requests[0]?.arguments.telegram_conversation_id, "111");
+  assert.equal(requests[0]?.arguments.conversation_binding_id, "binding-1");
 });
 
 test("whole-card reply uses one atomic D1 command and returns generation-bound actions", async () => {
@@ -977,6 +1212,8 @@ test("whole-card reply uses one atomic D1 command and returns generation-bound a
     async run(request) {
       requests.push(request);
       if (request.command === "apply_human_draft_card") return humanDraftCard(request);
+      if (request.command === "prepare_posting_review") return preparedD2Review(request);
+      if (request.command === "issue_posting_review_actions") return issuedD2Action(request);
       if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
       if (request.command === "begin_human_draft_card_delivery") {
         return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
@@ -1003,9 +1240,8 @@ test("whole-card reply uses one atomic D1 command and returns generation-bound a
   const result = await controller.handle(cardEvent, cardContext);
   assert.deepEqual(requests.map((request) => request.command), [
     "apply_human_draft_card",
-    "issue_human_actions",
-    "begin_human_draft_card_delivery",
-    "record_human_draft_card_delivery_outcome",
+    "prepare_posting_review",
+    "issue_posting_review_actions",
   ]);
   const applied = requests[0]!;
   assert.equal(applied.arguments.card_generation_public_id, D1_CARD_G0);
@@ -1021,15 +1257,51 @@ test("whole-card reply uses one atomic D1 command and returns generation-bound a
     `bridge-human-draft-apply:${String(applied.arguments.operation_public_id)}`,
   );
   assert.equal(requests[1]?.arguments.card_generation_public_id, D1_CARD_G1);
-  assert.equal(requests[1]?.arguments.reference_batch_id, "5".repeat(64));
-  assert.equal(requests[2]?.arguments.outbound_target_message_id, "20");
-  assert.equal(requests[3]?.arguments.outcome, "unknown");
+  assert.equal(requests[2]?.arguments.posting_review_public_id, D2_REVIEW);
+  assert.equal(result.reply?.presentation, undefined);
+  assert.match(replyText(result), /Account: Not specified/u);
+  const telegram = result.reply?.channelData?.telegram as {
+    buttons?: Array<Array<{text: string; callback_data: string}>>;
+    financeDeliveryMaterialV1?: {attemptNonce: string};
+  } | undefined;
+  assert.deepEqual(telegram?.buttons?.map((row) => row.map((button) => button.text)), [
+    ["Confirm"], ["Edit", "Reject"],
+  ]);
+  assert.equal(telegram?.financeDeliveryMaterialV1?.attemptNonce, `d2nonce_${"3".repeat(32)}`);
   assert.equal(requests.some((request) => request.command === "capture"), false);
   assert.match(replyText(result), new RegExp(`Card Ref: ${D1_CARD_G1}`, "u"));
-  const buttons = result.reply?.presentation?.blocks.find((block) => block.type === "buttons");
-  assert.equal(buttons?.type, "buttons");
-  if (buttons?.type !== "buttons") throw new Error("D1 buttons missing");
-  assert.deepEqual(buttons.buttons.map((button) => button.label), ["Confirm", "Edit", "Reject"]);
+});
+
+test("D2 terminal card refuses a host session that differs from the private binding", async () => {
+  const requests: BridgeRequest[] = [];
+  const controller = new FinanceInboundController("/tmp/workspace", {
+    async run(request) {
+      requests.push(request);
+      if (request.command === "apply_human_draft_card") return humanDraftCard(request);
+      throw new Error(`Unexpected command ${request.command}`);
+    },
+  });
+  const mismatchedEvent = {
+    ...event,
+    content: wholeCardText(),
+    messageId: "30",
+    replyToId: "20",
+    replyToIdFull: "telegram:111:20",
+    sessionKey: "different-session",
+  };
+  const mismatchedContext = {
+    ...context,
+    messageId: "30",
+    replyToId: "20",
+    replyToIdFull: "telegram:111:20",
+    sessionKey: "different-session",
+  };
+
+  assert.deepEqual(await controller.handle(mismatchedEvent, mismatchedContext), {
+    handled: true,
+    reply: { text: FINANCE_FAILURE_REPLY },
+  });
+  assert.deepEqual(requests.map((request) => request.command), ["apply_human_draft_card"]);
 });
 
 test("incomplete D1 cards expose Reject only and reply identity mismatches fail closed", async () => {
@@ -1156,6 +1428,12 @@ test("unknown delivery replay queries first and returns only the bounded success
           idempotent_replay: false,
         });
       }
+      if (request.command === "prepare_posting_review") {
+        return preparedD2Review(request, D1_CARD_G2);
+      }
+      if (request.command === "issue_posting_review_actions") {
+        return issuedD2Action(request, D1_CARD_G2);
+      }
       if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
       if (request.command === "begin_human_draft_card_delivery") {
         return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
@@ -1174,9 +1452,8 @@ test("unknown delivery replay queries first and returns only the bounded success
     "apply_human_draft_card",
     "get_human_draft_card",
     "reissue_human_draft_card",
-    "issue_human_actions",
-    "begin_human_draft_card_delivery",
-    "record_human_draft_card_delivery_outcome",
+    "prepare_posting_review",
+    "issue_posting_review_actions",
   ]);
   assert.equal(requests[2]?.arguments.expected_current_generation_public_id, D1_CARD_G1);
   assert.equal(requests[2]?.arguments.reason, "unknown_after_query");
@@ -1208,6 +1485,12 @@ test("replay after a completed reissue renders the durable current winner withou
           idempotent_replay: false,
         });
       }
+      if (request.command === "prepare_posting_review") {
+        return preparedD2Review(request, D1_CARD_G2);
+      }
+      if (request.command === "issue_posting_review_actions") {
+        return issuedD2Action(request, D1_CARD_G2);
+      }
       if (request.command === "issue_human_actions") return issuedD1Actions(request, true);
       if (request.command === "begin_human_draft_card_delivery") {
         return ok(request, { attempt_public_id: request.arguments.attempt_public_id });
@@ -1225,9 +1508,8 @@ test("replay after a completed reissue renders the durable current winner withou
   assert.deepEqual(requests.map((request) => request.command), [
     "apply_human_draft_card",
     "get_human_draft_card",
-    "issue_human_actions",
-    "begin_human_draft_card_delivery",
-    "record_human_draft_card_delivery_outcome",
+    "prepare_posting_review",
+    "issue_posting_review_actions",
   ]);
   assert.equal(requests[1]?.arguments.card_generation_public_id, D1_CARD_G2);
   assert.equal(requests.some((request) => request.command === "reissue_human_draft_card"), false);
@@ -1280,17 +1562,27 @@ test("structured guided edits bypass intake and completion emits a fresh review 
           expires_at: 2_000_000_000,
           recovery_required: false,
           review_batch_id: "7".repeat(32),
+          human_draft_card: guidedHumanDraftResult(
+            request, proposal, proposalVersion, proposalHash, "Example Cafe",
+          ),
           final_transaction_created: false,
         });
       }
-      if (request.command === "get_review") {
-        return reviewResult(request, proposal, {
-          proposal_version: proposalVersion,
-          effective_content_hash: proposalHash,
+      if (request.command === "prepare_posting_review") {
+        return preparedGuidedD2Review(
+          request, proposal, proposalVersion, proposalHash, "Example Cafe",
+        );
+      }
+      if (request.command === "issue_posting_review_actions") {
+        return issuedD2Action(request, D1_CARD_G1, {
+          ...DEFAULT_D2_CARD_FIELDS,
+          amount: "35.50",
+          transactionDate: "2026-08-13",
           merchant: "Example Cafe",
+          description: "Not specified",
+          category: "Not specified",
         });
       }
-      if (request.command === "issue_human_actions") return issuedActions(request, proposal);
       throw new Error(`Unexpected command ${request.command}`);
     },
   };
@@ -1310,14 +1602,18 @@ test("structured guided edits bypass intake and completion emits a fresh review 
   const completeEvent = { ...event, content: "完成", messageId: "31" };
   const completeContext = { ...context, messageId: "31" };
   const completed = await controller.handle(completeEvent, completeContext);
-  const buttons = completed.reply?.presentation?.blocks.find((block) => block.type === "buttons");
-  if (buttons?.type !== "buttons") throw new Error("Fresh review buttons are missing.");
-  assert.deepEqual(buttons.buttons.map((button) => button.label), ["Confirm", "Edit", "Reject"]);
+  const telegram = completed.reply?.channelData?.telegram as {
+    buttons?: Array<Array<{text: string}>>;
+  } | undefined;
+  assert.deepEqual(telegram?.buttons?.flat().map((button) => button.text), [
+    "Confirm", "Edit", "Reject",
+  ]);
   assert.deepEqual(requests.map((request) => request.command), [
-    "get_guided_edit_session", "complete_guided_edit", "get_review", "issue_human_actions",
+    "get_guided_edit_session", "complete_guided_edit",
+    "prepare_posting_review", "issue_posting_review_actions",
   ]);
   assert.equal(requests[1]?.idempotency_key, `bridge-guided-edit-complete:${session}:31`);
-  assert.match(replyText(completed), /Merchant: set "Example Cafe"/u);
+  assert.match(replyText(completed), /Merchant: Example Cafe/u);
 });
 
 test("restart-safe guided routing refuses natural, excluded, and media inputs before intake", async () => {
@@ -1412,16 +1708,27 @@ test("completion redelivery uses the durable current review capability generatio
           expires_at: 2_000_000_000,
           recovery_required: false,
           ...(reviewBatchId === undefined ? {} : { review_batch_id: reviewBatchId }),
+          ...(reviewBatchId === undefined ? {} : {
+            human_draft_card: guidedHumanDraftResult(
+              request, proposal, 1, "2".repeat(64),
+            ),
+          }),
           final_transaction_created: false,
         });
       }
-      if (request.command === "get_review") {
-        return reviewResult(request, proposal, {
-          proposal_version: 1,
-          effective_content_hash: "2".repeat(64),
+      if (request.command === "prepare_posting_review") {
+        return preparedGuidedD2Review(request, proposal, 1, "2".repeat(64));
+      }
+      if (request.command === "issue_posting_review_actions") {
+        return issuedD2Action(request, D1_CARD_G1, {
+          ...DEFAULT_D2_CARD_FIELDS,
+          amount: "35.50",
+          transactionDate: "2026-08-13",
+          merchant: "taxi",
+          description: "Not specified",
+          category: "Not specified",
         });
       }
-      if (request.command === "issue_human_actions") return issuedActions(request, proposal);
       throw new Error(`Unexpected command ${request.command}`);
     },
   };
@@ -1431,21 +1738,22 @@ test("completion redelivery uses the durable current review capability generatio
     .handle(completeEvent, completeContext);
   const second = await new FinanceInboundController("/tmp/workspace", runner)
     .handle(completeEvent, completeContext);
-  assert.match(replyText(first), /Amount: set/u);
-  assert.match(replyText(second), /Amount: set/u);
-  const issuances = requests.filter((request) => request.command === "issue_human_actions");
+  assert.match(replyText(first), /Amount: 35\.50/u);
+  assert.match(replyText(second), /Amount: 35\.50/u);
+  const issuances = requests.filter(
+    (request) => request.command === "issue_posting_review_actions",
+  );
   assert.equal(issuances.length, 2);
-  assert.equal(issuances[0]?.arguments.reference_batch_id, "4".repeat(32));
-  assert.equal(issuances[1]?.arguments.reference_batch_id, "4".repeat(32));
+  assert.equal(issuances[0]?.arguments.posting_review_public_id, D2_REVIEW);
+  assert.equal(issuances[1]?.arguments.posting_review_public_id, D2_REVIEW);
   assert.equal(issuances[0]?.idempotency_key, issuances[1]?.idempotency_key);
   assert.equal(requests.some((request) => request.command === "capture"), false);
 });
 
-test("guided review renews once when issuance says the claimed batch is expiring", async () => {
+test("guided completion uses D2 delivery and never renews a legacy action batch", async () => {
   const session = `gedit_${"6".repeat(32)}`;
   const proposal = "prop_bridge_0123456789abcdef0123456789abcdef";
   const requests: BridgeRequest[] = [];
-  let completions = 0;
   const runner: BridgeRunner = {
     async run(request) {
       requests.push(request);
@@ -1463,7 +1771,6 @@ test("guided review renews once when issuance says the claimed batch is expiring
         });
       }
       if (request.command === "complete_guided_edit") {
-        const batchId = String(4 + completions++).repeat(32);
         return ok(request, {
           active: false,
           session_status: "completed_replay",
@@ -1473,31 +1780,26 @@ test("guided review renews once when issuance says the claimed batch is expiring
           effective_content_hash: "2".repeat(64),
           expires_at: 2_000_000_000,
           recovery_required: false,
-          review_batch_id: batchId,
+          review_batch_id: "4".repeat(32),
+          human_draft_card: guidedHumanDraftResult(
+            request, proposal, 1, "2".repeat(64),
+          ),
           final_transaction_created: false,
         });
       }
-      if (request.command === "get_review") {
-        return reviewResult(request, proposal, {
-          proposal_version: 1,
-          effective_content_hash: "2".repeat(64),
+      if (request.command === "prepare_posting_review") {
+        return preparedGuidedD2Review(request, proposal, 1, "2".repeat(64));
+      }
+      if (request.command === "issue_posting_review_actions") {
+        return issuedD2Action(request, D1_CARD_G1, {
+          ...DEFAULT_D2_CARD_FIELDS,
+          amount: "35.50",
+          transactionDate: "2026-08-13",
+          merchant: "taxi",
+          description: "Not specified",
+          category: "Not specified",
         });
       }
-      if (request.command === "issue_human_actions" &&
-          request.arguments.reference_batch_id === "4".repeat(32)) {
-        return {
-          envelopeVersion: "v1",
-          requestId: request.request_id,
-          operationId: "op_0123456789abcdef0123456789abcdef",
-          status: "error",
-          error: {
-            code: "CALLBACK_EXPIRED",
-            message: "reference batch is expiring",
-            retryable: false,
-          },
-        };
-      }
-      if (request.command === "issue_human_actions") return issuedActions(request, proposal);
       throw new Error(`Unexpected command ${request.command}`);
     },
   };
@@ -1505,18 +1807,14 @@ test("guided review renews once when issuance says the claimed batch is expiring
     { ...event, content: "完成", messageId: "61" },
     { ...context, messageId: "61" },
   );
-  assert.match(replyText(result), /Amount: set/u);
+  assert.match(replyText(result), /Amount: 35\.50/u);
   const completionsSeen = requests.filter((request) => request.command === "complete_guided_edit");
-  const issuances = requests.filter((request) => request.command === "issue_human_actions");
-  assert.equal(completionsSeen.length, 2);
-  assert.deepEqual(
-    issuances.map((request) => request.arguments.reference_batch_id),
-    ["4".repeat(32), "5".repeat(32)],
-  );
-  assert.equal(issuances.every(
-    (request) => request.arguments.minimum_remaining_seconds === 60 &&
-      request.arguments.require_unconsumed_replay === true
-  ), true);
+  assert.equal(completionsSeen.length, 1);
+  assert.equal(requests.some((request) => request.command === "issue_human_actions"), false);
+  assert.deepEqual(requests.map((request) => request.command), [
+    "get_guided_edit_session", "complete_guided_edit",
+    "prepare_posting_review", "issue_posting_review_actions",
+  ]);
 });
 
 test("guided mutation responses must remain bound to the exact session material", async () => {
@@ -1594,7 +1892,7 @@ test("bound private receipt without caption is retained, captured, proposed, and
         });
       }
       if (request.command === "issue_human_actions") {
-        return issuedActions(request, "prop_bridge_686d5e5cd838efaa6565a084118bb81d");
+        return issuedRejectAction(request, "prop_bridge_686d5e5cd838efaa6565a084118bb81d");
       }
       return reviewResult(request, "prop_bridge_686d5e5cd838efaa6565a084118bb81d", {
         parse_status: "ocr_pending_confirmation",
@@ -1604,6 +1902,7 @@ test("bound private receipt without caption is retained, captured, proposed, and
           "merchant_not_determined",
           "transaction_date_not_found",
         ],
+        confirm_available: false,
       });
     },
   };
@@ -1643,6 +1942,10 @@ test("bound private receipt without caption is retained, captured, proposed, and
     telegram_chat_id: 111,
     telegram_message_date: 1_750_000_000,
     sender_id: 111,
+    authenticated_actor_id: "111",
+    telegram_account_id: "finance-account",
+    telegram_conversation_id: "111",
+    conversation_binding_id: "binding-1",
     declared_mime_type: "image/jpeg",
     original_filename: "receipt.jpg",
   });
@@ -2035,19 +2338,22 @@ test("review distinguishes literal material text from absent merchant and descri
   const renderedCards: string[] = [];
   for (const [overrides, expected] of [
     [
-      { merchant: null, description: "Lunch with client" },
+      { merchant: null, description: "Lunch with client", confirm_available: false },
       ["Merchant: unset", 'Description: set "Lunch with client"'],
     ],
     [
-      { merchant: "unspecified", description: "Lunch with client" },
+      { merchant: "unspecified", description: "Lunch with client", confirm_available: false },
       ['Merchant: set "unspecified"', 'Description: set "Lunch with client"'],
     ],
     [
-      { merchant: null, description: "not provided" },
+      { merchant: null, description: "not provided", confirm_available: false },
       ["Merchant: unset", 'Description: set "not provided"'],
     ],
     [
-      { merchant: null, description: null, account: null, account_status: "absent" },
+      {
+        merchant: null, description: null, account: null, account_status: "absent",
+        confirm_available: false,
+      },
       ["Merchant: unset", "Description: unset", "Account: unset (unspecified)"],
     ],
     [
@@ -2056,6 +2362,7 @@ test("review distinguishes literal material text from absent merchant and descri
         description: null,
         account: "unspecified",
         account_status: "present",
+        confirm_available: false,
       },
       ["Merchant: unset", "Description: unset", 'Account: set "unspecified"'],
     ],
@@ -2074,7 +2381,7 @@ test("review distinguishes literal material text from absent merchant and descri
           return ok(request, { proposal_public_id: proposalPublicId });
         }
         if (request.command === "issue_human_actions") {
-          return issuedActions(request, proposalPublicId);
+          return issuedRejectAction(request, proposalPublicId);
         }
         return reviewResult(request, proposalPublicId, overrides);
       },
@@ -2152,10 +2459,14 @@ test("review preserves financial scalars exactly or refuses before presenting al
         return ok(request, { proposal_public_id: "parser_output_12345678-1234-1234-1234-123456789abc" });
       }
       if (request.command === "issue_human_actions") {
-        return issuedActions(request, "parser_output_12345678-1234-1234-1234-123456789abc");
+        return issuedRejectAction(
+          request,
+          "parser_output_12345678-1234-1234-1234-123456789abc",
+        );
       }
       return reviewResult(request, "parser_output_12345678-1234-1234-1234-123456789abc", {
         amount: exactAmount,
+        confirm_available: false,
       });
     },
   });
@@ -2173,10 +2484,14 @@ test("review preserves financial scalars exactly or refuses before presenting al
         return ok(request, { proposal_public_id: "parser_output_12345678-1234-1234-1234-123456789abc" });
       }
       if (request.command === "issue_human_actions") {
-        return issuedActions(request, "parser_output_12345678-1234-1234-1234-123456789abc");
+        return issuedRejectAction(
+          request,
+          "parser_output_12345678-1234-1234-1234-123456789abc",
+        );
       }
       return reviewResult(request, "parser_output_12345678-1234-1234-1234-123456789abc", {
         amount: "35.50\nspoofed",
+        confirm_available: false,
       });
     },
   });
@@ -2197,10 +2512,14 @@ test("review preserves financial scalars exactly or refuses before presenting al
           });
         }
         if (request.command === "issue_human_actions") {
-          return issuedActions(request, "parser_output_12345678-1234-1234-1234-123456789abc");
+          return issuedRejectAction(
+            request,
+            "parser_output_12345678-1234-1234-1234-123456789abc",
+          );
         }
         return reviewResult(request, "parser_output_12345678-1234-1234-1234-123456789abc", {
           amount: unsafeScalar,
+          confirm_available: false,
         });
       },
     });

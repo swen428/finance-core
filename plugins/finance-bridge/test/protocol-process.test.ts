@@ -40,6 +40,7 @@ import {
   type ChildProcessLike,
   type SpawnProcess,
 } from "../src/subprocess.js";
+import type { FinanceDeliveryMaterialV1 } from "../src/delivery-receipt.js";
 
 const execFile = promisify(execFileCallback);
 const CURRENT_REPOSITORY_ROOT = resolve("../..");
@@ -298,6 +299,59 @@ class FakeChild extends EventEmitter implements ChildProcessLike {
     return true;
   }
 }
+
+test("closed delivery receipt runner invokes only the dedicated consumer module", async () => {
+  const child = new FakeChild();
+  let args: readonly string[] = [];
+  const input: Buffer[] = [];
+  child.stdin.on("data", (chunk: Buffer | string) => {
+    input.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  child.stdin.on("finish", () => {
+    child.stdout.end(JSON.stringify({
+      observation_public_id: `d2dobs_${"9".repeat(32)}`,
+      status: "ok",
+    }));
+    child.emit("close", 0, null);
+  });
+  const runner = new BridgeCliRunner(
+    {
+      repoRoot: "/repo",
+      coreDistributionRoot: "/core-distribution",
+      pythonExecutable: "/repo/.venv/bin/python",
+      workspaceRoot: "/tmp/workspace",
+      agentProfileV2: AGENT_PROFILE_V2,
+    },
+    (_executable, processArgs) => {
+      args = processArgs;
+      return child;
+    },
+    undefined,
+    undefined,
+    ACCEPT_TEST_EXECUTABLE,
+  );
+  const material: FinanceDeliveryMaterialV1 = {
+    capability: "telegram.finance-delivery-material-v1",
+    deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+    attemptNonce: `d2nonce_${"1".repeat(32)}`,
+    deliveryMaterialSha256: "2".repeat(64),
+    providerMessageId: "200",
+    receiptTokenSha256: "3".repeat(64),
+    channel: "telegram",
+    accountId: "finance-account",
+    conversationId: "111",
+    sessionKey: "binding-1",
+    sourceIdentitySha256: "4".repeat(64),
+  };
+  await runner.recordFinanceDeliveryReceipt(material, 1_000);
+  assert.match(String(args[3]), /delivery_receipt_cli/u);
+  const payload = JSON.parse(Buffer.concat(input).toString("utf8")) as Record<string, unknown>;
+  assert.equal(payload.workspace_path, "/tmp/workspace");
+  assert.equal(payload.attempt_nonce, material.attemptNonce);
+  assert.equal(payload.delivery_material_sha256, material.deliveryMaterialSha256);
+  assert.equal("command" in payload, false);
+  assert.equal("idempotency_key" in payload, false);
+});
 
 type PythonFixtureMode =
   | "error"

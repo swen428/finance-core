@@ -215,6 +215,46 @@ export function humanActionRedemptionKey(callbackId: string): string {
   return `bridge-human-action-redeem:${canonicalDigest(callbackId).slice(0, 32)}`;
 }
 
+export function postingReviewPreparationKey(cardGenerationPublicId: string): string {
+  if (!/^d1card_[0-9a-f]{32}$/u.test(cardGenerationPublicId)) {
+    throw new Error("D2 card generation ID is invalid.");
+  }
+  return `bridge-d2-prepare:${cardGenerationPublicId}`;
+}
+
+export function initialPostingReviewPreparationKey(
+  proposalPublicId: string,
+  admittedSourceMessageId: number,
+): string {
+  if (!/^(?:prop_bridge_[0-9a-f]{32}|parser_output_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u
+    .test(proposalPublicId) || !Number.isSafeInteger(admittedSourceMessageId) ||
+      admittedSourceMessageId <= 0) {
+    throw new Error("D2 initial posting review identity is invalid.");
+  }
+  return `bridge-d2-prepare-initial:${proposalPublicId}:${admittedSourceMessageId}`;
+}
+
+export function postingActionIssuanceKey(reviewPublicId: string): string {
+  if (!/^d2rev_[0-9a-f]{30}$/u.test(reviewPublicId)) {
+    throw new Error("D2 posting review ID is invalid.");
+  }
+  return `bridge-d2-issue:${reviewPublicId}`;
+}
+
+export function postingConfirmationKey(callbackId: string): string {
+  if (callbackId.length === 0 || callbackId.length > 200) {
+    throw new Error("Telegram callback ID is invalid.");
+  }
+  return `bridge-d2-confirm:${canonicalDigest(callbackId).slice(0, 32)}`;
+}
+
+export function postingResumeKey(attemptPublicId: string): string {
+  if (!/^d2att_[0-9a-f]{30}$/u.test(attemptPublicId)) {
+    throw new Error("D2 posting attempt ID is invalid.");
+  }
+  return `bridge-d2-resume:${attemptPublicId}`;
+}
+
 export function humanDraftOperationId(
   accountId: string,
   conversationId: string,

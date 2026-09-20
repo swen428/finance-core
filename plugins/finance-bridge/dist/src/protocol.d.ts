@@ -45,6 +45,11 @@ export declare function framedDigest(domain: string, ...fields: string[]): strin
 export declare function createHumanActionBatchId(): string;
 export declare function humanActionIssuanceKey(batchId: string): string;
 export declare function humanActionRedemptionKey(callbackId: string): string;
+export declare function postingReviewPreparationKey(cardGenerationPublicId: string): string;
+export declare function initialPostingReviewPreparationKey(proposalPublicId: string, admittedSourceMessageId: number): string;
+export declare function postingActionIssuanceKey(reviewPublicId: string): string;
+export declare function postingConfirmationKey(callbackId: string): string;
+export declare function postingResumeKey(attemptPublicId: string): string;
 export declare function humanDraftOperationId(accountId: string, conversationId: string, bindingId: string, messageId: number, cardGenerationPublicId: string): string;
 export declare function humanDraftApplyKey(operationPublicId: string): string;
 export declare function humanDraftDeliveryAttemptId(cardGenerationPublicId: string, transportMode: "replace" | "reply"): string;

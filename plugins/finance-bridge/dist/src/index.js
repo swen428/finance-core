@@ -9,6 +9,7 @@ import { financeProjectionOrRefusalV2, getLoadedCodexPluginSourceV2, getLoadedOp
 import { createBridgeRequest } from "./protocol.js";
 import { BridgeCliRunner } from "./subprocess.js";
 import { createDisabledTools } from "./tools.js";
+import { requireFinanceDeliveryHost, } from "./delivery-receipt.js";
 export function validateHostPolicy(value) {
     validateFinanceHostPolicyV2(value);
 }
@@ -67,6 +68,7 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
     }
     if (api.registrationMode !== "full")
         return;
+    requireFinanceDeliveryHost(api);
     validateRetryCapability(api.runtime.llm);
     getLoadedCodexPluginSourceV2(api.runtime);
     getLoadedOpenAIPluginSourceV2(api.runtime);
@@ -78,8 +80,13 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
     let healthy = false;
     let controller;
     let humanActionRuntime;
+    let deliveryReceiptRecorder;
     const ready = dependencies.validateConfig(api.pluginConfig).then(async (config) => {
         const runner = dependencies.createRunner(config, () => { healthy = false; });
+        const recorder = runner;
+        deliveryReceiptRecorder = typeof recorder.recordFinanceDeliveryReceipt === "function"
+            ? recorder
+            : undefined;
         const health = await runner.run(createBridgeRequest("health", { workspace_path: config.workspaceRoot }), 30_000);
         if (health.status !== "ok" || health.result.workspace_verified !== true ||
             health.result.database_verified !== true) {
@@ -94,16 +101,29 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
     }).catch(() => {
         healthy = false;
         humanActionRuntime = undefined;
+        deliveryReceiptRecorder = undefined;
+    });
+    api.registerFinanceDeliveryReceiptConsumerV1(async (receipt) => {
+        await receipt.consume(async (material) => {
+            await ready;
+            if (!healthy || deliveryReceiptRecorder === undefined) {
+                throw new Error("Finance delivery receipt consumer is unavailable.");
+            }
+            await deliveryReceiptRecorder.recordFinanceDeliveryReceipt(material, 30_000);
+        });
     });
     for (const tool of createDisabledTools(() => undefined)) {
         api.registerTool(tool, { optional: true });
     }
     api.registerCommand(createFinanceCommand(() => healthy ? humanActionRuntime : undefined));
-    api.registerInteractiveHandler({
-        channel: "telegram",
-        namespace: "finance-bridge",
-        handler: createHumanActionInteractiveHandler(() => healthy ? humanActionRuntime : undefined),
-    });
+    const humanActionHandler = createHumanActionInteractiveHandler(() => healthy ? humanActionRuntime : undefined);
+    for (const namespace of ["finance-bridge", "post", "edit", "reject"]) {
+        api.registerInteractiveHandler({
+            channel: "telegram",
+            namespace,
+            handler: humanActionHandler,
+        });
+    }
     api.on("inbound_claim", async (event, context) => {
         await ready;
         if (!healthy || controller === undefined) {
