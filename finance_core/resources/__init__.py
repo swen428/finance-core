@@ -65,17 +65,14 @@ def _load_migration_contract() -> tuple[str, tuple[str, ...]]:
     ):
         raise MigrationResourceError("Migration contract values are invalid")
     filenames = tuple(filename for filename in raw_filenames if isinstance(filename, str))
-    if (
-        len(filenames) != len(set(filenames))
-        or any(
-            len(filename) < 9
-            or not filename[:3].isdigit()
-            or filename[3] != "_"
-            or not filename.endswith(".sql")
-            or "/" in filename
-            or "\\" in filename
-            for filename in filenames
-        )
+    if len(filenames) != len(set(filenames)) or any(
+        len(filename) < 9
+        or not filename[:3].isdigit()
+        or filename[3] != "_"
+        or not filename.endswith(".sql")
+        or "/" in filename
+        or "\\" in filename
+        for filename in filenames
     ):
         raise MigrationResourceError("Migration contract filename inventory is invalid")
     return digest, filenames
