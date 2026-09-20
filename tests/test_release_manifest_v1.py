@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,25 @@ def _add_tar_directory(archive: tarfile.TarFile, name: str) -> None:
     info.type = tarfile.DIRTYPE
     info.mode = 0o755
     archive.addfile(info)
+
+
+def _rewrite_wheel(wheel: Path, updates: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(wheel) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    payloads.update(updates)
+    record_name = "finance_core-0.1.3.dist-info/RECORD"
+    record_stream = io.StringIO(newline="")
+    writer = csv.writer(record_stream, lineterminator="\n")
+    for name, payload in sorted(payloads.items()):
+        if name == record_name:
+            continue
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        writer.writerow((name, f"sha256={digest}", str(len(payload))))
+    writer.writerow((record_name, "", ""))
+    payloads[record_name] = record_stream.getvalue().encode()
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
 
 
 def _bridge_provenance(source_files: dict[str, bytes]) -> bytes:
@@ -428,6 +448,49 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
 
     assert completed.returncode != 0
     assert "metadata inventory is unexpected" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.replace(
+            b'MIGRATION_LEDGER_DIGEST = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9'
+            b'ee70857d95bf74ef47369af7"',
+            b'MIGRATION_LEDGER_DIGEST = "0000000000000000000000000000000000000000000'
+            b'000000000000000000000"',
+        ),
+        lambda payload: payload.replace(
+            b'    "049_d2_one_confirmation_posting.sql",\n',
+            b"",
+        ),
+    ],
+)
+def test_release_manifest_rejects_stale_wheel_migration_contract(
+    tmp_path: Path, mutate: Callable[[bytes], bytes]
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    with zipfile.ZipFile(wheel) as archive:
+        resources_init = archive.read("finance_core/resources/__init__.py")
+    mutated = mutate(resources_init)
+    assert mutated != resources_init
+    _rewrite_wheel(wheel, {"finance_core/resources/__init__.py": mutated})
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "wheel migration contract does not match its migration payload" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
 
 
 def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Path) -> None:

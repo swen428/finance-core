@@ -117,6 +117,41 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
+def _migration_contract(resources_init: bytes) -> tuple[str, tuple[str, ...]]:
+    try:
+        module = ast.parse(resources_init.decode("utf-8"))
+    except (SyntaxError, UnicodeDecodeError) as exc:
+        raise ValueError(
+            "wheel finance_core/resources/__init__.py is not valid UTF-8 Python"
+        ) from exc
+    assignments: dict[str, list[ast.expr]] = {
+        "MIGRATION_LEDGER_DIGEST": [],
+        "MIGRATION_FILENAMES": [],
+    }
+    for statement in module.body:
+        if not isinstance(statement, ast.Assign):
+            continue
+        for target in statement.targets:
+            if isinstance(target, ast.Name) and target.id in assignments:
+                assignments[target.id].append(statement.value)
+    if any(len(values) != 1 for values in assignments.values()):
+        raise ValueError("wheel migration contract declarations are missing or ambiguous")
+    try:
+        digest_value: object = ast.literal_eval(assignments["MIGRATION_LEDGER_DIGEST"][0])
+        filenames_value: object = ast.literal_eval(assignments["MIGRATION_FILENAMES"][0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("wheel migration contract declarations are not literal") from exc
+    if not isinstance(digest_value, str) or HEX_64.fullmatch(digest_value) is None:
+        raise ValueError("wheel migration ledger declaration is invalid")
+    if (
+        not isinstance(filenames_value, tuple)
+        or not filenames_value
+        or any(not isinstance(filename, str) for filename in filenames_value)
+    ):
+        raise ValueError("wheel migration filename declaration is invalid")
+    return digest_value, filenames_value
+
+
 def _api_contract_version(package_init: bytes) -> str:
     try:
         module = ast.parse(package_init.decode("utf-8"))
@@ -293,10 +328,25 @@ def _inspect_wheel(
     package_init = package_files.get("finance_core/__init__.py")
     if package_init is None:
         raise ValueError("wheel is missing finance_core/__init__.py")
+    resources_init = package_files.get("finance_core/resources/__init__.py")
+    if resources_init is None:
+        raise ValueError("wheel is missing finance_core/resources/__init__.py")
+    observed_ledger = _migration_ledger_digest(package_files)
+    declared_ledger, declared_filenames = _migration_contract(resources_init)
+    observed_filenames = tuple(
+        sorted(
+            PurePosixPath(name).name
+            for name in package_files
+            if name.startswith("finance_core/resources/migrations/")
+            and name.endswith(".sql")
+        )
+    )
+    if declared_ledger != observed_ledger or declared_filenames != observed_filenames:
+        raise ValueError("wheel migration contract does not match its migration payload")
     return (
         package_files,
         _api_contract_version(package_init),
-        _migration_ledger_digest(package_files),
+        observed_ledger,
     )
 
 
@@ -757,12 +807,12 @@ def main() -> int:
         for path in sorted(artifact_paths, key=lambda path: path.name)
     ]
     manifest = {
-        "api_contract_version": args.api_contract_version,
+        "api_contract_version": observed_api,
         "artifacts": artifact_entries,
         "bridge_version": args.core_version,
         "core_commit": args.core_commit,
         "core_version": args.core_version,
-        "migration_ledger_digest": args.migration_ledger_digest,
+        "migration_ledger_digest": observed_ledger,
         "schema": "finance-core-component-manifest-v1",
     }
     manifest_path = artifacts_dir / "component-manifest-v1.json"
