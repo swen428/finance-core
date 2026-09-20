@@ -1067,6 +1067,70 @@ def test_receipt_status_detects_canonical_transaction_drift_without_writes(
     assert status.attention_reason == "financial_authority_mismatch"
 
 
+def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-finalization-catchup-frozen-participant",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        receipt_payer_participant_public_id="person_owner",
+        clock=lambda: 1002,
+    )
+    key = b"d2-finalization-catchup-frozen-participant-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "after_receipt_finalization_commit":
+            raise RuntimeError("receipt-finalization-committed")
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", fail)
+    with pytest.raises(RuntimeError, match="receipt-finalization-committed"):
+        confirm_and_post(
+            conn,
+            key=key,
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-finalization-catchup-frozen-participant-callback",
+            callback_message_id=312,
+            clock=lambda: 1004,
+        )
+    attempt_id = str(
+        conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
+    )
+    assert (
+        conn.execute(
+            "SELECT stage FROM d2_posting_attempts WHERE attempt_public_id = ?", (attempt_id,)
+        ).fetchone()[0]
+        == "conditional_authorization_persisted"
+    )
+    conn.execute("UPDATE participants SET is_active = 0 WHERE public_id = 'person_owner'")
+    conn.execute("UPDATE participants SET is_self = 1 WHERE public_id = 'person_alice'")
+    conn.commit()
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
+    recovered = resume_posting(conn, attempt_public_id=attempt_id, context=context)
+    assert recovered.state == "finalized"
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert (
+        conn.execute(
+            "SELECT stage FROM d2_posting_attempts WHERE attempt_public_id = ?", (attempt_id,)
+        ).fetchone()[0]
+        == "finalized"
+    )
+
+
 @pytest.mark.parametrize(
     "failure_stage",
     (

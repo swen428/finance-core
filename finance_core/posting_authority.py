@@ -902,6 +902,38 @@ def resume_posting(
     _require_d2_schema(conn)
     _require_context(context)
     row = _authorized_attempt_for_resume(conn, attempt_public_id=attempt_public_id, context=context)
+    existing_status = get_status(
+        conn, review_public_id=str(row["review_public_id"]), context=context
+    )
+    if existing_status.state == "finalized":
+        if row["stage"] != "finalized":
+            if row["posting_path"] == "text":
+                evidence_public_id = existing_status.transaction_public_id
+            else:
+                evidence = conn.execute(
+                    "SELECT audits.finalization_id "
+                    "FROM d2_posting_decisions AS decisions "
+                    "JOIN d2_conditional_authorization_proofs AS proofs "
+                    "ON proofs.decision_public_id = decisions.decision_public_id "
+                    "JOIN receipt_finalization_audit AS audits "
+                    "ON audits.authorization_id = proofs.authorization_id "
+                    "WHERE decisions.attempt_public_id = ? AND audits.status = 'finalized'",
+                    (attempt_public_id,),
+                ).fetchone()
+                if evidence is None:
+                    raise PostingAuthorityError("finalized receipt evidence is unavailable")
+                evidence_public_id = str(evidence["finalization_id"])
+            _advance_attempt(
+                conn,
+                attempt_id=attempt_public_id,
+                expected_stage=str(row["stage"]),
+                new_stage="finalized",
+                transaction_public_id=existing_status.transaction_public_id,
+                evidence_public_id=evidence_public_id,
+            )
+        return get_status(conn, review_public_id=str(row["review_public_id"]), context=context)
+    if existing_status.state in {"needs_attention", "rejected"}:
+        return existing_status
     if row["stage"] == "accepted" and row["posting_path"] == "text":
         result = convert_confirmed_parser_proposal(conn, int(row["parser_output_id"]))
         _inject_failure("after_text_finalization_commit")
