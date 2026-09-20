@@ -124,16 +124,47 @@ def _migration_contract(resources_init: bytes) -> tuple[str, tuple[str, ...]]:
         raise ValueError(
             "wheel finance_core/resources/__init__.py is not valid UTF-8 Python"
         ) from exc
+    contract_names = {
+        "MIGRATION_LEDGER_DIGEST",
+        "MIGRATION_FILENAMES",
+    }
     assignments: dict[str, list[ast.expr]] = {
         "MIGRATION_LEDGER_DIGEST": [],
         "MIGRATION_FILENAMES": [],
     }
+    allowed_targets: set[int] = set()
     for statement in module.body:
-        if not isinstance(statement, ast.Assign):
+        if (
+            not isinstance(statement, ast.Assign)
+            or len(statement.targets) != 1
+            or not isinstance(statement.targets[0], ast.Name)
+            or statement.targets[0].id not in contract_names
+        ):
             continue
-        for target in statement.targets:
-            if isinstance(target, ast.Name) and target.id in assignments:
-                assignments[target.id].append(statement.value)
+        target = statement.targets[0]
+        assignments[target.id].append(statement.value)
+        allowed_targets.add(id(target))
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Name)
+            and node.id in contract_names
+            and isinstance(node.ctx, (ast.Store, ast.Del))
+            and id(node) not in allowed_targets
+        ):
+            raise ValueError("wheel migration contract has a hidden or repeated binding")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name in contract_names:
+                raise ValueError("wheel migration contract has a hidden or repeated binding")
+        if isinstance(node, ast.alias):
+            bound_name = node.asname or node.name.split(".", maxsplit=1)[0]
+            if bound_name in contract_names:
+                raise ValueError("wheel migration contract has a hidden or repeated binding")
+        if isinstance(node, ast.ExceptHandler) and node.name in contract_names:
+            raise ValueError("wheel migration contract has a hidden or repeated binding")
+        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in contract_names:
+            raise ValueError("wheel migration contract has a hidden or repeated binding")
+        if isinstance(node, ast.MatchMapping) and node.rest in contract_names:
+            raise ValueError("wheel migration contract has a hidden or repeated binding")
     if any(len(values) != 1 for values in assignments.values()):
         raise ValueError("wheel migration contract declarations are missing or ambiguous")
     try:

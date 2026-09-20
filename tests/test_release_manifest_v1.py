@@ -513,6 +513,43 @@ def test_release_manifest_rejects_stale_wheel_migration_contract(
     assert not (artifacts / "SHA256SUMS").exists()
 
 
+@pytest.mark.parametrize(
+    "rebind",
+    [
+        b'\nif True:\n    MIGRATION_LEDGER_DIGEST = "0" * 64\n',
+        b'\nMIGRATION_FILENAMES += ("050_unapproved.sql",)\n',
+        b'\nMIGRATION_LEDGER_DIGEST: str = "0" * 64\n',
+    ],
+)
+def test_release_manifest_rejects_hidden_wheel_migration_contract_rebinding(
+    tmp_path: Path, rebind: bytes
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    with zipfile.ZipFile(wheel) as archive:
+        resources_init = archive.read("finance_core/resources/__init__.py")
+    _rewrite_wheel(
+        wheel,
+        {"finance_core/resources/__init__.py": resources_init + rebind},
+    )
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "wheel migration contract has a hidden or repeated binding" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
 def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
