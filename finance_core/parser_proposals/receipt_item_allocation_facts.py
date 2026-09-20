@@ -551,6 +551,8 @@ def persist_receipt_item_allocation_facts(
     command: ReceiptItemAllocationFactsCommand,
     *,
     clock: Callable[[], str] | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, ReceiptItemAllocationFactsResult], None]
+    | None = None,
 ) -> ReceiptItemAllocationFactsResult:
     """Atomically persist one authorized item/allocation fact set (create).
 
@@ -576,6 +578,8 @@ def persist_receipt_item_allocation_facts(
                     "exists with different canonical material"
                 )
             result = _verify_replay(conn, existing)
+            if persistence_effect is not None:
+                persistence_effect(conn, result)
             conn.commit()
             return result
 
@@ -687,9 +691,7 @@ def persist_receipt_item_allocation_facts(
             now=now,
         )
 
-        _inject_failure("before_commit")
-        conn.commit()
-        return ReceiptItemAllocationFactsResult(
+        result = ReceiptItemAllocationFactsResult(
             command_public_id=command.command_public_id,
             receipt_public_id=str(receipt["public_id"]),
             receipt_id=int(receipt["id"]),
@@ -705,6 +707,11 @@ def persist_receipt_item_allocation_facts(
             audit_event_public_id=audit_event.event_public_id,
             idempotent=False,
         )
+        if persistence_effect is not None:
+            persistence_effect(conn, result)
+        _inject_failure("before_commit")
+        conn.commit()
+        return result
     except ReceiptItemAllocationFactsError:
         _rollback_if_needed(conn)
         raise

@@ -38,7 +38,7 @@ from tests.test_parser_human_drafts_v1 import _connection, _start, _validation_p
 def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
     conn = _connection()
     try:
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:-1])
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:47])
         before = [tuple(row) for row in migration_ledger_rows(conn)]
         old_sql = conn.execute(
             """
@@ -48,7 +48,7 @@ def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
             """
         ).fetchone()[0]
         assert "parser_human_draft_publications" not in old_sql
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:48])
         assert [tuple(row) for row in migration_ledger_rows(conn)[:-1]] == before
         assert migration_ledger_rows(conn)[-1]["migration_id"] == "048"
         new_sql = conn.execute(
@@ -60,6 +60,8 @@ def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
         ).fetchone()[0]
         assert "parser_human_draft_publications" in new_sql
         assert "operation.result_completeness = 'complete'" in new_sql
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        assert migration_ledger_rows(conn)[-1]["migration_id"] == "049"
         rows = [tuple(row) for row in migration_ledger_rows(conn)]
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         assert [tuple(row) for row in migration_ledger_rows(conn)] == rows

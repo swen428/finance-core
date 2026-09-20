@@ -49,6 +49,10 @@ from finance_core.calculators.receipt_calculator_input_projection import (
     project_receipt_calculator_input,
 )
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
+from finance_core.receipt_finalization.d2_conditional import (
+    D2ConditionalAuthorityError,
+    require_d2_conditional_authority,
+)
 
 # ``_require_active_fact_set_binding`` is the single source of truth for the
 # active-fact-set re-read query; the bridge and the finalizer share it so the
@@ -851,6 +855,7 @@ def authorize_receipt_finalization(
             evidence_json=evidence_json,
             actor_type=actor_type,
             actor_id=actor_id,
+            expected_authorization_version="v1",
         )
         conn.commit()
     except Exception:
@@ -863,6 +868,205 @@ def authorize_receipt_finalization(
         confirmation_id=prepared.confirmation_id,
         content_hash=fingerprint,
         actor_type=actor_type,
+        actor_id=actor_id,
+        prepared=prepared,
+    )
+
+
+def authorize_d2_conditional_receipt_finalization(
+    conn: sqlite3.Connection,
+    prepared: PreparedReceiptCalculation,
+    *,
+    actor_id: str,
+    decision_public_id: str,
+    review_public_id: str,
+    reviewed_projection_hash: str,
+    snapshot_projection_hash: str,
+    clock: Callable[[], str] | None = None,
+) -> ReceiptFinalizationAuthorization:
+    """Create D2B authority only when the accepted review equals snapshot truth.
+
+    This is intentionally separate from :func:`authorize_receipt_finalization`.
+    It cannot create or adopt the manual ``v1`` authorization shape, and the
+    finalizer accepts its version only while the immutable D2 proof remains
+    fully bound to the accepted decision, review, active fact set, and
+    authoritative calculation snapshot.
+    """
+    require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
+    if not actor_id.strip():
+        raise BridgeAuthorizationActorError("D2 receipt authorization requires a human actor")
+    if reviewed_projection_hash != snapshot_projection_hash:
+        raise BridgeAuthorizationConflictError(
+            "Reviewed receipt projection does not equal authoritative snapshot projection"
+        )
+
+    created_at = _now(clock)
+    fin_input = _build_finalization_input(prepared, actor_type=HUMAN_ACTOR_TYPE, actor_id=actor_id)
+    binding = _require_snapshot_bound_authority(
+        conn, prepared, output_payload=fin_input.calculation_snapshot
+    )
+    fingerprint = build_finalization_content_fingerprint(fin_input)
+    final_total = str(fin_input.calculation_snapshot.get("total_paid", ""))
+    if not final_total:
+        raise BridgePreparationError("Calculation snapshot has no total_paid")
+    obligations_json = _obligations_json(fin_input)
+    participants_json = json.dumps(sorted(fin_input.participant_public_ids))
+    evidence_json = json.dumps(sorted(prepared.source_evidence_refs))
+    proof_hash = hashlib.sha256(
+        canonical_json_text(
+            {
+                "authorization_id": prepared.authorization_id,
+                "decision_public_id": decision_public_id,
+                "review_public_id": review_public_id,
+                "fact_set_public_id": binding.fact_set_public_id,
+                "calculation_snapshot_id": prepared.calculation_snapshot_id,
+                "projection_hash": reviewed_projection_hash,
+                "proof_version": "d2_conditional_v1",
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO receipt_finalization_confirmations (
+                confirmation_id, receipt_group_public_id, calculation_run_public_id,
+                calculation_snapshot_id, content_hash, currency, final_total,
+                payer_participant_public_id, participant_public_ids_json,
+                settlement_obligations_json, actor_type, actor_id,
+                confirmation_state, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'human', ?, 'confirmed', ?)
+            """,
+            (
+                prepared.confirmation_id,
+                prepared.receipt_group_public_id,
+                prepared.calculation_run_public_id,
+                prepared.calculation_snapshot_id,
+                fingerprint,
+                prepared.currency,
+                final_total,
+                prepared.payer_participant_public_id,
+                participants_json,
+                obligations_json,
+                actor_id,
+                created_at,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO receipt_finalization_authorizations (
+                authorization_id, receipt_group_public_id, calculation_run_public_id,
+                calculation_snapshot_id, confirmation_id, content_hash,
+                currency, final_total, payer_participant_public_id,
+                participant_public_ids_json, settlement_obligations_json,
+                source_evidence_refs_json, actor_type, actor_id,
+                authorization_state, authorization_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'human', ?,
+                      'authorized', 'd2_conditional_v1', ?)
+            """,
+            (
+                prepared.authorization_id,
+                prepared.receipt_group_public_id,
+                prepared.calculation_run_public_id,
+                prepared.calculation_snapshot_id,
+                prepared.confirmation_id,
+                fingerprint,
+                prepared.currency,
+                final_total,
+                prepared.payer_participant_public_id,
+                participants_json,
+                obligations_json,
+                evidence_json,
+                actor_id,
+                created_at,
+            ),
+        )
+        append_fact_set_binding_evidence(
+            conn,
+            binding=binding,
+            bound_record_type="finalization_authorization",
+            bound_record_public_id=prepared.authorization_id,
+            created_at=created_at,
+        )
+        proof = conn.execute(
+            "SELECT * FROM d2_conditional_authorization_proofs "
+            "WHERE authorization_id = ? OR decision_public_id = ? OR review_public_id = ? "
+            "OR fact_set_public_id = ? OR calculation_snapshot_id = ? "
+            "OR equality_proof_hash = ?",
+            (
+                prepared.authorization_id,
+                decision_public_id,
+                review_public_id,
+                binding.fact_set_public_id,
+                prepared.calculation_snapshot_id,
+                proof_hash,
+            ),
+        ).fetchone()
+        if proof is None:
+            conn.execute(
+                """
+                INSERT INTO d2_conditional_authorization_proofs (
+                    authorization_id, decision_public_id, review_public_id,
+                    fact_set_public_id, calculation_snapshot_id,
+                    reviewed_projection_hash, snapshot_projection_hash,
+                    equality_proof_hash, proof_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'd2_conditional_v1', ?)
+                """,
+                (
+                    prepared.authorization_id,
+                    decision_public_id,
+                    review_public_id,
+                    binding.fact_set_public_id,
+                    prepared.calculation_snapshot_id,
+                    reviewed_projection_hash,
+                    snapshot_projection_hash,
+                    proof_hash,
+                    created_at,
+                ),
+            )
+            proof = conn.execute(
+                "SELECT * FROM d2_conditional_authorization_proofs WHERE authorization_id = ?",
+                (prepared.authorization_id,),
+            ).fetchone()
+        if proof is None or any(
+            str(proof[column]) != expected
+            for column, expected in (
+                ("decision_public_id", decision_public_id),
+                ("review_public_id", review_public_id),
+                ("fact_set_public_id", binding.fact_set_public_id),
+                ("calculation_snapshot_id", prepared.calculation_snapshot_id),
+                ("reviewed_projection_hash", reviewed_projection_hash),
+                ("snapshot_projection_hash", snapshot_projection_hash),
+                ("equality_proof_hash", proof_hash),
+                ("proof_version", "d2_conditional_v1"),
+            )
+        ):
+            raise BridgeAuthorizationConflictError("D2 conditional proof conflict")
+        _require_persisted_authorization_truth(
+            conn,
+            prepared=prepared,
+            fingerprint=fingerprint,
+            final_total=final_total,
+            participants_json=participants_json,
+            obligations_json=obligations_json,
+            evidence_json=evidence_json,
+            actor_type=HUMAN_ACTOR_TYPE,
+            actor_id=actor_id,
+            expected_authorization_version="d2_conditional_v1",
+        )
+        conn.commit()
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+    return ReceiptFinalizationAuthorization(
+        authorization_id=prepared.authorization_id,
+        confirmation_id=prepared.confirmation_id,
+        content_hash=fingerprint,
+        actor_type=HUMAN_ACTOR_TYPE,
         actor_id=actor_id,
         prepared=prepared,
     )
@@ -948,6 +1152,7 @@ def _require_persisted_authorization_truth(
     evidence_json: str,
     actor_type: str,
     actor_id: str,
+    expected_authorization_version: str,
 ) -> None:
     """Fail closed unless the durable rows match this exact request in full.
 
@@ -1025,7 +1230,7 @@ def _require_persisted_authorization_truth(
             f"A durable authorization {prepared.authorization_id!r} is in state "
             f"{str(auth['authorization_state'])!r}; refusing to reuse it"
         )
-    if str(auth["authorization_version"]) != "v1":
+    if str(auth["authorization_version"]) != expected_authorization_version:
         raise BridgeAuthorizationConflictError(
             f"A durable authorization {prepared.authorization_id!r} uses version "
             f"{str(auth['authorization_version'])!r}; refusing to reuse it"
@@ -1199,11 +1404,18 @@ def load_persisted_receipt_finalization_authorization(
             "only 'authorized' or 'consumed' can be recovered"
         )
     auth_version = str(auth["authorization_version"])
-    if auth_version != "v1":
+    if auth_version not in {"v1", "d2_conditional_v1"}:
         raise BridgeRecoveryError(
             f"Authorization {authorization_id!r} uses version {auth_version!r}; "
-            "only 'v1' is supported"
+            "only 'v1' and 'd2_conditional_v1' are supported"
         )
+    if auth_version == "d2_conditional_v1":
+        try:
+            require_d2_conditional_authority(
+                conn, {"authorization_id": authorization_id, **dict(auth)}
+            )
+        except D2ConditionalAuthorityError as exc:
+            raise BridgeRecoveryError(str(exc)) from exc
 
     receipt_group_public_id = str(auth["receipt_group_public_id"])
     calculation_run_public_id = str(auth["calculation_run_public_id"])
@@ -1536,6 +1748,7 @@ __all__ = [
     "PreparedReceiptCalculation",
     "ReceiptFactSetBridgeError",
     "ReceiptFinalizationAuthorization",
+    "authorize_d2_conditional_receipt_finalization",
     "authorize_receipt_finalization",
     "finalize_prepared_receipt",
     "load_persisted_receipt_finalization_authorization",

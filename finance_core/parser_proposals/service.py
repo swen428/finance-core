@@ -126,6 +126,7 @@ def confirm_parser_proposal(
     expected_version: int | None = None,
     d1_decision_binding: HumanDraftDecisionBinding | None = None,
     clock: Callable[[], str] | None = None,
+    _caller_owns_transaction: bool = False,
 ) -> dict[str, Any]:
     """Atomically persist an authoritative human decision and lifecycle change.
 
@@ -139,7 +140,13 @@ def confirm_parser_proposal(
     """
     _validate_human_command(authenticated_actor_id, actor_type, decision, confirmation_channel)
     require_staging_database(conn)
-    _begin_immediate(conn)
+    if _caller_owns_transaction:
+        if not conn.in_transaction:
+            raise ParserConfirmationError(
+                "caller-owned confirmation requires an active transaction"
+            )
+    else:
+        _begin_immediate(conn)
     try:
         proposals = ParserProposalRepository(conn)
         authorizations = ParserAuthorizationRepository(conn)
@@ -216,7 +223,8 @@ def confirm_parser_proposal(
                     decision_binding=d1_decision_binding,
                     now_epoch=decision_epoch,
                 )
-            conn.commit()
+            if not _caller_owns_transaction:
+                conn.commit()
             return result
 
         to_status = CONFIRMED if decision == "confirmed" else REJECTED
@@ -288,7 +296,8 @@ def confirm_parser_proposal(
                 decision_binding=d1_decision_binding,
                 now_epoch=decision_epoch,
             )
-        conn.commit()
+        if not _caller_owns_transaction:
+            conn.commit()
         return {
             "parser_output_id": parser_output_id,
             "from_status": proposal["parse_status"],
@@ -303,7 +312,8 @@ def confirm_parser_proposal(
             "idempotent": False,
         }
     except Exception as exc:
-        _rollback_if_needed(conn)
+        if not _caller_owns_transaction:
+            _rollback_if_needed(conn)
         if isinstance(exc, HumanDraftError):
             raise ParserConfirmationError(str(exc)) from exc
         raise

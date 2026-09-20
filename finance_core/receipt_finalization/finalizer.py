@@ -39,6 +39,10 @@ from finance_core.money import (
     money_decimal,
     quantize_for_currency,
 )
+from finance_core.receipt_finalization.d2_conditional import (
+    D2ConditionalAuthorityError,
+    require_d2_conditional_authority,
+)
 from finance_core.receipt_finalization.models import (
     ActiveFactSetBinding,
     ConfirmedReceiptIdentity,
@@ -1230,10 +1234,24 @@ def _load_and_validate_authorization(
             reason=FinalizationBlockReason.AUTHORIZATION_CONTENT_MISMATCH,
         )
 
-    # --- Version ---
-    if not auth.get("authorization_version"):
+    # --- Version and version-specific authority proof ---
+    authorization_version = str(auth.get("authorization_version") or "")
+    if not authorization_version:
         raise FinalizationAuthorizationError(
             f"Authorization {authorization_id!r} has missing or empty version",
+            reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED,
+        )
+    if authorization_version == "d2_conditional_v1":
+        try:
+            require_d2_conditional_authority(conn, auth)
+        except D2ConditionalAuthorityError as exc:
+            raise FinalizationAuthorizationError(
+                str(exc), reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED
+            ) from exc
+    elif authorization_version != "v1":
+        raise FinalizationAuthorizationError(
+            f"Authorization {authorization_id!r} uses unsupported version "
+            f"{authorization_version!r}",
             reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED,
         )
 
@@ -2419,9 +2437,17 @@ def _require_replay_authorization_truth(
             "a durably finalized authorization can only be 'consumed'",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
-    if str(auth.get("authorization_version") or "") != "v1":
+    authorization_version = str(auth.get("authorization_version") or "")
+    if authorization_version == "d2_conditional_v1":
+        try:
+            require_d2_conditional_authority(conn, auth)
+        except D2ConditionalAuthorityError as exc:
+            raise FinalizationIdempotencyError(
+                str(exc), reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value
+            ) from exc
+    elif authorization_version != "v1":
         raise FinalizationIdempotencyError(
-            f"Replay authorization version is {str(auth.get('authorization_version'))!r}, not 'v1'",
+            f"Replay authorization version is {authorization_version!r}; unsupported",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
     if auth["content_hash"] != fingerprint:

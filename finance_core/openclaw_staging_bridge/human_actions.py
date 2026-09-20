@@ -387,6 +387,7 @@ def issue_human_action_references(
     allowed_actions: tuple[str, ...] = REFERENCE_ACTIONS,
     card_generation_public_id: str | None = None,
     fallback_issuance_idempotency_keys: tuple[str, ...] = (),
+    issuance_effect: Callable[[sqlite3.Connection, tuple[dict, ...], int], None] | None = None,
     clock: Callable[[], int] = lambda: int(datetime.now(UTC).timestamp()),
 ) -> tuple[tuple[IssuedHumanActionReference, ...], bool]:
     """Issue or reconstruct the allowed direct-human references atomically."""
@@ -462,6 +463,8 @@ def issue_human_action_references(
             if min(int(row["expires_at"]) for row in existing) <= (now + minimum_remaining_seconds):
                 raise HumanActionReferenceError("reference_expiring")
             issued = tuple(_issued_from_row(row, key) for row in existing)
+            if issuance_effect is not None:
+                issuance_effect(conn, tuple(existing), now)
             conn.commit()
             return issued, True
 
@@ -555,6 +558,9 @@ def issue_human_action_references(
                     action=action, reference=reference, expires_at=expires_at
                 )
             )
+        if issuance_effect is not None:
+            persisted = _reference_rows_for_issuance(conn, issuance_idempotency_key)
+            issuance_effect(conn, tuple(persisted), now)
         conn.commit()
         return tuple(result), False
     except Exception:

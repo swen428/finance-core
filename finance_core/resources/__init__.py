@@ -7,7 +7,7 @@ from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 
-MIGRATION_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+MIGRATION_LEDGER_DIGEST = "566aba176d56dee833fd93fec73f2643f7b49d1507855b117576535aa4a531d5"
 MIGRATION_PREFLIGHT_FILENAME = "migration_029_preflight.py"
 MIGRATION_PREFLIGHT_SHA256 = "1fe3324447dbd128a80aadcafd54a70974d9c858cbc3a45a1bdaeae1cf48c295"
 MIGRATION_PREFLIGHT_BYTE_COUNT = 55_851
@@ -60,6 +60,7 @@ MIGRATION_FILENAMES = (
     "046_openclaw_guided_edit_sessions.sql",
     "047_parser_human_drafts.sql",
     "048_d1_human_ai_lineage_transition.sql",
+    "049_d2_one_confirmation_posting.sql",
 )
 
 

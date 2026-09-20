@@ -47,7 +47,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+EXPECTED_LEDGER_DIGEST = "566aba176d56dee833fd93fec73f2643f7b49d1507855b117576535aa4a531d5"
 
 
 def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
@@ -76,8 +76,8 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 48
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 49))
+    assert len(paths) == 49
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 50))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
@@ -317,7 +317,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.3"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 48
+        assert payload["migration_count"] == 49
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
