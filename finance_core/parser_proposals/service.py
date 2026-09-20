@@ -368,6 +368,13 @@ def convert_confirmed_parser_proposal(
             )
         existing = conversions.get_for_proposal(parser_output_id)
         if existing is not None:
+            _require_existing_conversion_truth(
+                conn,
+                proposal=proposal,
+                authorization=authorization,
+                content_hash=content_hash,
+                conversion=existing,
+            )
             conn.commit()
             return {
                 "transaction_id": existing["transaction_id"],
@@ -440,6 +447,98 @@ def convert_confirmed_parser_proposal(
     except Exception:
         _rollback_if_needed(conn)
         raise
+
+
+def verify_converted_parser_proposal(
+    conn: sqlite3.Connection, parser_output_id: int
+) -> dict[str, Any]:
+    """Verify one completed text conversion using SELECTs only.
+
+    The proposal, durable human authorization, conversion audit and canonical
+    transaction must still describe the same exact financial projection.
+    """
+    require_staging_database(conn)
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN DEFERRED")
+    try:
+        proposal = _require_proposal(ParserProposalRepository(conn), parser_output_id)
+        if proposal["parse_status"] != CONFIRMED:
+            raise InvalidProposalStatusError(
+                f"Only confirmed parser proposals can be verified: {proposal['parse_status']}"
+            )
+        content_hash = compute_effective_proposal_content_hash(conn, proposal)
+        authorization = _require_active_authorization(
+            ParserAuthorizationRepository(conn).get_for_proposal(parser_output_id),
+            parser_output_id,
+            content_hash,
+        )
+        conversion = ParserConversionRepository(conn).get_for_proposal(parser_output_id)
+        if conversion is None:
+            raise ProposalConversionError("Confirmed parser proposal has no conversion")
+        _require_existing_conversion_truth(
+            conn,
+            proposal=proposal,
+            authorization=authorization,
+            content_hash=content_hash,
+            conversion=conversion,
+        )
+        result = {
+            "transaction_id": conversion["transaction_id"],
+            "transaction_public_id": conversion["transaction_public_id"],
+            "parser_output_id": parser_output_id,
+            "confirmation_id": authorization["confirmation_public_id"],
+        }
+        if owns_snapshot:
+            conn.rollback()
+        return result
+    except BaseException:
+        if owns_snapshot and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _require_existing_conversion_truth(
+    conn: sqlite3.Connection,
+    *,
+    proposal: dict[str, Any],
+    authorization: dict[str, Any],
+    content_hash: str,
+    conversion: dict[str, Any],
+) -> None:
+    fields = _transaction_fields(conn, proposal)
+    expected_public_id = _converted_transaction_public_id(proposal, authorization, fields)
+    row = conn.execute(
+        "SELECT public_id, intent, intent_type, source_channel, transaction_date, status, "
+        "review_status, amount, total_amount, currency, merchant, category, raw_input, "
+        "statement_batch_id, parser_output_id FROM transactions WHERE id = ?",
+        (conversion["transaction_id"],),
+    ).fetchone()
+    expected_amount = money_decimal(fields["amount"])
+    if (
+        row is None
+        or conversion["confirmation_public_id"] != authorization["confirmation_public_id"]
+        or conversion["proposal_content_hash"] != content_hash
+        or conversion["authenticated_actor_id"] != authorization["authenticated_actor_id"]
+        or str(row["public_id"]) != expected_public_id
+        or decimal_from_numeric_mirror(row["amount"]) != expected_amount
+        or decimal_from_numeric_mirror(row["total_amount"]) != expected_amount
+        or str(row["currency"]) != fields["currency"]
+        or str(row["intent"]) != fields["intent"]
+        or str(row["intent_type"]) != "Generated"
+        or row["source_channel"] != fields["source_channel"]
+        or str(row["transaction_date"] or "")[:10] != fields["transaction_date"]
+        or str(row["status"]) != "active"
+        or str(row["review_status"]) != "confirmed_from_parser_proposal"
+        or row["merchant"] != fields["merchant"]
+        or row["category"] != fields["category"]
+        or str(row["raw_input"]) != str(proposal["raw_text"])
+        or row["statement_batch_id"] != proposal["statement_batch_id"]
+        or int(row["parser_output_id"]) != int(proposal["id"])
+    ):
+        raise ProposalConversionError(
+            "Canonical parser transaction drifted from its confirmed proposal"
+        )
 
 
 def _validate_human_command(actor_id: str, actor_type: str, decision: str, channel: str) -> None:

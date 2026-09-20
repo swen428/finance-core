@@ -63,6 +63,7 @@ from finance_core.receipt_finalization.d2_conditional import (
 from finance_core.receipt_finalization.finalizer import (
     _require_active_fact_set_binding,
     finalize_receipt_split,
+    verify_finalized_receipt_split,
 )
 from finance_core.receipt_finalization.models import (
     ActiveFactSetBinding,
@@ -912,6 +913,16 @@ def authorize_d2_conditional_receipt_finalization(
         binding = _require_snapshot_bound_authority(
             conn, prepared, output_payload=fin_input.calculation_snapshot
         )
+        active_self_rows = conn.execute(
+            "SELECT public_id FROM participants "
+            "WHERE is_self = 1 AND is_active = 1 ORDER BY public_id"
+        ).fetchall()
+        if [str(row["public_id"]) for row in active_self_rows] != [
+            prepared.payer_participant_public_id
+        ]:
+            raise BridgeAuthorizationConflictError(
+                "D2 receipt authorization requires the payer to be the unique active self"
+            )
         d2_authority = conn.execute(
             """
             SELECT reviews.visible_projection_hash, reviews.authenticated_actor_id,
@@ -965,6 +976,18 @@ def authorize_d2_conditional_receipt_finalization(
             raise BridgeAuthorizationConflictError(
                 "Reviewed receipt projection does not equal authoritative snapshot projection"
             )
+        participant_authority_hash = hashlib.sha256(
+            canonical_json_text(
+                {
+                    "active_self_count": 1,
+                    "authorization_id": prepared.authorization_id,
+                    "payer_participant_public_id": prepared.payer_participant_public_id,
+                    "payer_was_active_self": 1,
+                    "proof_version": "d2_participant_authority_v1",
+                    "review_public_id": review_public_id,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
         proof_hash = hashlib.sha256(
             canonical_json_text(
                 {
@@ -1043,13 +1066,14 @@ def authorize_d2_conditional_receipt_finalization(
             "SELECT * FROM d2_conditional_authorization_proofs "
             "WHERE authorization_id = ? OR decision_public_id = ? OR review_public_id = ? "
             "OR fact_set_public_id = ? OR calculation_snapshot_id = ? "
-            "OR equality_proof_hash = ?",
+            "OR participant_authority_hash = ? OR equality_proof_hash = ?",
             (
                 prepared.authorization_id,
                 decision_public_id,
                 review_public_id,
                 binding.fact_set_public_id,
                 prepared.calculation_snapshot_id,
+                participant_authority_hash,
                 proof_hash,
             ),
         ).fetchone()
@@ -1060,8 +1084,10 @@ def authorize_d2_conditional_receipt_finalization(
                     authorization_id, decision_public_id, review_public_id,
                     fact_set_public_id, calculation_snapshot_id,
                     reviewed_projection_hash, snapshot_projection_hash,
+                    payer_participant_public_id, payer_was_active_self,
+                    active_self_count, participant_authority_hash,
                     equality_proof_hash, proof_version, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'd2_conditional_v1', ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, 'd2_conditional_v1', ?)
                 """,
                 (
                     prepared.authorization_id,
@@ -1071,6 +1097,8 @@ def authorize_d2_conditional_receipt_finalization(
                     prepared.calculation_snapshot_id,
                     reviewed_projection_hash,
                     snapshot_projection_hash,
+                    prepared.payer_participant_public_id,
+                    participant_authority_hash,
                     proof_hash,
                     created_at,
                 ),
@@ -1088,6 +1116,10 @@ def authorize_d2_conditional_receipt_finalization(
                 ("calculation_snapshot_id", prepared.calculation_snapshot_id),
                 ("reviewed_projection_hash", reviewed_projection_hash),
                 ("snapshot_projection_hash", snapshot_projection_hash),
+                ("payer_participant_public_id", prepared.payer_participant_public_id),
+                ("payer_was_active_self", "1"),
+                ("active_self_count", "1"),
+                ("participant_authority_hash", participant_authority_hash),
                 ("equality_proof_hash", proof_hash),
                 ("proof_version", "d2_conditional_v1"),
             )
@@ -1339,6 +1371,19 @@ def finalize_prepared_receipt(
         actor_id=authorization.actor_id,
     )
     return finalize_receipt_split(conn, fin_input, clock=clock)
+
+
+def verify_finalized_prepared_receipt(
+    conn: sqlite3.Connection, authorization_id: str
+) -> FinalizationOutput:
+    """Recover and verify a completed prepared receipt without writing."""
+    authorization = load_persisted_receipt_finalization_authorization(conn, authorization_id)
+    fin_input = _build_finalization_input(
+        authorization.prepared,
+        actor_type=authorization.actor_type,
+        actor_id=authorization.actor_id,
+    )
+    return verify_finalized_receipt_split(conn, fin_input)
 
 
 # ---------------------------------------------------------------------------
@@ -1808,6 +1853,7 @@ __all__ = [
     "authorize_d2_conditional_receipt_finalization",
     "authorize_receipt_finalization",
     "finalize_prepared_receipt",
+    "verify_finalized_prepared_receipt",
     "load_persisted_receipt_finalization_authorization",
     "prepare_receipt_calculation",
 ]

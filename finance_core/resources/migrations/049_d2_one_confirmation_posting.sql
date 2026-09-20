@@ -132,6 +132,15 @@ CREATE TABLE d2_conditional_authorization_proofs (
         length(snapshot_projection_hash) = 64
         AND snapshot_projection_hash NOT GLOB '*[^0-9a-f]*'
     ),
+    payer_participant_public_id TEXT NOT NULL CHECK (
+        length(trim(payer_participant_public_id)) > 0
+    ),
+    payer_was_active_self INTEGER NOT NULL CHECK (payer_was_active_self = 1),
+    active_self_count INTEGER NOT NULL CHECK (active_self_count = 1),
+    participant_authority_hash TEXT NOT NULL UNIQUE CHECK (
+        length(participant_authority_hash) = 64
+        AND participant_authority_hash NOT GLOB '*[^0-9a-f]*'
+    ),
     equality_proof_hash TEXT NOT NULL UNIQUE CHECK (
         length(equality_proof_hash) = 64
         AND equality_proof_hash NOT GLOB '*[^0-9a-f]*'
@@ -259,6 +268,7 @@ WHEN EXISTS (
        OR existing.review_public_id = NEW.review_public_id
        OR existing.fact_set_public_id = NEW.fact_set_public_id
        OR existing.calculation_snapshot_id = NEW.calculation_snapshot_id
+       OR existing.participant_authority_hash = NEW.participant_authority_hash
        OR existing.equality_proof_hash = NEW.equality_proof_hash
 ) BEGIN
     SELECT RAISE(ABORT, 'D2 conditional proof identity collision');

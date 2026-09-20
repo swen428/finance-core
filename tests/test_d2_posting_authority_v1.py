@@ -15,10 +15,12 @@ from finance_core.parser_proposals import human_drafts
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.human_drafts import (
     HumanDraftCommand,
+    HumanDraftDecisionBinding,
     apply_human_draft_card,
     begin_human_draft_in_transaction,
 )
 from finance_core.parser_proposals.human_revision import publish_human_revision_in_transaction
+from finance_core.parser_proposals.service import confirm_parser_proposal
 from finance_core.posting_authority import (
     PostingAuthorityError,
     confirm_and_post,
@@ -298,6 +300,122 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
     assert recovered == status
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
     conn.close()
+
+
+def test_text_status_detects_canonical_transaction_drift_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-transaction-drift",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-text-transaction-drift-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+    assert (
+        confirm_and_post(
+            conn,
+            key=b"d2-text-transaction-drift-key",
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-text-transaction-drift-callback",
+            callback_message_id=211,
+            clock=lambda: 1004,
+        ).state
+        == "finalized"
+    )
+    conn.execute("UPDATE transactions SET amount = 99.99 WHERE parser_output_id IS NOT NULL")
+    conn.commit()
+    before = conn.total_changes
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert conn.total_changes == before
+    assert status.state == "needs_attention"
+    assert status.transaction_public_id is None
+    assert status.attention_reason == "financial_authority_mismatch"
+
+
+def test_resume_requires_complete_d2_decision_before_text_financial_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-missing-decision",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-text-missing-decision-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+    ref = conn.execute(
+        "SELECT refs.* FROM openclaw_human_action_references AS refs "
+        "JOIN d2_posting_review_action_bindings AS bindings ON bindings.reference_id = refs.id "
+        "WHERE bindings.review_public_id = ?",
+        (review.review_public_id,),
+    ).fetchone()
+    assert ref is not None
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO openclaw_human_action_redemptions "
+        "(reference_id, callback_id_sha256, callback_message_id, redeemed_at) "
+        "VALUES (?, ?, 212, '1970-01-01T00:16:44+00:00')",
+        (ref["id"], hashlib.sha256(b"missing-decision").hexdigest()),
+    )
+    confirmation_id = "pca_d2_missing_decision"
+    confirm_parser_proposal(
+        conn,
+        int(ref["parser_output_id"]),
+        authenticated_actor_id="111",
+        decision="confirmed",
+        confirmation_channel="telegram",
+        confirmation_public_id=confirmation_id,
+        expected_content_hash=str(ref["proposal_content_hash"]),
+        expected_version=int(ref["proposal_version"]),
+        d1_decision_binding=HumanDraftDecisionBinding(
+            reference_public_id=str(ref["reference_public_id"]),
+            card_generation_public_id=published.card_generation_public_id,
+            authenticated_actor_id="111",
+            telegram_account_id="acct",
+            telegram_conversation_id="111",
+            conversation_binding_id="binding",
+        ),
+        clock=lambda: "1970-01-01T00:16:44+00:00",
+        _caller_owns_transaction=True,
+    )
+    attempt_id = "d2att_" + "a" * 30
+    conn.execute(
+        "INSERT INTO d2_posting_attempts "
+        "(attempt_public_id, review_public_id, reference_id, posting_path, stage, "
+        "stage_evidence_public_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, 'text', 'accepted', ?, ?, ?)",
+        (
+            attempt_id,
+            review.review_public_id,
+            ref["id"],
+            confirmation_id,
+            "1970-01-01T00:16:44+00:00",
+            "1970-01-01T00:16:44+00:00",
+        ),
+    )
+    conn.commit()
+    with pytest.raises(PostingAuthorityError, match="posting authority unavailable"):
+        resume_posting(conn, attempt_public_id=attempt_id, context=context)
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
 
 def test_status_refuses_finalized_coordination_row_with_wrong_transaction(
@@ -848,6 +966,105 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
                 f"SELECT {projection} FROM {table} LIMIT 1"
             )
         conn.rollback()
+
+
+def test_finalized_personal_receipt_uses_frozen_participant_authority(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-frozen-participant-authority",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        receipt_payer_participant_public_id="person_owner",
+        clock=lambda: 1002,
+    )
+    key = b"d2-frozen-participant-authority-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+    first = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-frozen-participant-authority-callback",
+        callback_message_id=310,
+        clock=lambda: 1004,
+    )
+    assert first.state == "finalized"
+    conn.execute("UPDATE participants SET is_active = 0 WHERE public_id = 'person_owner'")
+    conn.execute("UPDATE participants SET is_self = 1 WHERE public_id = 'person_alice'")
+    conn.commit()
+    before = conn.total_changes
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert conn.total_changes == before
+    assert status == first
+    replay = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-frozen-participant-authority-callback",
+        callback_message_id=310,
+        clock=lambda: 9999,
+    )
+    assert replay == first
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+
+
+def test_receipt_status_detects_canonical_transaction_drift_without_writes(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-receipt-transaction-drift",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        receipt_payer_participant_public_id="person_owner",
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-receipt-transaction-drift-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+    assert (
+        confirm_and_post(
+            conn,
+            key=b"d2-receipt-transaction-drift-key",
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-receipt-transaction-drift-callback",
+            callback_message_id=311,
+            clock=lambda: 1004,
+        ).state
+        == "finalized"
+    )
+    conn.execute("UPDATE transactions SET amount = 99.99")
+    conn.commit()
+    before = conn.total_changes
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert conn.total_changes == before
+    assert status.state == "needs_attention"
+    assert status.transaction_public_id is None
+    assert status.attention_reason == "financial_authority_mismatch"
 
 
 @pytest.mark.parametrize(

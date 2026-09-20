@@ -44,9 +44,9 @@ from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.parser_proposals.service import (
     confirm_parser_proposal,
     convert_confirmed_parser_proposal,
+    verify_converted_parser_proposal,
 )
 from finance_core.receipt_finalization.d2_conditional import (
-    D2ConditionalAuthorityError,
     build_d2_receipt_projection,
     require_d2_conditional_authority,
 )
@@ -55,6 +55,7 @@ from finance_core.receipt_finalization.fact_set_bridge import (
     authorize_d2_conditional_receipt_finalization,
     finalize_prepared_receipt,
     prepare_receipt_calculation,
+    verify_finalized_prepared_receipt,
 )
 from finance_core.sqlite_connection import require_foreign_keys_enabled
 from finance_core.staging_guard import require_staging_database
@@ -72,7 +73,7 @@ _D2_TABLES = frozenset(
         "d2_posting_attempt_events",
     }
 )
-_D2_SCHEMA_FINGERPRINT = "d19b4bf7cdfea901ddff8428a4e3538d35460078019b984288f93aaeb69654e7"
+_D2_SCHEMA_FINGERPRINT = "a8d6d11e9bdf65b09691a23df69eabcd8c2f63427f0b4245d7bffa3f4d95cdb2"
 
 
 class PostingAuthorityError(RuntimeError):
@@ -548,6 +549,67 @@ def _accepted_attempt_for_callback(
     return str(row["attempt_public_id"])
 
 
+def _authorized_attempt_for_resume(
+    conn: sqlite3.Connection,
+    *,
+    attempt_public_id: str,
+    context: HumanActionContext,
+) -> sqlite3.Row:
+    """Require the complete redeemed D2 authority chain before any financial write."""
+    row = conn.execute(
+        """
+        SELECT attempts.*, reviews.parser_output_id, reviews.review_public_id,
+               reviews.proposal_version, reviews.proposal_content_hash,
+               decisions.decision_public_id, decisions.confirmation_public_id
+        FROM d2_posting_attempts AS attempts
+        JOIN d2_posting_reviews AS reviews
+          ON reviews.review_public_id = attempts.review_public_id
+        JOIN d2_posting_review_action_bindings AS bindings
+          ON bindings.review_public_id = reviews.review_public_id
+         AND bindings.reference_id = attempts.reference_id
+        JOIN openclaw_human_action_references AS refs
+          ON refs.id = attempts.reference_id
+         AND refs.action = 'confirm'
+         AND refs.parser_output_id = reviews.parser_output_id
+         AND refs.proposal_version = reviews.proposal_version
+         AND refs.proposal_content_hash = reviews.proposal_content_hash
+         AND refs.authenticated_actor_id = reviews.authenticated_actor_id
+         AND refs.channel_account_id = reviews.telegram_account_id
+         AND refs.channel_conversation_id = reviews.telegram_conversation_id
+         AND refs.conversation_binding_id = reviews.conversation_binding_id
+        JOIN openclaw_human_action_redemptions AS redemptions
+          ON redemptions.reference_id = refs.id
+        JOIN d2_posting_decisions AS decisions
+          ON decisions.attempt_public_id = attempts.attempt_public_id
+         AND decisions.review_public_id = reviews.review_public_id
+         AND decisions.reference_id = refs.id
+        JOIN parser_proposal_authorizations AS confirmations
+          ON confirmations.confirmation_public_id = decisions.confirmation_public_id
+         AND confirmations.parser_output_id = reviews.parser_output_id
+         AND confirmations.proposal_content_hash = reviews.proposal_content_hash
+         AND confirmations.authenticated_actor_id = reviews.authenticated_actor_id
+         AND confirmations.actor_type = 'human'
+         AND confirmations.confirmation_state = 'confirmed'
+        WHERE attempts.attempt_public_id = ?
+          AND attempts.posting_path = reviews.posting_path
+          AND reviews.authenticated_actor_id = ?
+          AND reviews.telegram_account_id = ?
+          AND reviews.telegram_conversation_id = ?
+          AND reviews.conversation_binding_id = ?
+        """,
+        (
+            attempt_public_id,
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise PostingAuthorityError("posting authority unavailable")
+    return row
+
+
 def confirm_and_post(
     conn: sqlite3.Connection,
     *,
@@ -839,24 +901,7 @@ def resume_posting(
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
     _require_context(context)
-    row = conn.execute(
-        "SELECT attempts.*, reviews.parser_output_id, reviews.review_public_id "
-        "FROM d2_posting_attempts AS attempts "
-        "JOIN d2_posting_reviews AS reviews "
-        "ON reviews.review_public_id = attempts.review_public_id "
-        "WHERE attempts.attempt_public_id = ? "
-        "AND reviews.authenticated_actor_id = ? AND reviews.telegram_account_id = ? "
-        "AND reviews.telegram_conversation_id = ? AND reviews.conversation_binding_id = ?",
-        (
-            attempt_public_id,
-            context.actor_id,
-            context.account_id,
-            context.conversation_id,
-            context.binding_id,
-        ),
-    ).fetchone()
-    if row is None:
-        raise PostingAuthorityError("posting authority unavailable")
+    row = _authorized_attempt_for_resume(conn, attempt_public_id=attempt_public_id, context=context)
     if row["stage"] == "accepted" and row["posting_path"] == "text":
         result = convert_confirmed_parser_proposal(conn, int(row["parser_output_id"]))
         _inject_failure("after_text_finalization_commit")
@@ -1220,14 +1265,20 @@ def get_status(
                 (row["parser_output_id"],),
             ).fetchone()
             if conversion is not None:
-                if (
-                    conversion["confirmation_public_id"] != decision["confirmation_public_id"]
-                    or conversion["proposal_content_hash"] != row["proposal_content_hash"]
-                    or conversion["authenticated_actor_id"] != row["authenticated_actor_id"]
-                ):
+                try:
+                    verified = verify_converted_parser_proposal(conn, int(row["parser_output_id"]))
+                except Exception:
                     integrity_error = True
                 else:
-                    authoritative_transaction = str(conversion["transaction_public_id"])
+                    if (
+                        conversion["confirmation_public_id"] != decision["confirmation_public_id"]
+                        or conversion["proposal_content_hash"] != row["proposal_content_hash"]
+                        or conversion["authenticated_actor_id"] != row["authenticated_actor_id"]
+                        or verified["transaction_public_id"] != conversion["transaction_public_id"]
+                    ):
+                        integrity_error = True
+                    else:
+                        authoritative_transaction = str(conversion["transaction_public_id"])
         else:
             finalization = conn.execute(
                 "SELECT authorizations.*, audits.status AS finalization_status, "
@@ -1245,7 +1296,10 @@ def get_status(
             if finalization is not None:
                 try:
                     require_d2_conditional_authority(conn, dict(finalization))
-                except D2ConditionalAuthorityError:
+                    verified_receipt = verify_finalized_prepared_receipt(
+                        conn, str(finalization["authorization_id"])
+                    )
+                except Exception:
                     integrity_error = True
                 else:
                     if (
@@ -1253,6 +1307,8 @@ def get_status(
                         or finalization["authorization_version"] != "d2_conditional_v1"
                         or finalization["finalization_status"] != "finalized"
                         or finalization["final_transaction_public_id"]
+                        != finalization["canonical_transaction_public_id"]
+                        or verified_receipt.transaction_public_id
                         != finalization["canonical_transaction_public_id"]
                     ):
                         integrity_error = True

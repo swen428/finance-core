@@ -108,10 +108,6 @@ def require_d2_conditional_authority(
                receipts.receipt_datetime AS receipt_date,
                receipts.currency AS receipt_currency,
                payer.public_id AS receipt_payer_public_id,
-               payer.is_self AS receipt_payer_is_self,
-               payer.is_active AS receipt_payer_is_active,
-               (SELECT COUNT(*) FROM participants WHERE is_self = 1 AND is_active = 1)
-                   AS active_self_count,
                snapshots.output_payload_json,
                snapshot_binding.fact_set_public_id AS snapshot_fact_set_public_id,
                authorization_binding.fact_set_public_id AS authorization_fact_set_public_id
@@ -184,6 +180,18 @@ def require_d2_conditional_authority(
             }
         ).encode("utf-8")
     ).hexdigest()
+    expected_participant_authority_hash = hashlib.sha256(
+        canonical_json_text(
+            {
+                "active_self_count": 1,
+                "authorization_id": authorization_id,
+                "payer_participant_public_id": values["receipt_payer_public_id"],
+                "payer_was_active_self": 1,
+                "proof_version": "d2_participant_authority_v1",
+                "review_public_id": values["review_public_id"],
+            }
+        ).encode("utf-8")
+    ).hexdigest()
     if (
         values["proof_version"] != "d2_conditional_v1"
         or values["calculation_snapshot_id"] != snapshot_id
@@ -196,9 +204,12 @@ def require_d2_conditional_authority(
         or values["review_conversation_id"] != values["reference_conversation_id"]
         or values["review_binding_id"] != values["reference_binding_id"]
         or values["fact_set_public_id"] != values["evidence_fact_set_public_id"]
-        or int(values["receipt_payer_is_self"]) != 1
-        or int(values["receipt_payer_is_active"]) != 1
+        or values["payer_participant_public_id"] != values["receipt_payer_public_id"]
+        or int(values["payer_was_active_self"]) != 1
         or int(values["active_self_count"]) != 1
+        or not hmac.compare_digest(
+            str(values["participant_authority_hash"]), expected_participant_authority_hash
+        )
         or values["fact_set_public_id"] != values["snapshot_fact_set_public_id"]
         or values["fact_set_public_id"] != values["authorization_fact_set_public_id"]
         or not hmac.compare_digest(

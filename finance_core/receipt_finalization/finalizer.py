@@ -492,6 +492,28 @@ def finalize_receipt_split(
     )
 
 
+def verify_finalized_receipt_split(
+    conn: sqlite3.Connection, fin_input: FinalizationInput
+) -> FinalizationOutput:
+    """Read-only verification of a completed finalization's full durable graph."""
+    require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
+    _require_schema(conn)
+    fingerprint = build_finalization_content_fingerprint(fin_input)
+    result = _verify_replay_in_coherent_snapshot(
+        conn,
+        fin_input=fin_input,
+        fingerprint=fingerprint,
+        recheck=lambda: _check_idempotency(conn, fin_input.idempotency_key, fingerprint),
+    )
+    if result is None:
+        raise FinalizationIdempotencyError(
+            "Completed receipt finalization is missing its durable idempotency record",
+            reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
+        )
+    return result
+
+
 def _verify_replay_in_coherent_snapshot(
     conn: sqlite3.Connection,
     *,
