@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import finance_core.resources as resource_runtime
 from finance_core.reconciliation import migrations as migration_runtime
 from finance_core.resources import (
     MIGRATION_LEDGER_DIGEST,
@@ -81,6 +82,20 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
+
+
+def test_migration_runtime_authority_reloads_the_non_executable_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration_resource_paths.cache_clear()
+    monkeypatch.setattr(resource_runtime, "MIGRATION_LEDGER_DIGEST", "0" * 64)
+    monkeypatch.setattr(resource_runtime, "MIGRATION_FILENAMES", ("001_wrong.sql",))
+
+    paths = migration_resource_paths()
+
+    assert len(paths) == 49
+    assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
+    migration_resource_paths.cache_clear()
 
 
 def test_migration_runtime_consumes_the_package_resources() -> None:

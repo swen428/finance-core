@@ -117,70 +117,58 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def _migration_contract(resources_init: bytes) -> tuple[str, tuple[str, ...]]:
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate migration contract field")
+        result[key] = value
+    return result
+
+
+def _migration_contract(contract_payload: bytes) -> tuple[str, tuple[str, ...]]:
+    if not contract_payload or len(contract_payload) > 64 * 1024:
+        raise ValueError("wheel migration contract size is invalid")
     try:
-        module = ast.parse(resources_init.decode("utf-8"))
-    except (SyntaxError, UnicodeDecodeError) as exc:
-        raise ValueError(
-            "wheel finance_core/resources/__init__.py is not valid UTF-8 Python"
-        ) from exc
-    contract_names = {
-        "MIGRATION_LEDGER_DIGEST",
-        "MIGRATION_FILENAMES",
-    }
-    assignments: dict[str, list[ast.expr]] = {
-        "MIGRATION_LEDGER_DIGEST": [],
-        "MIGRATION_FILENAMES": [],
-    }
-    allowed_targets: set[int] = set()
-    for statement in module.body:
-        if (
-            not isinstance(statement, ast.Assign)
-            or len(statement.targets) != 1
-            or not isinstance(statement.targets[0], ast.Name)
-            or statement.targets[0].id not in contract_names
-        ):
-            continue
-        target = statement.targets[0]
-        assignments[target.id].append(statement.value)
-        allowed_targets.add(id(target))
-    for node in ast.walk(module):
-        if (
-            isinstance(node, ast.Name)
-            and node.id in contract_names
-            and isinstance(node.ctx, (ast.Store, ast.Del))
-            and id(node) not in allowed_targets
-        ):
-            raise ValueError("wheel migration contract has a hidden or repeated binding")
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name in contract_names:
-                raise ValueError("wheel migration contract has a hidden or repeated binding")
-        if isinstance(node, ast.alias):
-            bound_name = node.asname or node.name.split(".", maxsplit=1)[0]
-            if bound_name in contract_names:
-                raise ValueError("wheel migration contract has a hidden or repeated binding")
-        if isinstance(node, ast.ExceptHandler) and node.name in contract_names:
-            raise ValueError("wheel migration contract has a hidden or repeated binding")
-        if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name in contract_names:
-            raise ValueError("wheel migration contract has a hidden or repeated binding")
-        if isinstance(node, ast.MatchMapping) and node.rest in contract_names:
-            raise ValueError("wheel migration contract has a hidden or repeated binding")
-    if any(len(values) != 1 for values in assignments.values()):
-        raise ValueError("wheel migration contract declarations are missing or ambiguous")
-    try:
-        digest_value: object = ast.literal_eval(assignments["MIGRATION_LEDGER_DIGEST"][0])
-        filenames_value: object = ast.literal_eval(assignments["MIGRATION_FILENAMES"][0])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("wheel migration contract declarations are not literal") from exc
+        contract: object = json.loads(
+            contract_payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("wheel migration contract is invalid JSON") from exc
+    if not isinstance(contract, dict) or set(contract) != {
+        "migration_filenames",
+        "migration_ledger_digest",
+        "schema",
+    }:
+        raise ValueError("wheel migration contract schema is invalid")
+    if contract["schema"] != "finance-core-migration-contract-v1":
+        raise ValueError("wheel migration contract schema is invalid")
+    digest_value = contract["migration_ledger_digest"]
+    filenames_value = contract["migration_filenames"]
     if not isinstance(digest_value, str) or HEX_64.fullmatch(digest_value) is None:
         raise ValueError("wheel migration ledger declaration is invalid")
     if (
-        not isinstance(filenames_value, tuple)
+        not isinstance(filenames_value, list)
         or not filenames_value
         or any(not isinstance(filename, str) for filename in filenames_value)
     ):
         raise ValueError("wheel migration filename declaration is invalid")
-    return digest_value, filenames_value
+    filenames = tuple(filename for filename in filenames_value if isinstance(filename, str))
+    if (
+        len(filenames) != len(set(filenames))
+        or any(
+            len(filename) < 9
+            or not filename[:3].isdigit()
+            or filename[3] != "_"
+            or not filename.endswith(".sql")
+            or "/" in filename
+            or "\\" in filename
+            for filename in filenames
+        )
+    ):
+        raise ValueError("wheel migration filename declaration is invalid")
+    return digest_value, filenames
 
 
 def _api_contract_version(package_init: bytes) -> str:
@@ -359,11 +347,13 @@ def _inspect_wheel(
     package_init = package_files.get("finance_core/__init__.py")
     if package_init is None:
         raise ValueError("wheel is missing finance_core/__init__.py")
-    resources_init = package_files.get("finance_core/resources/__init__.py")
-    if resources_init is None:
-        raise ValueError("wheel is missing finance_core/resources/__init__.py")
+    migration_contract = package_files.get(
+        "finance_core/resources/migration-contract-v1.json"
+    )
+    if migration_contract is None:
+        raise ValueError("wheel is missing the migration contract resource")
     observed_ledger = _migration_ledger_digest(package_files)
-    declared_ledger, declared_filenames = _migration_contract(resources_init)
+    declared_ledger, declared_filenames = _migration_contract(migration_contract)
     observed_filenames = tuple(
         sorted(
             PurePosixPath(name).name

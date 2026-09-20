@@ -474,14 +474,15 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
     "mutate",
     [
         lambda payload: payload.replace(
-            b'MIGRATION_LEDGER_DIGEST = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9'
+            b'"migration_ledger_digest": "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9'
             b'ee70857d95bf74ef47369af7"',
-            b'MIGRATION_LEDGER_DIGEST = "0000000000000000000000000000000000000000000'
+            b'"migration_ledger_digest": "0000000000000000000000000000000000000000000'
             b'000000000000000000000"',
         ),
         lambda payload: payload.replace(
-            b'    "049_d2_one_confirmation_posting.sql",\n',
-            b"",
+            b'    "048_d1_human_ai_lineage_transition.sql",\n'
+            b'    "049_d2_one_confirmation_posting.sql"\n',
+            b'    "048_d1_human_ai_lineage_transition.sql"\n',
         ),
     ],
 )
@@ -490,11 +491,12 @@ def test_release_manifest_rejects_stale_wheel_migration_contract(
 ) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    contract_name = "finance_core/resources/migration-contract-v1.json"
     with zipfile.ZipFile(wheel) as archive:
-        resources_init = archive.read("finance_core/resources/__init__.py")
-    mutated = mutate(resources_init)
-    assert mutated != resources_init
-    _rewrite_wheel(wheel, {"finance_core/resources/__init__.py": mutated})
+        contract = archive.read(contract_name)
+    mutated = mutate(contract)
+    assert mutated != contract
+    _rewrite_wheel(wheel, {contract_name: mutated})
 
     completed = subprocess.run(
         _manifest_command(
@@ -514,24 +516,30 @@ def test_release_manifest_rejects_stale_wheel_migration_contract(
 
 
 @pytest.mark.parametrize(
-    "rebind",
+    "mutate",
     [
-        b'\nif True:\n    MIGRATION_LEDGER_DIGEST = "0" * 64\n',
-        b'\nMIGRATION_FILENAMES += ("050_unapproved.sql",)\n',
-        b'\nMIGRATION_LEDGER_DIGEST: str = "0" * 64\n',
+        lambda payload: payload.replace(
+            b"{\n",
+            b'{\n  "schema": "duplicate",\n',
+            1,
+        ),
+        lambda payload: payload.replace(
+            b"{\n",
+            b'{\n  "unexpected": true,\n',
+            1,
+        ),
+        lambda _payload: b'globals()["MIGRATION_LEDGER_DIGEST"] = "0" * 64\n',
     ],
 )
-def test_release_manifest_rejects_hidden_wheel_migration_contract_rebinding(
-    tmp_path: Path, rebind: bytes
+def test_release_manifest_rejects_non_data_migration_contract(
+    tmp_path: Path, mutate: Callable[[bytes], bytes]
 ) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    contract_name = "finance_core/resources/migration-contract-v1.json"
     with zipfile.ZipFile(wheel) as archive:
-        resources_init = archive.read("finance_core/resources/__init__.py")
-    _rewrite_wheel(
-        wheel,
-        {"finance_core/resources/__init__.py": resources_init + rebind},
-    )
+        contract = archive.read(contract_name)
+    _rewrite_wheel(wheel, {contract_name: mutate(contract)})
 
     completed = subprocess.run(
         _manifest_command(
@@ -545,7 +553,7 @@ def test_release_manifest_rejects_hidden_wheel_migration_contract_rebinding(
     )
 
     assert completed.returncode != 0
-    assert "wheel migration contract has a hidden or repeated binding" in completed.stderr
+    assert "wheel migration contract" in completed.stderr
     assert not (artifacts / "component-manifest-v1.json").exists()
     assert not (artifacts / "SHA256SUMS").exists()
 

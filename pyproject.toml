@@ -23,6 +23,7 @@ namespaces = false
 
 [tool.setuptools.package-data]
 "finance_core.resources" = [
+    "migration-contract-v1.json",
     "migrations/*.sql",
     "preflight/*.py",
     "finance_ai/*.json",
