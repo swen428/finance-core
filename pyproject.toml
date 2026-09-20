@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "finance-core"
-version = "0.1.2"
+version = "0.1.3"
 description = "Deterministic, auditable personal-finance core"
 readme = "README.md"
 license = "Apache-2.0"
