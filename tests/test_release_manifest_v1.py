@@ -256,7 +256,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def test_release_manifest_accepts_and_binds_inspected_exact_artifacts(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    migration_digest = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+    migration_digest = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"
 
     completed = subprocess.run(
         _manifest_command(
@@ -292,7 +292,7 @@ def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -325,7 +325,7 @@ def test_release_manifest_rejects_modified_build_metadata(tmp_path: Path) -> Non
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -352,7 +352,7 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -396,7 +396,7 @@ def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -420,7 +420,7 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -458,7 +458,7 @@ def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Pa
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -488,7 +488,7 @@ def test_release_manifest_rejects_sdist_sources_inventory_drift(tmp_path: Path) 
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -517,7 +517,7 @@ def test_release_manifest_rejects_bridge_payload_not_in_exact_source(tmp_path: P
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -548,7 +548,7 @@ def test_release_manifest_rejects_dirty_compiled_bridge_output(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
