@@ -404,8 +404,8 @@ def _migration_digest(payloads: dict[str, bytes]) -> str:
         for name, body in payloads.items()
         if name.startswith(prefix) and name.endswith(".sql")
     }
-    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 49)):
-        raise ValueError("installed Finance Core migration inventory is not 001-048")
+    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 50)):
+        raise ValueError("installed Finance Core migration inventory is not 001-049")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]
