@@ -6,6 +6,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
@@ -112,6 +113,118 @@ SIMPLE_EXPENSE_TYPES = frozenset({"personal_expense", "simple_expense", "expense
 CONVERTED_TRANSACTION_PUBLIC_ID_PREFIX = "txn_parser_proposal"
 
 
+@dataclass(frozen=True)
+class InitialProposalDecisionBinding:
+    """Exact activated D2 initial-card authority for one proposal decision."""
+
+    review_public_id: str
+    reference_public_id: str
+    authenticated_actor_id: str
+    telegram_account_id: str
+    telegram_conversation_id: str
+    conversation_binding_id: str
+
+
+def _require_current_initial_proposal_review_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    parser_output_id: int,
+    authenticated_actor_id: str,
+    decision_binding: InitialProposalDecisionBinding,
+    now_epoch: int,
+) -> None:
+    if not conn.in_transaction:
+        raise ParserConfirmationError("initial D2 decision requires an owning transaction")
+    row = conn.execute(
+        """
+        SELECT reviews.parser_output_id, reviews.proposal_version,
+               reviews.proposal_content_hash, reviews.expires_at,
+               cards.raw_intake_record_id, cards.admitted_source_message_id,
+               cards.authenticated_actor_id, cards.telegram_account_id,
+               cards.telegram_conversation_id, cards.conversation_binding_id,
+               cards.expires_at AS card_expires_at,
+               refs.reference_public_id, refs.authenticated_actor_id AS ref_actor_id,
+               refs.channel_account_id, refs.channel_conversation_id,
+               refs.conversation_binding_id AS ref_binding_id,
+               purposes.purpose, redemptions.callback_message_id,
+               activations.provider_message_id,
+               supersessions.successor_review_public_id
+        FROM d2_posting_reviews AS reviews
+        JOIN d2_initial_proposal_cards AS cards
+          ON cards.initial_card_public_id = reviews.initial_card_public_id
+        JOIN d2_posting_review_action_bindings AS bindings
+          ON bindings.review_public_id = reviews.review_public_id
+        JOIN openclaw_human_action_references AS refs
+          ON refs.id = bindings.reference_id
+        JOIN openclaw_human_action_reference_purposes AS purposes
+          ON purposes.reference_id = refs.id
+        JOIN openclaw_human_action_redemptions AS redemptions
+          ON redemptions.reference_id = refs.id
+        JOIN d2_posting_review_delivery_activations AS activations
+          ON activations.review_public_id = reviews.review_public_id
+        LEFT JOIN d2_posting_review_supersessions AS supersessions
+          ON supersessions.predecessor_review_public_id = reviews.review_public_id
+        WHERE reviews.review_public_id = ?
+          AND reviews.source_kind = 'initial_proposal_card'
+          AND refs.reference_public_id = ?
+          AND refs.action = 'confirm'
+        """,
+        (decision_binding.review_public_id, decision_binding.reference_public_id),
+    ).fetchone()
+    if row is None:
+        raise ParserConfirmationError("initial D2 decision authority is unavailable")
+    raw = conn.execute(
+        "SELECT parser_output_id, source_message_id, status FROM raw_intake_records WHERE id = ?",
+        (row["raw_intake_record_id"],),
+    ).fetchone()
+    active_draft = conn.execute(
+        "SELECT 1 FROM parser_human_drafts "
+        "WHERE decision_target_parser_output_id = ? AND state = 'active' LIMIT 1",
+        (parser_output_id,),
+    ).fetchone()
+    expected_context = (
+        decision_binding.authenticated_actor_id,
+        decision_binding.telegram_account_id,
+        decision_binding.telegram_conversation_id,
+        decision_binding.conversation_binding_id,
+    )
+    if (
+        int(row["parser_output_id"]) != parser_output_id
+        or authenticated_actor_id != decision_binding.authenticated_actor_id
+        or tuple(
+            row[name]
+            for name in (
+                "authenticated_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            )
+        )
+        != expected_context
+        or tuple(
+            row[name]
+            for name in (
+                "ref_actor_id",
+                "channel_account_id",
+                "channel_conversation_id",
+                "ref_binding_id",
+            )
+        )
+        != expected_context
+        or row["purpose"] != "d2_post_v1"
+        or int(row["callback_message_id"]) != int(row["provider_message_id"])
+        or row["successor_review_public_id"] is not None
+        or int(row["expires_at"]) <= now_epoch
+        or int(row["card_expires_at"]) <= now_epoch
+        or raw is None
+        or int(raw["parser_output_id"]) != parser_output_id
+        or str(raw["source_message_id"]) != str(row["admitted_source_message_id"])
+        or raw["status"] != "parsed_pending_confirmation"
+        or active_draft is not None
+    ):
+        raise ParserConfirmationError("initial D2 decision authority is stale")
+
+
 def confirm_parser_proposal(
     conn: sqlite3.Connection,
     parser_output_id: int,
@@ -125,6 +238,7 @@ def confirm_parser_proposal(
     expected_content_hash: str | None = None,
     expected_version: int | None = None,
     d1_decision_binding: HumanDraftDecisionBinding | None = None,
+    initial_d2_decision_binding: InitialProposalDecisionBinding | None = None,
     clock: Callable[[], str] | None = None,
     _caller_owns_transaction: bool = False,
 ) -> dict[str, Any]:
@@ -166,14 +280,25 @@ def confirm_parser_proposal(
                 verify_deterministic_intent_policy(proposal)
         except AiFallbackServiceError as exc:
             raise ParserConfirmationError(str(exc)) from exc
+        if d1_decision_binding is not None and initial_d2_decision_binding is not None:
+            raise ParserConfirmationError("proposal decision has conflicting authority sources")
         if decision == "confirmed":
-            require_current_human_draft_publication_in_transaction(
-                conn,
-                parser_output_id=parser_output_id,
-                authenticated_actor_id=authenticated_actor_id,
-                decision_binding=d1_decision_binding,
-                now_epoch=decision_epoch,
-            )
+            if initial_d2_decision_binding is not None:
+                _require_current_initial_proposal_review_in_transaction(
+                    conn,
+                    parser_output_id=parser_output_id,
+                    authenticated_actor_id=authenticated_actor_id,
+                    decision_binding=initial_d2_decision_binding,
+                    now_epoch=decision_epoch,
+                )
+            else:
+                require_current_human_draft_publication_in_transaction(
+                    conn,
+                    parser_output_id=parser_output_id,
+                    authenticated_actor_id=authenticated_actor_id,
+                    decision_binding=d1_decision_binding,
+                    now_epoch=decision_epoch,
+                )
         elif d1_decision_binding is not None:
             require_human_draft_reject_capability_in_transaction(
                 conn,

@@ -15,7 +15,7 @@ import hmac
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Callable
+from typing import Callable, Mapping
 
 from finance_core.openclaw_staging_bridge import callback_tokens
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
@@ -31,6 +31,22 @@ REFERENCE_ACTIONS = (
     callback_tokens.ACTION_EDIT,
     callback_tokens.ACTION_REJECT,
 )
+REFERENCE_PURPOSES = frozenset(
+    {
+        "d2_post_v1",
+        "d2_post_accepted_pre050_v1",
+        "d2_post_fenced_pre050_v1",
+        "edit_v1",
+        "reject_v1",
+        "manual_s5d_v1",
+        "legacy_pre050_v1",
+    }
+)
+DEFAULT_ACTION_PURPOSES = {
+    callback_tokens.ACTION_CONFIRM: "manual_s5d_v1",
+    callback_tokens.ACTION_EDIT: "edit_v1",
+    callback_tokens.ACTION_REJECT: "reject_v1",
+}
 
 
 class HumanActionReferenceError(RuntimeError):
@@ -166,13 +182,16 @@ def _reference_rows_for_issuance(conn: sqlite3.Connection, issuance_key: str) ->
         """
         SELECT refs.*, proposals.public_id AS proposal_public_id,
                redemptions.id AS redemption_id,
-               bindings.card_generation_public_id
+               bindings.card_generation_public_id,
+               purposes.purpose
         FROM openclaw_human_action_references AS refs
         JOIN parser_outputs AS proposals ON proposals.id = refs.parser_output_id
         LEFT JOIN openclaw_human_action_redemptions AS redemptions
           ON redemptions.reference_id = refs.id
         LEFT JOIN parser_human_draft_action_bindings AS bindings
           ON bindings.reference_id = refs.id
+        LEFT JOIN openclaw_human_action_reference_purposes AS purposes
+          ON purposes.reference_id = refs.id
         WHERE refs.issuance_idempotency_key = ?
         ORDER BY refs.action
         """,
@@ -218,6 +237,7 @@ def _issuance_rows_match(
     expected_proposal_content_hash: str,
     context: HumanActionContext,
     ttl_seconds: int,
+    action_purposes: Mapping[str, str],
     card_generation_public_id: str | None,
 ) -> bool:
     expected_actions = set(allowed_actions)
@@ -235,6 +255,7 @@ def _issuance_rows_match(
             and row["channel"] == "telegram"
             and int(row["ttl_seconds"]) == ttl_seconds
             and row["card_generation_public_id"] == card_generation_public_id
+            and row["purpose"] == action_purposes[str(row["action"])]
             for row in rows
         )
     )
@@ -387,13 +408,27 @@ def issue_human_action_references(
     allowed_actions: tuple[str, ...] = REFERENCE_ACTIONS,
     card_generation_public_id: str | None = None,
     fallback_issuance_idempotency_keys: tuple[str, ...] = (),
-    issuance_effect: Callable[[sqlite3.Connection, tuple[dict, ...], int], None] | None = None,
+    action_purposes: Mapping[str, str] | None = None,
+    issuance_effect: Callable[
+        [sqlite3.Connection, tuple[dict, ...], tuple[IssuedHumanActionReference, ...], int],
+        None,
+    ]
+    | None = None,
     clock: Callable[[], int] = lambda: int(datetime.now(UTC).timestamp()),
 ) -> tuple[tuple[IssuedHumanActionReference, ...], bool]:
     """Issue or reconstruct the allowed direct-human references atomically."""
     if not allowed_actions or len(set(allowed_actions)) != len(allowed_actions):
         raise HumanActionReferenceError("issuance_conflict")
     if any(action not in REFERENCE_ACTIONS for action in allowed_actions):
+        raise HumanActionReferenceError("issuance_conflict")
+    purposes = (
+        {action: DEFAULT_ACTION_PURPOSES[action] for action in allowed_actions}
+        if action_purposes is None
+        else dict(action_purposes)
+    )
+    if set(purposes) != set(allowed_actions) or any(
+        purpose not in REFERENCE_PURPOSES for purpose in purposes.values()
+    ):
         raise HumanActionReferenceError("issuance_conflict")
     if minimum_remaining_seconds < 0 or minimum_remaining_seconds >= ttl_seconds:
         raise HumanActionReferenceError("issuance_conflict")
@@ -429,6 +464,7 @@ def issue_human_action_references(
                 expected_proposal_content_hash=expected_proposal_content_hash,
                 context=context,
                 ttl_seconds=ttl_seconds,
+                action_purposes=purposes,
                 card_generation_public_id=card_generation_public_id,
             ):
                 occupied_generations = {row["card_generation_public_id"] for row in candidate_rows}
@@ -464,7 +500,7 @@ def issue_human_action_references(
                 raise HumanActionReferenceError("reference_expiring")
             issued = tuple(_issued_from_row(row, key) for row in existing)
             if issuance_effect is not None:
-                issuance_effect(conn, tuple(existing), now)
+                issuance_effect(conn, tuple(existing), issued, now)
             conn.commit()
             return issued, True
 
@@ -553,6 +589,18 @@ def issue_human_action_references(
                         now,
                     ),
                 )
+            reference_id = int(
+                conn.execute(
+                    "SELECT id FROM openclaw_human_action_references "
+                    "WHERE reference_public_id = ?",
+                    (public_id,),
+                ).fetchone()[0]
+            )
+            conn.execute(
+                "INSERT INTO openclaw_human_action_reference_purposes "
+                "(reference_id, purpose, classified_at) VALUES (?, ?, ?)",
+                (reference_id, purposes[action], issued_at),
+            )
             result.append(
                 IssuedHumanActionReference(
                     action=action, reference=reference, expires_at=expires_at
@@ -560,7 +608,7 @@ def issue_human_action_references(
             )
         if issuance_effect is not None:
             persisted = _reference_rows_for_issuance(conn, issuance_idempotency_key)
-            issuance_effect(conn, tuple(persisted), now)
+            issuance_effect(conn, tuple(persisted), tuple(result), now)
         conn.commit()
         return tuple(result), False
     except Exception:
@@ -573,6 +621,7 @@ def _reference_row(conn: sqlite3.Connection, reference: str) -> dict | None:
         """
         SELECT refs.*, proposals.public_id AS proposal_public_id,
                redemptions.callback_id_sha256, redemptions.callback_message_id,
+               purposes.purpose,
                bindings.card_generation_public_id,
                cards.expires_at AS card_expires_at,
                cards.parser_output_id AS card_parser_output_id,
@@ -592,6 +641,8 @@ def _reference_row(conn: sqlite3.Connection, reference: str) -> dict | None:
         JOIN parser_outputs AS proposals ON proposals.id = refs.parser_output_id
         LEFT JOIN openclaw_human_action_redemptions AS redemptions
           ON redemptions.reference_id = refs.id
+        LEFT JOIN openclaw_human_action_reference_purposes AS purposes
+          ON purposes.reference_id = refs.id
         LEFT JOIN parser_human_draft_action_bindings AS bindings
           ON bindings.reference_id = refs.id
         LEFT JOIN parser_human_draft_cards AS cards
@@ -701,6 +752,7 @@ def redeem_human_action_reference(
     context: HumanActionContext,
     callback_id: str,
     callback_message_id: int,
+    required_purpose: str | None = None,
     action_validator: Callable[[sqlite3.Connection, dict, str], None] | None = None,
     redemption_effect: Callable[[sqlite3.Connection, dict, str, int], None] | None = None,
     clock: Callable[[], int] = lambda: int(datetime.now(UTC).timestamp()),
@@ -717,6 +769,18 @@ def redeem_human_action_reference(
             raise HumanActionReferenceError("reference_invalid")
         if str(row["action"]) != action:
             raise HumanActionReferenceError("wrong_action")
+        purpose = row.get("purpose")
+        if purpose not in REFERENCE_PURPOSES:
+            raise HumanActionReferenceError("reference_purpose_invalid")
+        if required_purpose is not None:
+            if required_purpose not in REFERENCE_PURPOSES or purpose != required_purpose:
+                raise HumanActionReferenceError("reference_purpose_mismatch")
+        elif purpose in {
+            "d2_post_v1",
+            "d2_post_accepted_pre050_v1",
+            "d2_post_fenced_pre050_v1",
+        }:
+            raise HumanActionReferenceError("reference_requires_d2_redemption")
         if _row_context(row) != context or row["channel"] != "telegram":
             raise HumanActionReferenceError("actor_or_context_mismatch")
         if int(row["expires_at"]) <= now:
@@ -788,6 +852,7 @@ __all__ = [
     "HumanActionReferenceError",
     "IssuedHumanActionReference",
     "REFERENCE_ACTIONS",
+    "REFERENCE_PURPOSES",
     "REFERENCE_PREFIX",
     "RedeemedHumanAction",
     "issue_human_action_references",
