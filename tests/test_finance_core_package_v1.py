@@ -315,7 +315,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["api"] == "finance-core-api-v1"
         assert payload["canonical"] == "12.30"
         assert payload["distribution_name"] == "finance-core"
-        assert payload["distribution_version"] == "0.1.2"
+        assert payload["distribution_version"] == "0.1.3"
         assert payload["money_module"] == "finance_core.money"
         assert payload["migration_count"] == 48
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
@@ -366,7 +366,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert missing_runtime.returncode != 0
         assert "FINANCE_RUNTIME_ROOT is required" in missing_runtime.stderr
 
-    distribution_prefix = "finance_core-0.1.2.dist-info"
+    distribution_prefix = "finance_core-0.1.3.dist-info"
     expected_package_members = {
         path.relative_to(REPOSITORY_ROOT).as_posix()
         for path in (REPOSITORY_ROOT / "finance_core").rglob("*")
@@ -407,7 +407,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert all(member.isfile() or member.isdir() for member in members)
         member_paths = [PurePosixPath(member.name) for member in members]
         assert all(not path.is_absolute() and ".." not in path.parts for path in member_paths)
-        assert {path.parts[0] for path in member_paths} == {"finance_core-0.1.2"}
+        assert {path.parts[0] for path in member_paths} == {"finance_core-0.1.3"}
         files = [member for member in members if member.isfile()]
         observed_files = {PurePosixPath(member.name).parts[1:] for member in files}
         expected_source_files = {PurePosixPath(path).parts for path in expected_package_members}
