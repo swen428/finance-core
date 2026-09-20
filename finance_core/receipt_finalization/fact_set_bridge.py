@@ -37,6 +37,7 @@ from finance_core.calculation.authoritative_snapshot import (
     AuthoritativeSnapshotRepository,
     build_authoritative_snapshot,
     canonical_json_text,
+    canonical_json_value,
     persist_authoritative_snapshot_in_transaction,
 )
 from finance_core.calculation.run_persistence import (
@@ -51,6 +52,7 @@ from finance_core.calculators.receipt_calculator_input_projection import (
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
 from finance_core.receipt_finalization.d2_conditional import (
     D2ConditionalAuthorityError,
+    build_d2_receipt_projection,
     require_d2_conditional_authority,
 )
 
@@ -880,8 +882,6 @@ def authorize_d2_conditional_receipt_finalization(
     actor_id: str,
     decision_public_id: str,
     review_public_id: str,
-    reviewed_projection_hash: str,
-    snapshot_projection_hash: str,
     clock: Callable[[], str] | None = None,
 ) -> ReceiptFinalizationAuthorization:
     """Create D2B authority only when the accepted review equals snapshot truth.
@@ -896,16 +896,9 @@ def authorize_d2_conditional_receipt_finalization(
     require_foreign_keys_enabled(conn)
     if not actor_id.strip():
         raise BridgeAuthorizationActorError("D2 receipt authorization requires a human actor")
-    if reviewed_projection_hash != snapshot_projection_hash:
-        raise BridgeAuthorizationConflictError(
-            "Reviewed receipt projection does not equal authoritative snapshot projection"
-        )
 
     created_at = _now(clock)
     fin_input = _build_finalization_input(prepared, actor_type=HUMAN_ACTOR_TYPE, actor_id=actor_id)
-    binding = _require_snapshot_bound_authority(
-        conn, prepared, output_payload=fin_input.calculation_snapshot
-    )
     fingerprint = build_finalization_content_fingerprint(fin_input)
     final_total = str(fin_input.calculation_snapshot.get("total_paid", ""))
     if not final_total:
@@ -913,22 +906,78 @@ def authorize_d2_conditional_receipt_finalization(
     obligations_json = _obligations_json(fin_input)
     participants_json = json.dumps(sorted(fin_input.participant_public_ids))
     evidence_json = json.dumps(sorted(prepared.source_evidence_refs))
-    proof_hash = hashlib.sha256(
-        canonical_json_text(
-            {
-                "authorization_id": prepared.authorization_id,
-                "decision_public_id": decision_public_id,
-                "review_public_id": review_public_id,
-                "fact_set_public_id": binding.fact_set_public_id,
-                "calculation_snapshot_id": prepared.calculation_snapshot_id,
-                "projection_hash": reviewed_projection_hash,
-                "proof_version": "d2_conditional_v1",
-            }
-        ).encode("utf-8")
-    ).hexdigest()
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        binding = _require_snapshot_bound_authority(
+            conn, prepared, output_payload=fin_input.calculation_snapshot
+        )
+        d2_authority = conn.execute(
+            """
+            SELECT reviews.visible_projection_hash, reviews.authenticated_actor_id,
+                   reviews.receipt_fact_candidate_json, reviews.posting_path,
+                   attempts.stage, confirmations.authenticated_actor_id AS confirmation_actor_id,
+                   evidence.fact_set_public_id
+            FROM d2_posting_decisions AS decisions
+            JOIN d2_posting_reviews AS reviews
+              ON reviews.review_public_id = decisions.review_public_id
+            JOIN d2_posting_attempts AS attempts
+              ON attempts.attempt_public_id = decisions.attempt_public_id
+             AND attempts.review_public_id = reviews.review_public_id
+            JOIN parser_proposal_authorizations AS confirmations
+              ON confirmations.confirmation_public_id = decisions.confirmation_public_id
+            JOIN d2_posting_receipt_evidence AS evidence
+              ON evidence.decision_public_id = decisions.decision_public_id
+             AND evidence.evidence_type = 'fact_set'
+            WHERE decisions.decision_public_id = ? AND reviews.review_public_id = ?
+            """,
+            (decision_public_id, review_public_id),
+        ).fetchone()
+        if d2_authority is None:
+            raise BridgeAuthorizationConflictError("D2 decision authority is incomplete")
+        candidate = canonical_json_value(
+            str(d2_authority["receipt_fact_candidate_json"]),
+            label="D2 receipt fact candidate",
+        )
+        if (
+            d2_authority["posting_path"] != "personal_receipt"
+            or d2_authority["stage"]
+            not in {"snapshot_persisted", "conditional_authorization_persisted", "finalized"}
+            or d2_authority["authenticated_actor_id"] != actor_id
+            or d2_authority["confirmation_actor_id"] != actor_id
+            or d2_authority["fact_set_public_id"] != binding.fact_set_public_id
+            or not isinstance(candidate, dict)
+            or candidate.get("payer_participant_public_id") != prepared.payer_participant_public_id
+        ):
+            raise BridgeAuthorizationConflictError("D2 decision authority is contradictory")
+        projection = build_d2_receipt_projection(
+            merchant=prepared.confirmed_receipt_identity.merchant,
+            receipt_date=prepared.confirmed_receipt_identity.receipt_date,
+            currency=prepared.currency,
+            payer_participant_public_id=prepared.payer_participant_public_id,
+            calculation=prepared.calculation_result,
+        )
+        snapshot_projection_hash = hashlib.sha256(
+            canonical_json_text(projection).encode("utf-8")
+        ).hexdigest()
+        reviewed_projection_hash = str(d2_authority["visible_projection_hash"])
+        if reviewed_projection_hash != snapshot_projection_hash:
+            raise BridgeAuthorizationConflictError(
+                "Reviewed receipt projection does not equal authoritative snapshot projection"
+            )
+        proof_hash = hashlib.sha256(
+            canonical_json_text(
+                {
+                    "authorization_id": prepared.authorization_id,
+                    "decision_public_id": decision_public_id,
+                    "review_public_id": review_public_id,
+                    "fact_set_public_id": binding.fact_set_public_id,
+                    "calculation_snapshot_id": prepared.calculation_snapshot_id,
+                    "projection_hash": reviewed_projection_hash,
+                    "proof_version": "d2_conditional_v1",
+                }
+            ).encode("utf-8")
+        ).hexdigest()
         conn.execute(
             """
             INSERT OR IGNORE INTO receipt_finalization_confirmations (
@@ -1055,6 +1104,14 @@ def authorize_d2_conditional_receipt_finalization(
             actor_type=HUMAN_ACTOR_TYPE,
             actor_id=actor_id,
             expected_authorization_version="d2_conditional_v1",
+        )
+        require_d2_conditional_authority(
+            conn,
+            {
+                "authorization_id": prepared.authorization_id,
+                "calculation_snapshot_id": prepared.calculation_snapshot_id,
+                "actor_id": actor_id,
+            },
         )
         conn.commit()
     except Exception:

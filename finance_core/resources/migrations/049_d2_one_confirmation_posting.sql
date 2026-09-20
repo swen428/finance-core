@@ -68,12 +68,14 @@ CREATE TABLE d2_posting_attempts (
         'finalized', 'needs_attention'
     )),
     row_version INTEGER NOT NULL DEFAULT 0 CHECK (row_version >= 0),
-    transaction_public_id TEXT,
+    transaction_public_id TEXT REFERENCES transactions(public_id),
     attention_reason TEXT,
+    stage_evidence_public_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     CHECK ((stage = 'finalized') = (transaction_public_id IS NOT NULL)),
-    CHECK ((stage = 'needs_attention') = (attention_reason IS NOT NULL))
+    CHECK ((stage = 'needs_attention') = (attention_reason IS NOT NULL)),
+    CHECK (row_version <= 16777215)
 ) STRICT;
 
 CREATE TABLE d2_posting_decisions (
@@ -150,8 +152,13 @@ CREATE TABLE d2_posting_attempt_events (
     to_stage TEXT NOT NULL,
     row_version INTEGER NOT NULL CHECK (row_version >= 0),
     evidence_public_id TEXT,
+    transaction_public_id TEXT REFERENCES transactions(public_id),
+    attention_reason TEXT,
     created_at TEXT NOT NULL,
-    UNIQUE (attempt_public_id, row_version)
+    UNIQUE (attempt_public_id, row_version),
+    CHECK (row_version <= 16777215),
+    CHECK ((to_stage = 'finalized') = (transaction_public_id IS NOT NULL)),
+    CHECK ((to_stage = 'needs_attention') = (attention_reason IS NOT NULL))
 ) STRICT;
 
 CREATE TRIGGER trg_d2_posting_reviews_no_update
@@ -275,6 +282,31 @@ WHEN EXISTS (
 ) BEGIN
     SELECT RAISE(ABORT, 'D2 posting attempt event identity collision');
 END;
+CREATE TRIGGER trg_d2_attempt_events_match_attempt
+BEFORE INSERT ON d2_posting_attempt_events
+WHEN NOT EXISTS (
+    SELECT 1 FROM d2_posting_attempts AS attempts
+    WHERE attempts.attempt_public_id = NEW.attempt_public_id
+      AND attempts.stage = NEW.to_stage
+      AND attempts.row_version = NEW.row_version
+      AND attempts.stage_evidence_public_id IS NEW.evidence_public_id
+      AND attempts.transaction_public_id IS NEW.transaction_public_id
+      AND attempts.attention_reason IS NEW.attention_reason
+      AND (
+          (NEW.row_version = 0 AND NEW.from_stage IS NULL)
+          OR (
+              NEW.row_version > 0
+              AND EXISTS (
+                  SELECT 1 FROM d2_posting_attempt_events AS previous
+                  WHERE previous.attempt_public_id = NEW.attempt_public_id
+                    AND previous.row_version = NEW.row_version - 1
+                    AND previous.to_stage = NEW.from_stage
+              )
+          )
+      )
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 posting attempt event contradicts attempt state');
+END;
 CREATE TRIGGER trg_d2_attempt_events_no_delete
 BEFORE DELETE ON d2_posting_attempt_events BEGIN
     SELECT RAISE(ABORT, 'D2 posting attempt events are append-only');
@@ -294,6 +326,15 @@ WHEN EXISTS (
 ) BEGIN
     SELECT RAISE(ABORT, 'D2 posting attempt identity collision');
 END;
+CREATE TRIGGER trg_d2_posting_attempts_initial_state
+BEFORE INSERT ON d2_posting_attempts
+WHEN NEW.stage != 'accepted'
+  OR NEW.row_version != 0
+  OR NEW.transaction_public_id IS NOT NULL
+  OR NEW.attention_reason IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'D2 posting attempt must begin accepted');
+END;
 
 CREATE TRIGGER trg_d2_posting_attempts_guarded_update
 BEFORE UPDATE ON d2_posting_attempts
@@ -305,13 +346,41 @@ WHEN NOT (
     AND NEW.created_at IS OLD.created_at
     AND NEW.row_version = OLD.row_version + 1
     AND (
-        (OLD.stage = 'accepted' AND NEW.stage IN ('conversion_persisted', 'finalized', 'needs_attention'))
+        (OLD.stage = 'accepted' AND OLD.posting_path = 'text'
+            AND NEW.stage IN ('finalized', 'needs_attention'))
+        OR (OLD.stage = 'accepted' AND OLD.posting_path = 'personal_receipt'
+            AND NEW.stage IN ('conversion_persisted', 'needs_attention'))
         OR (OLD.stage = 'conversion_persisted' AND NEW.stage IN ('fact_set_persisted', 'needs_attention'))
         OR (OLD.stage = 'fact_set_persisted' AND NEW.stage IN ('snapshot_persisted', 'needs_attention'))
         OR (OLD.stage = 'snapshot_persisted' AND NEW.stage IN ('conditional_authorization_persisted', 'needs_attention'))
         OR (OLD.stage = 'conditional_authorization_persisted' AND NEW.stage IN ('finalized', 'needs_attention'))
-        OR (OLD.stage = 'needs_attention' AND NEW.stage = 'needs_attention')
     )
 ) BEGIN
     SELECT RAISE(ABORT, 'invalid D2 posting attempt transition');
+END;
+
+CREATE TRIGGER trg_d2_posting_attempts_initial_event
+AFTER INSERT ON d2_posting_attempts BEGIN
+    INSERT INTO d2_posting_attempt_events (
+        event_public_id, attempt_public_id, from_stage, to_stage, row_version,
+        evidence_public_id, transaction_public_id, attention_reason, created_at
+    ) VALUES (
+        'd2evt_' || substr(NEW.attempt_public_id, 7, 24) || printf('%06x', NEW.row_version),
+        NEW.attempt_public_id, NULL, NEW.stage, NEW.row_version,
+        NEW.stage_evidence_public_id, NEW.transaction_public_id, NEW.attention_reason,
+        NEW.created_at
+    );
+END;
+
+CREATE TRIGGER trg_d2_posting_attempts_transition_event
+AFTER UPDATE ON d2_posting_attempts BEGIN
+    INSERT INTO d2_posting_attempt_events (
+        event_public_id, attempt_public_id, from_stage, to_stage, row_version,
+        evidence_public_id, transaction_public_id, attention_reason, created_at
+    ) VALUES (
+        'd2evt_' || substr(NEW.attempt_public_id, 7, 24) || printf('%06x', NEW.row_version),
+        NEW.attempt_public_id, OLD.stage, NEW.stage, NEW.row_version,
+        NEW.stage_evidence_public_id, NEW.transaction_public_id, NEW.attention_reason,
+        NEW.updated_at
+    );
 END;

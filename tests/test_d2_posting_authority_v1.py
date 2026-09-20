@@ -29,10 +29,13 @@ from finance_core.posting_authority import (
 )
 from finance_core.receipt_finalization.fact_set_bridge import (
     BridgeAuthorizationConflictError,
+    authorize_d2_conditional_receipt_finalization,
     authorize_receipt_finalization,
     prepare_receipt_calculation,
 )
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
+from finance_core.sqlite_connection import ForeignKeysDisabledError
+from finance_core.staging_guard import StagingDatabaseError
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
@@ -51,7 +54,11 @@ def test_migration_049_inventory_and_pre_d2_database_fail_closed() -> None:
     pre_d2.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(pre_d2, TEMP_DB_MIGRATION_PATHS[:48])
     with pytest.raises(PostingAuthorityError, match="migration 049 is missing or incomplete"):
-        get_status(pre_d2, review_public_id="d2rev_" + "0" * 30)
+        get_status(
+            pre_d2,
+            review_public_id="d2rev_" + "0" * 30,
+            context=HumanActionContext("111", "acct", "111", "binding"),
+        )
     pre_d2.close()
 
     current = _connection()
@@ -71,6 +78,18 @@ def test_migration_049_inventory_and_pre_d2_database_fail_closed() -> None:
         "d2_posting_attempt_events",
     }
     current.close()
+
+
+def test_migration_049_missing_trigger_fails_closed() -> None:
+    conn = _connection()
+    conn.execute("DROP TRIGGER trg_d2_posting_attempts_guarded_update")
+    with pytest.raises(PostingAuthorityError, match="migration 049 is missing or incomplete"):
+        get_status(
+            conn,
+            review_public_id="d2rev_" + "0" * 30,
+            context=HumanActionContext("111", "acct", "111", "binding"),
+        )
+    conn.close()
 
 
 def _published_text_card(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Connection, object]:
@@ -134,7 +153,7 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
     )
     assert review.posting_path == "text"
     changes_before_status = conn.total_changes
-    assert get_status(conn, review_public_id=review.review_public_id).state == (
+    assert get_status(conn, review_public_id=review.review_public_id, context=context).state == (
         "awaiting_confirmation"
     )
     assert conn.total_changes == changes_before_status
@@ -223,6 +242,299 @@ def test_changed_callback_cannot_reuse_an_accepted_confirm(
             clock=lambda: 1005,
         )
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    conn.close()
+
+
+def test_text_committed_result_is_visible_before_attempt_catchup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-result-recovery",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    key = b"d2-text-result-recovery-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "after_text_finalization_commit":
+            raise RuntimeError("text-finalization-committed")
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", fail)
+    with pytest.raises(RuntimeError, match="text-finalization-committed"):
+        confirm_and_post(
+            conn,
+            key=key,
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-text-result-callback",
+            callback_message_id=210,
+            clock=lambda: 1004,
+        )
+    attempt_id = str(
+        conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
+    )
+    before = conn.total_changes
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert conn.total_changes == before
+    assert status.state == "finalized"
+    assert (
+        status.transaction_public_id
+        == conn.execute("SELECT public_id FROM transactions").fetchone()[0]
+    )
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
+    recovered = resume_posting(conn, attempt_public_id=attempt_id, context=context)
+    assert recovered == status
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    conn.close()
+
+
+def test_status_refuses_finalized_coordination_row_with_wrong_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-false-finalized",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-text-false-finalized-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "after_text_finalization_commit":
+            raise RuntimeError("text-committed-before-coordination")
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", fail)
+    with pytest.raises(RuntimeError, match="text-committed-before-coordination"):
+        confirm_and_post(
+            conn,
+            key=b"d2-text-false-finalized-key",
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-text-false-finalized-callback",
+            callback_message_id=215,
+            clock=lambda: 1004,
+        )
+    canonical = dict(conn.execute("SELECT * FROM transactions").fetchone())
+    canonical.pop("id")
+    canonical["public_id"] = "txn_unrelated_d2_coordination"
+    columns = tuple(canonical)
+    conn.execute(
+        f"INSERT INTO transactions ({', '.join(columns)}) "
+        f"VALUES ({', '.join('?' for _ in columns)})",
+        tuple(canonical[column] for column in columns),
+    )
+    attempt = conn.execute("SELECT * FROM d2_posting_attempts").fetchone()
+    conn.execute(
+        "UPDATE d2_posting_attempts SET stage = 'finalized', row_version = ?, "
+        "transaction_public_id = ?, attention_reason = NULL, "
+        "stage_evidence_public_id = ?, updated_at = ? WHERE attempt_public_id = ?",
+        (
+            int(attempt["row_version"]) + 1,
+            canonical["public_id"],
+            canonical["public_id"],
+            "1970-01-01T00:20:00+00:00",
+            attempt["attempt_public_id"],
+        ),
+    )
+    conn.commit()
+    before = conn.total_changes
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert conn.total_changes == before
+    assert status.state == "needs_attention"
+    assert status.transaction_public_id is None
+    assert status.attention_reason == "financial_authority_mismatch"
+    conn.close()
+
+
+def test_exact_confirm_replay_inside_redemption_transaction_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-lock-race",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    key = b"d2-text-lock-race-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+    monkeypatch.setattr(
+        posting_authority_module,
+        "_accepted_attempt_for_callback",
+        lambda *_args, **_kwargs: None,
+    )
+    first = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-lock-race-callback",
+        callback_message_id=220,
+        clock=lambda: 1004,
+    )
+    replay = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-lock-race-callback",
+        callback_message_id=220,
+        clock=lambda: 1005,
+    )
+    assert replay == first
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM openclaw_human_action_redemptions AS redemptions "
+            "JOIN openclaw_human_action_references AS refs ON refs.id = redemptions.reference_id "
+            "WHERE refs.action = 'confirm'"
+        ).fetchone()[0]
+        == 1
+    )
+    for table in ("d2_posting_attempts", "d2_posting_decisions", "transactions"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 1
+    conn.close()
+
+
+def test_status_and_resume_reject_cross_context_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-cross-context",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-cross-context-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def fail(stage: str) -> None:
+        if stage == "after_confirmation_commit":
+            raise RuntimeError("confirmation-committed")
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", fail)
+    with pytest.raises(RuntimeError, match="confirmation-committed"):
+        confirm_and_post(
+            conn,
+            key=b"d2-cross-context-key",
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-cross-context-callback",
+            callback_message_id=230,
+            clock=lambda: 1004,
+        )
+    attempt_id = str(
+        conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
+    )
+    for wrong in (
+        HumanActionContext("222", "acct", "222", "binding"),
+        HumanActionContext("111", "other-account", "111", "binding"),
+        HumanActionContext("111", "acct", "111", "other-binding"),
+    ):
+        before = conn.total_changes
+        with pytest.raises(PostingAuthorityError, match="posting authority unavailable"):
+            get_status(conn, review_public_id=review.review_public_id, context=wrong)
+        with pytest.raises(PostingAuthorityError, match="posting authority unavailable"):
+            resume_posting(conn, attempt_public_id=attempt_id, context=wrong)
+        assert conn.total_changes == before
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    conn.close()
+
+
+def test_issue_actions_requires_staging_and_foreign_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-issue-guards",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    before_references = conn.execute(
+        "SELECT COUNT(*) FROM openclaw_human_action_references"
+    ).fetchone()[0]
+    before_bindings = conn.execute(
+        "SELECT COUNT(*) FROM d2_posting_review_action_bindings"
+    ).fetchone()[0]
+    conn.execute("PRAGMA foreign_keys = OFF")
+    with pytest.raises(ForeignKeysDisabledError):
+        issue_posting_review_actions(
+            conn,
+            review_public_id=review.review_public_id,
+            key=b"d2-issue-guard-key",
+            context=context,
+            clock=lambda: 1003,
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM openclaw_human_action_references").fetchone()[0]
+        == before_references
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_action_bindings").fetchone()[0]
+        == before_bindings
+    )
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    untrusted = sqlite3.connect(tmp_path / "untrusted-copy.sqlite")
+    untrusted.row_factory = sqlite3.Row
+    conn.backup(untrusted)
+    with pytest.raises(StagingDatabaseError):
+        issue_posting_review_actions(
+            untrusted,
+            review_public_id=review.review_public_id,
+            key=b"d2-issue-guard-key",
+            context=context,
+            clock=lambda: 1003,
+        )
+    assert (
+        untrusted.execute("SELECT COUNT(*) FROM openclaw_human_action_references").fetchone()[0]
+        == before_references
+    )
+    assert (
+        untrusted.execute("SELECT COUNT(*) FROM d2_posting_review_action_bindings").fetchone()[0]
+        == before_bindings
+    )
+    untrusted.close()
     conn.close()
 
 
@@ -328,6 +640,102 @@ def _published_receipt_card(
     )
 
 
+def test_personal_receipt_requires_unique_active_self_at_review(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    with pytest.raises(PostingAuthorityError, match="unique active self"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key="d2-nonself-review",
+            card_generation_public_id=published.card_generation_public_id,
+            context=context,
+            receipt_payer_participant_public_id="person_alice",
+            clock=lambda: 1002,
+        )
+
+    conn.execute("UPDATE participants SET is_active = 0 WHERE public_id = 'person_owner'")
+    conn.commit()
+    with pytest.raises(PostingAuthorityError, match="unique active self"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key="d2-inactive-self-review",
+            card_generation_public_id=published.card_generation_public_id,
+            context=context,
+            receipt_payer_participant_public_id="person_owner",
+            clock=lambda: 1002,
+        )
+
+    conn.execute("UPDATE participants SET is_active = 1 WHERE public_id = 'person_owner'")
+    conn.execute("UPDATE participants SET is_self = 1 WHERE public_id = 'person_alice'")
+    conn.commit()
+    with pytest.raises(PostingAuthorityError, match="unique active self"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key="d2-multiple-self-review",
+            card_generation_public_id=published.card_generation_public_id,
+            context=context,
+            receipt_payer_participant_public_id="person_owner",
+            clock=lambda: 1002,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM d2_posting_reviews").fetchone()[0] == 0
+
+
+def test_personal_identity_drift_before_confirm_creates_no_decision_or_financial_fact(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-self-drift-before-confirm",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        receipt_payer_participant_public_id="person_owner",
+        clock=lambda: 1002,
+    )
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-self-drift-key",
+        context=context,
+        clock=lambda: 1003,
+    )
+    redemptions_before = conn.execute(
+        "SELECT COUNT(*) FROM openclaw_human_action_redemptions"
+    ).fetchone()[0]
+    conn.execute("UPDATE participants SET is_active = 0 WHERE public_id = 'person_owner'")
+    conn.commit()
+    with pytest.raises(PostingAuthorityError, match="unique active self"):
+        confirm_and_post(
+            conn,
+            key=b"d2-self-drift-key",
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-self-drift-callback",
+            callback_message_id=290,
+            clock=lambda: 1004,
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0]
+        == redemptions_before
+    )
+    for table in (
+        "d2_posting_decisions",
+        "receipt_item_allocation_fact_sets",
+        "receipt_finalization_authorizations",
+        "transactions",
+    ):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
 def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
     migrated_temp_db_connection: sqlite3.Connection,
     tmp_path: Path,
@@ -376,6 +784,14 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
     assert (
         conn.execute("SELECT COUNT(*) FROM d2_conditional_authorization_proofs").fetchone()[0] == 1
     )
+    proof = conn.execute(
+        "SELECT proofs.reviewed_projection_hash, proofs.snapshot_projection_hash, "
+        "reviews.visible_projection_hash FROM d2_conditional_authorization_proofs AS proofs "
+        "JOIN d2_posting_reviews AS reviews "
+        "ON reviews.review_public_id = proofs.review_public_id"
+    ).fetchone()
+    assert proof["reviewed_projection_hash"] == proof["visible_projection_hash"]
+    assert proof["snapshot_projection_hash"] == proof["visible_projection_hash"]
     assert conn.execute("SELECT COUNT(*) FROM d2_posting_receipt_evidence").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
 
@@ -390,6 +806,27 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
     )
     assert replay == first
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    attempt = conn.execute("SELECT * FROM d2_posting_attempts").fetchone()
+    events = conn.execute("SELECT * FROM d2_posting_attempt_events ORDER BY row_version").fetchall()
+    assert len(events) == int(attempt["row_version"]) + 1
+    assert events[-1]["to_stage"] == attempt["stage"]
+    assert events[-1]["transaction_public_id"] == attempt["transaction_public_id"]
+    with pytest.raises(sqlite3.IntegrityError, match="contradicts attempt state"):
+        conn.execute(
+            "INSERT INTO d2_posting_attempt_events "
+            "(event_public_id, attempt_public_id, from_stage, to_stage, row_version, "
+            "evidence_public_id, transaction_public_id, attention_reason, created_at) "
+            "VALUES (?, ?, 'finalized', 'finalized', ?, ?, ?, NULL, ?)",
+            (
+                "d2evt_" + "f" * 30,
+                attempt["attempt_public_id"],
+                int(attempt["row_version"]) + 1,
+                events[-1]["evidence_public_id"],
+                attempt["transaction_public_id"],
+                attempt["updated_at"],
+            ),
+        )
+    conn.rollback()
 
     for table in (
         "d2_posting_reviews",
@@ -402,7 +839,10 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
     ):
         columns = [str(column[1]) for column in conn.execute(f"PRAGMA table_info({table})")]
         projection = ", ".join(columns)
-        with pytest.raises(sqlite3.IntegrityError, match="identity collision"):
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="identity collision|must begin accepted|contradicts attempt state",
+        ):
             conn.execute(
                 f"INSERT OR REPLACE INTO {table} ({projection}) "
                 f"SELECT {projection} FROM {table} LIMIT 1"
@@ -465,8 +905,17 @@ def test_receipt_crash_boundaries_resume_without_second_confirmation_or_duplicat
     attempt_id = str(
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
+    if failure_stage == "after_receipt_finalization_commit":
+        before = conn.total_changes
+        committed = get_status(conn, review_public_id=review.review_public_id, context=context)
+        assert conn.total_changes == before
+        assert committed.state == "finalized"
+        assert (
+            committed.transaction_public_id
+            == conn.execute("SELECT public_id FROM transactions").fetchone()[0]
+        )
     monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
-    recovered = resume_posting(conn, attempt_public_id=attempt_id)
+    recovered = resume_posting(conn, attempt_public_id=attempt_id, context=context)
     assert recovered.state == "finalized"
     assert recovered.transaction_public_id is not None
     assert conn.execute("SELECT COUNT(*) FROM d2_posting_decisions").fetchone()[0] == 1
@@ -521,14 +970,38 @@ def test_d2_refuses_to_adopt_manual_receipt_authorization(
         actor_type="system",
         actor_id="d2-posting-authority",
     )
-    authorize_receipt_finalization(conn, prepared, actor_id="111")
     attempt_id = str(
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
+    posting_authority_module._advance_attempt(
+        conn,
+        attempt_id=attempt_id,
+        expected_stage="fact_set_persisted",
+        new_stage="snapshot_persisted",
+        evidence_public_id=prepared.calculation_snapshot_id,
+    )
+    decision = conn.execute(
+        "SELECT decision_public_id, review_public_id FROM d2_posting_decisions"
+    ).fetchone()
+    with pytest.raises(BridgeAuthorizationConflictError, match="contradictory"):
+        authorize_d2_conditional_receipt_finalization(
+            conn,
+            prepared,
+            actor_id="unaccepted_actor",
+            decision_public_id=str(decision["decision_public_id"]),
+            review_public_id=str(decision["review_public_id"]),
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM receipt_finalization_authorizations").fetchone()[0] == 0
+    )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_conditional_authorization_proofs").fetchone()[0] == 0
+    )
+    authorize_receipt_finalization(conn, prepared, actor_id="111")
     monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
     with pytest.raises(BridgeAuthorizationConflictError, match="uses version 'v1'"):
-        resume_posting(conn, attempt_public_id=attempt_id)
-    attention = get_status(conn, review_public_id=review.review_public_id)
+        resume_posting(conn, attempt_public_id=attempt_id, context=context)
+    attention = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert attention.state == "needs_attention"
     assert attention.attention_reason == "conditional_authorization_conflict"
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0

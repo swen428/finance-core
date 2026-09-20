@@ -45,6 +45,11 @@ from finance_core.parser_proposals.service import (
     confirm_parser_proposal,
     convert_confirmed_parser_proposal,
 )
+from finance_core.receipt_finalization.d2_conditional import (
+    D2ConditionalAuthorityError,
+    build_d2_receipt_projection,
+    require_d2_conditional_authority,
+)
 from finance_core.receipt_finalization.fact_set_bridge import (
     BridgeAuthorizationConflictError,
     authorize_d2_conditional_receipt_finalization,
@@ -67,6 +72,7 @@ _D2_TABLES = frozenset(
         "d2_posting_attempt_events",
     }
 )
+_D2_SCHEMA_FINGERPRINT = "d19b4bf7cdfea901ddff8428a4e3538d35460078019b984288f93aaeb69654e7"
 
 
 class PostingAuthorityError(RuntimeError):
@@ -86,6 +92,18 @@ def _require_d2_schema(conn: sqlite3.Connection) -> None:
         ).fetchall()
     }
     if observed != _D2_TABLES:
+        raise PostingAuthorityError("migration 049 is missing or incomplete")
+    schema_rows = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE (name GLOB 'd2_*' OR name GLOB 'trg_d2_*') "
+        "AND type IN ('table', 'trigger', 'index') ORDER BY type, name"
+    ).fetchall()
+    material = json.dumps(
+        [tuple(row) for row in schema_rows],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if not hmac.compare_digest(hashlib.sha256(material).hexdigest(), _D2_SCHEMA_FINGERPRINT):
         raise PostingAuthorityError("migration 049 is missing or incomplete")
 
 
@@ -146,6 +164,14 @@ def _require_context(context: HumanActionContext) -> None:
         raise PostingAuthorityError("authenticated Telegram context is incomplete")
     if context.actor_id != context.conversation_id:
         raise PostingAuthorityError("D2 supports only authenticated private direct conversations")
+
+
+def _require_active_self_participant(conn: sqlite3.Connection, public_id: str) -> None:
+    rows = conn.execute(
+        "SELECT public_id FROM participants WHERE is_self = 1 AND is_active = 1 ORDER BY public_id"
+    ).fetchall()
+    if len(rows) != 1 or str(rows[0]["public_id"]) != public_id:
+        raise PostingAuthorityError("personal receipt payer must be the unique active self")
 
 
 def _review_row(conn: sqlite3.Connection, review_public_id: str) -> sqlite3.Row:
@@ -267,6 +293,7 @@ def prepare_posting_review(
                 )
             posting_path = "personal_receipt"
             payer = receipt_payer_participant_public_id
+            _require_active_self_participant(conn, payer)
             candidate = {
                 "payer_participant_public_id": payer,
                 "item": {
@@ -421,6 +448,8 @@ def issue_posting_review_actions(
     clock: Callable[[], int] = _now_epoch,
 ) -> tuple[IssuedHumanActionReference, bool]:
     """Issue exactly one Confirm reference and bind it before returning the raw capability."""
+    require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
     review = _review_row(conn, review_public_id)
     _require_context(context)
@@ -542,7 +571,7 @@ def confirm_and_post(
         callback_message_id=callback_message_id,
     )
     if accepted is not None:
-        return resume_posting(conn, attempt_public_id=accepted)
+        return resume_posting(conn, attempt_public_id=accepted, context=context)
 
     def validate(locked: sqlite3.Connection, ref_row: dict, action: str) -> None:
         binding = locked.execute(
@@ -566,6 +595,16 @@ def confirm_and_post(
             )
         ):
             raise PostingAuthorityError("Confirm reference and review material do not match")
+        if binding["posting_path"] == "personal_receipt":
+            candidate_value = canonical_json_value(
+                str(binding["receipt_fact_candidate_json"]),
+                label="D2 receipt fact candidate",
+            )
+            if not isinstance(candidate_value, dict):
+                raise PostingAuthorityError("D2 receipt fact candidate is malformed")
+            _require_active_self_participant(
+                locked, str(candidate_value.get("payer_participant_public_id") or "")
+            )
 
     def accept(locked: sqlite3.Connection, ref_row: dict, action: str, accepted_at: int) -> None:
         review = locked.execute(
@@ -584,6 +623,44 @@ def confirm_and_post(
         confirmation_id = _identity(
             "pca_d2", review["review_public_id"], ref_row["reference_public_id"]
         )
+        attempts = locked.execute(
+            "SELECT attempt_public_id, review_public_id, reference_id, posting_path "
+            "FROM d2_posting_attempts WHERE attempt_public_id = ? OR review_public_id = ? "
+            "OR reference_id = ?",
+            (attempt_id, review["review_public_id"], ref_row["id"]),
+        ).fetchall()
+        decisions = locked.execute(
+            "SELECT decision_public_id, review_public_id, attempt_public_id, reference_id, "
+            "confirmation_public_id FROM d2_posting_decisions "
+            "WHERE decision_public_id = ? OR review_public_id = ? OR attempt_public_id = ? "
+            "OR reference_id = ? OR confirmation_public_id = ?",
+            (
+                decision_id,
+                review["review_public_id"],
+                attempt_id,
+                ref_row["id"],
+                confirmation_id,
+            ),
+        ).fetchall()
+        if attempts or decisions:
+            if len(attempts) != 1 or len(decisions) != 1:
+                raise PostingAuthorityError("D2 accepted replay authority is incomplete")
+            attempt_material = tuple(attempts[0])
+            decision_material = tuple(decisions[0])
+            if attempt_material != (
+                attempt_id,
+                review["review_public_id"],
+                ref_row["id"],
+                review["posting_path"],
+            ) or decision_material != (
+                decision_id,
+                review["review_public_id"],
+                attempt_id,
+                ref_row["id"],
+                confirmation_id,
+            ):
+                raise PostingAuthorityError("D2 accepted replay authority conflicts")
+            return
         d1_binding = HumanDraftDecisionBinding(
             reference_public_id=str(ref_row["reference_public_id"]),
             card_generation_public_id=str(review["card_generation_public_id"]),
@@ -611,12 +688,14 @@ def confirm_and_post(
         locked.execute(
             "INSERT INTO d2_posting_attempts "
             "(attempt_public_id, review_public_id, reference_id, posting_path, stage, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, 'accepted', ?, ?)",
+            "stage_evidence_public_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)",
             (
                 attempt_id,
                 review["review_public_id"],
                 ref_row["id"],
                 review["posting_path"],
+                confirmation_id,
                 created_at,
                 created_at,
             ),
@@ -635,7 +714,6 @@ def confirm_and_post(
                 created_at,
             ),
         )
-        _insert_attempt_event(locked, attempt_id, None, "accepted", 0, confirmation_id, created_at)
 
     redeemed = redeem_human_action_reference(
         conn,
@@ -658,31 +736,8 @@ def confirm_and_post(
     if attempt is None:
         raise PostingAuthorityError("accepted Confirm has no durable posting attempt")
     _inject_failure("after_confirmation_commit")
-    return resume_posting(conn, attempt_public_id=str(attempt["attempt_public_id"]))
-
-
-def _insert_attempt_event(
-    conn: sqlite3.Connection,
-    attempt_id: str,
-    from_stage: str | None,
-    to_stage: str,
-    version: int,
-    evidence_id: str | None,
-    created_at: str,
-) -> None:
-    conn.execute(
-        "INSERT INTO d2_posting_attempt_events "
-        "(event_public_id, attempt_public_id, from_stage, to_stage, row_version, "
-        "evidence_public_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (
-            _identity("d2evt", attempt_id, version),
-            attempt_id,
-            from_stage,
-            to_stage,
-            version,
-            evidence_id,
-            created_at,
-        ),
+    return resume_posting(
+        conn, attempt_public_id=str(attempt["attempt_public_id"]), context=context
     )
 
 
@@ -712,12 +767,14 @@ def _advance_attempt(
         created_at = _now_text(_now_epoch())
         cursor = conn.execute(
             "UPDATE d2_posting_attempts SET stage = ?, row_version = ?, "
-            "transaction_public_id = ?, attention_reason = NULL, updated_at = ? "
+            "transaction_public_id = ?, attention_reason = NULL, "
+            "stage_evidence_public_id = ?, updated_at = ? "
             "WHERE attempt_public_id = ? AND stage = ? AND row_version = ?",
             (
                 new_stage,
                 version,
                 transaction_public_id,
+                evidence_public_id,
                 created_at,
                 attempt_id,
                 expected_stage,
@@ -726,9 +783,6 @@ def _advance_attempt(
         )
         if cursor.rowcount != 1:
             raise PostingAuthorityError("posting attempt transition conflict")
-        _insert_attempt_event(
-            conn, attempt_id, expected_stage, new_stage, version, evidence_public_id, created_at
-        )
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -760,21 +814,13 @@ def _mark_attempt_needs_attention(
         created_at = _now_text(_now_epoch())
         cursor = conn.execute(
             "UPDATE d2_posting_attempts SET stage = 'needs_attention', row_version = ?, "
-            "transaction_public_id = NULL, attention_reason = ?, updated_at = ? "
+            "transaction_public_id = NULL, attention_reason = ?, "
+            "stage_evidence_public_id = NULL, updated_at = ? "
             "WHERE attempt_public_id = ? AND stage = ? AND row_version = ?",
             (version, reason, created_at, attempt_id, expected_stage, version - 1),
         )
         if cursor.rowcount != 1:
             raise PostingAuthorityError("posting attention transition conflict")
-        _insert_attempt_event(
-            conn,
-            attempt_id,
-            expected_stage,
-            "needs_attention",
-            version,
-            None,
-            created_at,
-        )
         conn.commit()
     except Exception:
         if conn.in_transaction:
@@ -782,21 +828,35 @@ def _mark_attempt_needs_attention(
         raise
 
 
-def resume_posting(conn: sqlite3.Connection, *, attempt_public_id: str) -> PostingStatus:
+def resume_posting(
+    conn: sqlite3.Connection,
+    *,
+    attempt_public_id: str,
+    context: HumanActionContext,
+) -> PostingStatus:
     """Advance an already-authorized attempt; never creates a human decision."""
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
+    _require_context(context)
     row = conn.execute(
         "SELECT attempts.*, reviews.parser_output_id, reviews.review_public_id "
         "FROM d2_posting_attempts AS attempts "
         "JOIN d2_posting_reviews AS reviews "
         "ON reviews.review_public_id = attempts.review_public_id "
-        "WHERE attempts.attempt_public_id = ?",
-        (attempt_public_id,),
+        "WHERE attempts.attempt_public_id = ? "
+        "AND reviews.authenticated_actor_id = ? AND reviews.telegram_account_id = ? "
+        "AND reviews.telegram_conversation_id = ? AND reviews.conversation_binding_id = ?",
+        (
+            attempt_public_id,
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
     ).fetchone()
     if row is None:
-        raise PostingAuthorityError("posting attempt not found")
+        raise PostingAuthorityError("posting authority unavailable")
     if row["stage"] == "accepted" and row["posting_path"] == "text":
         result = convert_confirmed_parser_proposal(conn, int(row["parser_output_id"]))
         _inject_failure("after_text_finalization_commit")
@@ -810,7 +870,7 @@ def resume_posting(conn: sqlite3.Connection, *, attempt_public_id: str) -> Posti
         )
     elif row["posting_path"] == "personal_receipt" and row["stage"] != "finalized":
         _resume_personal_receipt(conn, attempt_public_id=attempt_public_id)
-    return get_status(conn, review_public_id=str(row["review_public_id"]))
+    return get_status(conn, review_public_id=str(row["review_public_id"]), context=context)
 
 
 def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str) -> None:
@@ -848,6 +908,16 @@ def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str
         item = candidate["item"]
         if not isinstance(item, dict):
             raise PostingAuthorityError("D2 receipt fact candidate item is malformed")
+        try:
+            _require_active_self_participant(conn, payer)
+        except PostingAuthorityError:
+            _mark_attempt_needs_attention(
+                conn,
+                attempt_id=attempt_public_id,
+                expected_stage=stage,
+                reason="personal_participant_authority_changed",
+            )
+            raise
 
         conversion_command_id = f"rpfc_d2_{_sha256_text(attempt_public_id)[:24]}"
         if stage == "accepted":
@@ -1020,60 +1090,13 @@ def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str
             )
             continue
 
-        receipt = conn.execute(
-            "SELECT merchant, receipt_datetime, net_paid_amount, currency "
-            "FROM receipts WHERE public_id = ?",
-            (conversion_row["receipt_public_id"],),
-        ).fetchone()
-        if receipt is None:
-            raise PostingAuthorityError("D2 receipt facts are missing")
-        calculation = prepared.calculation_result
-        actual_projection = {
-            "amount": canonical_money_str(
-                money_decimal(str(receipt["net_paid_amount"]), label="receipt total"),
-                str(receipt["currency"]),
-            ),
-            "currency": str(receipt["currency"]),
-            "transaction_date": str(receipt["receipt_datetime"]),
-            "merchant": str(receipt["merchant"]),
-            "account": "unspecified",
-            "receipt_total": canonical_money_str(
-                money_decimal(str(calculation["total_paid"]), label="calculated total"),
-                str(receipt["currency"]),
-            ),
-            "personal_share": canonical_money_str(
-                money_decimal(
-                    str(calculation["participant_shares"][payer]),
-                    label="calculated personal share",
-                ),
-                str(receipt["currency"]),
-            ),
-            "calculation": {
-                "total_paid": canonical_money_str(
-                    money_decimal(str(calculation["total_paid"]), label="calculated total"),
-                    str(receipt["currency"]),
-                ),
-                "total_to_collect": canonical_money_str(
-                    money_decimal(
-                        str(calculation["total_to_collect"]),
-                        label="calculated collection total",
-                    ),
-                    str(receipt["currency"]),
-                ),
-                "settlement_obligations": [
-                    {
-                        "debtor": str(obligation["debtor"]),
-                        "creditor": str(obligation["creditor"]),
-                        "amount": canonical_money_str(
-                            money_decimal(str(obligation["amount"]), label="settlement obligation"),
-                            str(receipt["currency"]),
-                        ),
-                        "currency": str(obligation["currency"]),
-                    }
-                    for obligation in calculation["settlement_obligations"]
-                ],
-            },
-        }
+        actual_projection = build_d2_receipt_projection(
+            merchant=prepared.confirmed_receipt_identity.merchant,
+            receipt_date=prepared.confirmed_receipt_identity.receipt_date,
+            currency=prepared.currency,
+            payer_participant_public_id=payer,
+            calculation=prepared.calculation_result,
+        )
         actual_json = _canonical(actual_projection)
         actual_hash = _sha256_text(actual_json)
         if actual_json != str(row["visible_projection_json"]) or not hmac.compare_digest(
@@ -1096,8 +1119,6 @@ def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str
                 actor_id=str(row["authenticated_actor_id"]),
                 decision_public_id=str(row["decision_public_id"]),
                 review_public_id=str(row["review_public_id"]),
-                reviewed_projection_hash=str(row["visible_projection_hash"]),
-                snapshot_projection_hash=actual_hash,
             )
         except BridgeAuthorizationConflictError:
             _mark_attempt_needs_attention(
@@ -1132,35 +1153,134 @@ def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str
         raise PostingAuthorityError(f"unsupported D2 receipt attempt stage: {stage}")
 
 
-def get_status(conn: sqlite3.Connection, *, review_public_id: str) -> PostingStatus:
+def get_status(
+    conn: sqlite3.Connection,
+    *,
+    review_public_id: str,
+    context: HumanActionContext,
+) -> PostingStatus:
     """Return stable D2 status using SELECTs only."""
     require_staging_database(conn)
     _require_d2_schema(conn)
+    _require_context(context)
     row = conn.execute(
         "SELECT reviews.review_public_id, attempts.attempt_public_id, attempts.stage, "
-        "attempts.transaction_public_id, attempts.attention_reason, drafts.state AS draft_state "
+        "attempts.transaction_public_id, attempts.attention_reason, drafts.state AS draft_state, "
+        "reviews.posting_path, reviews.parser_output_id, reviews.proposal_content_hash, "
+        "reviews.authenticated_actor_id "
         "FROM d2_posting_reviews AS reviews "
         "JOIN parser_human_draft_cards AS cards "
         "ON cards.card_generation_public_id = reviews.card_generation_public_id "
         "JOIN parser_human_drafts AS drafts ON drafts.id = cards.draft_id "
         "LEFT JOIN d2_posting_attempts AS attempts "
         "ON attempts.review_public_id = reviews.review_public_id "
-        "WHERE reviews.review_public_id = ?",
-        (review_public_id,),
+        "WHERE reviews.review_public_id = ? "
+        "AND reviews.authenticated_actor_id = ? AND reviews.telegram_account_id = ? "
+        "AND reviews.telegram_conversation_id = ? AND reviews.conversation_binding_id = ?",
+        (
+            review_public_id,
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
     ).fetchone()
     if row is None:
-        raise PostingAuthorityError("posting review not found")
+        raise PostingAuthorityError("posting authority unavailable")
     stage = row["stage"]
     if stage is None and row["draft_state"] == "rejected":
         state = "rejected"
     elif stage is None:
         state = "awaiting_confirmation"
-    elif stage == "finalized":
-        state = "finalized"
-    elif stage == "needs_attention":
-        state = "needs_attention"
     else:
-        state = "posting"
+        decision = conn.execute(
+            "SELECT decision_public_id, confirmation_public_id FROM d2_posting_decisions "
+            "WHERE attempt_public_id = ? AND review_public_id = ?",
+            (row["attempt_public_id"], review_public_id),
+        ).fetchone()
+        if decision is None:
+            return PostingStatus(
+                review_public_id=review_public_id,
+                state="needs_attention",
+                attempt_public_id=str(row["attempt_public_id"]),
+                transaction_public_id=None,
+                attention_reason="coordination_integrity_mismatch",
+            )
+
+        authoritative_transaction: str | None = None
+        integrity_error = False
+        if row["posting_path"] == "text":
+            conversion = conn.execute(
+                "SELECT conversions.confirmation_public_id, "
+                "conversions.proposal_content_hash, conversions.authenticated_actor_id, "
+                "transactions.public_id AS transaction_public_id "
+                "FROM parser_proposal_conversion_audit AS conversions "
+                "JOIN transactions ON transactions.id = conversions.transaction_id "
+                "WHERE conversions.parser_output_id = ?",
+                (row["parser_output_id"],),
+            ).fetchone()
+            if conversion is not None:
+                if (
+                    conversion["confirmation_public_id"] != decision["confirmation_public_id"]
+                    or conversion["proposal_content_hash"] != row["proposal_content_hash"]
+                    or conversion["authenticated_actor_id"] != row["authenticated_actor_id"]
+                ):
+                    integrity_error = True
+                else:
+                    authoritative_transaction = str(conversion["transaction_public_id"])
+        else:
+            finalization = conn.execute(
+                "SELECT authorizations.*, audits.status AS finalization_status, "
+                "audits.transaction_public_id AS final_transaction_public_id, "
+                "transactions.public_id AS canonical_transaction_public_id "
+                "FROM d2_conditional_authorization_proofs AS proofs "
+                "JOIN receipt_finalization_authorizations AS authorizations "
+                "ON authorizations.authorization_id = proofs.authorization_id "
+                "JOIN receipt_finalization_audit AS audits "
+                "ON audits.authorization_id = authorizations.authorization_id "
+                "JOIN transactions ON transactions.public_id = audits.transaction_public_id "
+                "WHERE proofs.decision_public_id = ?",
+                (decision["decision_public_id"],),
+            ).fetchone()
+            if finalization is not None:
+                try:
+                    require_d2_conditional_authority(conn, dict(finalization))
+                except D2ConditionalAuthorityError:
+                    integrity_error = True
+                else:
+                    if (
+                        finalization["authorization_state"] != "consumed"
+                        or finalization["authorization_version"] != "d2_conditional_v1"
+                        or finalization["finalization_status"] != "finalized"
+                        or finalization["final_transaction_public_id"]
+                        != finalization["canonical_transaction_public_id"]
+                    ):
+                        integrity_error = True
+                    else:
+                        authoritative_transaction = str(
+                            finalization["canonical_transaction_public_id"]
+                        )
+
+        if authoritative_transaction is not None:
+            if row["transaction_public_id"] not in {None, authoritative_transaction}:
+                integrity_error = True
+            else:
+                return PostingStatus(
+                    review_public_id=review_public_id,
+                    state="finalized",
+                    attempt_public_id=str(row["attempt_public_id"]),
+                    transaction_public_id=authoritative_transaction,
+                    attention_reason=None,
+                )
+        if integrity_error or stage == "finalized":
+            return PostingStatus(
+                review_public_id=review_public_id,
+                state="needs_attention",
+                attempt_public_id=str(row["attempt_public_id"]),
+                transaction_public_id=None,
+                attention_reason="financial_authority_mismatch",
+            )
+        state = "needs_attention" if stage == "needs_attention" else "posting"
     return PostingStatus(
         review_public_id=review_public_id,
         state=state,
