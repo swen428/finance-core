@@ -1004,22 +1004,22 @@ def resume_posting(
     if existing_status.state in {"needs_attention", "rejected"}:
         return existing_status
     if row["stage"] == "accepted" and row["posting_path"] == "text":
-        result = convert_confirmed_parser_proposal(conn, int(row["parser_output_id"]))
+        convert_confirmed_parser_proposal(conn, int(row["parser_output_id"]))
         _inject_failure("after_text_finalization_commit")
-        _advance_attempt(
-            conn,
-            attempt_id=attempt_public_id,
-            expected_stage="accepted",
-            new_stage="finalized",
-            transaction_public_id=str(result["transaction_public_id"]),
-            evidence_public_id=str(result["transaction_public_id"]),
+        return _catch_up_finalized_attempt(
+            conn, attempt_public_id=attempt_public_id, context=context
         )
     elif row["posting_path"] == "personal_receipt" and row["stage"] != "finalized":
-        _resume_personal_receipt(conn, attempt_public_id=attempt_public_id)
+        _resume_personal_receipt(conn, attempt_public_id=attempt_public_id, context=context)
     return get_status(conn, review_public_id=str(row["review_public_id"]), context=context)
 
 
-def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str) -> None:
+def _resume_personal_receipt(
+    conn: sqlite3.Connection,
+    *,
+    attempt_public_id: str,
+    context: HumanActionContext,
+) -> None:
     """Advance the closed D2 personal-total receipt stage machine."""
     while True:
         row = conn.execute(
@@ -1285,17 +1285,10 @@ def _resume_personal_receipt(conn: sqlite3.Connection, *, attempt_public_id: str
             )
             continue
         if stage == "conditional_authorization_persisted":
-            result = finalize_prepared_receipt(conn, authorization)
+            finalize_prepared_receipt(conn, authorization)
             _inject_failure("after_receipt_finalization_commit")
-            _advance_attempt(
-                conn,
-                attempt_id=attempt_public_id,
-                expected_stage="conditional_authorization_persisted",
-                new_stage="finalized",
-                transaction_public_id=result.transaction_public_id,
-                evidence_public_id=result.finalization_public_id,
-            )
-            continue
+            _catch_up_finalized_attempt(conn, attempt_public_id=attempt_public_id, context=context)
+            return
         raise PostingAuthorityError(f"unsupported D2 receipt attempt stage: {stage}")
 
 

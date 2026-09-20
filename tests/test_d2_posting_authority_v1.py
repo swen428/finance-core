@@ -407,6 +407,55 @@ def test_finalized_catchup_revalidates_under_write_lock_before_event(
     )
 
 
+def test_initial_text_finalization_uses_atomic_verified_catchup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-initial-text-catchup-race",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    key = b"d2-initial-text-catchup-race-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def drift_after_financial_commit(stage: str) -> None:
+        if stage == "after_text_finalization_commit":
+            conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.commit()
+
+    monkeypatch.setattr(
+        posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
+    )
+    status = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-initial-text-catchup-race-callback",
+        callback_message_id=214,
+        clock=lambda: 1004,
+    )
+    assert status.state == "needs_attention"
+    attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
+    assert attempt["stage"] == "accepted"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
+        ).fetchone()[0]
+        == 0
+    )
+
+
 def test_resume_requires_complete_d2_decision_before_text_financial_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1196,6 +1245,59 @@ def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(
     assert (
         attempt["stage_evidence_public_id"]
         == conn.execute("SELECT finalization_id FROM receipt_finalization_audit").fetchone()[0]
+    )
+
+
+def test_initial_receipt_finalization_uses_atomic_verified_catchup(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    published = _published_receipt_card(conn, tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-initial-receipt-catchup-race",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        receipt_payer_participant_public_id="person_owner",
+        clock=lambda: 1002,
+    )
+    key = b"d2-initial-receipt-catchup-race-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def drift_after_financial_commit(stage: str) -> None:
+        if stage == "after_receipt_finalization_commit":
+            conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.commit()
+
+    monkeypatch.setattr(
+        posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
+    )
+    status = confirm_and_post(
+        conn,
+        key=key,
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-initial-receipt-catchup-race-callback",
+        callback_message_id=313,
+        clock=lambda: 1004,
+    )
+    assert status.state == "needs_attention"
+    attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
+    assert attempt["stage"] == "conditional_authorization_persisted"
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
+        ).fetchone()[0]
+        == 0
     )
 
 
