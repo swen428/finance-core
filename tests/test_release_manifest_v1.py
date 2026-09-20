@@ -300,6 +300,26 @@ def test_release_manifest_accepts_and_binds_inspected_exact_artifacts(tmp_path: 
     assert len(checksum_lines) == 4
 
 
+def test_release_manifest_rejects_external_migration_digest_mismatch(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest="0" * 64,
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "migration ledger digest does not match the wheel" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
 def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     (source_root / "finance_core" / "private_runtime_secret.py").write_text(
