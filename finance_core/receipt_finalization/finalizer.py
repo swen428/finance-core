@@ -39,6 +39,10 @@ from finance_core.money import (
     money_decimal,
     quantize_for_currency,
 )
+from finance_core.receipt_finalization.d2_conditional import (
+    D2ConditionalAuthorityError,
+    require_d2_conditional_authority,
+)
 from finance_core.receipt_finalization.models import (
     ActiveFactSetBinding,
     ConfirmedReceiptIdentity,
@@ -486,6 +490,28 @@ def finalize_receipt_split(
         audit_id=finalization_pub_id,
         idempotency_key=fin_input.idempotency_key,
     )
+
+
+def verify_finalized_receipt_split(
+    conn: sqlite3.Connection, fin_input: FinalizationInput
+) -> FinalizationOutput:
+    """Read-only verification of a completed finalization's full durable graph."""
+    require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
+    _require_schema(conn)
+    fingerprint = build_finalization_content_fingerprint(fin_input)
+    result = _verify_replay_in_coherent_snapshot(
+        conn,
+        fin_input=fin_input,
+        fingerprint=fingerprint,
+        recheck=lambda: _check_idempotency(conn, fin_input.idempotency_key, fingerprint),
+    )
+    if result is None:
+        raise FinalizationIdempotencyError(
+            "Completed receipt finalization is missing its durable idempotency record",
+            reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
+        )
+    return result
 
 
 def _verify_replay_in_coherent_snapshot(
@@ -1230,10 +1256,24 @@ def _load_and_validate_authorization(
             reason=FinalizationBlockReason.AUTHORIZATION_CONTENT_MISMATCH,
         )
 
-    # --- Version ---
-    if not auth.get("authorization_version"):
+    # --- Version and version-specific authority proof ---
+    authorization_version = str(auth.get("authorization_version") or "")
+    if not authorization_version:
         raise FinalizationAuthorizationError(
             f"Authorization {authorization_id!r} has missing or empty version",
+            reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED,
+        )
+    if authorization_version == "d2_conditional_v1":
+        try:
+            require_d2_conditional_authority(conn, auth)
+        except D2ConditionalAuthorityError as exc:
+            raise FinalizationAuthorizationError(
+                str(exc), reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED
+            ) from exc
+    elif authorization_version != "v1":
+        raise FinalizationAuthorizationError(
+            f"Authorization {authorization_id!r} uses unsupported version "
+            f"{authorization_version!r}",
             reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED,
         )
 
@@ -2419,9 +2459,17 @@ def _require_replay_authorization_truth(
             "a durably finalized authorization can only be 'consumed'",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
-    if str(auth.get("authorization_version") or "") != "v1":
+    authorization_version = str(auth.get("authorization_version") or "")
+    if authorization_version == "d2_conditional_v1":
+        try:
+            require_d2_conditional_authority(conn, auth)
+        except D2ConditionalAuthorityError as exc:
+            raise FinalizationIdempotencyError(
+                str(exc), reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value
+            ) from exc
+    elif authorization_version != "v1":
         raise FinalizationIdempotencyError(
-            f"Replay authorization version is {str(auth.get('authorization_version'))!r}, not 'v1'",
+            f"Replay authorization version is {authorization_version!r}; unsupported",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
     if auth["content_hash"] != fingerprint:

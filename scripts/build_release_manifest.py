@@ -105,8 +105,8 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
         if name.startswith(prefix) and name.endswith(".sql")
     }
     observed_numbers = [int(name[:3]) for name in sorted(migrations)]
-    if observed_numbers != list(range(1, 49)):
-        raise ValueError("wheel must contain the exact migration inventory 001-048")
+    if observed_numbers != list(range(1, 50)):
+        raise ValueError("wheel must contain the exact migration inventory 001-049")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]
@@ -115,6 +115,60 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
         digest.update(len(body).to_bytes(8, "big"))
         digest.update(body)
     return digest.hexdigest()
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate migration contract field")
+        result[key] = value
+    return result
+
+
+def _migration_contract(contract_payload: bytes) -> tuple[str, tuple[str, ...]]:
+    if not contract_payload or len(contract_payload) > 64 * 1024:
+        raise ValueError("wheel migration contract size is invalid")
+    try:
+        contract: object = json.loads(
+            contract_payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("wheel migration contract is invalid JSON") from exc
+    if not isinstance(contract, dict) or set(contract) != {
+        "migration_filenames",
+        "migration_ledger_digest",
+        "schema",
+    }:
+        raise ValueError("wheel migration contract schema is invalid")
+    if contract["schema"] != "finance-core-migration-contract-v1":
+        raise ValueError("wheel migration contract schema is invalid")
+    digest_value = contract["migration_ledger_digest"]
+    filenames_value = contract["migration_filenames"]
+    if not isinstance(digest_value, str) or HEX_64.fullmatch(digest_value) is None:
+        raise ValueError("wheel migration ledger declaration is invalid")
+    if (
+        not isinstance(filenames_value, list)
+        or not filenames_value
+        or any(not isinstance(filename, str) for filename in filenames_value)
+    ):
+        raise ValueError("wheel migration filename declaration is invalid")
+    filenames = tuple(filename for filename in filenames_value if isinstance(filename, str))
+    if (
+        len(filenames) != len(set(filenames))
+        or any(
+            len(filename) < 9
+            or not filename[:3].isdigit()
+            or filename[3] != "_"
+            or not filename.endswith(".sql")
+            or "/" in filename
+            or "\\" in filename
+            for filename in filenames
+        )
+    ):
+        raise ValueError("wheel migration filename declaration is invalid")
+    return digest_value, filenames
 
 
 def _api_contract_version(package_init: bytes) -> str:
@@ -293,10 +347,27 @@ def _inspect_wheel(
     package_init = package_files.get("finance_core/__init__.py")
     if package_init is None:
         raise ValueError("wheel is missing finance_core/__init__.py")
+    migration_contract = package_files.get(
+        "finance_core/resources/migration-contract-v1.json"
+    )
+    if migration_contract is None:
+        raise ValueError("wheel is missing the migration contract resource")
+    observed_ledger = _migration_ledger_digest(package_files)
+    declared_ledger, declared_filenames = _migration_contract(migration_contract)
+    observed_filenames = tuple(
+        sorted(
+            PurePosixPath(name).name
+            for name in package_files
+            if name.startswith("finance_core/resources/migrations/")
+            and name.endswith(".sql")
+        )
+    )
+    if declared_ledger != observed_ledger or declared_filenames != observed_filenames:
+        raise ValueError("wheel migration contract does not match its migration payload")
     return (
         package_files,
         _api_contract_version(package_init),
-        _migration_ledger_digest(package_files),
+        observed_ledger,
     )
 
 
@@ -757,12 +828,12 @@ def main() -> int:
         for path in sorted(artifact_paths, key=lambda path: path.name)
     ]
     manifest = {
-        "api_contract_version": args.api_contract_version,
+        "api_contract_version": observed_api,
         "artifacts": artifact_entries,
         "bridge_version": args.core_version,
         "core_commit": args.core_commit,
         "core_version": args.core_version,
-        "migration_ledger_digest": args.migration_ledger_digest,
+        "migration_ledger_digest": observed_ledger,
         "schema": "finance-core-component-manifest-v1",
     }
     manifest_path = artifacts_dir / "component-manifest-v1.json"

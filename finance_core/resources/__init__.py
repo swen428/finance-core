@@ -3,68 +3,82 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from functools import lru_cache
 from importlib.resources import files
 from pathlib import Path
 
-MIGRATION_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
 MIGRATION_PREFLIGHT_FILENAME = "migration_029_preflight.py"
 MIGRATION_PREFLIGHT_SHA256 = "1fe3324447dbd128a80aadcafd54a70974d9c858cbc3a45a1bdaeae1cf48c295"
 MIGRATION_PREFLIGHT_BYTE_COUNT = 55_851
-MIGRATION_FILENAMES = (
-    "001_create_core_schema.sql",
-    "002_receipt_split_schema.sql",
-    "003_raw_intake_persistence.sql",
-    "004_parser_proposal_confirmation.sql",
-    "005_raw_intake_source_evidence.sql",
-    "006_reconciliation_persistence_schema_v1.sql",
-    "007_reconciliation_review_resolution_persistence.sql",
-    "008_reconciliation_apply_results.sql",
-    "009_statement_import_fingerprint_dedup.sql",
-    "010_statement_amount_direction_persistence.sql",
-    "011_reconciliation_structured_evidence.sql",
-    "012_reconciliation_apply_state_persistence.sql",
-    "013_reconciliation_final_mutation_guard_decisions.sql",
-    "014_reconciliation_guarded_apply_execution_persistence.sql",
-    "015_calculation_run_persistence.sql",
-    "016_calculation_snapshot_persistence.sql",
-    "017_pdf_statement_import_run_persistence.sql",
-    "018_reconciliation_final_mutation_authorization.sql",
-    "019_reconciliation_final_mutation_audit.sql",
-    "020_receipt_finalization_hardening.sql",
-    "021_parser_confirmation_authorization.sql",
-    "022_database_conflict_fingerprints.sql",
-    "023_finance_application_identity.sql",
-    "024_authoritative_calculation_snapshots.sql",
-    "025_append_only_financial_audit_chain.sql",
-    "026_reconciliation_direction_decision_hashes.sql",
-    "027_statement_content_identity.sql",
-    "028_pdf_statement_direction_evidence.sql",
-    "029_authoritative_proof_evidence_integrity.sql",
-    "030_parser_proposal_completion.sql",
-    "031_telegram_attachment_evidence.sql",
-    "032_receipt_ocr_evidence.sql",
-    "033_receipt_ocr_proposal_links.sql",
-    "034_receipt_proposal_revisions.sql",
-    "035_receipt_proposal_conversions.sql",
-    "036_receipt_item_allocation_facts.sql",
-    "037_receipt_fact_set_binding_evidence.sql",
-    "038_finalization_audit_immutability.sql",
-    "039_receipt_scoped_membership_evidence.sql",
-    "040_local_receipt_source_evidence.sql",
-    "041_openclaw_human_action_references.sql",
-    "042_s5e_ai_fallback_provenance_foundation.sql",
-    "043_s5e_ai_fallback_lineage_sealing.sql",
-    "044_nomi_ai_model_compatibility_receipts.sql",
-    "045_nomi_ai_model_admission_decisions.sql",
-    "046_openclaw_guided_edit_sessions.sql",
-    "047_parser_human_drafts.sql",
-    "048_d1_human_ai_lineage_transition.sql",
-)
+MIGRATION_CONTRACT_FILENAME = "migration-contract-v1.json"
+MIGRATION_CONTRACT_SCHEMA = "finance-core-migration-contract-v1"
+MAX_MIGRATION_CONTRACT_BYTES = 64 * 1024
 
 
 class MigrationResourceError(RuntimeError):
     """Raised when installed migration resources are absent or have drifted."""
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate migration contract field")
+        result[key] = value
+    return result
+
+
+def _load_migration_contract() -> tuple[str, tuple[str, ...]]:
+    path = Path(__file__).with_name(MIGRATION_CONTRACT_FILENAME)
+    if path.is_symlink() or not path.is_file():
+        raise MigrationResourceError("Migration contract resource is missing or unsafe")
+    try:
+        payload = path.read_bytes()
+    except OSError as exc:
+        raise MigrationResourceError("Migration contract resource cannot be read") from exc
+    if not payload or len(payload) > MAX_MIGRATION_CONTRACT_BYTES:
+        raise MigrationResourceError("Migration contract resource size is invalid")
+    try:
+        contract: object = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_unique_json_object,
+        )
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise MigrationResourceError("Migration contract resource is invalid JSON") from exc
+    if not isinstance(contract, dict) or set(contract) != {
+        "migration_filenames",
+        "migration_ledger_digest",
+        "schema",
+    }:
+        raise MigrationResourceError("Migration contract schema is invalid")
+    digest = contract["migration_ledger_digest"]
+    raw_filenames = contract["migration_filenames"]
+    if (
+        contract["schema"] != MIGRATION_CONTRACT_SCHEMA
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(raw_filenames, list)
+        or not raw_filenames
+        or any(not isinstance(filename, str) for filename in raw_filenames)
+    ):
+        raise MigrationResourceError("Migration contract values are invalid")
+    filenames = tuple(filename for filename in raw_filenames if isinstance(filename, str))
+    if len(filenames) != len(set(filenames)) or any(
+        len(filename) < 9
+        or not filename[:3].isdigit()
+        or filename[3] != "_"
+        or not filename.endswith(".sql")
+        or "/" in filename
+        or "\\" in filename
+        for filename in filenames
+    ):
+        raise MigrationResourceError("Migration contract filename inventory is invalid")
+    return digest, filenames
+
+
+MIGRATION_LEDGER_DIGEST, MIGRATION_FILENAMES = _load_migration_contract()
 
 
 @lru_cache(maxsize=1)
@@ -99,11 +113,12 @@ def migration_resource_paths() -> tuple[Path, ...]:
     """Return the exact ordered, checksum-verified migration ledger resources."""
 
     root = migrations_dir()
+    expected_digest, expected_filenames = _load_migration_contract()
     observed = tuple(path.name for path in sorted(root.glob("*.sql")))
-    if observed != MIGRATION_FILENAMES:
+    if observed != expected_filenames:
         raise MigrationResourceError("Installed migration resource inventory has drifted")
-    paths = tuple(root / name for name in MIGRATION_FILENAMES)
-    if _ledger_digest(paths) != MIGRATION_LEDGER_DIGEST:
+    paths = tuple(root / name for name in expected_filenames)
+    if _ledger_digest(paths) != expected_digest:
         raise MigrationResourceError("Installed migration resource bytes have drifted")
     return paths
 

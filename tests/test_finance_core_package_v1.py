@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import finance_core.resources as resource_runtime
 from finance_core.reconciliation import migrations as migration_runtime
 from finance_core.resources import (
     MIGRATION_LEDGER_DIGEST,
@@ -47,7 +48,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+EXPECTED_LEDGER_DIGEST = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"
 
 
 def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
@@ -76,11 +77,25 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 48
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 49))
+    assert len(paths) == 49
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 50))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
+
+
+def test_migration_runtime_authority_reloads_the_non_executable_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    migration_resource_paths.cache_clear()
+    monkeypatch.setattr(resource_runtime, "MIGRATION_LEDGER_DIGEST", "0" * 64)
+    monkeypatch.setattr(resource_runtime, "MIGRATION_FILENAMES", ("001_wrong.sql",))
+
+    paths = migration_resource_paths()
+
+    assert len(paths) == 49
+    assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
+    migration_resource_paths.cache_clear()
 
 
 def test_migration_runtime_consumes_the_package_resources() -> None:
@@ -317,7 +332,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.3"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 48
+        assert payload["migration_count"] == 49
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True

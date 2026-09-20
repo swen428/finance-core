@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -65,6 +66,25 @@ def _add_tar_directory(archive: tarfile.TarFile, name: str) -> None:
     info.type = tarfile.DIRTYPE
     info.mode = 0o755
     archive.addfile(info)
+
+
+def _rewrite_wheel(wheel: Path, updates: dict[str, bytes]) -> None:
+    with zipfile.ZipFile(wheel) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    payloads.update(updates)
+    record_name = "finance_core-0.1.3.dist-info/RECORD"
+    record_stream = io.StringIO(newline="")
+    writer = csv.writer(record_stream, lineterminator="\n")
+    for name, payload in sorted(payloads.items()):
+        if name == record_name:
+            continue
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest()).rstrip(b"=").decode()
+        writer.writerow((name, f"sha256={digest}", str(len(payload))))
+    writer.writerow((record_name, "", ""))
+    payloads[record_name] = record_stream.getvalue().encode()
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
 
 
 def _bridge_provenance(source_files: dict[str, bytes]) -> bytes:
@@ -256,7 +276,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def test_release_manifest_accepts_and_binds_inspected_exact_artifacts(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    migration_digest = "61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"
+    migration_digest = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"
 
     completed = subprocess.run(
         _manifest_command(
@@ -280,6 +300,26 @@ def test_release_manifest_accepts_and_binds_inspected_exact_artifacts(tmp_path: 
     assert len(checksum_lines) == 4
 
 
+def test_release_manifest_rejects_external_migration_digest_mismatch(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest="0" * 64,
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "migration ledger digest does not match the wheel" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
 def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     (source_root / "finance_core" / "private_runtime_secret.py").write_text(
@@ -292,7 +332,7 @@ def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -325,7 +365,7 @@ def test_release_manifest_rejects_modified_build_metadata(tmp_path: Path) -> Non
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -352,7 +392,7 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -396,7 +436,7 @@ def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -420,7 +460,7 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -428,6 +468,94 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
 
     assert completed.returncode != 0
     assert "metadata inventory is unexpected" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.replace(
+            b'"migration_ledger_digest": "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9'
+            b'ee70857d95bf74ef47369af7"',
+            b'"migration_ledger_digest": "0000000000000000000000000000000000000000000'
+            b'000000000000000000000"',
+        ),
+        lambda payload: payload.replace(
+            b'    "048_d1_human_ai_lineage_transition.sql",\n'
+            b'    "049_d2_one_confirmation_posting.sql"\n',
+            b'    "048_d1_human_ai_lineage_transition.sql"\n',
+        ),
+    ],
+)
+def test_release_manifest_rejects_stale_wheel_migration_contract(
+    tmp_path: Path, mutate: Callable[[bytes], bytes]
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    contract_name = "finance_core/resources/migration-contract-v1.json"
+    with zipfile.ZipFile(wheel) as archive:
+        contract = archive.read(contract_name)
+    mutated = mutate(contract)
+    assert mutated != contract
+    _rewrite_wheel(wheel, {contract_name: mutated})
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "wheel migration contract does not match its migration payload" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda payload: payload.replace(
+            b"{\n",
+            b'{\n  "schema": "duplicate",\n',
+            1,
+        ),
+        lambda payload: payload.replace(
+            b"{\n",
+            b'{\n  "unexpected": true,\n',
+            1,
+        ),
+        lambda _payload: b'globals()["MIGRATION_LEDGER_DIGEST"] = "0" * 64\n',
+    ],
+)
+def test_release_manifest_rejects_non_data_migration_contract(
+    tmp_path: Path, mutate: Callable[[bytes], bytes]
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.3-py3-none-any.whl"
+    contract_name = "finance_core/resources/migration-contract-v1.json"
+    with zipfile.ZipFile(wheel) as archive:
+        contract = archive.read(contract_name)
+    _rewrite_wheel(wheel, {contract_name: mutate(contract)})
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "wheel migration contract" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
 
 
 def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Path) -> None:
@@ -458,7 +586,7 @@ def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Pa
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -488,7 +616,7 @@ def test_release_manifest_rejects_sdist_sources_inventory_drift(tmp_path: Path) 
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -517,7 +645,7 @@ def test_release_manifest_rejects_bridge_payload_not_in_exact_source(tmp_path: P
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,
@@ -548,7 +676,7 @@ def test_release_manifest_rejects_dirty_compiled_bridge_output(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3"),
+            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
         ),
         capture_output=True,
         text=True,

@@ -57,6 +57,10 @@ from finance_core.parser_proposals.effective_payload import (
     EffectivePayloadError,
     resolve_effective_payload,
 )
+from finance_core.parser_proposals.human_revision import (
+    HumanRevisionLineageError,
+    verify_human_revision_descendant,
+)
 from finance_core.parser_proposals.lifecycle import (
     CONFIRMED,
     SUPERSEDED,
@@ -347,6 +351,8 @@ def convert_confirmed_receipt_proposal_to_facts(
     command: ReceiptFactsConversionCommand,
     *,
     clock: Callable[[], str] | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, ReceiptFactsConversionResult], None]
+    | None = None,
 ) -> ReceiptFactsConversionResult:
     """Atomically convert one confirmed receipt total proposal to receipt facts.
 
@@ -370,6 +376,8 @@ def convert_confirmed_receipt_proposal_to_facts(
             _require_replay_material(existing, material_hash, command)
             _verify_replay_integrity(conn, existing)
             result = _replay_result(existing)
+            if persistence_effect is not None:
+                persistence_effect(conn, result)
             conn.commit()
             return result
 
@@ -476,9 +484,7 @@ def convert_confirmed_receipt_proposal_to_facts(
             chain_root_id=chain_root_id,
         )
 
-        _inject_failure("before_commit")
-        conn.commit()
-        return ReceiptFactsConversionResult(
+        result = ReceiptFactsConversionResult(
             command_public_id=command.command_public_id,
             proposal_public_id=str(proposal["public_id"]),
             parser_output_id=parser_output_id,
@@ -490,6 +496,11 @@ def convert_confirmed_receipt_proposal_to_facts(
             conversion_result_hash=result_hash,
             idempotent=False,
         )
+        if persistence_effect is not None:
+            persistence_effect(conn, result)
+        _inject_failure("before_commit")
+        conn.commit()
+        return result
     except ReceiptFactsConversionError:
         _rollback_if_needed(conn)
         raise
@@ -1678,6 +1689,16 @@ def _durable_resolution_provenance(
     ``ConversionEvidenceLineageError`` before any write.
     """
     path = _supersession_path(conn, int(proposal["id"]))
+    try:
+        _payload, _completion_id, proposal_version = resolve_effective_payload(conn, proposal)
+        d1_lineage = verify_human_revision_descendant(
+            conn,
+            proposal,
+            content_hash=compute_effective_proposal_content_hash(conn, proposal),
+            proposal_version=proposal_version,
+        )
+    except HumanRevisionLineageError as exc:
+        raise ConversionEvidenceLineageError(str(exc)) from exc
     public_ids = _proposal_public_ids(conn, path)
     corrected: set[str] = set()
     last_corrected_value: dict[str, Any] = {}
@@ -1695,6 +1716,8 @@ def _durable_resolution_provenance(
         )
         row = cursor.fetchone()
         if row is None:
+            if _is_valid_d1_nonmonetary_publication_edge(conn, parent_id, child_id):
+                continue
             raise ConversionEvidenceLineageError(
                 "A supersession parent-child edge has no durable receipt proposal revision evidence"
             )
@@ -1713,7 +1736,8 @@ def _durable_resolution_provenance(
             leaf_revision = revision
             leaf_applied = applied
 
-    _require_payload_correction_matches(effective, leaf_revision, leaf_applied, public_ids)
+    if leaf_revision is not None or d1_lineage is None:
+        _require_payload_correction_matches(effective, leaf_revision, leaf_applied, public_ids)
 
     completed: set[str] = set()
     leaf_completed_values: dict[str, Any] = {}
@@ -1740,7 +1764,15 @@ def _durable_resolution_provenance(
                 _verify_inherited_completion_evidence(conn, item, field_name, path, public_ids)
                 completed.add(field_name)
             elif item.get("correction_public_id") is not None:
-                _verify_inherited_correction_evidence(item, field_name, revision_index, public_ids)
+                correction_id = str(item.get("correction_public_id"))
+                if not (
+                    d1_lineage is not None
+                    and correction_id.startswith("rcor_d1_")
+                    and correction_id not in revision_index
+                ):
+                    _verify_inherited_correction_evidence(
+                        item, field_name, revision_index, public_ids
+                    )
             else:
                 raise ConversionEvidenceLineageError(
                     f"Human field evidence for {field_name!r} carries no "
@@ -1790,6 +1822,67 @@ def _durable_resolution_provenance(
                 "effective proposal transaction date"
             )
     return frozenset(corrected), frozenset(completed)
+
+
+def _is_valid_d1_nonmonetary_publication_edge(
+    conn: sqlite3.Connection,
+    parent_id: int,
+    child_id: int,
+) -> bool:
+    """Accept one sealed D1 publication edge without inventing correction proof.
+
+    D1's receipt publisher intentionally uses ``receipt_proposal_revisions``
+    only when amount or currency changes.  A complete non-monetary whole-card
+    publication still has an immutable operation/publication pair.  Verify its
+    exact before/after material here; it advances lineage but contributes no
+    monetary ``corrected`` fields.
+    """
+    row = conn.execute(
+        """
+        SELECT operations.material_changes_json
+        FROM parser_human_draft_publications AS publications
+        JOIN parser_human_draft_operations AS operations
+          ON operations.id = publications.operation_id
+         AND operations.draft_id = publications.draft_id
+        JOIN parser_outputs AS child ON child.id = publications.parser_output_id
+        WHERE publications.parser_output_id = ?
+          AND child.parent_parser_output_id = ?
+          AND operations.operation_type = 'accepted'
+          AND operations.operation_outcome = 'accepted'
+          AND operations.result_completeness = 'complete'
+          AND operations.publication_parser_output_id = publications.parser_output_id
+        """,
+        (child_id, parent_id),
+    ).fetchone()
+    if row is None:
+        return False
+    changes = _durable_json_object(row["material_changes_json"], "D1 material changes")
+    if not changes or {"amount", "currency"} & set(changes):
+        return False
+    parent_row = conn.execute("SELECT * FROM parser_outputs WHERE id = ?", (parent_id,)).fetchone()
+    child_row = conn.execute("SELECT * FROM parser_outputs WHERE id = ?", (child_id,)).fetchone()
+    if parent_row is None or child_row is None:
+        return False
+    try:
+        parent, _parent_completion, _parent_version = resolve_effective_payload(
+            conn, dict(parent_row)
+        )
+        child, _child_completion, _child_version = resolve_effective_payload(conn, dict(child_row))
+    except EffectivePayloadError as exc:
+        raise ConversionEvidenceLineageError(
+            "D1 receipt publication payload could not be resolved"
+        ) from exc
+    for field, pair in changes.items():
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or parent.get(field) != pair[0]
+            or child.get(field) != pair[1]
+        ):
+            raise ConversionEvidenceLineageError(
+                "D1 receipt publication material contradicts its parent-child payloads"
+            )
+    return True
 
 
 def _supersession_path(conn: sqlite3.Connection, leaf_id: int) -> list[int]:
