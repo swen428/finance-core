@@ -343,6 +343,70 @@ def test_text_status_detects_canonical_transaction_drift_without_writes(
     assert status.attention_reason == "financial_authority_mismatch"
 
 
+def test_finalized_catchup_revalidates_under_write_lock_before_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, published = _published_text_card(monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-catchup-race",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    key = b"d2-text-catchup-race-key"
+    issued, _ = issue_posting_review_actions(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: 1003,
+    )
+
+    def crash_after_financial_commit(stage: str) -> None:
+        if stage == "after_text_finalization_commit":
+            raise RuntimeError("text-financial-commit")
+
+    monkeypatch.setattr(
+        posting_authority_module, "_failure_injection_hook", crash_after_financial_commit
+    )
+    with pytest.raises(RuntimeError, match="text-financial-commit"):
+        confirm_and_post(
+            conn,
+            key=key,
+            reference=issued.reference,
+            context=context,
+            callback_id="d2-text-catchup-race-callback",
+            callback_message_id=213,
+            clock=lambda: 1004,
+        )
+    attempt_id = str(
+        conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
+    )
+    events_before = conn.execute("SELECT COUNT(*) FROM d2_posting_attempt_events").fetchone()[0]
+
+    def drift_before_lock(stage: str) -> None:
+        if stage == "before_finalized_catchup_lock":
+            conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.commit()
+
+    monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", drift_before_lock)
+    status = resume_posting(conn, attempt_public_id=attempt_id, context=context)
+    assert status.state == "needs_attention"
+    assert status.attention_reason == "financial_authority_mismatch"
+    attempt = conn.execute(
+        "SELECT stage, transaction_public_id FROM d2_posting_attempts WHERE attempt_public_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    assert attempt["stage"] == "accepted"
+    assert attempt["transaction_public_id"] is None
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_attempt_events").fetchone()[0]
+        == events_before
+    )
+
+
 def test_resume_requires_complete_d2_decision_before_text_financial_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1123,11 +1187,15 @@ def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(
     recovered = resume_posting(conn, attempt_public_id=attempt_id, context=context)
     assert recovered.state == "finalized"
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    attempt = conn.execute(
+        "SELECT stage, stage_evidence_public_id FROM d2_posting_attempts "
+        "WHERE attempt_public_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    assert attempt["stage"] == "finalized"
     assert (
-        conn.execute(
-            "SELECT stage FROM d2_posting_attempts WHERE attempt_public_id = ?", (attempt_id,)
-        ).fetchone()[0]
-        == "finalized"
+        attempt["stage_evidence_public_id"]
+        == conn.execute("SELECT finalization_id FROM receipt_finalization_audit").fetchone()[0]
     )
 
 

@@ -816,40 +816,68 @@ def _advance_attempt(
         raise PostingAuthorityError("attempt transition requires a connection without pending work")
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute(
-            "SELECT stage, row_version FROM d2_posting_attempts WHERE attempt_public_id = ?",
-            (attempt_id,),
+        current = conn.execute(
+            "SELECT stage FROM d2_posting_attempts WHERE attempt_public_id = ?", (attempt_id,)
         ).fetchone()
-        if row is None:
+        if current is None:
             raise PostingAuthorityError("posting attempt not found")
-        if row["stage"] != expected_stage:
+        if current["stage"] != expected_stage:
             conn.rollback()
             return
-        version = int(row["row_version"]) + 1
-        created_at = _now_text(_now_epoch())
-        cursor = conn.execute(
-            "UPDATE d2_posting_attempts SET stage = ?, row_version = ?, "
-            "transaction_public_id = ?, attention_reason = NULL, "
-            "stage_evidence_public_id = ?, updated_at = ? "
-            "WHERE attempt_public_id = ? AND stage = ? AND row_version = ?",
-            (
-                new_stage,
-                version,
-                transaction_public_id,
-                evidence_public_id,
-                created_at,
-                attempt_id,
-                expected_stage,
-                version - 1,
-            ),
+        _advance_attempt_in_transaction(
+            conn,
+            attempt_id=attempt_id,
+            expected_stage=expected_stage,
+            new_stage=new_stage,
+            transaction_public_id=transaction_public_id,
+            evidence_public_id=evidence_public_id,
         )
-        if cursor.rowcount != 1:
-            raise PostingAuthorityError("posting attempt transition conflict")
         conn.commit()
     except Exception:
         if conn.in_transaction:
             conn.rollback()
         raise
+
+
+def _advance_attempt_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    attempt_id: str,
+    expected_stage: str,
+    new_stage: str,
+    transaction_public_id: str | None,
+    evidence_public_id: str | None,
+) -> None:
+    if not conn.in_transaction:
+        raise PostingAuthorityError("attempt transition requires an owning transaction")
+    row = conn.execute(
+        "SELECT stage, row_version FROM d2_posting_attempts WHERE attempt_public_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if row is None:
+        raise PostingAuthorityError("posting attempt not found")
+    if row["stage"] != expected_stage:
+        raise PostingAuthorityError("posting attempt stage changed")
+    version = int(row["row_version"]) + 1
+    created_at = _now_text(_now_epoch())
+    cursor = conn.execute(
+        "UPDATE d2_posting_attempts SET stage = ?, row_version = ?, "
+        "transaction_public_id = ?, attention_reason = NULL, "
+        "stage_evidence_public_id = ?, updated_at = ? "
+        "WHERE attempt_public_id = ? AND stage = ? AND row_version = ?",
+        (
+            new_stage,
+            version,
+            transaction_public_id,
+            evidence_public_id,
+            created_at,
+            attempt_id,
+            expected_stage,
+            version - 1,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise PostingAuthorityError("posting attempt transition conflict")
 
 
 def _mark_attempt_needs_attention(
@@ -890,6 +918,69 @@ def _mark_attempt_needs_attention(
         raise
 
 
+def _catch_up_finalized_attempt(
+    conn: sqlite3.Connection,
+    *,
+    attempt_public_id: str,
+    context: HumanActionContext,
+) -> PostingStatus:
+    """Re-verify financial truth and catch up coordination under one write lock."""
+    if conn.in_transaction:
+        raise PostingAuthorityError("finalized catch-up requires no pending transaction")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _authorized_attempt_for_resume(
+            conn, attempt_public_id=attempt_public_id, context=context
+        )
+        status = get_status(conn, review_public_id=str(row["review_public_id"]), context=context)
+        if status.state != "finalized" or row["stage"] == "finalized":
+            conn.rollback()
+            return status
+        expected_stage = (
+            "accepted" if row["posting_path"] == "text" else "conditional_authorization_persisted"
+        )
+        if row["stage"] != expected_stage:
+            raise PostingAuthorityError("finalized result has an invalid coordination stage")
+        if row["posting_path"] == "text":
+            evidence_public_id = status.transaction_public_id
+        else:
+            authorization = conn.execute(
+                "SELECT proofs.authorization_id "
+                "FROM d2_posting_decisions AS decisions "
+                "JOIN d2_conditional_authorization_proofs AS proofs "
+                "ON proofs.decision_public_id = decisions.decision_public_id "
+                "WHERE decisions.attempt_public_id = ?",
+                (attempt_public_id,),
+            ).fetchone()
+            if authorization is None:
+                raise PostingAuthorityError("finalized receipt authority is unavailable")
+            verified = verify_finalized_prepared_receipt(
+                conn, str(authorization["authorization_id"])
+            )
+            if verified.transaction_public_id != status.transaction_public_id:
+                raise PostingAuthorityError("finalized receipt result changed during catch-up")
+            evidence_public_id = verified.finalization_public_id
+        _advance_attempt_in_transaction(
+            conn,
+            attempt_id=attempt_public_id,
+            expected_stage=expected_stage,
+            new_stage="finalized",
+            transaction_public_id=status.transaction_public_id,
+            evidence_public_id=evidence_public_id,
+        )
+        verified_status = get_status(
+            conn, review_public_id=str(row["review_public_id"]), context=context
+        )
+        if verified_status.state != "finalized":
+            raise PostingAuthorityError("finalized coordination catch-up did not verify")
+        conn.commit()
+        return verified_status
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+
+
 def resume_posting(
     conn: sqlite3.Connection,
     *,
@@ -906,32 +997,10 @@ def resume_posting(
         conn, review_public_id=str(row["review_public_id"]), context=context
     )
     if existing_status.state == "finalized":
-        if row["stage"] != "finalized":
-            if row["posting_path"] == "text":
-                evidence_public_id = existing_status.transaction_public_id
-            else:
-                evidence = conn.execute(
-                    "SELECT audits.finalization_id "
-                    "FROM d2_posting_decisions AS decisions "
-                    "JOIN d2_conditional_authorization_proofs AS proofs "
-                    "ON proofs.decision_public_id = decisions.decision_public_id "
-                    "JOIN receipt_finalization_audit AS audits "
-                    "ON audits.authorization_id = proofs.authorization_id "
-                    "WHERE decisions.attempt_public_id = ? AND audits.status = 'finalized'",
-                    (attempt_public_id,),
-                ).fetchone()
-                if evidence is None:
-                    raise PostingAuthorityError("finalized receipt evidence is unavailable")
-                evidence_public_id = str(evidence["finalization_id"])
-            _advance_attempt(
-                conn,
-                attempt_id=attempt_public_id,
-                expected_stage=str(row["stage"]),
-                new_stage="finalized",
-                transaction_public_id=existing_status.transaction_public_id,
-                evidence_public_id=evidence_public_id,
-            )
-        return get_status(conn, review_public_id=str(row["review_public_id"]), context=context)
+        _inject_failure("before_finalized_catchup_lock")
+        return _catch_up_finalized_attempt(
+            conn, attempt_public_id=attempt_public_id, context=context
+        )
     if existing_status.state in {"needs_attention", "rejected"}:
         return existing_status
     if row["stage"] == "accepted" and row["posting_path"] == "text":
