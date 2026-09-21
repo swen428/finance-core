@@ -43,8 +43,10 @@ from finance_core.parser_proposals.receipt_item_allocation_facts import (
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.parser_proposals.service import (
     InitialProposalDecisionBinding,
+    ParserConfirmationError,
     confirm_parser_proposal,
     convert_confirmed_parser_proposal,
+    resolve_simple_expense_conversion_fields,
     verify_converted_parser_proposal,
 )
 from finance_core.receipt_finalization.d2_conditional import (
@@ -85,7 +87,7 @@ _D2_TABLES = frozenset(
         "d2_posting_attempt_events",
     }
 )
-_D2_SCHEMA_FINGERPRINT = "37cdb47038ce123aab65bbf2dde33f440404d3078f91208fca76d8350cf901ec"
+_D2_SCHEMA_FINGERPRINT = "76ff04e3e4d02ea5fbd5aed14e6c254956651eab3d652dde63888a5bce3c0123"
 
 
 class PostingAuthorityError(RuntimeError):
@@ -315,11 +317,15 @@ def _projection_for_review(
     fields: Mapping[str, object],
     receipt_payer_participant_public_id: str | None,
 ) -> tuple[str, dict[str, object], dict[str, object] | None]:
-    required = ("amount", "currency", "transaction_date", "merchant")
+    required = ("amount", "currency", "transaction_date")
     if any(
         not isinstance(fields.get(name), str) or not str(fields[name]).strip()
         for name in required
     ):
+        raise PostingAuthorityError("proposal is incomplete for D2 posting")
+    merchant = fields.get("merchant")
+    description = fields.get("description")
+    if not isinstance(merchant, str) and not isinstance(description, str):
         raise PostingAuthorityError("proposal is incomplete for D2 posting")
     currency = normalize_currency(str(fields["currency"]))
     amount = canonical_money_str(
@@ -329,7 +335,7 @@ def _projection_for_review(
         "amount": amount,
         "currency": currency,
         "transaction_date": str(fields["transaction_date"]),
-        "merchant": str(fields["merchant"]),
+        "merchant": merchant,
         "account": "unspecified",
     }
     is_receipt = conn.execute(
@@ -346,7 +352,7 @@ def _projection_for_review(
         "payer_participant_public_id": payer,
         "item": {
             "line_number": 1,
-            "item_name": fields.get("merchant") or "Receipt total",
+            "item_name": "Receipt total",
             "line_amount": amount,
             "currency": currency,
         },
@@ -361,7 +367,7 @@ def _projection_for_review(
                 "paid_by": payer,
                 "net_paid": amount,
                 "items": [{
-                    "description": fields.get("merchant") or "Receipt total",
+                    "description": "Receipt total",
                     "amount": amount,
                     "owners": [payer],
                 }],
@@ -394,7 +400,7 @@ def _presentation_text(
         f"Amount: {projection['amount']}",
         f"Currency: {projection['currency']}",
         f"Date: {projection['transaction_date']}",
-        f"Merchant: {projection['merchant']}",
+        f"Merchant: {projection.get('merchant') or 'Not specified'}",
         f"Description: {fields.get('description') or 'Not specified'}",
         f"Category: {fields.get('category') or 'Not specified'}",
         "Account: Not specified",
@@ -405,13 +411,17 @@ def _presentation_text(
             raise PostingAuthorityError("receipt projection is malformed")
         lines.extend(
             [
+                "Source: Receipt",
                 f"Receipt total: {projection['receipt_total']}",
+                "Posting basis: one receipt-total line",
                 f"Your share: {projection['personal_share']}",
-                f"To collect: {calculation['total_to_collect']}",
-                "Settlement: None",
+                f"Collectible from others: {calculation['total_to_collect']}",
+                "Settlement obligations: none",
+                "No itemization, tax, fee, or shared allocation will be inferred.",
             ]
         )
-    lines.append("No account or shared-expense details will be inferred.")
+    else:
+        lines.append("No account or shared-expense details will be inferred.")
     return "\n".join(lines)
 
 
@@ -443,6 +453,7 @@ def prepare_posting_review(
         now = clock()
         source_kind: str
         initial_card_public_id: str | None = None
+        display_fields: Mapping[str, object] | None = None
         if card_generation_public_id is not None:
             source_kind = "d1_human_card"
             card = conn.execute(
@@ -490,13 +501,13 @@ def prepare_posting_review(
             proposal = ParserProposalRepository(conn).get(parser_output_id)
             if proposal is None:
                 raise PostingAuthorityError("proposal_missing")
-            payload, _completion_id, version = resolve_effective_payload(conn, proposal)
+            _payload, _completion_id, version = resolve_effective_payload(conn, proposal)
             content_hash = compute_effective_proposal_content_hash(conn, {"id": parser_output_id})
             if version != int(card["decision_target_proposal_version"]) or not hmac.compare_digest(
                 content_hash, str(card["decision_target_proposal_content_hash"])
             ):
                 raise PostingAuthorityError("proposal_state_stale")
-            fields: Mapping[str, object] = json.loads(str(card["field_values_json"]))
+            display_fields = json.loads(str(card["field_values_json"]))
             resolved_proposal_public_id = str(card["proposal_public_id"])
             expires_at = min(int(card["expires_at"]), int(card["draft_expires_at"]))
             card_ref = card_generation_public_id
@@ -512,16 +523,20 @@ def prepare_posting_review(
             parser_output_id = int(proposal["id"])
             if proposal["parse_status"] != "parsed_pending_confirmation":
                 raise PostingAuthorityError("proposal_state_stale")
-            payload, _completion_id, version = resolve_effective_payload(conn, proposal)
+            _payload, _completion_id, version = resolve_effective_payload(conn, proposal)
             content_hash = compute_effective_proposal_content_hash(conn, {"id": parser_output_id})
             intake = conn.execute(
                 "SELECT * FROM raw_intake_records WHERE parser_output_id = ?",
                 (parser_output_id,),
             ).fetchone()
+            expected_source_identity = (
+                f"telegram:{context.conversation_id}:{admitted_source_message_id}"
+            )
             if (
                 intake is None
                 or intake["source_channel"] != "telegram"
                 or str(intake["source_message_id"] or "") != admitted_source_message_id
+                or str(intake["external_source_id"] or "") != expected_source_identity
                 or intake["status"] != "parsed_pending_confirmation"
             ):
                 raise PostingAuthorityError("initial proposal source evidence is unavailable")
@@ -538,9 +553,16 @@ def prepare_posting_review(
                 context.binding_id, admitted_source_message_id,
             )
             expires_at = now + 3600
-            fields = payload
             card_ref = initial_card_public_id
 
+        try:
+            fields: Mapping[str, object] = resolve_simple_expense_conversion_fields(
+                conn, proposal
+            )
+        except ParserConfirmationError as exc:
+            raise PostingAuthorityError("proposal is not eligible for D2 posting") from exc
+        if display_fields is None:
+            display_fields = fields
         posting_path, projection, candidate = _projection_for_review(
             conn,
             parser_output_id=parser_output_id,
@@ -550,7 +572,7 @@ def prepare_posting_review(
         projection_json = _canonical(projection)
         projection_hash = _sha256_text(projection_json)
         presentation = _presentation_text(
-            card_ref, projection, posting_path, display_fields=fields
+            card_ref, projection, posting_path, display_fields=display_fields
         )
         created_at = _now_text(now)
         if source_kind == "initial_proposal_card":
@@ -564,17 +586,19 @@ def prepare_posting_review(
                     INSERT INTO d2_initial_proposal_cards (
                         initial_card_public_id, card_idempotency_key, parser_output_id,
                         proposal_version, proposal_content_hash, raw_intake_record_id,
-                        admitted_source_message_id, authenticated_actor_id,
+                        admitted_source_message_id, admitted_source_identity_sha256,
+                        authenticated_actor_id,
                         telegram_account_id, telegram_conversation_id,
                         conversation_binding_id, visible_projection_json,
                         visible_projection_hash, presentation_text,
                         presentation_text_hash, expires_at, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         initial_card_public_id, f"initial:{review_idempotency_key}",
                         parser_output_id, version, content_hash, int(intake["id"]),
-                        admitted_source_message_id, context.actor_id, context.account_id,
+                        admitted_source_message_id, _sha256_text(expected_source_identity),
+                        context.actor_id, context.account_id,
                         context.conversation_id, context.binding_id, projection_json,
                         projection_hash, presentation, _sha256_text(presentation),
                         expires_at, created_at,
@@ -588,7 +612,8 @@ def prepare_posting_review(
                     raise PostingAuthorityError("initial card expired")
                 expected_card = (
                     parser_output_id, version, content_hash, int(intake["id"]),
-                    admitted_source_message_id, context.actor_id, context.account_id,
+                    admitted_source_message_id, _sha256_text(expected_source_identity),
+                    context.actor_id, context.account_id,
                     context.conversation_id, context.binding_id, projection_json,
                     projection_hash, presentation, _sha256_text(presentation), expires_at,
                 )
@@ -596,6 +621,7 @@ def prepare_posting_review(
                     existing_card[name] for name in (
                         "parser_output_id", "proposal_version", "proposal_content_hash",
                         "raw_intake_record_id", "admitted_source_message_id",
+                        "admitted_source_identity_sha256",
                         "authenticated_actor_id", "telegram_account_id",
                         "telegram_conversation_id", "conversation_binding_id",
                         "visible_projection_json", "visible_projection_hash",
@@ -828,19 +854,44 @@ def begin_posting_review_delivery(
         ).hexdigest()[:32]
         for control in controls:
             row = row_by_action[control.action]
-            locked.execute(
-                "INSERT OR IGNORE INTO d2_posting_review_controls "
-                "(review_public_id, action, reference_id, purpose, row_index, "
-                "column_index, label, callback_route, callback_value_sha256, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            durable = locked.execute(
+                "SELECT * FROM d2_posting_review_controls "
+                "WHERE (review_public_id = ? AND action = ?) OR reference_id = ? "
+                "OR (review_public_id = ? AND row_index = ? AND column_index = ?)",
                 (
-                    review_public_id, control.action, row["id"], row["purpose"],
-                    control.row_index, control.column_index, control.label,
-                    layouts[control.action][1],
-                    _callback_value_digest(control.callback_value).hex(),
-                    _now_text(bound_at),
+                    review_public_id, control.action, row["id"], review_public_id,
+                    control.row_index, control.column_index,
                 ),
+            ).fetchall()
+            expected_control = (
+                review_public_id, control.action, int(row["id"]), str(row["purpose"]),
+                control.row_index, control.column_index, control.label,
+                layouts[control.action][1],
+                _callback_value_digest(control.callback_value).hex(),
             )
+            if not durable:
+                locked.execute(
+                    "INSERT INTO d2_posting_review_controls "
+                    "(review_public_id, action, reference_id, purpose, row_index, "
+                    "column_index, label, callback_route, callback_value_sha256, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (*expected_control, _now_text(bound_at)),
+                )
+                durable = locked.execute(
+                    "SELECT * FROM d2_posting_review_controls "
+                    "WHERE review_public_id = ? AND action = ?",
+                    (review_public_id, control.action),
+                ).fetchall()
+            actual_control = tuple(
+                durable[0][name]
+                for name in (
+                    "review_public_id", "action", "reference_id", "purpose",
+                    "row_index", "column_index", "label", "callback_route",
+                    "callback_value_sha256",
+                )
+            ) if len(durable) == 1 else ()
+            if actual_control != expected_control:
+                raise PostingAuthorityError("posting review control binding conflict")
         attempt = locked.execute(
             "SELECT * FROM d2_posting_review_delivery_attempts "
             "WHERE review_public_id = ?",
@@ -996,13 +1047,19 @@ def _require_current_review(
     initial = conn.execute(
         """
         SELECT cards.*, intake.parser_output_id AS intake_parser_output_id,
-               intake.source_message_id, intake.status AS intake_status
+               intake.source_message_id, intake.external_source_id,
+               intake.source_channel, intake.status AS intake_status
         FROM d2_initial_proposal_cards AS cards
         JOIN raw_intake_records AS intake ON intake.id = cards.raw_intake_record_id
         WHERE cards.initial_card_public_id = ?
         """,
         (review["initial_card_public_id"],),
     ).fetchone()
+    expected_source_identity = (
+        "" if initial is None else
+        f"telegram:{review['telegram_conversation_id']}:"
+        f"{initial['admitted_source_message_id']}"
+    )
     active_draft = conn.execute(
         "SELECT 1 FROM parser_human_drafts "
         "WHERE decision_target_parser_output_id = ? AND state = 'active' LIMIT 1",
@@ -1014,6 +1071,12 @@ def _require_current_review(
         or int(initial["intake_parser_output_id"]) != int(review["parser_output_id"])
         or str(initial["source_message_id"] or "")
         != str(initial["admitted_source_message_id"])
+        or initial["source_channel"] != "telegram"
+        or str(initial["external_source_id"] or "") != expected_source_identity
+        or not hmac.compare_digest(
+            str(initial["admitted_source_identity_sha256"]),
+            _sha256_text(expected_source_identity),
+        )
         or initial["intake_status"] != "parsed_pending_confirmation"
         or int(initial["expires_at"]) <= now
         or active_draft is not None
@@ -1073,7 +1136,9 @@ def record_posting_review_delivery(
     try:
         row = conn.execute(
             """
-            SELECT attempts.*, reviews.*, activations.provider_message_id AS activated_message_id
+            SELECT attempts.*, reviews.*,
+                   activations.provider_message_id AS activated_message_id,
+                   activations.observation_public_id AS activated_observation_id
             FROM d2_posting_review_delivery_attempts AS attempts
             JOIN d2_posting_reviews AS reviews
               ON reviews.review_public_id = attempts.review_public_id
@@ -1102,7 +1167,6 @@ def record_posting_review_delivery(
             (receipt_sha256,),
         ).fetchone()
         now = clock()
-        _require_current_review(conn, row, now=now)
         delivery_attempt_public_id = str(row["delivery_attempt_public_id"])
         if token_owner is not None:
             if (
@@ -1149,49 +1213,62 @@ def record_posting_review_delivery(
                 "INSERT INTO d2_posting_review_delivery_observations "
                 "(observation_public_id, delivery_attempt_public_id, outcome, "
                 "provider_message_id, finance_delivery_material_sha256, "
-                "receipt_token_sha256, source_identity_sha256, error_code, observed_at) "
-                "VALUES (?, ?, 'conflict', ?, ?, ?, ?, 'multiple_provider_messages', ?)",
+                "receipt_token_sha256, source_identity_sha256, channel, "
+                "telegram_account_id, telegram_conversation_id, conversation_binding_id, "
+                "error_code, observed_at) VALUES (?, ?, 'conflict', ?, ?, ?, ?, "
+                "'telegram', ?, ?, ?, 'multiple_provider_messages', ?)",
                 (
                     observation_id, delivery_attempt_public_id, message_id, material_sha256,
-                    receipt_sha256, source_sha256, now,
+                    receipt_sha256, source_sha256, account_id, conversation_id,
+                    session_key, now,
                 ),
             )
             conn.execute(
                 "INSERT INTO d2_posting_review_delivery_conflicts "
                 "(conflict_public_id, review_public_id, delivery_attempt_public_id, "
-                "activated_provider_message_id, conflicting_provider_message_id, "
+                "activated_observation_public_id, conflicting_observation_public_id, "
+                "conflicting_observation_outcome, activated_provider_message_id, "
+                "conflicting_provider_message_id, "
                 "finance_delivery_material_sha256, receipt_token_sha256, "
-                "source_identity_sha256, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "source_identity_sha256, channel, telegram_account_id, "
+                "telegram_conversation_id, conversation_binding_id, observed_at) "
+                "VALUES (?, ?, ?, ?, ?, 'conflict', ?, ?, ?, ?, ?, 'telegram', ?, ?, ?, ?)",
                 (
                     conflict_id, row["review_public_id"], delivery_attempt_public_id,
+                    row["activated_observation_id"], observation_id,
                     activated_message_id, message_id, material_sha256, receipt_sha256,
-                    source_sha256, now,
+                    source_sha256, account_id, conversation_id, session_key, now,
                 ),
             )
             conflict = True
         else:
+            _require_current_review(conn, row, now=now)
             conn.execute(
                 "INSERT INTO d2_posting_review_delivery_observations "
                 "(observation_public_id, delivery_attempt_public_id, outcome, "
                 "provider_message_id, finance_delivery_material_sha256, "
-                "receipt_token_sha256, source_identity_sha256, error_code, observed_at) "
-                "VALUES (?, ?, 'success', ?, ?, ?, ?, NULL, ?)",
+                "receipt_token_sha256, source_identity_sha256, channel, "
+                "telegram_account_id, telegram_conversation_id, conversation_binding_id, "
+                "error_code, observed_at) VALUES (?, ?, 'success', ?, ?, ?, ?, "
+                "'telegram', ?, ?, ?, NULL, ?)",
                 (
                     observation_id, delivery_attempt_public_id, message_id, material_sha256,
-                    receipt_sha256, source_sha256, now,
+                    receipt_sha256, source_sha256, account_id, conversation_id,
+                    session_key, now,
                 ),
             )
             conn.execute(
                 "INSERT INTO d2_posting_review_delivery_activations "
                 "(review_public_id, delivery_attempt_public_id, observation_public_id, "
-                "provider_message_id, telegram_account_id, telegram_conversation_id, "
+                "observation_outcome, provider_message_id, channel, telegram_account_id, "
+                "telegram_conversation_id, conversation_binding_id, "
                 "finance_delivery_material_sha256, receipt_token_sha256, "
                 "source_identity_sha256, activated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, 'success', ?, 'telegram', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     row["review_public_id"], delivery_attempt_public_id, observation_id,
-                    message_id, account_id, conversation_id, material_sha256,
-                    receipt_sha256, source_sha256, now,
+                    message_id, account_id, conversation_id, session_key,
+                    material_sha256, receipt_sha256, source_sha256, now,
                 ),
             )
         conn.commit()
@@ -1335,17 +1412,20 @@ def _accepted_attempt_for_callback(
     context: HumanActionContext,
     callback_id: str,
     callback_message_id: int,
-) -> str | None:
+) -> tuple[str, str, str] | None:
     """Authenticate an exact accepted replay without reapplying expiry checks."""
     row = conn.execute(
         """
-        SELECT attempts.attempt_public_id, refs.reference_sha256,
+        SELECT attempts.attempt_public_id, attempts.review_public_id,
+               purposes.purpose, refs.reference_sha256,
                refs.authenticated_actor_id, refs.channel_account_id,
                refs.channel_conversation_id, refs.conversation_binding_id,
                redemptions.callback_id_sha256, redemptions.callback_message_id
         FROM openclaw_human_action_references AS refs
         JOIN openclaw_human_action_redemptions AS redemptions
           ON redemptions.reference_id = refs.id
+        JOIN openclaw_human_action_reference_purposes AS purposes
+          ON purposes.reference_id = refs.id
         JOIN d2_posting_decisions AS decisions ON decisions.reference_id = refs.id
         JOIN d2_posting_attempts AS attempts
           ON attempts.attempt_public_id = decisions.attempt_public_id
@@ -1364,7 +1444,135 @@ def _accepted_attempt_for_callback(
         or int(row["callback_message_id"]) != callback_message_id
     ):
         raise PostingAuthorityError("accepted Confirm replay does not match durable authority")
-    return str(row["attempt_public_id"])
+    return (
+        str(row["attempt_public_id"]),
+        str(row["review_public_id"]),
+        str(row["purpose"]),
+    )
+
+
+def _has_valid_delivery_authority(
+    row: sqlite3.Row, *, allow_post_decision_conflict: bool = False
+) -> bool:
+    required = (
+        "delivery_attempt_id", "delivery_review_id", "delivery_material_sha256",
+        "delivery_actor_id", "delivery_account_id", "delivery_conversation_id",
+        "delivery_binding_id", "activation_attempt_id", "activation_review_id",
+        "activation_observation_id", "activation_message_id", "activation_channel",
+        "activation_account_id", "activation_conversation_id", "activation_binding_id",
+        "activation_material_sha256", "activation_receipt_sha256",
+        "activation_source_sha256", "observation_id", "observation_attempt_id",
+        "observation_outcome", "observation_message_id", "observation_channel",
+        "observation_account_id", "observation_conversation_id",
+        "observation_binding_id", "observation_material_sha256",
+        "observation_receipt_sha256", "observation_source_sha256",
+    )
+    if any(row[name] is None for name in required):
+        return False
+    if row["delivery_conflict_id"] is not None and (
+        not allow_post_decision_conflict
+        or row["decision_accepted_at"] is None
+        or row["delivery_conflict_observed_at"] is None
+        or int(row["delivery_conflict_observed_at"]) < int(row["decision_accepted_at"])
+    ):
+        return False
+    return (
+        str(row["delivery_review_id"]) == str(row["review_public_id"])
+        and str(row["delivery_actor_id"]) == str(row["review_actor_id"])
+        and str(row["delivery_account_id"]) == str(row["review_account_id"])
+        and str(row["delivery_conversation_id"]) == str(row["review_conversation_id"])
+        and str(row["delivery_binding_id"]) == str(row["review_binding_id"])
+        and str(row["activation_review_id"]) == str(row["review_public_id"])
+        and str(row["activation_attempt_id"]) == str(row["delivery_attempt_id"])
+        and str(row["activation_channel"]) == "telegram"
+        and str(row["activation_account_id"]) == str(row["delivery_account_id"])
+        and str(row["activation_conversation_id"])
+        == str(row["delivery_conversation_id"])
+        and str(row["activation_binding_id"]) == str(row["delivery_binding_id"])
+        and str(row["observation_id"]) == str(row["activation_observation_id"])
+        and str(row["observation_attempt_id"]) == str(row["delivery_attempt_id"])
+        and str(row["observation_outcome"]) == "success"
+        and int(row["observation_message_id"]) == int(row["activation_message_id"])
+        and str(row["observation_channel"]) == "telegram"
+        and str(row["observation_account_id"]) == str(row["activation_account_id"])
+        and str(row["observation_conversation_id"])
+        == str(row["activation_conversation_id"])
+        and str(row["observation_binding_id"]) == str(row["activation_binding_id"])
+        and all(
+            hmac.compare_digest(str(row[left]), str(row[right]))
+            for left, right in (
+                ("delivery_material_sha256", "activation_material_sha256"),
+                ("delivery_material_sha256", "observation_material_sha256"),
+                ("activation_receipt_sha256", "observation_receipt_sha256"),
+                ("activation_source_sha256", "observation_source_sha256"),
+            )
+        )
+    )
+
+
+def _review_has_valid_delivery_authority(
+    conn: sqlite3.Connection, review_public_id: str
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT reviews.review_public_id,
+               reviews.authenticated_actor_id AS review_actor_id,
+               reviews.telegram_account_id AS review_account_id,
+               reviews.telegram_conversation_id AS review_conversation_id,
+               reviews.conversation_binding_id AS review_binding_id,
+               deliveries.delivery_attempt_public_id AS delivery_attempt_id,
+               deliveries.review_public_id AS delivery_review_id,
+               deliveries.finance_delivery_material_sha256 AS delivery_material_sha256,
+               deliveries.authenticated_actor_id AS delivery_actor_id,
+               deliveries.telegram_account_id AS delivery_account_id,
+               deliveries.telegram_conversation_id AS delivery_conversation_id,
+               deliveries.conversation_binding_id AS delivery_binding_id,
+               activations.review_public_id AS activation_review_id,
+               activations.delivery_attempt_public_id AS activation_attempt_id,
+               activations.observation_public_id AS activation_observation_id,
+               activations.provider_message_id AS activation_message_id,
+               activations.channel AS activation_channel,
+               activations.telegram_account_id AS activation_account_id,
+               activations.telegram_conversation_id AS activation_conversation_id,
+               activations.conversation_binding_id AS activation_binding_id,
+               activations.finance_delivery_material_sha256 AS activation_material_sha256,
+               activations.receipt_token_sha256 AS activation_receipt_sha256,
+               activations.source_identity_sha256 AS activation_source_sha256,
+               observations.observation_public_id AS observation_id,
+               observations.delivery_attempt_public_id AS observation_attempt_id,
+               observations.outcome AS observation_outcome,
+               observations.provider_message_id AS observation_message_id,
+               observations.channel AS observation_channel,
+               observations.telegram_account_id AS observation_account_id,
+               observations.telegram_conversation_id AS observation_conversation_id,
+               observations.conversation_binding_id AS observation_binding_id,
+               observations.finance_delivery_material_sha256 AS observation_material_sha256,
+               observations.receipt_token_sha256 AS observation_receipt_sha256,
+               observations.source_identity_sha256 AS observation_source_sha256,
+               conflicts.conflict_public_id AS delivery_conflict_id,
+               conflicts.observed_at AS delivery_conflict_observed_at,
+               decisions.accepted_at AS decision_accepted_at
+        FROM d2_posting_reviews AS reviews
+        LEFT JOIN d2_posting_review_delivery_attempts AS deliveries
+          ON deliveries.review_public_id = reviews.review_public_id
+        LEFT JOIN d2_posting_review_delivery_activations AS activations
+          ON activations.review_public_id = reviews.review_public_id
+         AND activations.delivery_attempt_public_id = deliveries.delivery_attempt_public_id
+        LEFT JOIN d2_posting_review_delivery_observations AS observations
+          ON observations.observation_public_id = activations.observation_public_id
+        LEFT JOIN d2_posting_review_delivery_conflicts AS conflicts
+          ON conflicts.review_public_id = reviews.review_public_id
+        LEFT JOIN d2_posting_decisions AS decisions
+          ON decisions.review_public_id = reviews.review_public_id
+        WHERE reviews.review_public_id = ?
+        """,
+        (review_public_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    return _has_valid_delivery_authority(
+        row, allow_post_decision_conflict=row["decision_accepted_at"] is not None
+    )
 
 
 def _authorized_attempt_for_resume(
@@ -1378,7 +1586,44 @@ def _authorized_attempt_for_resume(
         """
         SELECT attempts.*, reviews.parser_output_id, reviews.review_public_id,
                reviews.proposal_version, reviews.proposal_content_hash,
-               decisions.decision_public_id, decisions.confirmation_public_id
+               reviews.authenticated_actor_id AS review_actor_id,
+               reviews.telegram_account_id AS review_account_id,
+               reviews.telegram_conversation_id AS review_conversation_id,
+               reviews.conversation_binding_id AS review_binding_id,
+               decisions.decision_public_id, decisions.confirmation_public_id,
+               decisions.accepted_at AS decision_accepted_at,
+               purposes.purpose,
+               deliveries.delivery_attempt_public_id AS delivery_attempt_id,
+               deliveries.review_public_id AS delivery_review_id,
+               deliveries.finance_delivery_material_sha256 AS delivery_material_sha256,
+               deliveries.authenticated_actor_id AS delivery_actor_id,
+               deliveries.telegram_account_id AS delivery_account_id,
+               deliveries.telegram_conversation_id AS delivery_conversation_id,
+               deliveries.conversation_binding_id AS delivery_binding_id,
+               activations.review_public_id AS activation_review_id,
+               activations.delivery_attempt_public_id AS activation_attempt_id,
+               activations.observation_public_id AS activation_observation_id,
+               activations.provider_message_id AS activation_message_id,
+               activations.channel AS activation_channel,
+               activations.telegram_account_id AS activation_account_id,
+               activations.telegram_conversation_id AS activation_conversation_id,
+               activations.conversation_binding_id AS activation_binding_id,
+               activations.finance_delivery_material_sha256 AS activation_material_sha256,
+               activations.receipt_token_sha256 AS activation_receipt_sha256,
+               activations.source_identity_sha256 AS activation_source_sha256,
+               observations.observation_public_id AS observation_id,
+               observations.delivery_attempt_public_id AS observation_attempt_id,
+               observations.outcome AS observation_outcome,
+               observations.provider_message_id AS observation_message_id,
+               observations.channel AS observation_channel,
+               observations.telegram_account_id AS observation_account_id,
+               observations.telegram_conversation_id AS observation_conversation_id,
+               observations.conversation_binding_id AS observation_binding_id,
+               observations.finance_delivery_material_sha256 AS observation_material_sha256,
+               observations.receipt_token_sha256 AS observation_receipt_sha256,
+               observations.source_identity_sha256 AS observation_source_sha256,
+               conflicts.conflict_public_id AS delivery_conflict_id,
+               conflicts.observed_at AS delivery_conflict_observed_at
         FROM d2_posting_attempts AS attempts
         JOIN d2_posting_reviews AS reviews
           ON reviews.review_public_id = attempts.review_public_id
@@ -1397,6 +1642,8 @@ def _authorized_attempt_for_resume(
          AND refs.conversation_binding_id = reviews.conversation_binding_id
         JOIN openclaw_human_action_redemptions AS redemptions
           ON redemptions.reference_id = refs.id
+        JOIN openclaw_human_action_reference_purposes AS purposes
+          ON purposes.reference_id = refs.id
         JOIN d2_posting_decisions AS decisions
           ON decisions.attempt_public_id = attempts.attempt_public_id
          AND decisions.review_public_id = reviews.review_public_id
@@ -1408,6 +1655,15 @@ def _authorized_attempt_for_resume(
          AND confirmations.authenticated_actor_id = reviews.authenticated_actor_id
          AND confirmations.actor_type = 'human'
          AND confirmations.confirmation_state = 'confirmed'
+        LEFT JOIN d2_posting_review_delivery_attempts AS deliveries
+          ON deliveries.review_public_id = reviews.review_public_id
+        LEFT JOIN d2_posting_review_delivery_activations AS activations
+          ON activations.review_public_id = reviews.review_public_id
+         AND activations.delivery_attempt_public_id = deliveries.delivery_attempt_public_id
+        LEFT JOIN d2_posting_review_delivery_observations AS observations
+          ON observations.observation_public_id = activations.observation_public_id
+        LEFT JOIN d2_posting_review_delivery_conflicts AS conflicts
+          ON conflicts.review_public_id = reviews.review_public_id
         WHERE attempts.attempt_public_id = ?
           AND attempts.posting_path = reviews.posting_path
           AND reviews.authenticated_actor_id = ?
@@ -1425,6 +1681,12 @@ def _authorized_attempt_for_resume(
     ).fetchone()
     if row is None:
         raise PostingAuthorityError("posting authority unavailable")
+    purpose = str(row["purpose"])
+    if purpose == "d2_post_v1":
+        if not _has_valid_delivery_authority(row, allow_post_decision_conflict=True):
+            raise PostingAuthorityError("current D2 delivery authority is incomplete")
+    elif purpose != "d2_post_accepted_pre050_v1":
+        raise PostingAuthorityError("posting recovery purpose is invalid")
     return row
 
 
@@ -1451,16 +1713,53 @@ def confirm_and_post(
         callback_message_id=callback_message_id,
     )
     if accepted is not None:
-        return resume_posting(conn, attempt_public_id=accepted, context=context)
+        attempt_public_id, review_public_id, purpose = accepted
+        if purpose == "d2_post_accepted_pre050_v1":
+            return get_status(conn, review_public_id=review_public_id, context=context)
+        if purpose != "d2_post_v1":
+            raise PostingAuthorityError("accepted Confirm replay purpose is invalid")
+        return resume_posting(conn, attempt_public_id=attempt_public_id, context=context)
 
     def validate(locked: sqlite3.Connection, ref_row: dict, action: str) -> None:
         binding = locked.execute(
             """
             SELECT reviews.*, purposes.purpose,
-                   activations.provider_message_id,
+                   reviews.authenticated_actor_id AS review_actor_id,
+                   reviews.telegram_account_id AS review_account_id,
+                   reviews.telegram_conversation_id AS review_conversation_id,
+                   reviews.conversation_binding_id AS review_binding_id,
+                   attempts.delivery_attempt_public_id AS delivery_attempt_id,
+                   attempts.review_public_id AS delivery_review_id,
+                   attempts.finance_delivery_material_sha256 AS delivery_material_sha256,
+                   attempts.authenticated_actor_id AS delivery_actor_id,
+                   attempts.telegram_account_id AS delivery_account_id,
+                   attempts.telegram_conversation_id AS delivery_conversation_id,
+                   attempts.conversation_binding_id AS delivery_binding_id,
+                   activations.review_public_id AS activation_review_id,
+                   activations.delivery_attempt_public_id AS activation_attempt_id,
+                   activations.observation_public_id AS activation_observation_id,
+                   activations.provider_message_id AS activation_message_id,
+                   activations.channel AS activation_channel,
+                   activations.telegram_account_id AS activation_account_id,
+                   activations.telegram_conversation_id AS activation_conversation_id,
+                   activations.conversation_binding_id AS activation_binding_id,
                    activations.finance_delivery_material_sha256 AS activation_material_sha256,
-                   attempts.finance_delivery_material_sha256 AS attempt_material_sha256,
-                   conflicts.conflict_public_id AS delivery_conflict_public_id
+                   activations.receipt_token_sha256 AS activation_receipt_sha256,
+                   activations.source_identity_sha256 AS activation_source_sha256,
+                   observations.observation_public_id AS observation_id,
+                   observations.delivery_attempt_public_id AS observation_attempt_id,
+                   observations.outcome AS observation_outcome,
+                   observations.provider_message_id AS observation_message_id,
+                   observations.channel AS observation_channel,
+                   observations.telegram_account_id AS observation_account_id,
+                   observations.telegram_conversation_id AS observation_conversation_id,
+                   observations.conversation_binding_id AS observation_binding_id,
+                   observations.finance_delivery_material_sha256 AS observation_material_sha256,
+                   observations.receipt_token_sha256 AS observation_receipt_sha256,
+                   observations.source_identity_sha256 AS observation_source_sha256,
+                   conflicts.conflict_public_id AS delivery_conflict_id,
+                   conflicts.observed_at AS delivery_conflict_observed_at,
+                   NULL AS decision_accepted_at
             FROM d2_posting_review_action_bindings AS bindings
             JOIN d2_posting_reviews AS reviews
               ON reviews.review_public_id = bindings.review_public_id
@@ -1475,6 +1774,8 @@ def confirm_and_post(
             JOIN d2_posting_review_delivery_activations AS activations
               ON activations.review_public_id = reviews.review_public_id
              AND activations.delivery_attempt_public_id = attempts.delivery_attempt_public_id
+            JOIN d2_posting_review_delivery_observations AS observations
+              ON observations.observation_public_id = activations.observation_public_id
             LEFT JOIN d2_posting_review_delivery_conflicts AS conflicts
               ON conflicts.review_public_id = reviews.review_public_id
             WHERE bindings.reference_id = ?
@@ -1487,12 +1788,8 @@ def confirm_and_post(
             raise PostingAuthorityError("posting review expired")
         if (
             binding["purpose"] != "d2_post_v1"
-            or binding["delivery_conflict_public_id"] is not None
-            or int(binding["provider_message_id"]) != callback_message_id
-            or not hmac.compare_digest(
-                str(binding["activation_material_sha256"]),
-                str(binding["attempt_material_sha256"]),
-            )
+            or not _has_valid_delivery_authority(binding)
+            or int(binding["activation_message_id"]) != callback_message_id
         ):
             raise PostingAuthorityError("Confirm is not bound to the activated provider message")
         _require_current_review(locked, binding, now=clock())
@@ -2163,8 +2460,10 @@ def get_status(
 ) -> PostingStatus:
     """Return stable D2 status using SELECTs only."""
     require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
     _require_context(context)
+    delivery_is_valid = _review_has_valid_delivery_authority(conn, review_public_id)
     row = conn.execute(
         "SELECT reviews.review_public_id, attempts.attempt_public_id, attempts.stage, "
         "attempts.transaction_public_id, attempts.attention_reason, "
@@ -2206,7 +2505,7 @@ def get_status(
         state = "rejected"
     elif (
         stage is None
-        and row["provider_message_id"] is not None
+        and delivery_is_valid
         and row["successor_review_public_id"] is None
         and row["conflict_public_id"] is None
         and not (
@@ -2229,6 +2528,18 @@ def get_status(
         else:
             attention_reason = "delivery_not_activated"
     else:
+        try:
+            _authorized_attempt_for_resume(
+                conn, attempt_public_id=str(row["attempt_public_id"]), context=context
+            )
+        except PostingAuthorityError:
+            return PostingStatus(
+                review_public_id=review_public_id,
+                state="needs_attention",
+                attempt_public_id=str(row["attempt_public_id"]),
+                transaction_public_id=None,
+                attention_reason="posting_authority_incomplete",
+            )
         decision = conn.execute(
             "SELECT decision_public_id, confirmation_public_id FROM d2_posting_decisions "
             "WHERE attempt_public_id = ? AND review_public_id = ?",

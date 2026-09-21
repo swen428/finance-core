@@ -23,6 +23,10 @@ CREATE TABLE d2_initial_proposal_cards (
     ),
     raw_intake_record_id INTEGER NOT NULL,
     admitted_source_message_id TEXT NOT NULL CHECK (length(trim(admitted_source_message_id)) > 0),
+    admitted_source_identity_sha256 TEXT NOT NULL CHECK (
+        length(admitted_source_identity_sha256) = 64
+        AND admitted_source_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
     authenticated_actor_id TEXT NOT NULL CHECK (length(trim(authenticated_actor_id)) > 0),
     telegram_account_id TEXT NOT NULL CHECK (length(trim(telegram_account_id)) > 0),
     telegram_conversation_id TEXT NOT NULL CHECK (length(trim(telegram_conversation_id)) > 0),
@@ -51,6 +55,24 @@ CREATE TABLE d2_initial_proposal_cards (
 CREATE TRIGGER trg_d2_initial_cards_no_update
 BEFORE UPDATE ON d2_initial_proposal_cards BEGIN
     SELECT RAISE(ABORT, 'D2 initial proposal cards are append-only');
+END;
+CREATE TRIGGER trg_d2_initial_cards_no_insert_collision
+BEFORE INSERT ON d2_initial_proposal_cards
+WHEN EXISTS (
+    SELECT 1 FROM d2_initial_proposal_cards AS existing
+    WHERE existing.initial_card_public_id = NEW.initial_card_public_id
+       OR existing.card_idempotency_key = NEW.card_idempotency_key
+       OR (
+            existing.parser_output_id = NEW.parser_output_id
+            AND existing.proposal_version = NEW.proposal_version
+            AND existing.proposal_content_hash = NEW.proposal_content_hash
+            AND existing.authenticated_actor_id = NEW.authenticated_actor_id
+            AND existing.telegram_account_id = NEW.telegram_account_id
+            AND existing.telegram_conversation_id = NEW.telegram_conversation_id
+            AND existing.conversation_binding_id = NEW.conversation_binding_id
+       )
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 initial proposal card identity collision');
 END;
 CREATE TRIGGER trg_d2_initial_cards_no_delete
 BEFORE DELETE ON d2_initial_proposal_cards BEGIN
@@ -114,7 +136,11 @@ CREATE TABLE d2_posting_reviews_v2 (
         OR (posting_path = 'personal_receipt' AND receipt_fact_candidate_json IS NOT NULL)
     ),
     UNIQUE (card_generation_public_id, source_generation),
-    UNIQUE (initial_card_public_id, source_generation)
+    UNIQUE (initial_card_public_id, source_generation),
+    UNIQUE (
+        review_public_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    )
 ) STRICT;
 
 INSERT INTO d2_posting_reviews_v2 (
@@ -188,6 +214,10 @@ SELECT
             THEN 'd2_post_accepted_pre050_v1'
         WHEN bindings.reference_id IS NOT NULL
             THEN 'd2_post_fenced_pre050_v1'
+        WHEN refs.action = 'confirm'
+             AND d1_bindings.reference_id IS NULL
+             AND redemptions.reference_id IS NULL
+            THEN 'd2_post_fenced_pre050_v1'
         WHEN refs.action = 'edit' THEN 'edit_v1'
         WHEN refs.action = 'reject' THEN 'reject_v1'
         ELSE 'legacy_pre050_v1'
@@ -197,7 +227,9 @@ FROM openclaw_human_action_references AS refs
 LEFT JOIN d2_posting_review_action_bindings AS bindings
   ON bindings.reference_id = refs.id
 LEFT JOIN openclaw_human_action_redemptions AS redemptions
-  ON redemptions.reference_id = refs.id;
+  ON redemptions.reference_id = refs.id
+LEFT JOIN parser_human_draft_action_bindings AS d1_bindings
+  ON d1_bindings.reference_id = refs.id;
 
 -- Abort the migration instead of guessing if an already redeemed 049 D2
 -- reference lacks any part of its accepted decision/attempt chain.
@@ -224,6 +256,14 @@ DROP TABLE d2_migration_050_guard;
 CREATE TRIGGER trg_human_action_purposes_no_update
 BEFORE UPDATE ON openclaw_human_action_reference_purposes BEGIN
     SELECT RAISE(ABORT, 'human-action purposes are append-only');
+END;
+CREATE TRIGGER trg_human_action_purposes_no_insert_collision
+BEFORE INSERT ON openclaw_human_action_reference_purposes
+WHEN EXISTS (
+    SELECT 1 FROM openclaw_human_action_reference_purposes AS existing
+    WHERE existing.reference_id = NEW.reference_id
+) BEGIN
+    SELECT RAISE(ABORT, 'human-action purpose identity collision');
 END;
 CREATE TRIGGER trg_human_action_purposes_no_delete
 BEFORE DELETE ON openclaw_human_action_reference_purposes BEGIN
@@ -286,7 +326,18 @@ CREATE TABLE d2_posting_review_delivery_attempts (
     telegram_conversation_id TEXT NOT NULL,
     conversation_binding_id TEXT NOT NULL,
     attempted_at INTEGER NOT NULL CHECK (attempted_at > 0),
-    FOREIGN KEY (review_public_id) REFERENCES d2_posting_reviews(review_public_id)
+    FOREIGN KEY (review_public_id) REFERENCES d2_posting_reviews(review_public_id),
+    FOREIGN KEY (
+        review_public_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    ) REFERENCES d2_posting_reviews (
+        review_public_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    ),
+    UNIQUE (
+        delivery_attempt_public_id, review_public_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    )
 ) STRICT;
 
 CREATE TABLE d2_posting_review_delivery_observations (
@@ -310,11 +361,21 @@ CREATE TABLE d2_posting_review_delivery_observations (
         length(source_identity_sha256) = 64
         AND source_identity_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
+    channel TEXT NOT NULL CHECK (channel = 'telegram'),
+    telegram_account_id TEXT NOT NULL,
+    telegram_conversation_id TEXT NOT NULL,
+    conversation_binding_id TEXT NOT NULL,
     error_code TEXT,
     observed_at INTEGER NOT NULL CHECK (observed_at > 0),
     FOREIGN KEY (delivery_attempt_public_id)
         REFERENCES d2_posting_review_delivery_attempts(delivery_attempt_public_id),
     UNIQUE (delivery_attempt_public_id, provider_message_id),
+    UNIQUE (
+        observation_public_id, delivery_attempt_public_id, outcome,
+        provider_message_id, finance_delivery_material_sha256,
+        receipt_token_sha256, source_identity_sha256, channel,
+        telegram_account_id, telegram_conversation_id, conversation_binding_id
+    ),
     CHECK (outcome != 'success' OR provider_message_id IS NOT NULL),
     CHECK (outcome != 'failure' OR error_code IS NOT NULL)
 ) STRICT;
@@ -323,9 +384,12 @@ CREATE TABLE d2_posting_review_delivery_activations (
     review_public_id TEXT PRIMARY KEY,
     delivery_attempt_public_id TEXT NOT NULL UNIQUE,
     observation_public_id TEXT NOT NULL UNIQUE,
+    observation_outcome TEXT NOT NULL CHECK (observation_outcome = 'success'),
     provider_message_id INTEGER NOT NULL CHECK (provider_message_id > 0),
+    channel TEXT NOT NULL CHECK (channel = 'telegram'),
     telegram_account_id TEXT NOT NULL,
     telegram_conversation_id TEXT NOT NULL,
+    conversation_binding_id TEXT NOT NULL,
     finance_delivery_material_sha256 TEXT NOT NULL CHECK (
         length(finance_delivery_material_sha256) = 64
         AND finance_delivery_material_sha256 NOT GLOB '*[^0-9a-f]*'
@@ -344,7 +408,29 @@ CREATE TABLE d2_posting_review_delivery_activations (
         REFERENCES d2_posting_review_delivery_attempts(delivery_attempt_public_id),
     FOREIGN KEY (observation_public_id)
         REFERENCES d2_posting_review_delivery_observations(observation_public_id),
-    UNIQUE (telegram_account_id, telegram_conversation_id, provider_message_id)
+    FOREIGN KEY (
+        delivery_attempt_public_id, review_public_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    ) REFERENCES d2_posting_review_delivery_attempts (
+        delivery_attempt_public_id, review_public_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    ),
+    FOREIGN KEY (
+        observation_public_id, delivery_attempt_public_id, observation_outcome,
+        provider_message_id, finance_delivery_material_sha256,
+        receipt_token_sha256, source_identity_sha256, channel,
+        telegram_account_id, telegram_conversation_id, conversation_binding_id
+    ) REFERENCES d2_posting_review_delivery_observations (
+        observation_public_id, delivery_attempt_public_id, outcome,
+        provider_message_id, finance_delivery_material_sha256,
+        receipt_token_sha256, source_identity_sha256, channel,
+        telegram_account_id, telegram_conversation_id, conversation_binding_id
+    ),
+    UNIQUE (telegram_account_id, telegram_conversation_id, provider_message_id),
+    UNIQUE (
+        review_public_id, delivery_attempt_public_id,
+        observation_public_id, provider_message_id
+    )
 ) STRICT;
 
 CREATE TABLE d2_posting_review_delivery_conflicts (
@@ -355,6 +441,11 @@ CREATE TABLE d2_posting_review_delivery_conflicts (
     ),
     review_public_id TEXT NOT NULL,
     delivery_attempt_public_id TEXT NOT NULL,
+    activated_observation_public_id TEXT NOT NULL,
+    conflicting_observation_public_id TEXT NOT NULL UNIQUE,
+    conflicting_observation_outcome TEXT NOT NULL CHECK (
+        conflicting_observation_outcome = 'conflict'
+    ),
     activated_provider_message_id INTEGER NOT NULL CHECK (activated_provider_message_id > 0),
     conflicting_provider_message_id INTEGER NOT NULL CHECK (conflicting_provider_message_id > 0),
     finance_delivery_material_sha256 TEXT NOT NULL CHECK (
@@ -369,10 +460,35 @@ CREATE TABLE d2_posting_review_delivery_conflicts (
         length(source_identity_sha256) = 64
         AND source_identity_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
+    channel TEXT NOT NULL CHECK (channel = 'telegram'),
+    telegram_account_id TEXT NOT NULL,
+    telegram_conversation_id TEXT NOT NULL,
+    conversation_binding_id TEXT NOT NULL,
     observed_at INTEGER NOT NULL CHECK (observed_at > 0),
     FOREIGN KEY (review_public_id) REFERENCES d2_posting_reviews(review_public_id),
     FOREIGN KEY (delivery_attempt_public_id)
         REFERENCES d2_posting_review_delivery_attempts(delivery_attempt_public_id),
+    FOREIGN KEY (
+        review_public_id, delivery_attempt_public_id,
+        activated_observation_public_id, activated_provider_message_id
+    ) REFERENCES d2_posting_review_delivery_activations (
+        review_public_id, delivery_attempt_public_id,
+        observation_public_id, provider_message_id
+    ),
+    FOREIGN KEY (
+        conflicting_observation_public_id, delivery_attempt_public_id,
+        conflicting_observation_outcome, conflicting_provider_message_id,
+        finance_delivery_material_sha256,
+        receipt_token_sha256, source_identity_sha256, channel,
+        telegram_account_id, telegram_conversation_id, conversation_binding_id
+    ) REFERENCES d2_posting_review_delivery_observations (
+        observation_public_id, delivery_attempt_public_id, outcome, provider_message_id,
+        finance_delivery_material_sha256, receipt_token_sha256,
+        source_identity_sha256, channel, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id
+    ),
+    FOREIGN KEY (activated_observation_public_id)
+        REFERENCES d2_posting_review_delivery_observations(observation_public_id),
     UNIQUE (review_public_id, conflicting_provider_message_id),
     CHECK (activated_provider_message_id != conflicting_provider_message_id)
 ) STRICT;
@@ -399,6 +515,19 @@ CREATE TRIGGER trg_d2_controls_no_update
 BEFORE UPDATE ON d2_posting_review_controls BEGIN
     SELECT RAISE(ABORT, 'D2 review controls are append-only');
 END;
+CREATE TRIGGER trg_d2_controls_no_insert_collision
+BEFORE INSERT ON d2_posting_review_controls
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_controls AS existing
+    WHERE (existing.review_public_id = NEW.review_public_id
+           AND existing.action = NEW.action)
+       OR existing.reference_id = NEW.reference_id
+       OR (existing.review_public_id = NEW.review_public_id
+           AND existing.row_index = NEW.row_index
+           AND existing.column_index = NEW.column_index)
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 review control identity collision');
+END;
 CREATE TRIGGER trg_d2_controls_no_delete
 BEFORE DELETE ON d2_posting_review_controls BEGIN
     SELECT RAISE(ABORT, 'D2 review controls are append-only');
@@ -406,6 +535,16 @@ END;
 CREATE TRIGGER trg_d2_delivery_attempts_no_update
 BEFORE UPDATE ON d2_posting_review_delivery_attempts BEGIN
     SELECT RAISE(ABORT, 'D2 delivery attempts are append-only');
+END;
+CREATE TRIGGER trg_d2_delivery_attempts_no_insert_collision
+BEFORE INSERT ON d2_posting_review_delivery_attempts
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_delivery_attempts AS existing
+    WHERE existing.delivery_attempt_public_id = NEW.delivery_attempt_public_id
+       OR existing.review_public_id = NEW.review_public_id
+       OR existing.attempt_nonce_sha256 = NEW.attempt_nonce_sha256
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 delivery attempt identity collision');
 END;
 CREATE TRIGGER trg_d2_delivery_attempts_no_delete
 BEFORE DELETE ON d2_posting_review_delivery_attempts BEGIN
@@ -415,6 +554,17 @@ CREATE TRIGGER trg_d2_delivery_observations_no_update
 BEFORE UPDATE ON d2_posting_review_delivery_observations BEGIN
     SELECT RAISE(ABORT, 'D2 delivery observations are append-only');
 END;
+CREATE TRIGGER trg_d2_delivery_observations_no_insert_collision
+BEFORE INSERT ON d2_posting_review_delivery_observations
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_delivery_observations AS existing
+    WHERE existing.observation_public_id = NEW.observation_public_id
+       OR existing.receipt_token_sha256 = NEW.receipt_token_sha256
+       OR (existing.delivery_attempt_public_id = NEW.delivery_attempt_public_id
+           AND existing.provider_message_id = NEW.provider_message_id)
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 delivery observation identity collision');
+END;
 CREATE TRIGGER trg_d2_delivery_observations_no_delete
 BEFORE DELETE ON d2_posting_review_delivery_observations BEGIN
     SELECT RAISE(ABORT, 'D2 delivery observations are append-only');
@@ -422,6 +572,20 @@ END;
 CREATE TRIGGER trg_d2_delivery_activations_no_update
 BEFORE UPDATE ON d2_posting_review_delivery_activations BEGIN
     SELECT RAISE(ABORT, 'D2 delivery activations are append-only');
+END;
+CREATE TRIGGER trg_d2_delivery_activations_no_insert_collision
+BEFORE INSERT ON d2_posting_review_delivery_activations
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_delivery_activations AS existing
+    WHERE existing.review_public_id = NEW.review_public_id
+       OR existing.delivery_attempt_public_id = NEW.delivery_attempt_public_id
+       OR existing.observation_public_id = NEW.observation_public_id
+       OR existing.receipt_token_sha256 = NEW.receipt_token_sha256
+       OR (existing.telegram_account_id = NEW.telegram_account_id
+           AND existing.telegram_conversation_id = NEW.telegram_conversation_id
+           AND existing.provider_message_id = NEW.provider_message_id)
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 delivery activation identity collision');
 END;
 CREATE TRIGGER trg_d2_delivery_activations_no_delete
 BEFORE DELETE ON d2_posting_review_delivery_activations BEGIN
@@ -431,6 +595,18 @@ CREATE TRIGGER trg_d2_delivery_conflicts_no_update
 BEFORE UPDATE ON d2_posting_review_delivery_conflicts BEGIN
     SELECT RAISE(ABORT, 'D2 delivery conflicts are append-only');
 END;
+CREATE TRIGGER trg_d2_delivery_conflicts_no_insert_collision
+BEFORE INSERT ON d2_posting_review_delivery_conflicts
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_delivery_conflicts AS existing
+    WHERE existing.conflict_public_id = NEW.conflict_public_id
+       OR existing.conflicting_observation_public_id = NEW.conflicting_observation_public_id
+       OR existing.receipt_token_sha256 = NEW.receipt_token_sha256
+       OR (existing.review_public_id = NEW.review_public_id
+           AND existing.conflicting_provider_message_id = NEW.conflicting_provider_message_id)
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 delivery conflict identity collision');
+END;
 CREATE TRIGGER trg_d2_delivery_conflicts_no_delete
 BEFORE DELETE ON d2_posting_review_delivery_conflicts BEGIN
     SELECT RAISE(ABORT, 'D2 delivery conflicts are append-only');
@@ -438,6 +614,16 @@ END;
 CREATE TRIGGER trg_d2_supersessions_no_update
 BEFORE UPDATE ON d2_posting_review_supersessions BEGIN
     SELECT RAISE(ABORT, 'D2 review supersessions are append-only');
+END;
+CREATE TRIGGER trg_d2_supersessions_no_insert_collision
+BEFORE INSERT ON d2_posting_review_supersessions
+WHEN EXISTS (
+    SELECT 1 FROM d2_posting_review_supersessions AS existing
+    WHERE existing.predecessor_review_public_id = NEW.predecessor_review_public_id
+       OR existing.successor_review_public_id = NEW.successor_review_public_id
+       OR existing.replacement_idempotency_key = NEW.replacement_idempotency_key
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 review supersession identity collision');
 END;
 CREATE TRIGGER trg_d2_supersessions_no_delete
 BEFORE DELETE ON d2_posting_review_supersessions BEGIN

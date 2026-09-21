@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import sqlite3
 import uuid
@@ -140,6 +141,7 @@ def _require_current_initial_proposal_review_in_transaction(
         SELECT reviews.parser_output_id, reviews.proposal_version,
                reviews.proposal_content_hash, reviews.expires_at,
                cards.raw_intake_record_id, cards.admitted_source_message_id,
+               cards.admitted_source_identity_sha256,
                cards.authenticated_actor_id, cards.telegram_account_id,
                cards.telegram_conversation_id, cards.conversation_binding_id,
                cards.expires_at AS card_expires_at,
@@ -174,7 +176,8 @@ def _require_current_initial_proposal_review_in_transaction(
     if row is None:
         raise ParserConfirmationError("initial D2 decision authority is unavailable")
     raw = conn.execute(
-        "SELECT parser_output_id, source_message_id, status FROM raw_intake_records WHERE id = ?",
+        "SELECT parser_output_id, source_message_id, external_source_id, source_channel, "
+        "status FROM raw_intake_records WHERE id = ?",
         (row["raw_intake_record_id"],),
     ).fetchone()
     active_draft = conn.execute(
@@ -187,6 +190,10 @@ def _require_current_initial_proposal_review_in_transaction(
         decision_binding.telegram_account_id,
         decision_binding.telegram_conversation_id,
         decision_binding.conversation_binding_id,
+    )
+    expected_source_identity = (
+        f"telegram:{decision_binding.telegram_conversation_id}:"
+        f"{row['admitted_source_message_id']}"
     )
     if (
         int(row["parser_output_id"]) != parser_output_id
@@ -219,6 +226,12 @@ def _require_current_initial_proposal_review_in_transaction(
         or raw is None
         or int(raw["parser_output_id"]) != parser_output_id
         or str(raw["source_message_id"]) != str(row["admitted_source_message_id"])
+        or raw["source_channel"] != "telegram"
+        or str(raw["external_source_id"] or "") != expected_source_identity
+        or not hmac.compare_digest(
+            str(row["admitted_source_identity_sha256"]),
+            hashlib.sha256(expected_source_identity.encode("utf-8")).hexdigest(),
+        )
         or raw["status"] != "parsed_pending_confirmation"
         or active_draft is not None
     ):
@@ -510,7 +523,7 @@ def convert_confirmed_parser_proposal(
                 "idempotent": True,
             }
 
-        fields = _transaction_fields(conn, proposal)
+        fields = resolve_simple_expense_conversion_fields(conn, proposal)
         _require_exact_transaction_money(conn, fields["amount"])
         public_id = _converted_transaction_public_id(proposal, authorization, fields)
         notes = json.dumps(
@@ -631,7 +644,7 @@ def _require_existing_conversion_truth(
     content_hash: str,
     conversion: dict[str, Any],
 ) -> None:
-    fields = _transaction_fields(conn, proposal)
+    fields = resolve_simple_expense_conversion_fields(conn, proposal)
     expected_public_id = _converted_transaction_public_id(proposal, authorization, fields)
     row = conn.execute(
         "SELECT public_id, intent, intent_type, source_channel, transaction_date, status, "
@@ -912,7 +925,10 @@ def _effective_transaction_payload(
     return effective
 
 
-def _transaction_fields(conn: sqlite3.Connection, proposal: dict[str, Any]) -> dict[str, Any]:
+def resolve_simple_expense_conversion_fields(
+    conn: sqlite3.Connection, proposal: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve the same read-only fields enforced by guarded text conversion."""
     payload = _effective_transaction_payload(conn, proposal)
     transaction_type = payload.get("transaction_type")
     intent = payload.get("intent")
