@@ -360,8 +360,8 @@ test("D2 Confirm posts once and shows Posted only with the canonical transaction
     conversationId: "111", parentConversationId: "111", senderId: "111",
     isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
     callback: {
-      data: postingActionCallbackData(reference), namespace: "finance-bridge",
-      payload: `post:${reference}`, messageId: 20, chatId: "111",
+      data: `post:${reference}`, namespace: "post",
+      payload: reference, messageId: 20, chatId: "111",
     },
     respond: {
       async reply() { throw new Error("reply fallback should not run"); },
@@ -397,8 +397,8 @@ test("lost D2 response queries durable status and returns the original result", 
     conversationId: "111", parentConversationId: "111", senderId: "111",
     isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
     callback: {
-      data: postingActionCallbackData(reference), namespace: "finance-bridge",
-      payload: `post:${reference}`, messageId: 20, chatId: "111",
+      data: `post:${reference}`, namespace: "post",
+      payload: reference, messageId: 20, chatId: "111",
     },
     respond: {
       async reply({ text }: {text: string}) {
@@ -412,6 +412,40 @@ test("lost D2 response queries durable status and returns the original result", 
   assert.deepEqual(requests.map((request) => request.command), ["confirm_and_post", "get_status"]);
   assert.equal(replies, 0);
   assert.match(edits[0] ?? "", new RegExp(`Transaction ID: txn_${"3".repeat(32)}`, "u"));
+});
+
+test("D2 production callback route rejects mismatched namespace, payload, or data", async () => {
+  const reference = `fha1_${"R".repeat(24)}`;
+  let runnerCalls = 0;
+  const handler = createHumanActionInteractiveHandler(() => ({
+    workspaceRoot: "/tmp/workspace",
+    runner: {
+      async run(request: BridgeRequest): Promise<BridgeResponse> {
+        runnerCalls += 1;
+        return finalizedPosting(request);
+      },
+    },
+  }));
+  const callbacks = [
+    { namespace: "post", payload: `${reference}x`, data: `post:${reference}` },
+    { namespace: "post", payload: reference, data: `confirm:${reference}` },
+    { namespace: "confirm", payload: reference, data: `post:${reference}` },
+  ];
+  for (const callback of callbacks) {
+    const result = await handler({
+      channel: "telegram", accountId: "finance-account", callbackId: "callback-d2-tamper",
+      conversationId: "111", parentConversationId: "111", senderId: "111",
+      isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
+      callback: { ...callback, messageId: 20, chatId: "111" },
+      respond: {
+        async reply() { throw new Error("tampered callback must not reply"); },
+        async editMessage() { throw new Error("tampered callback must not edit"); },
+      },
+      async getCurrentConversationBinding() { return binding; },
+    });
+    assert.deepEqual(result, { handled: true });
+  }
+  assert.equal(runnerCalls, 0);
 });
 
 test("generation-bound decisions carry only the redeemed durable D1 reference", async () => {

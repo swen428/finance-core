@@ -2308,8 +2308,9 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         description, description_truncated = _bounded_review_scalar(
             "description", payload.get("description")
         )
+        category, category_truncated = _bounded_review_scalar("category", payload.get("category"))
         ambiguity_indicators = _ambiguity_indicators(conn, proposal, payload)
-        if merchant_truncated or description_truncated or account_truncated:
+        if merchant_truncated or description_truncated or category_truncated or account_truncated:
             ambiguity_indicators = sorted([*ambiguity_indicators, "oversized_display_field"])
         if classification_unknown:
             ambiguity_indicators = sorted([*ambiguity_indicators, "unknown_classification"])
@@ -2334,6 +2335,7 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "transaction_date": _bounded_review_scalar("transaction_date", transaction_date)[0],
             "merchant": merchant,
             "description": description,
+            "category": category,
             "account": account,
             "account_status": account_status,
             "classification": classification,

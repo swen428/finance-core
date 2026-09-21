@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from finance_core import posting_authority as posting_authority_module
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    authenticate_delivery_receipt,
+    receipt_proof_sha256,
+)
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.parser_proposals import human_drafts
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
@@ -69,19 +73,33 @@ def _issue_and_activate(
         context=context,
         clock=lambda: issue_time,
     )
+    fields = {
+        "workspace_path": "/synthetic/d2-posting-authority",
+        "attempt_nonce": manifest.delivery_attempt_nonce,
+        "capability": "telegram.finance-delivery-material-v1",
+        "delivery_material_version": "finance_d2_delivery_material_v1",
+        "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+        "provider_message_id": provider_message_id,
+        "receipt_token_sha256": hashlib.sha256(
+            f"receipt:{provider_message_id}".encode()
+        ).hexdigest(),
+        "channel": "telegram",
+        "account_id": context.account_id,
+        "conversation_id": context.conversation_id,
+        "session_key": context.binding_id,
+        "source_identity_sha256": "b" * 64,
+    }
+    signing_key = b"p" * 32
     record_posting_review_delivery(
         conn,
-        attempt_nonce=manifest.delivery_attempt_nonce,
-        capability="telegram.finance-delivery-material-v1",
-        delivery_material_version="finance_d2_delivery_material_v1",
-        finance_delivery_material_sha256=manifest.finance_delivery_material_sha256,
-        provider_message_id=provider_message_id,
-        receipt_token_sha256=hashlib.sha256(f"receipt:{provider_message_id}".encode()).hexdigest(),
-        channel="telegram",
-        account_id=context.account_id,
-        conversation_id=context.conversation_id,
-        session_key=context.binding_id,
-        source_identity_sha256="b" * 64,
+        receipt=authenticate_delivery_receipt(
+            signing_key=signing_key,
+            receipt_proof_sha256_value=receipt_proof_sha256(
+                signing_key=signing_key,
+                **fields,
+            ),
+            **fields,
+        ),
         clock=lambda: issue_time + 1,
     )
     confirm = next(control for control in manifest.controls if control.action == "confirm")

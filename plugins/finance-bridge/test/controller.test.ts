@@ -396,6 +396,7 @@ function reviewResult(
     transaction_date: "2026-08-13",
     merchant: "taxi",
     description: null,
+    category: "transport",
     account: null,
     account_status: "absent",
     classification: "personal",
@@ -427,7 +428,7 @@ function initialD2Text(overrides: {
     `Date: ${overrides.transactionDate ?? "2026-08-13"}`,
     `Merchant: ${overrides.merchant ?? "taxi"}`,
     `Description: ${overrides.description ?? "Not specified"}`,
-    `Category: ${overrides.category ?? "Not specified"}`,
+    `Category: ${overrides.category ?? "transport"}`,
     "Account: Not specified",
     "No account or shared-expense details will be inferred.",
   ].join("\n");

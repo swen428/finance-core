@@ -52,6 +52,8 @@ _DATABASE_FILENAME = "staging.sqlite"
 
 _CALLBACK_KEY_FILENAME = "callback_signing.key"
 CALLBACK_SIGNING_KEY_BYTES = 32
+_DELIVERY_RECEIPT_KEY_FILENAME = "delivery_receipt_signing.key"
+DELIVERY_RECEIPT_SIGNING_KEY_BYTES = 32
 
 # Bounded key status values reported by health checks; never key material.
 CALLBACK_KEY_PRESENT = "present"
@@ -189,6 +191,9 @@ def create_runner_workspace(
 
     # Generate the callback signing key exclusively under runtime/ (0600).
     generate_callback_signing_key(str(resolved / _RUNTIME_DIR))
+    # D2 terminal receipts use a separate key.  Keeping it distinct prevents
+    # the host-consumer proof channel from becoming a callback-token oracle.
+    generate_delivery_receipt_signing_key(str(resolved / _RUNTIME_DIR))
 
     db_path = resolved / _DATABASE_DIR / _DATABASE_FILENAME
     return RunnerWorkspace(
@@ -399,6 +404,76 @@ def load_callback_signing_key(runtime_path: str) -> bytes:
     return key_bytes
 
 
+def generate_delivery_receipt_signing_key(runtime_path: str) -> Path:
+    """Generate the D2 host-consumer receipt key without overwriting one."""
+    runtime = _validate_runtime_dir(runtime_path)
+    key_path = runtime / _DELIVERY_RECEIPT_KEY_FILENAME
+    if key_path.is_symlink():
+        raise RunnerWorkspaceError(f"Delivery receipt key path is a symlink: {key_path}")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(key_path), flags, 0o600)
+    except FileExistsError:
+        raise RunnerWorkspaceError(
+            f"Refusing to overwrite existing delivery receipt signing key: {key_path}"
+        ) from None
+    except OSError as exc:
+        raise RunnerWorkspaceError(f"Cannot create delivery receipt signing key: {exc}") from None
+    try:
+        os.write(fd, secrets.token_bytes(DELIVERY_RECEIPT_SIGNING_KEY_BYTES))
+    except OSError as exc:
+        raise RunnerWorkspaceError(f"Cannot write delivery receipt signing key: {exc}") from None
+    finally:
+        os.close(fd)
+    os.chmod(key_path, 0o600)
+    return key_path
+
+
+def verify_delivery_receipt_signing_key(runtime_path: str) -> Path:
+    """Verify the dedicated D2 receipt key without exposing its bytes."""
+    runtime = _validate_runtime_dir(runtime_path)
+    key_path = runtime / _DELIVERY_RECEIPT_KEY_FILENAME
+    if key_path.is_symlink():
+        raise RunnerWorkspaceError(f"Delivery receipt key path is a symlink: {key_path}")
+    if not key_path.is_file():
+        raise CallbackKeyMissingError(f"Delivery receipt signing key is missing: {key_path}")
+    st = os.lstat(key_path)
+    if not stat.S_ISREG(st.st_mode):
+        raise RunnerWorkspaceError(f"Delivery receipt key is not a regular file: {key_path}")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        raise RunnerWorkspaceError(f"Delivery receipt key permissions are unsafe: {key_path}")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise RunnerWorkspaceError(
+            f"Delivery receipt key is not owned by the current user: {key_path}"
+        )
+    if st.st_size != DELIVERY_RECEIPT_SIGNING_KEY_BYTES:
+        raise RunnerWorkspaceError(f"Delivery receipt key length is unsafe: {key_path}")
+    return key_path
+
+
+def load_delivery_receipt_signing_key(runtime_path: str) -> bytes:
+    """Verify and read the D2 receipt key for in-memory HMAC operations."""
+    key_path = verify_delivery_receipt_signing_key(runtime_path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(key_path), flags)
+    except OSError as exc:
+        raise RunnerWorkspaceError(f"Cannot open delivery receipt signing key: {exc}") from None
+    try:
+        key_bytes = os.read(fd, DELIVERY_RECEIPT_SIGNING_KEY_BYTES + 1)
+    except OSError as exc:
+        raise RunnerWorkspaceError(f"Cannot read delivery receipt signing key: {exc}") from None
+    finally:
+        os.close(fd)
+    if len(key_bytes) != DELIVERY_RECEIPT_SIGNING_KEY_BYTES:
+        raise RunnerWorkspaceError("Delivery receipt signing key length changed during read.")
+    return key_bytes
+
+
 def callback_key_status(runtime_path: str) -> str:
     """Return a bounded key status for health reporting: present/missing/unsafe.
 
@@ -418,10 +493,14 @@ __all__ = [
     "CALLBACK_KEY_PRESENT",
     "CALLBACK_KEY_UNSAFE",
     "CALLBACK_SIGNING_KEY_BYTES",
+    "DELIVERY_RECEIPT_SIGNING_KEY_BYTES",
     "callback_key_status",
     "create_runner_workspace",
     "generate_callback_signing_key",
+    "generate_delivery_receipt_signing_key",
     "load_callback_signing_key",
+    "load_delivery_receipt_signing_key",
     "recover_runner_workspace",
     "verify_callback_signing_key",
+    "verify_delivery_receipt_signing_key",
 ]

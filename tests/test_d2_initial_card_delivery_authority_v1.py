@@ -11,6 +11,10 @@ import pytest
 
 from finance_core import posting_authority as posting_authority_module
 from finance_core.calculation.authoritative_snapshot import canonical_json_text
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    authenticate_delivery_receipt,
+    receipt_proof_sha256,
+)
 from finance_core.openclaw_staging_bridge.human_actions import (
     HumanActionContext,
     HumanActionReferenceError,
@@ -57,6 +61,27 @@ def _connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     return conn
+
+
+def test_delivery_receipt_proof_matches_bridge_vector() -> None:
+    assert (
+        receipt_proof_sha256(
+            signing_key=b"k" * 32,
+            workspace_path="/tmp/workspace",
+            attempt_nonce=f"d2nonce_{'1' * 32}",
+            capability="telegram.finance-delivery-material-v1",
+            delivery_material_version="finance_d2_delivery_material_v1",
+            delivery_material_sha256="2" * 64,
+            provider_message_id="200",
+            receipt_token_sha256="3" * 64,
+            channel="telegram",
+            account_id="finance-account",
+            conversation_id="111",
+            session_key="binding-1",
+            source_identity_sha256="4" * 64,
+        )
+        == "c747dd610a43d562c380a71aafb704c3f7a4706e758120b5c2a42a9e9bd170ca"
+    )
 
 
 def _bind_source_context(
@@ -380,33 +405,47 @@ def _record_delivery(
     now: int,
 ) -> str:
     delivery_attempt_public_id = str(getattr(manifest, "delivery_attempt_public_id"))
-    return record_posting_review_delivery(
-        conn,
-        attempt_nonce=(
+    fields = {
+        "workspace_path": "/synthetic/d2-initial-card-authority",
+        "attempt_nonce": (
             str(getattr(manifest, "delivery_attempt_nonce"))
             if attempt_nonce is None
             else attempt_nonce
         ),
-        capability=capability,
-        delivery_material_version=delivery_material_version,
-        finance_delivery_material_sha256=(
+        "capability": capability,
+        "delivery_material_version": delivery_material_version,
+        "delivery_material_sha256": (
             str(getattr(manifest, "finance_delivery_material_sha256"))
             if material_sha256 is None
             else material_sha256
         ),
-        provider_message_id=provider_message_id,
-        receipt_token_sha256=(
+        "provider_message_id": provider_message_id,
+        "receipt_token_sha256": (
             hashlib.sha256(
                 f"receipt:{delivery_attempt_public_id}:{provider_message_id}".encode()
             ).hexdigest()
             if receipt_token_sha256 is None
             else receipt_token_sha256
         ),
-        channel=channel,
-        account_id=context.account_id if account_id is None else account_id,
-        conversation_id=(context.conversation_id if conversation_id is None else conversation_id),
-        session_key=context.binding_id if session_key is None else session_key,
-        source_identity_sha256=source_identity_sha256,
+        "channel": channel,
+        "account_id": context.account_id if account_id is None else account_id,
+        "conversation_id": (
+            context.conversation_id if conversation_id is None else conversation_id
+        ),
+        "session_key": context.binding_id if session_key is None else session_key,
+        "source_identity_sha256": source_identity_sha256,
+    }
+    signing_key = b"i" * 32
+    return record_posting_review_delivery(
+        conn,
+        receipt=authenticate_delivery_receipt(
+            signing_key=signing_key,
+            receipt_proof_sha256_value=receipt_proof_sha256(
+                signing_key=signing_key,
+                **fields,
+            ),
+            **fields,
+        ),
         clock=lambda: now,
     )
 
@@ -425,6 +464,29 @@ def test_delivery_material_shared_golden_vector() -> None:
     )
     assert finance_delivery_material_digest("D2 test €", mutated) != (
         "33133daf947b4c35586040a8d9aa702ffe2da8f7336723ab6e2c481bab9cd290"
+    )
+
+
+def test_delivery_writer_refuses_raw_field_only_module_call() -> None:
+    conn = _connection()
+    with pytest.raises(TypeError):
+        record_posting_review_delivery(  # type: ignore[call-arg]
+            conn,
+            attempt_nonce="d2nonce_" + "1" * 32,
+            capability="telegram.finance-delivery-material-v1",
+            delivery_material_version="finance_d2_delivery_material_v1",
+            finance_delivery_material_sha256="2" * 64,
+            provider_message_id=1,
+            receipt_token_sha256="3" * 64,
+            channel="telegram",
+            account_id="acct",
+            conversation_id="111",
+            session_key="binding",
+            source_identity_sha256="4" * 64,
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
     )
 
 
@@ -518,6 +580,70 @@ def test_initial_review_accepts_description_when_merchant_is_unset() -> None:
     )
     assert "Merchant: Not specified" in review.presentation_text
     assert "Description: Lunch" in review.presentation_text
+
+
+def test_description_only_initial_card_recovers_one_final_transaction() -> None:
+    conn = _connection()
+    proposal_public_id = _seed_initial_text(conn)
+    row = conn.execute(
+        "SELECT parsed_payload FROM parser_outputs WHERE public_id = ?",
+        (proposal_public_id,),
+    ).fetchone()
+    payload = json.loads(str(row[0]))
+    payload["merchant"] = None
+    conn.execute(
+        "UPDATE parser_outputs SET parsed_payload = ? WHERE public_id = ?",
+        (json.dumps(payload), proposal_public_id),
+    )
+    conn.commit()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-initial-description-only-final",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-description-only-key",
+        context=context,
+        clock=lambda: 1001,
+    )
+    _record_delivery(
+        conn,
+        manifest=manifest,
+        context=context,
+        provider_message_id=901,
+        now=1002,
+    )
+    confirm = next(control for control in manifest.controls if control.action == "confirm")
+    confirmed = confirm_and_post(
+        conn,
+        key=b"d2-description-only-key",
+        reference=confirm.callback_value.removeprefix("post:"),
+        context=context,
+        callback_id="description-only-confirm",
+        callback_message_id=901,
+        clock=lambda: 1003,
+    )
+    assert confirmed.state == "finalized"
+    assert confirmed.merchant == ""
+    assert confirmed.transaction_public_id is not None
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert status.state == "finalized"
+    assert status.transaction_public_id == confirmed.transaction_public_id
+    resumed = resume_posting(
+        conn,
+        attempt_public_id=str(confirmed.attempt_public_id),
+        context=context,
+    )
+    assert resumed.state == "finalized"
+    assert resumed.transaction_public_id == confirmed.transaction_public_id
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert conn.execute("SELECT merchant FROM transactions").fetchone()[0] is None
 
 
 @pytest.mark.parametrize(

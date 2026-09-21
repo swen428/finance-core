@@ -35,6 +35,7 @@ import type { BridgeRunner } from "../src/controller.js";
 import type {
   FinanceDeliveryMaterialV1,
   FinanceDeliveryReceiptConsumerV1,
+  FinanceDeliveryReceiptRecorder,
 } from "../src/delivery-receipt.js";
 import { computeBuildSourceIdentityV1 } from "../src/artifact-hash-v1.js";
 import { HandoffPublisher } from "../src/handoff.js";
@@ -286,6 +287,7 @@ const dependencies: RegistrationDependencies = {
   },
   createRunner() {
     return {
+      async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
       async recordFinanceDeliveryReceipt(_material: FinanceDeliveryMaterialV1): Promise<void> {},
       async run(request: BridgeRequest): Promise<BridgeResponse> {
         return {
@@ -423,6 +425,7 @@ test("host-owned Finance delivery receipt is consumed once by the closed Python 
     ...dependencies,
     createRunner() {
       return {
+        async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
         async recordFinanceDeliveryReceipt(material: FinanceDeliveryMaterialV1) {
           recorded.push(material);
         },
@@ -894,7 +897,9 @@ test("cross-path build removes its staging directory when a required build fails
 test("registration injects the typed host runtime into one inbound fallback call", async () => {
   const fixture = fakeApi();
   const runnerRequests: BridgeRequest[] = [];
-  const runner: BridgeRunner = {
+  const runner: BridgeRunner & FinanceDeliveryReceiptRecorder = {
+    async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+    async recordFinanceDeliveryReceipt(): Promise<void> {},
     async run(request) {
       runnerRequests.push(request);
       if (request.command === "health") {
@@ -1071,7 +1076,9 @@ test("registered inbound claim routes one whole card without model or intake fal
   const card0 = `d1card_${"a".repeat(32)}`;
   const card1 = `d1card_${"b".repeat(32)}`;
   const proposal = `po_d1_${"c".repeat(32)}`;
-  const runner: BridgeRunner = {
+  const runner: BridgeRunner & FinanceDeliveryReceiptRecorder = {
+    async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+    async recordFinanceDeliveryReceipt(): Promise<void> {},
     async run(request) {
       requests.push(request);
       if (request.command === "health") {

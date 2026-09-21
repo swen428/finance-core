@@ -19,6 +19,7 @@ export interface FinanceDeliveryReceiptV1 {
 }
 export type FinanceDeliveryReceiptConsumerV1 = (receipt: FinanceDeliveryReceiptV1) => void | Promise<void>;
 export interface FinanceDeliveryReceiptRecorder {
+    validateFinanceDeliveryReceiptCapability(deadlineMs: number): Promise<void>;
     recordFinanceDeliveryReceipt(material: FinanceDeliveryMaterialV1, deadlineMs: number): Promise<void>;
 }
 export type FinanceDeliveryPluginApi = OpenClawPluginApi & {

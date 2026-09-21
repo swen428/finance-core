@@ -1,4 +1,4 @@
-"""D2 Bridge orchestration tests using only synthetic staging workspaces."""
+"""Reusable D2 Bridge orchestration cases collected by the existing suite."""
 
 from __future__ import annotations
 
@@ -13,10 +13,15 @@ import pytest
 
 from finance_core.openclaw_staging_bridge import delivery_receipt_cli
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    PROOF_VERSION,
+    receipt_proof_sha256,
+)
 from finance_core.parser_proposals import human_drafts
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 from finance_core.parser_proposals.human_revision import publish_human_revision_in_transaction
+from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     record_telegram_source_context,
@@ -170,6 +175,97 @@ def _context(workspace: support.BridgeWorkspace) -> dict[str, object]:
     }
 
 
+def _delivery_receipt_payload(
+    workspace: support.BridgeWorkspace,
+    manifest: dict[str, object],
+    *,
+    provider_message_id: str,
+    receipt_token_sha256: str,
+    source_identity_sha256: str,
+) -> dict[str, object]:
+    fields = {
+        "workspace_path": str(workspace.workspace_path),
+        "attempt_nonce": manifest["delivery_attempt_nonce"],
+        "capability": "telegram.finance-delivery-material-v1",
+        "delivery_material_version": "finance_d2_delivery_material_v1",
+        "delivery_material_sha256": manifest["finance_delivery_material_sha256"],
+        "provider_message_id": provider_message_id,
+        "receipt_token_sha256": receipt_token_sha256,
+        "channel": "telegram",
+        "account_id": ACCOUNT,
+        "conversation_id": CONVERSATION,
+        "session_key": BINDING,
+        "source_identity_sha256": source_identity_sha256,
+    }
+    signing_key = load_delivery_receipt_signing_key(str(workspace.workspace_path / "runtime"))
+    return {
+        **fields,
+        "receipt_proof_version": PROOF_VERSION,
+        "receipt_proof_sha256": receipt_proof_sha256(
+            signing_key=signing_key,
+            **fields,
+        ),
+    }
+
+
+def test_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    card_id, _proposal_id, _version, _content_hash, _batch_id = _published_text_card(
+        workspace, monkeypatch
+    )
+    context = _context(workspace)
+    prepared = support.run_cli(
+        support.make_request(
+            "prepare_posting_review",
+            {**context, "card_generation_public_id": card_id},
+            idempotency_key=support.canonical_prepare_posting_review_key(card_id),
+        )
+    )
+    review_id = str(prepared.response["result"]["review_public_id"])
+    issued = support.run_cli(
+        support.make_request(
+            "issue_posting_review_actions",
+            {**context, "posting_review_public_id": review_id},
+            idempotency_key=support.canonical_issue_posting_review_actions_key(review_id),
+        )
+    )
+    manifest = issued.response["result"]
+    raw_fields = {
+        "workspace_path": str(workspace.workspace_path),
+        "attempt_nonce": manifest["delivery_attempt_nonce"],
+        "capability": "telegram.finance-delivery-material-v1",
+        "delivery_material_version": "finance_d2_delivery_material_v1",
+        "delivery_material_sha256": manifest["finance_delivery_material_sha256"],
+        "provider_message_id": "299",
+        "receipt_token_sha256": hashlib.sha256(b"forged-receipt").hexdigest(),
+        "channel": "telegram",
+        "account_id": ACCOUNT,
+        "conversation_id": CONVERSATION,
+        "session_key": BINDING,
+        "source_identity_sha256": "f" * 64,
+    }
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    assert (
+        delivery_receipt_cli.execute_stream(
+            io.BytesIO(json.dumps(raw_fields).encode()), stdout, stderr
+        )
+        == bridge_errors.EXIT_AUTHORITY_REFUSED
+    )
+    conn = support.open_database(workspace)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[
+                0
+            ]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
 def test_one_confirm_posts_once_and_status_recovers_same_result(
     workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
@@ -217,24 +313,13 @@ def test_one_confirm_posts_once_and_status_recovers_same_result(
     receipt_exit = delivery_receipt_cli.execute_stream(
         io.BytesIO(
             json.dumps(
-                {
-                    "workspace_path": str(workspace.workspace_path),
-                    "attempt_nonce": manifest["delivery_attempt_nonce"],
-                    "capability": "telegram.finance-delivery-material-v1",
-                    "delivery_material_version": "finance_d2_delivery_material_v1",
-                    "delivery_material_sha256": manifest[
-                        "finance_delivery_material_sha256"
-                    ],
-                    "provider_message_id": "200",
-                    "receipt_token_sha256": hashlib.sha256(
-                        b"bridge-receipt-200"
-                    ).hexdigest(),
-                    "channel": "telegram",
-                    "account_id": ACCOUNT,
-                    "conversation_id": CONVERSATION,
-                    "session_key": BINDING,
-                    "source_identity_sha256": "b" * 64,
-                }
+                _delivery_receipt_payload(
+                    workspace,
+                    manifest,
+                    provider_message_id="200",
+                    receipt_token_sha256=hashlib.sha256(b"bridge-receipt-200").hexdigest(),
+                    source_identity_sha256="b" * 64,
+                )
             ).encode()
         ),
         receipt_stdout,
@@ -345,9 +430,7 @@ def test_personal_total_receipt_uses_python_card_and_posts_once(
                 "proposal_public_id": proposal_public_id,
                 "admitted_source_message_id": "78",
             },
-            idempotency_key=(
-                f"bridge-d2-prepare-initial:{proposal_public_id}:78"
-            ),
+            idempotency_key=(f"bridge-d2-prepare-initial:{proposal_public_id}:78"),
         )
     )
     assert prepared.exit_code == bridge_errors.EXIT_OK, prepared.response
@@ -394,24 +477,13 @@ def test_personal_total_receipt_uses_python_card_and_posts_once(
     receipt_exit = delivery_receipt_cli.execute_stream(
         io.BytesIO(
             json.dumps(
-                {
-                    "workspace_path": str(workspace.workspace_path),
-                    "attempt_nonce": manifest["delivery_attempt_nonce"],
-                    "capability": "telegram.finance-delivery-material-v1",
-                    "delivery_material_version": "finance_d2_delivery_material_v1",
-                    "delivery_material_sha256": manifest[
-                        "finance_delivery_material_sha256"
-                    ],
-                    "provider_message_id": "930",
-                    "receipt_token_sha256": hashlib.sha256(
-                        b"bridge-receipt-930"
-                    ).hexdigest(),
-                    "channel": "telegram",
-                    "account_id": ACCOUNT,
-                    "conversation_id": CONVERSATION,
-                    "session_key": BINDING,
-                    "source_identity_sha256": "c" * 64,
-                }
+                _delivery_receipt_payload(
+                    workspace,
+                    manifest,
+                    provider_message_id="930",
+                    receipt_token_sha256=hashlib.sha256(b"bridge-receipt-930").hexdigest(),
+                    source_identity_sha256="c" * 64,
+                )
             ).encode()
         ),
         receipt_stdout,
@@ -441,21 +513,15 @@ def test_personal_total_receipt_uses_python_card_and_posts_once(
     try:
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
         assert (
-            conn.execute(
-                "SELECT COUNT(*) FROM receipt_item_allocation_fact_sets"
-            ).fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM receipt_item_allocation_fact_sets").fetchone()[0]
             == 1
         )
         assert (
-            conn.execute(
-                "SELECT COUNT(*) FROM authoritative_calculation_snapshots"
-            ).fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM authoritative_calculation_snapshots").fetchone()[0]
             == 1
         )
         assert (
-            conn.execute(
-                "SELECT COUNT(*) FROM d2_conditional_authorization_proofs"
-            ).fetchone()[0]
+            conn.execute("SELECT COUNT(*) FROM d2_conditional_authorization_proofs").fetchone()[0]
             == 1
         )
     finally:

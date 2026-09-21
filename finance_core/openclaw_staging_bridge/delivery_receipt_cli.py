@@ -14,6 +14,12 @@ from typing import BinaryIO, TextIO
 
 from finance_core import posting_authority
 from finance_core.openclaw_staging_bridge import workspace_access
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    PROOF_VERSION,
+    authenticate_delivery_receipt,
+)
+from finance_core.receipt_staging_runner.models import RunnerWorkspaceError
+from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 
 MAX_REQUEST_BYTES = 16_384
 MAX_RESPONSE_BYTES = 1_024
@@ -32,6 +38,8 @@ _FIELDS = frozenset(
         "conversation_id",
         "session_key",
         "source_identity_sha256",
+        "receipt_proof_version",
+        "receipt_proof_sha256",
     }
 )
 
@@ -55,21 +63,32 @@ def execute_stream(stdin: BinaryIO, stdout: TextIO, stderr: TextIO) -> int:
             raise ValueError("shape")
         workspace = workspace_access.validate_workspace_path(payload["workspace_path"])
         workspace_access.verify_workspace_structure(workspace)
+        if payload["receipt_proof_version"] != PROOF_VERSION:
+            raise ValueError("proof version")
+        proof_fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": payload["attempt_nonce"],
+            "capability": payload["capability"],
+            "delivery_material_version": payload["delivery_material_version"],
+            "delivery_material_sha256": payload["delivery_material_sha256"],
+            "provider_message_id": payload["provider_message_id"],
+            "receipt_token_sha256": payload["receipt_token_sha256"],
+            "channel": payload["channel"],
+            "account_id": payload["account_id"],
+            "conversation_id": payload["conversation_id"],
+            "session_key": payload["session_key"],
+            "source_identity_sha256": payload["source_identity_sha256"],
+        }
+        receipt = authenticate_delivery_receipt(
+            signing_key=load_delivery_receipt_signing_key(str(workspace / "runtime")),
+            receipt_proof_sha256_value=payload["receipt_proof_sha256"],
+            **proof_fields,
+        )
         conn = workspace_access.open_workspace_database(workspace)
         try:
             observation_public_id = posting_authority.record_posting_review_delivery(
                 conn,
-                attempt_nonce=payload["attempt_nonce"],
-                capability=payload["capability"],
-                delivery_material_version=payload["delivery_material_version"],
-                finance_delivery_material_sha256=payload["delivery_material_sha256"],
-                provider_message_id=payload["provider_message_id"],
-                receipt_token_sha256=payload["receipt_token_sha256"],
-                channel=payload["channel"],
-                account_id=payload["account_id"],
-                conversation_id=payload["conversation_id"],
-                session_key=payload["session_key"],
-                source_identity_sha256=payload["source_identity_sha256"],
+                receipt=receipt,
             )
         finally:
             conn.close()
@@ -77,7 +96,13 @@ def execute_stream(stdin: BinaryIO, stdout: TextIO, stderr: TextIO) -> int:
             stdout,
             {"observation_public_id": observation_public_id, "status": "ok"},
         )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        TypeError,
+        RunnerWorkspaceError,
+    ):
         stderr.write("delivery receipt request refused\n")
         return 6
     except posting_authority.PostingAuthorityError:

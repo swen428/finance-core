@@ -362,9 +362,7 @@ def _projection_for_review(
     else:
         payer = receipt_payer_participant_public_id.strip()
         if not payer:
-            raise PostingAuthorityError(
-                "personal receipt payer participant must not be empty"
-            )
+            raise PostingAuthorityError("personal receipt payer participant must not be empty")
     _require_active_self_participant(conn, payer)
     candidate: dict[str, object] = {
         "payer_participant_public_id": payer,
@@ -1261,20 +1259,29 @@ def _require_current_review(conn: sqlite3.Connection, review: sqlite3.Row, *, no
 def record_posting_review_delivery(
     conn: sqlite3.Connection,
     *,
-    attempt_nonce: str,
-    capability: str,
-    delivery_material_version: str,
-    finance_delivery_material_sha256: str,
-    provider_message_id: int | str,
-    receipt_token_sha256: str,
-    channel: str,
-    account_id: str,
-    conversation_id: str,
-    session_key: str,
-    source_identity_sha256: str,
+    receipt: object,
     clock: Callable[[], int] = _now_epoch,
 ) -> str:
     """Record material exposed only while consuming one host-owned receipt."""
+    from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+        require_verified_delivery_receipt,
+    )
+
+    try:
+        verified = require_verified_delivery_receipt(receipt)
+    except ValueError as exc:
+        raise PostingAuthorityError("host-authenticated delivery receipt is required") from exc
+    attempt_nonce = verified.attempt_nonce
+    capability = verified.capability
+    delivery_material_version = verified.delivery_material_version
+    finance_delivery_material_sha256 = verified.delivery_material_sha256
+    provider_message_id = verified.provider_message_id
+    receipt_token_sha256 = verified.receipt_token_sha256
+    channel = verified.channel
+    account_id = verified.account_id
+    conversation_id = verified.conversation_id
+    session_key = verified.session_key
+    source_identity_sha256 = verified.source_identity_sha256
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
@@ -2881,12 +2888,14 @@ def get_status(
                         currency,
                     )
                     transaction_date = str(transaction["transaction_date"] or "")[:10]
-                    merchant = str(transaction["merchant"] or "")
+                    authoritative_merchant = (
+                        None if transaction["merchant"] is None else str(transaction["merchant"])
+                    )
                     if (
                         projection.get("amount") != amount
                         or projection.get("currency") != currency
                         or projection.get("transaction_date") != transaction_date
-                        or projection.get("merchant") != merchant
+                        or projection.get("merchant") != authoritative_merchant
                         or projection.get("account") != "unspecified"
                         or transaction["account_id"] is not None
                     ):
@@ -2894,6 +2903,7 @@ def get_status(
                 except (TypeError, ValueError, json.JSONDecodeError):
                     integrity_error = True
                 else:
+                    merchant = authoritative_merchant or ""
                     return PostingStatus(
                         review_public_id=review_public_id,
                         state="finalized",

@@ -29,6 +29,7 @@ export type FinanceDeliveryReceiptConsumerV1 = (
 ) => void | Promise<void>;
 
 export interface FinanceDeliveryReceiptRecorder {
+  validateFinanceDeliveryReceiptCapability(deadlineMs: number): Promise<void>;
   recordFinanceDeliveryReceipt(
     material: FinanceDeliveryMaterialV1,
     deadlineMs: number,

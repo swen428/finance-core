@@ -19,6 +19,11 @@ import type {
   FinanceDeliveryMaterialV1,
   FinanceDeliveryReceiptRecorder,
 } from "./delivery-receipt.js";
+import {
+  FINANCE_DELIVERY_RECEIPT_PROOF_VERSION,
+  financeDeliveryReceiptProofProvider,
+  type FinanceDeliveryReceiptProofProvider,
+} from "./delivery-receipt-proof.js";
 
 const DEFAULT_REAP_GRACE_MS = 1_000;
 const CORE_CLI_BOOTSTRAP = [
@@ -196,7 +201,42 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     private readonly markUnhealthy: () => void = () => undefined,
     private readonly revalidateExecutable: RevalidatePythonExecutable =
       revalidateRuntimeForSpawn,
+    private readonly receiptProofProvider: FinanceDeliveryReceiptProofProvider =
+      financeDeliveryReceiptProofProvider,
   ) {}
+
+  private async boundedReceiptPreparation<T>(
+    operation: Promise<T>,
+    deadlineMs: number,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(processFailure("BRIDGE_PROCESS_TIMEOUT")),
+            deadlineMs,
+          );
+        }),
+      ]);
+    } catch (error) {
+      if (error instanceof BridgeProcessFailure) throw error;
+      throw processFailure("BRIDGE_PROCESS_STARTUP_FAILED");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  async validateFinanceDeliveryReceiptCapability(deadlineMs: number): Promise<void> {
+    if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > 30_000) {
+      throw new Error("Delivery receipt deadline must be an integer from 1 through 30000 milliseconds.");
+    }
+    await this.boundedReceiptPreparation(Promise.all([
+      this.revalidateExecutable(this.config),
+      this.receiptProofProvider.validate(this.config),
+    ]).then(() => undefined), deadlineMs);
+  }
 
   async recordFinanceDeliveryReceipt(
     material: FinanceDeliveryMaterialV1,
@@ -206,9 +246,15 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > 30_000) {
       throw new Error("Delivery receipt deadline must be an integer from 1 through 30000 milliseconds.");
     }
-    await this.revalidateExecutable(this.config).catch(() => {
-      throw processFailure("BRIDGE_PROCESS_STARTUP_FAILED");
-    });
+    if (!Number.isSafeInteger(this.reapGraceMs) || this.reapGraceMs <= 0 ||
+        this.reapGraceMs > DEFAULT_REAP_GRACE_MS) {
+      throw new Error("Bridge reap grace is invalid.");
+    }
+    const expiresAt = performance.now() + deadlineMs;
+    const receiptProofSha256 = await this.boundedReceiptPreparation(Promise.all([
+      this.revalidateExecutable(this.config),
+      this.receiptProofProvider.authenticate(this.config, material),
+    ]).then(([, proof]) => proof), deadlineMs);
     const input = Buffer.from(JSON.stringify({
       workspace_path: this.config.workspaceRoot,
       attempt_nonce: material.attemptNonce,
@@ -222,8 +268,11 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
       conversation_id: material.conversationId,
       session_key: material.sessionKey,
       source_identity_sha256: material.sourceIdentitySha256,
+      receipt_proof_version: FINANCE_DELIVERY_RECEIPT_PROOF_VERSION,
+      receipt_proof_sha256: receiptProofSha256,
     }));
     if (input.byteLength > 16_384) throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
+    if (performance.now() >= expiresAt) throw processFailure("BRIDGE_PROCESS_TIMEOUT");
     const child = this.spawn(
       this.config.pythonExecutable,
       ["-I", "-B", "-c", DELIVERY_RECEIPT_CLI_BOOTSTRAP, this.config.coreDistributionRoot],
@@ -245,55 +294,80 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     await new Promise<void>((resolve, reject) => {
       const stdout: Buffer[] = [];
       let stdoutBytes = 0;
+      let terminalError: Error | undefined;
       let settled = false;
-      const timer = setTimeout(() => {
-        if (settled) return;
-        child.kill("SIGTERM");
-        finish(() => reject(processFailure("BRIDGE_PROCESS_TIMEOUT")));
-      }, deadlineMs);
-      const finish = (callback: () => void): void => {
-        if (settled) return;
-        settled = true;
+      let killTimer: NodeJS.Timeout | undefined;
+      let reapTimer: NodeJS.Timeout | undefined;
+      const clearTimers = (): void => {
         clearTimeout(timer);
-        callback();
+        if (killTimer !== undefined) clearTimeout(killTimer);
+        if (reapTimer !== undefined) clearTimeout(reapTimer);
       };
+      const terminate = (error: Error): void => {
+        if (terminalError !== undefined || settled) return;
+        terminalError = error;
+        child.kill("SIGTERM");
+        killTimer = setTimeout(() => {
+          if (settled) return;
+          child.kill("SIGKILL");
+          reapTimer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            this.poisoned = true;
+            this.markUnhealthy();
+            clearTimers();
+            reject(processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT"));
+          }, this.reapGraceMs);
+        }, this.reapGraceMs);
+      };
+      const timer = setTimeout(
+        () => terminate(processFailure("BRIDGE_PROCESS_TIMEOUT")),
+        Math.max(0, Math.floor(expiresAt - performance.now())),
+      );
       child.stdout.on("data", (value: Buffer | string) => {
         const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
         stdoutBytes = appendBounded(stdout, chunk, stdoutBytes, 1_024);
         if (stdoutBytes > 1_024) {
-          child.kill("SIGTERM");
-          finish(() => reject(processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT")));
+          terminate(processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT"));
         }
       });
       child.stderr.on("data", (value: Buffer | string) => { void value; });
       child.stdin.on("error", () => {
-        finish(() => reject(processFailure("BRIDGE_PROCESS_IO_FAILURE")));
+        terminate(processFailure("BRIDGE_PROCESS_IO_FAILURE"));
       });
       child.once("error", () => {
-        finish(() => reject(processFailure("BRIDGE_PROCESS_STARTUP_FAILED")));
+        if (settled) return;
+        settled = true;
+        clearTimers();
+        reject(processFailure("BRIDGE_PROCESS_STARTUP_FAILED"));
       });
       child.once("close", (code, signal) => {
-        finish(() => {
-          if (signal !== null || code !== 0) {
-            reject(processFailure("BRIDGE_PROCESS_NONZERO_UNVERIFIED"));
-            return;
+        if (settled) return;
+        settled = true;
+        clearTimers();
+        if (terminalError !== undefined) {
+          reject(terminalError);
+          return;
+        }
+        if (signal !== null || code !== 0) {
+          reject(processFailure("BRIDGE_PROCESS_NONZERO_UNVERIFIED"));
+          return;
+        }
+        try {
+          const response = JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown;
+          if (typeof response !== "object" || response === null || Array.isArray(response) ||
+              Object.keys(response).sort().join(",") !== "observation_public_id,status" ||
+              (response as {status?: unknown}).status !== "ok" ||
+              typeof (response as {observation_public_id?: unknown}).observation_public_id !== "string" ||
+              !/^d2dobs_[0-9a-f]{32}$/u.test(
+                (response as {observation_public_id: string}).observation_public_id,
+              )) {
+            throw new Error("invalid response");
           }
-          try {
-            const response = JSON.parse(Buffer.concat(stdout).toString("utf8")) as unknown;
-            if (typeof response !== "object" || response === null || Array.isArray(response) ||
-                Object.keys(response).sort().join(",") !== "observation_public_id,status" ||
-                (response as {status?: unknown}).status !== "ok" ||
-                typeof (response as {observation_public_id?: unknown}).observation_public_id !== "string" ||
-                !/^d2dobs_[0-9a-f]{32}$/u.test(
-                  (response as {observation_public_id: string}).observation_public_id,
-                )) {
-              throw new Error("invalid response");
-            }
-            resolve();
-          } catch {
-            reject(processFailure("BRIDGE_PROCESS_PROTOCOL_INVALID"));
-          }
-        });
+          resolve();
+        } catch {
+          reject(processFailure("BRIDGE_PROCESS_PROTOCOL_INVALID"));
+        }
       });
       child.stdin.end(input);
     });

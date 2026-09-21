@@ -132,8 +132,13 @@ export function registerFinanceBridge(
     const runner = dependencies.createRunner(config, () => { healthy = false; });
     const recorder = runner as BridgeRunner & Partial<FinanceDeliveryReceiptRecorder>;
     deliveryReceiptRecorder = typeof recorder.recordFinanceDeliveryReceipt === "function"
+      && typeof recorder.validateFinanceDeliveryReceiptCapability === "function"
       ? recorder as BridgeRunner & FinanceDeliveryReceiptRecorder
       : undefined;
+    if (deliveryReceiptRecorder === undefined) {
+      throw new Error("Finance delivery receipt recorder is unavailable.");
+    }
+    await deliveryReceiptRecorder.validateFinanceDeliveryReceiptCapability(30_000);
     const health = await runner.run(createBridgeRequest(
       "health",
       { workspace_path: config.workspaceRoot },

@@ -52,6 +52,9 @@ personal-total receipt cards. The Bridge renders Python-owned projections,
 uses one Confirm action, reports Posted only with a verified canonical
 transaction ID, and recovers lost responses without creating a second
 authorization or transaction. It does not activate or upgrade a runtime.
+New workspaces receive a separate mode-0600 delivery-receipt signing key;
+an existing workspace fails closed until that key is provisioned during a
+separately authorized runtime upgrade.
 
 Version 0.1.3 completes the bounded D1 whole-card Bridge routing flow. It
 parses and renders bilingual whole cards, routes reply-bound edits through the
