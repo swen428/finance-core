@@ -17,6 +17,9 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "build_release_manifest.py"
+MIGRATION_DIGEST = json.loads(
+    (REPOSITORY_ROOT / "finance_core/resources/migration-contract-v1.json").read_text()
+)["migration_ledger_digest"]
 
 
 def _manifest_command(
@@ -276,7 +279,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
 
 def test_release_manifest_accepts_and_binds_inspected_exact_artifacts(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
-    migration_digest = "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"
+    migration_digest = MIGRATION_DIGEST
 
     completed = subprocess.run(
         _manifest_command(
@@ -332,7 +335,7 @@ def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -365,7 +368,7 @@ def test_release_manifest_rejects_modified_build_metadata(tmp_path: Path) -> Non
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -392,7 +395,7 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -436,7 +439,7 @@ def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -460,7 +463,7 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -474,15 +477,13 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
     "mutate",
     [
         lambda payload: payload.replace(
-            b'"migration_ledger_digest": "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9'
-            b'ee70857d95bf74ef47369af7"',
-            b'"migration_ledger_digest": "0000000000000000000000000000000000000000000'
-            b'000000000000000000000"',
+            f'"migration_ledger_digest": "{MIGRATION_DIGEST}"'.encode(),
+            b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
         lambda payload: payload.replace(
-            b'    "048_d1_human_ai_lineage_transition.sql",\n'
+            b'    "049_d2_one_confirmation_posting.sql",\n'
+            b'    "050_d2_initial_card_delivery_authority.sql"\n',
             b'    "049_d2_one_confirmation_posting.sql"\n',
-            b'    "048_d1_human_ai_lineage_transition.sql"\n',
         ),
     ],
 )
@@ -503,7 +504,7 @@ def test_release_manifest_rejects_stale_wheel_migration_contract(
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -546,7 +547,7 @@ def test_release_manifest_rejects_non_data_migration_contract(
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -586,7 +587,7 @@ def test_release_manifest_rejects_unapproved_python_metadata_header(tmp_path: Pa
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -616,7 +617,7 @@ def test_release_manifest_rejects_sdist_sources_inventory_drift(tmp_path: Path) 
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -645,7 +646,7 @@ def test_release_manifest_rejects_bridge_payload_not_in_exact_source(tmp_path: P
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,
@@ -676,7 +677,7 @@ def test_release_manifest_rejects_dirty_compiled_bridge_output(tmp_path: Path) -
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest=("aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7"),
+            migration_digest=MIGRATION_DIGEST,
         ),
         capture_output=True,
         text=True,

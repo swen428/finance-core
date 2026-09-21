@@ -2061,22 +2061,22 @@ def _verify_inherited_completion_evidence(
 # ---------------------------------------------------------------------------
 
 
-def _require_complete_inputs(
+def resolve_receipt_conversion_payload_fields(
     conn: sqlite3.Connection,
-    command: ReceiptFactsConversionCommand,
-    entries: list[tuple[str, int]],
-    effective: dict[str, Any],
-) -> dict[str, Any]:
-    _require_supported_metadata(effective)
+    effective: Mapping[str, Any],
+) -> dict[str, str]:
+    """Apply the receipt conversion's read-only payload field guards."""
+    payload = dict(effective)
+    _require_supported_metadata(payload)
 
-    merchant = effective.get("merchant")
+    merchant = payload.get("merchant")
     if not isinstance(merchant, str) or not merchant.strip():
         raise IncompleteReceiptInputsError(
             "Effective proposal has no merchant; receipts.merchant is required"
         )
     merchant = merchant.strip()
 
-    currency_value = effective.get("currency")
+    currency_value = payload.get("currency")
     if not isinstance(currency_value, str):
         raise IncompleteReceiptInputsError(
             "Effective proposal has no currency; a supported currency is required"
@@ -2088,7 +2088,7 @@ def _require_complete_inputs(
             f"Effective proposal currency failed the Money Contract: {exc}"
         ) from exc
 
-    amount_value = effective.get("amount")
+    amount_value = payload.get("amount")
     if amount_value is None:
         raise IncompleteReceiptInputsError(
             "Effective proposal has no amount; receipts.net_paid_amount is required"
@@ -2101,7 +2101,21 @@ def _require_complete_inputs(
         ) from exc
     _require_exact_monetary_representation(conn, canonical_amount)
 
-    receipt_date = _validate_receipt_date(effective.get("transaction_date"))
+    return {
+        "merchant": merchant,
+        "currency": currency,
+        "canonical_amount": canonical_amount,
+        "receipt_date": _validate_receipt_date(payload.get("transaction_date")),
+    }
+
+
+def _require_complete_inputs(
+    conn: sqlite3.Connection,
+    command: ReceiptFactsConversionCommand,
+    entries: list[tuple[str, int]],
+    effective: dict[str, Any],
+) -> dict[str, Any]:
+    payload_fields = resolve_receipt_conversion_payload_fields(conn, effective)
 
     resolved_entries: list[dict[str, Any]] = []
     payer_participant_id: int | None = None
@@ -2132,10 +2146,7 @@ def _require_complete_inputs(
         raise AmbiguousReceiptInputError("The payer could not be resolved to a known participant")
 
     return {
-        "merchant": merchant,
-        "currency": currency,
-        "canonical_amount": canonical_amount,
-        "receipt_date": receipt_date,
+        **payload_fields,
         "payer_participant_id": payer_participant_id,
         "resolved_entries": resolved_entries,
     }
@@ -2988,4 +2999,5 @@ __all__ = [
     "convert_confirmed_receipt_proposal_to_facts",
     "decimal_from_numeric_mirror",
     "derive_receipt_public_id",
+    "resolve_receipt_conversion_payload_fields",
 ]

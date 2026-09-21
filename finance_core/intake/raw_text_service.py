@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from finance_core.intake.raw_text_repository import (
     TELEGRAM_TEXT,
@@ -23,6 +23,7 @@ def process_raw_text_input(
     source_channel: str | None = None,
     source_metadata: Mapping[str, Any] | None = None,
     received_at: datetime | str | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Persist raw text intake and parser proposal without finalizing records."""
     with conn:
@@ -47,6 +48,9 @@ def process_raw_text_input(
                 proposal,
             )
         updated_intake_record = get_raw_intake_record(conn, intake_record["id"])
+        assert updated_intake_record is not None
+        if persistence_effect is not None:
+            persistence_effect(conn, updated_intake_record)
 
     return {
         "intake": updated_intake_record,

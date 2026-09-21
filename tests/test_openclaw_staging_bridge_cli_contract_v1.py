@@ -398,6 +398,56 @@ class TestGetStatus:
 
 
 class TestCaptureText:
+    def test_capture_freezes_complete_d2_source_context(
+        self, workspace: support.BridgeWorkspace
+    ) -> None:
+        update = support.telegram_text_update("coffee 6.40")
+        arguments = support.capture_text_arguments(workspace, update)
+        arguments.update(
+            {
+                "authenticated_actor_id": "111",
+                "telegram_account_id": "finance-bot",
+                "telegram_conversation_id": "111",
+                "conversation_binding_id": "session-111",
+            }
+        )
+        request = support.make_request(
+            "capture",
+            arguments,
+            idempotency_key=support.canonical_capture_key(message_id=10),
+        )
+        first = support.run_cli(request)
+        replay = support.run_cli(request)
+        assert first.exit_code == bridge_errors.EXIT_OK
+        assert replay.exit_code == bridge_errors.EXIT_OK
+        assert replay.response["idempotent_replay"] is True
+
+        conn = support.open_database(workspace)
+        try:
+            row = conn.execute("SELECT * FROM d2_telegram_source_contexts").fetchone()
+            assert row is not None
+            assert (
+                row["authenticated_actor_id"],
+                row["telegram_account_id"],
+                row["telegram_conversation_id"],
+                row["conversation_binding_id"],
+                row["source_message_id"],
+            ) == ("111", "finance-bot", "111", "session-111", "10")
+        finally:
+            conn.close()
+
+        conflicting_arguments = dict(arguments)
+        conflicting_arguments["telegram_account_id"] = "other-bot"
+        conflict = support.run_cli(
+            support.make_request(
+                "capture",
+                conflicting_arguments,
+                idempotency_key=support.canonical_capture_key(message_id=10),
+            )
+        )
+        assert conflict.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
+        assert conflict.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
+
     def test_capture_persists_raw_intake_and_proposal(
         self, workspace: support.BridgeWorkspace
     ) -> None:

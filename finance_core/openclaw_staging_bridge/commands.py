@@ -221,6 +221,12 @@ from finance_core.receipt_finalization.stage_read import (
 from finance_core.receipt_staging_runner import workspace as runner_workspace
 from finance_core.receipt_staging_runner.models import CallbackKeyMissingError, RunnerWorkspaceError
 from finance_core.receipt_staging_runner.participants import read_participants
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    TelegramSourceContextError,
+    record_telegram_source_context,
+    require_telegram_source_context,
+)
 
 DEFAULT_DEADLINE_SECONDS = 30.0
 
@@ -926,6 +932,110 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
 # ---------------------------------------------------------------------------
 
 
+_D2_CAPTURE_CONTEXT_FIELDS = frozenset(
+    {
+        "authenticated_actor_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+)
+
+
+def _validated_capture_source_context(
+    arguments: dict[str, Any],
+    *,
+    chat_id: int,
+    message_id: int,
+    sender_id: int | None,
+) -> TelegramSourceContext | None:
+    supplied = frozenset(arguments) & _D2_CAPTURE_CONTEXT_FIELDS
+    if not supplied:
+        return None
+    if supplied != _D2_CAPTURE_CONTEXT_FIELDS:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "D2 capture source context fields must be supplied together.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    actor_id = _require_string(
+        arguments["authenticated_actor_id"],
+        "authenticated_actor_id",
+        max_length=_MAX_ACTOR_ID_LENGTH,
+    )
+    account_id = _require_string(
+        arguments["telegram_account_id"], "telegram_account_id", max_length=200
+    )
+    conversation_id = _require_string(
+        arguments["telegram_conversation_id"],
+        "telegram_conversation_id",
+        max_length=200,
+    )
+    binding_id = _require_string(
+        arguments["conversation_binding_id"],
+        "conversation_binding_id",
+        max_length=500,
+    )
+    if sender_id is None or actor_id != str(sender_id) or conversation_id != str(chat_id):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "D2 capture source context does not match the Telegram message.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    return TelegramSourceContext(
+        authenticated_actor_id=actor_id,
+        account_id=account_id,
+        conversation_id=conversation_id,
+        binding_id=binding_id,
+        message_id=str(message_id),
+    )
+
+
+def _capture_context_effect(
+    source_context: TelegramSourceContext | None,
+) -> Callable[[sqlite3.Connection, dict[str, Any]], None] | None:
+    if source_context is None:
+        return None
+
+    def persist(conn: sqlite3.Connection, intake: dict[str, Any]) -> None:
+        try:
+            record_telegram_source_context(
+                conn,
+                raw_intake_record_id=int(intake["id"]),
+                context=source_context,
+                captured_at=str(intake["received_at"]),
+            )
+        except TelegramSourceContextError as exc:
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Capture source context conflicts with durable intake identity.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
+
+    return persist
+
+
+def _require_replay_source_context(
+    conn: sqlite3.Connection,
+    intake: dict[str, Any],
+    source_context: TelegramSourceContext | None,
+) -> None:
+    if source_context is None:
+        return
+    try:
+        require_telegram_source_context(
+            conn,
+            raw_intake_record_id=int(intake["id"]),
+            context=source_context,
+        )
+    except TelegramSourceContextError as exc:
+        raise errors.bridge_error(
+            errors.IDEMPOTENCY_CONFLICT,
+            "Capture source context conflicts with durable intake identity.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
+
+
 def handle_capture(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     kind = request.arguments.get("kind")
     if kind == "text":
@@ -964,7 +1074,9 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         )
     payload_field = "telegram_update" if has_update else "telegram_message"
     _require_exact_arguments(
-        request.arguments, required=frozenset({"workspace_path", "kind", payload_field})
+        request.arguments,
+        required=frozenset({"workspace_path", "kind", payload_field}),
+        optional=_D2_CAPTURE_CONTEXT_FIELDS,
     )
     payload = request.arguments[payload_field]
     policy_payload = payload if has_update else {"message": payload}
@@ -984,6 +1096,12 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             else errors.ARGUMENTS_REFUSED
         )
         raise errors.bridge_error(code, str(exc), errors.EXIT_VALIDATION_REFUSED) from exc
+    source_context = _validated_capture_source_context(
+        request.arguments,
+        chat_id=validated.chat_id,
+        message_id=validated.message_id,
+        sender_id=validated.sender_id,
+    )
 
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
@@ -1004,15 +1122,20 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                     "Capture idempotency key is already bound to different content.",
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
+            _require_replay_source_context(conn, existing, source_context)
             return _text_capture_result(conn, existing), True
 
         deadline.check("capture persistence")
         try:
-            result = (
-                process_telegram_text_update(conn, payload)
-                if has_update
-                else process_openclaw_telegram_text_message(conn, payload)
-            )
+            persistence_effect = _capture_context_effect(source_context)
+            if has_update:
+                result = process_telegram_text_update(
+                    conn, payload, persistence_effect=persistence_effect
+                )
+            else:
+                result = process_openclaw_telegram_text_message(
+                    conn, payload, persistence_effect=persistence_effect
+                )
         except RawIntakeIdempotencyConflictError as exc:
             raise errors.bridge_error(
                 errors.IDEMPOTENCY_CONFLICT,
@@ -1032,6 +1155,7 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                     "Capture idempotency key is already bound to different content.",
                     errors.EXIT_AUTHORITY_REFUSED,
                 ) from exc
+            _require_replay_source_context(conn, winner, source_context)
             return _text_capture_result(conn, winner), True
         return _text_capture_result(conn, result["intake"]), False
     finally:
@@ -1142,7 +1266,8 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 "declared_mime_type",
                 "caption",
             }
-        ),
+        )
+        | _D2_CAPTURE_CONTEXT_FIELDS,
     )
     arguments = request.arguments
     has_update_id = arguments.get("telegram_update_id") is not None
@@ -1185,6 +1310,12 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
     # mismatches are refused before any persistence.
     telegram_boundary.validate_private_direct_chat(chat_id=chat_id, sender_id=sender_id)
     assert sender_id is not None
+    source_context = _validated_capture_source_context(
+        arguments,
+        chat_id=chat_id,
+        message_id=message_id,
+        sender_id=sender_id,
+    )
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
         request, canonical_capture_key(chat_id=chat_id, message_id=message_id)
@@ -1262,6 +1393,8 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 errors.EXIT_AUTHORITY_REFUSED,
             )
         is_replay = existing is not None
+        if existing is not None:
+            _require_replay_source_context(conn, existing, source_context)
 
         deadline.check("receipt handoff publication")
         handoff_dir = workspace_access.ensure_handoff_directory(workspace)
@@ -1311,6 +1444,9 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                         source_metadata=source_metadata,
                         public_id=identities["raw_intake_public_id"],
                     )
+                    persistence_effect = _capture_context_effect(source_context)
+                    if persistence_effect is not None:
+                        persistence_effect(conn, existing)
             except RawIntakeIdempotencyConflictError as exc:
                 raise errors.bridge_error(
                     errors.IDEMPOTENCY_CONFLICT,
@@ -1333,6 +1469,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 )
                 existing = winner
                 is_replay = True
+                _require_replay_source_context(conn, winner, source_context)
         else:
             preloaded_content = _require_replay_content_matches(
                 conn, existing, handoff_path, descriptor_content

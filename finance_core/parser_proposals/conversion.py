@@ -35,7 +35,7 @@ def validate_confirmed_proposal_for_transaction(
     from finance_core.parser_proposals.repository import ParserProposalRepository
     from finance_core.parser_proposals.service import (
         _require_active_authorization,
-        _transaction_fields,
+        resolve_simple_expense_conversion_fields,
     )
 
     proposal = ParserProposalRepository(conn).get(parser_output_id)
@@ -52,7 +52,10 @@ def validate_confirmed_proposal_for_transaction(
         parser_output_id,
         compute_proposal_content_hash(conn, proposal),
     )
-    return {"parser_output": proposal, "transaction_fields": _transaction_fields(conn, proposal)}
+    return {
+        "parser_output": proposal,
+        "transaction_fields": resolve_simple_expense_conversion_fields(conn, proposal),
+    }
 
 
 __all__ = [

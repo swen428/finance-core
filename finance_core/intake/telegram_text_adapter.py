@@ -12,7 +12,7 @@ records, and does not introduce Telegram SDK dependencies.
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -133,6 +133,7 @@ def process_telegram_text_update(
     payload: Any,
     *,
     received_at: datetime | str | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Validate a raw Telegram text-message update payload and persist.
 
@@ -147,6 +148,7 @@ def process_telegram_text_update(
         conn,
         validated,
         received_at=received_at,
+        persistence_effect=persistence_effect,
     )
 
 
@@ -184,10 +186,16 @@ def process_openclaw_telegram_text_message(
     payload: Any,
     *,
     received_at: datetime | str | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Persist one validated OpenClaw-normalized Telegram message."""
     validated = validate_openclaw_telegram_text_message(payload)
-    return _persist_validated_telegram_text_update(conn, validated, received_at=received_at)
+    return _persist_validated_telegram_text_update(
+        conn,
+        validated,
+        received_at=received_at,
+        persistence_effect=persistence_effect,
+    )
 
 
 def _persist_validated_telegram_text_update(
@@ -195,6 +203,7 @@ def _persist_validated_telegram_text_update(
     telegram_update: TelegramTextUpdate,
     *,
     received_at: datetime | str | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Persist an already-validated TelegramTextUpdate.
 
@@ -208,6 +217,7 @@ def _persist_validated_telegram_text_update(
         source_channel="telegram",
         source_metadata=telegram_update.source_metadata,
         received_at=received_at,
+        persistence_effect=persistence_effect,
     )
 
 

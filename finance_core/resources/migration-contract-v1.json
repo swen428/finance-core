@@ -1,6 +1,6 @@
 {
   "schema": "finance-core-migration-contract-v1",
-  "migration_ledger_digest": "aa13e5a9a54617b27f43b1f6c0fc0f4f2a008dd9ee70857d95bf74ef47369af7",
+  "migration_ledger_digest": "5155484e41a927151e4af430da4027c61d42691dc0ff598ad56da0a0d3c95667",
   "migration_filenames": [
     "001_create_core_schema.sql",
     "002_receipt_split_schema.sql",
@@ -50,6 +50,7 @@
     "046_openclaw_guided_edit_sessions.sql",
     "047_parser_human_drafts.sql",
     "048_d1_human_ai_lineage_transition.sql",
-    "049_d2_one_confirmation_posting.sql"
+    "049_d2_one_confirmation_posting.sql",
+    "050_d2_initial_card_delivery_authority.sql"
   ]
 }

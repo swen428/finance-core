@@ -23,10 +23,12 @@ from finance_core.parser_proposals.human_revision import publish_human_revision_
 from finance_core.parser_proposals.service import confirm_parser_proposal
 from finance_core.posting_authority import (
     PostingAuthorityError,
+    begin_posting_review_delivery,
     confirm_and_post,
     get_status,
     issue_posting_review_actions,
     prepare_posting_review,
+    record_posting_review_delivery,
     resume_posting,
 )
 from finance_core.receipt_finalization.fact_set_bridge import (
@@ -50,12 +52,50 @@ def _connection() -> sqlite3.Connection:
     return conn
 
 
-def test_migration_049_inventory_and_pre_d2_database_fail_closed() -> None:
+def _issue_and_activate(
+    conn: sqlite3.Connection,
+    *,
+    review_public_id: str,
+    key: bytes,
+    context: HumanActionContext,
+    provider_message_id: int,
+    issue_time: int = 1003,
+) -> tuple[object, bool]:
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review_public_id,
+        key=key,
+        context=context,
+        clock=lambda: issue_time,
+    )
+    record_posting_review_delivery(
+        conn,
+        attempt_nonce=manifest.delivery_attempt_nonce,
+        capability="telegram.finance-delivery-material-v1",
+        delivery_material_version="finance_d2_delivery_material_v1",
+        finance_delivery_material_sha256=manifest.finance_delivery_material_sha256,
+        provider_message_id=provider_message_id,
+        receipt_token_sha256=hashlib.sha256(f"receipt:{provider_message_id}".encode()).hexdigest(),
+        channel="telegram",
+        account_id=context.account_id,
+        conversation_id=context.conversation_id,
+        session_key=context.binding_id,
+        source_identity_sha256="b" * 64,
+        clock=lambda: issue_time + 1,
+    )
+    confirm = next(control for control in manifest.controls if control.action == "confirm")
+    return (
+        SimpleNamespace(reference=confirm.callback_value.removeprefix("post:")),
+        manifest.idempotent,
+    )
+
+
+def test_migration_050_inventory_and_pre_d2_database_fail_closed() -> None:
     pre_d2 = sqlite3.connect(":memory:")
     pre_d2.row_factory = sqlite3.Row
     pre_d2.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(pre_d2, TEMP_DB_MIGRATION_PATHS[:48])
-    with pytest.raises(PostingAuthorityError, match="migration 049 is missing or incomplete"):
+    with pytest.raises(PostingAuthorityError, match="migration 050 is missing or incomplete"):
         get_status(
             pre_d2,
             review_public_id="d2rev_" + "0" * 30,
@@ -72,7 +112,15 @@ def test_migration_049_inventory_and_pre_d2_database_fail_closed() -> None:
     }
     assert tables == {
         "d2_posting_reviews",
+        "d2_telegram_source_contexts",
+        "d2_initial_proposal_cards",
         "d2_posting_review_action_bindings",
+        "d2_posting_review_controls",
+        "d2_posting_review_delivery_attempts",
+        "d2_posting_review_delivery_observations",
+        "d2_posting_review_delivery_activations",
+        "d2_posting_review_delivery_conflicts",
+        "d2_posting_review_supersessions",
         "d2_posting_attempts",
         "d2_posting_decisions",
         "d2_posting_receipt_evidence",
@@ -82,10 +130,10 @@ def test_migration_049_inventory_and_pre_d2_database_fail_closed() -> None:
     current.close()
 
 
-def test_migration_049_missing_trigger_fails_closed() -> None:
+def test_migration_050_missing_trigger_fails_closed() -> None:
     conn = _connection()
     conn.execute("DROP TRIGGER trg_d2_posting_attempts_guarded_update")
-    with pytest.raises(PostingAuthorityError, match="migration 049 is missing or incomplete"):
+    with pytest.raises(PostingAuthorityError, match="migration 050 is missing or incomplete"):
         get_status(
             conn,
             review_public_id="d2rev_" + "0" * 30,
@@ -156,7 +204,7 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
     assert review.posting_path == "text"
     changes_before_status = conn.total_changes
     assert get_status(conn, review_public_id=review.review_public_id, context=context).state == (
-        "awaiting_confirmation"
+        "needs_attention"
     )
     assert conn.total_changes == changes_before_status
     for table in (
@@ -168,12 +216,12 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
     key = b"d2-one-confirmation-test-key"
-    issued, replayed_issue = issue_posting_review_actions(
+    issued, replayed_issue = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=200,
     )
     assert replayed_issue is False
     status = confirm_and_post(
@@ -217,12 +265,12 @@ def test_changed_callback_cannot_reuse_an_accepted_confirm(
         clock=lambda: 1002,
     )
     key = b"d2-one-confirmation-test-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=200,
     )
     confirm_and_post(
         conn,
@@ -260,12 +308,12 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
         clock=lambda: 1002,
     )
     key = b"d2-text-result-recovery-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=210,
     )
 
     def fail(stage: str) -> None:
@@ -314,12 +362,12 @@ def test_text_status_detects_canonical_transaction_drift_without_writes(
         context=context,
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-text-transaction-drift-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=211,
     )
     assert (
         confirm_and_post(
@@ -356,12 +404,12 @@ def test_finalized_catchup_revalidates_under_write_lock_before_event(
         clock=lambda: 1002,
     )
     key = b"d2-text-catchup-race-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=213,
     )
 
     def crash_after_financial_commit(stage: str) -> None:
@@ -420,12 +468,12 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
         clock=lambda: 1002,
     )
     key = b"d2-initial-text-catchup-race-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=214,
     )
 
     def drift_after_financial_commit(stage: str) -> None:
@@ -468,12 +516,12 @@ def test_resume_requires_complete_d2_decision_before_text_financial_write(
         context=context,
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-text-missing-decision-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=215,
     )
     ref = conn.execute(
         "SELECT refs.* FROM openclaw_human_action_references AS refs "
@@ -543,12 +591,12 @@ def test_status_refuses_finalized_coordination_row_with_wrong_transaction(
         context=context,
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-text-false-finalized-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=215,
     )
 
     def fail(stage: str) -> None:
@@ -611,12 +659,12 @@ def test_exact_confirm_replay_inside_redemption_transaction_is_idempotent(
         clock=lambda: 1002,
     )
     key = b"d2-text-lock-race-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=220,
     )
     monkeypatch.setattr(
         posting_authority_module,
@@ -667,12 +715,12 @@ def test_status_and_resume_reject_cross_context_without_writes(
         context=context,
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-cross-context-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=230,
     )
 
     def fail(stage: str) -> None:
@@ -932,12 +980,12 @@ def test_personal_identity_drift_before_confirm_creates_no_decision_or_financial
         receipt_payer_participant_public_id="person_owner",
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-self-drift-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=290,
     )
     redemptions_before = conn.execute(
         "SELECT COUNT(*) FROM openclaw_human_action_redemptions"
@@ -990,12 +1038,12 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
     )
 
     key = b"d2-personal-receipt-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=300,
     )
     first = confirm_and_post(
         conn,
@@ -1098,12 +1146,12 @@ def test_finalized_personal_receipt_uses_frozen_participant_authority(
         clock=lambda: 1002,
     )
     key = b"d2-frozen-participant-authority-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=310,
     )
     first = confirm_and_post(
         conn,
@@ -1151,12 +1199,12 @@ def test_receipt_status_detects_canonical_transaction_drift_without_writes(
         receipt_payer_participant_public_id="person_owner",
         clock=lambda: 1002,
     )
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=b"d2-receipt-transaction-drift-key",
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=311,
     )
     assert (
         confirm_and_post(
@@ -1197,12 +1245,12 @@ def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(
         clock=lambda: 1002,
     )
     key = b"d2-finalization-catchup-frozen-participant-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=312,
     )
 
     def fail(stage: str) -> None:
@@ -1265,12 +1313,12 @@ def test_initial_receipt_finalization_uses_atomic_verified_catchup(
         clock=lambda: 1002,
     )
     key = b"d2-initial-receipt-catchup-race-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=313,
     )
 
     def drift_after_financial_commit(stage: str) -> None:
@@ -1330,12 +1378,12 @@ def test_receipt_crash_boundaries_resume_without_second_confirmation_or_duplicat
         clock=lambda: 1002,
     )
     key = b"d2-receipt-crash-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=400,
     )
 
     def fail(stage: str) -> None:
@@ -1391,12 +1439,12 @@ def test_d2_refuses_to_adopt_manual_receipt_authorization(
         clock=lambda: 1002,
     )
     key = b"d2-manual-conflict-key"
-    issued, _ = issue_posting_review_actions(
+    issued, _ = _issue_and_activate(
         conn,
         review_public_id=review.review_public_id,
         key=key,
         context=context,
-        clock=lambda: 1003,
+        provider_message_id=500,
     )
 
     def fail_after_snapshot(stage: str) -> None:
