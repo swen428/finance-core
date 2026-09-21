@@ -34,7 +34,9 @@ from finance_core.parser_proposals.effective_payload import resolve_effective_pa
 from finance_core.parser_proposals.human_drafts import HumanDraftDecisionBinding
 from finance_core.parser_proposals.receipt_facts_conversion import (
     ReceiptFactsConversionCommand,
+    ReceiptFactsConversionError,
     convert_confirmed_receipt_proposal_to_facts,
+    resolve_receipt_conversion_payload_fields,
 )
 from finance_core.parser_proposals.receipt_item_allocation_facts import (
     ReceiptItemAllocationFactsCommand,
@@ -62,6 +64,11 @@ from finance_core.receipt_finalization.fact_set_bridge import (
 )
 from finance_core.sqlite_connection import require_foreign_keys_enabled
 from finance_core.staging_guard import require_staging_database
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    TelegramSourceContextError,
+    require_telegram_source_context,
+)
 
 POSTING_REVIEW_SCHEMA_VERSION = "d2-posting-review-v2"
 DELIVERY_MANIFEST_VERSION = "finance_d2_controls_v1"
@@ -71,6 +78,7 @@ CALLBACK_VALUE_VERSION = "finance_d2_callback_value_v1"
 _failure_injection_hook: Callable[[str], None] | None = None
 _D2_TABLES = frozenset(
     {
+        "d2_telegram_source_contexts",
         "d2_initial_proposal_cards",
         "d2_posting_reviews",
         "d2_posting_review_action_bindings",
@@ -87,7 +95,7 @@ _D2_TABLES = frozenset(
         "d2_posting_attempt_events",
     }
 )
-_D2_SCHEMA_FINGERPRINT = "76ff04e3e4d02ea5fbd5aed14e6c254956651eab3d652dde63888a5bce3c0123"
+_D2_SCHEMA_FINGERPRINT = "20e4ed72cf4749003f54bca99bd94d181d4f8f3fcb8f180fe9e4da8de5fb9ff2"
 
 
 class PostingAuthorityError(RuntimeError):
@@ -449,6 +457,7 @@ def prepare_posting_review(
         now = clock()
         source_kind: str
         initial_card_public_id: str | None = None
+        admitted_source_identity_sha256: str | None = None
         display_fields: Mapping[str, object] | None = None
         if card_generation_public_id is not None:
             source_kind = "d1_human_card"
@@ -497,7 +506,7 @@ def prepare_posting_review(
             proposal = ParserProposalRepository(conn).get(parser_output_id)
             if proposal is None:
                 raise PostingAuthorityError("proposal_missing")
-            _payload, _completion_id, version = resolve_effective_payload(conn, proposal)
+            effective_payload, _completion_id, version = resolve_effective_payload(conn, proposal)
             content_hash = compute_effective_proposal_content_hash(conn, {"id": parser_output_id})
             if version != int(card["decision_target_proposal_version"]) or not hmac.compare_digest(
                 content_hash, str(card["decision_target_proposal_content_hash"])
@@ -519,7 +528,7 @@ def prepare_posting_review(
             parser_output_id = int(proposal["id"])
             if proposal["parse_status"] != "parsed_pending_confirmation":
                 raise PostingAuthorityError("proposal_state_stale")
-            _payload, _completion_id, version = resolve_effective_payload(conn, proposal)
+            effective_payload, _completion_id, version = resolve_effective_payload(conn, proposal)
             content_hash = compute_effective_proposal_content_hash(conn, {"id": parser_output_id})
             intake = conn.execute(
                 "SELECT * FROM raw_intake_records WHERE parser_output_id = ?",
@@ -536,6 +545,22 @@ def prepare_posting_review(
                 or intake["status"] != "parsed_pending_confirmation"
             ):
                 raise PostingAuthorityError("initial proposal source evidence is unavailable")
+            try:
+                admitted_source_identity_sha256 = require_telegram_source_context(
+                    conn,
+                    raw_intake_record_id=int(intake["id"]),
+                    context=TelegramSourceContext(
+                        authenticated_actor_id=context.actor_id,
+                        account_id=context.account_id,
+                        conversation_id=context.conversation_id,
+                        binding_id=context.binding_id,
+                        message_id=admitted_source_message_id,
+                    ),
+                )
+            except TelegramSourceContextError as exc:
+                raise PostingAuthorityError(
+                    "initial proposal source context is unavailable"
+                ) from exc
             if (
                 conn.execute(
                     "SELECT 1 FROM parser_human_drafts WHERE decision_target_parser_output_id = ? "
@@ -560,9 +585,27 @@ def prepare_posting_review(
             expires_at = now + 3600
             card_ref = initial_card_public_id
 
+        is_receipt = (
+            conn.execute(
+                "SELECT 1 FROM receipt_ocr_proposal_links WHERE parser_output_id = ?",
+                (parser_output_id,),
+            ).fetchone()
+            is not None
+        )
         try:
-            fields: Mapping[str, object] = resolve_simple_expense_conversion_fields(conn, proposal)
-        except ParserConfirmationError as exc:
+            if is_receipt:
+                receipt_fields = resolve_receipt_conversion_payload_fields(conn, effective_payload)
+                fields: Mapping[str, object] = {
+                    "amount": receipt_fields["canonical_amount"],
+                    "currency": receipt_fields["currency"],
+                    "transaction_date": receipt_fields["receipt_date"],
+                    "merchant": receipt_fields["merchant"],
+                    "description": None,
+                    "category": None,
+                }
+            else:
+                fields = resolve_simple_expense_conversion_fields(conn, proposal)
+        except (ParserConfirmationError, ReceiptFactsConversionError) as exc:
             raise PostingAuthorityError("proposal is not eligible for D2 posting") from exc
         if display_fields is None:
             display_fields = fields
@@ -579,6 +622,7 @@ def prepare_posting_review(
         )
         created_at = _now_text(now)
         if source_kind == "initial_proposal_card":
+            assert admitted_source_identity_sha256 is not None
             existing_card = conn.execute(
                 "SELECT * FROM d2_initial_proposal_cards WHERE initial_card_public_id = ?",
                 (initial_card_public_id,),
@@ -605,7 +649,7 @@ def prepare_posting_review(
                         content_hash,
                         int(intake["id"]),
                         admitted_source_message_id,
-                        _sha256_text(expected_source_identity),
+                        admitted_source_identity_sha256,
                         context.actor_id,
                         context.account_id,
                         context.conversation_id,
@@ -630,7 +674,7 @@ def prepare_posting_review(
                     content_hash,
                     int(intake["id"]),
                     admitted_source_message_id,
-                    _sha256_text(expected_source_identity),
+                    admitted_source_identity_sha256,
                     context.actor_id,
                     context.account_id,
                     context.conversation_id,
@@ -1155,12 +1199,22 @@ def _require_current_review(conn: sqlite3.Connection, review: sqlite3.Row, *, no
         """,
         (review["initial_card_public_id"],),
     ).fetchone()
-    expected_source_identity = (
-        ""
-        if initial is None
-        else f"telegram:{review['telegram_conversation_id']}:"
-        f"{initial['admitted_source_message_id']}"
-    )
+    source_context_digest: str | None = None
+    if initial is not None:
+        try:
+            source_context_digest = require_telegram_source_context(
+                conn,
+                raw_intake_record_id=int(initial["raw_intake_record_id"]),
+                context=TelegramSourceContext(
+                    authenticated_actor_id=str(review["authenticated_actor_id"]),
+                    account_id=str(review["telegram_account_id"]),
+                    conversation_id=str(review["telegram_conversation_id"]),
+                    binding_id=str(review["conversation_binding_id"]),
+                    message_id=str(initial["admitted_source_message_id"]),
+                ),
+            )
+        except TelegramSourceContextError:
+            source_context_digest = None
     active_draft = conn.execute(
         "SELECT 1 FROM parser_human_drafts "
         "WHERE decision_target_parser_output_id = ? AND state = 'active' LIMIT 1",
@@ -1172,10 +1226,12 @@ def _require_current_review(conn: sqlite3.Connection, review: sqlite3.Row, *, no
         or int(initial["intake_parser_output_id"]) != int(review["parser_output_id"])
         or str(initial["source_message_id"] or "") != str(initial["admitted_source_message_id"])
         or initial["source_channel"] != "telegram"
-        or str(initial["external_source_id"] or "") != expected_source_identity
+        or str(initial["external_source_id"] or "")
+        != f"telegram:{review['telegram_conversation_id']}:{initial['admitted_source_message_id']}"
+        or source_context_digest is None
         or not hmac.compare_digest(
             str(initial["admitted_source_identity_sha256"]),
-            _sha256_text(expected_source_identity),
+            source_context_digest,
         )
         or initial["intake_status"] != "parsed_pending_confirmation"
         or int(initial["expires_at"]) <= now

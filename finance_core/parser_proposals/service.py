@@ -63,6 +63,11 @@ from finance_core.parser_proposals.repository import (
     ParserProposalRepository,
 )
 from finance_core.staging_guard import require_staging_database
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    TelegramSourceContextError,
+    require_telegram_source_context,
+)
 
 
 class ParserConfirmationError(ValueError):
@@ -194,6 +199,21 @@ def _require_current_initial_proposal_review_in_transaction(
     expected_source_identity = (
         f"telegram:{decision_binding.telegram_conversation_id}:{row['admitted_source_message_id']}"
     )
+    source_context_digest: str | None = None
+    try:
+        source_context_digest = require_telegram_source_context(
+            conn,
+            raw_intake_record_id=int(row["raw_intake_record_id"]),
+            context=TelegramSourceContext(
+                authenticated_actor_id=decision_binding.authenticated_actor_id,
+                account_id=decision_binding.telegram_account_id,
+                conversation_id=decision_binding.telegram_conversation_id,
+                binding_id=decision_binding.conversation_binding_id,
+                message_id=str(row["admitted_source_message_id"]),
+            ),
+        )
+    except TelegramSourceContextError:
+        source_context_digest = None
     if (
         int(row["parser_output_id"]) != parser_output_id
         or authenticated_actor_id != decision_binding.authenticated_actor_id
@@ -227,9 +247,10 @@ def _require_current_initial_proposal_review_in_transaction(
         or str(raw["source_message_id"]) != str(row["admitted_source_message_id"])
         or raw["source_channel"] != "telegram"
         or str(raw["external_source_id"] or "") != expected_source_identity
+        or source_context_digest is None
         or not hmac.compare_digest(
             str(row["admitted_source_identity_sha256"]),
-            hashlib.sha256(expected_source_identity.encode("utf-8")).hexdigest(),
+            source_context_digest,
         )
         or raw["status"] != "parsed_pending_confirmation"
         or active_draft is not None
@@ -523,7 +544,6 @@ def convert_confirmed_parser_proposal(
             }
 
         fields = resolve_simple_expense_conversion_fields(conn, proposal)
-        _require_exact_transaction_money(conn, fields["amount"])
         public_id = _converted_transaction_public_id(proposal, authorization, fields)
         notes = json.dumps(
             {
@@ -945,6 +965,7 @@ def resolve_simple_expense_conversion_fields(
         raise MissingRequiredTransactionFieldError(
             "Missing required field: merchant_or_description"
         )
+    _require_exact_transaction_money(conn, amount)
     return {
         "intent": intent or "personal_expense_log",
         "amount": amount,

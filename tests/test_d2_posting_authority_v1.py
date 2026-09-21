@@ -112,6 +112,7 @@ def test_migration_050_inventory_and_pre_d2_database_fail_closed() -> None:
     }
     assert tables == {
         "d2_posting_reviews",
+        "d2_telegram_source_contexts",
         "d2_initial_proposal_cards",
         "d2_posting_review_action_bindings",
         "d2_posting_review_controls",

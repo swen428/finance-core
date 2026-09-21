@@ -144,16 +144,25 @@ class TestReceiptCaptureSuccess:
         self, workspace: support.BridgeWorkspace
     ) -> None:
         handoff_path = support.write_handoff_file(workspace, "receipt_001.jpg", support.JPEG_BYTES)
+        arguments = support.capture_receipt_arguments(
+            workspace,
+            handoff_filename="receipt_001.jpg",
+            declared_mime_type="image/jpeg",
+            original_filename="receipt_001.jpg",
+            caption="lunch receipt",
+        )
+        arguments.update(
+            {
+                "authenticated_actor_id": "111",
+                "telegram_account_id": "finance-bot",
+                "telegram_conversation_id": "111",
+                "conversation_binding_id": "session-111",
+            }
+        )
         outcome = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_receipt_arguments(
-                    workspace,
-                    handoff_filename="receipt_001.jpg",
-                    declared_mime_type="image/jpeg",
-                    original_filename="receipt_001.jpg",
-                    caption="lunch receipt",
-                ),
+                arguments,
                 idempotency_key=support.canonical_capture_key(message_id=20),
             )
         )
@@ -186,6 +195,12 @@ class TestReceiptCaptureSuccess:
             assert raw_input["raw_input"] == "lunch receipt"
             assert raw_input["source_type"] == "telegram_image"
             assert raw_input["source_channel"] == "telegram"
+            source_context = conn.execute(
+                "SELECT telegram_account_id, telegram_conversation_id, "
+                "conversation_binding_id, source_message_id "
+                "FROM d2_telegram_source_contexts"
+            ).fetchone()
+            assert tuple(source_context) == ("finance-bot", "111", "session-111", "20")
         finally:
             conn.close()
 

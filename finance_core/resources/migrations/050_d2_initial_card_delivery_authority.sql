@@ -8,6 +8,48 @@ PRAGMA foreign_keys = OFF;
 -- terminal-delivery activation gate without changing any accepted 049
 -- decision, attempt, authorization, or transaction identity.
 
+CREATE TABLE d2_telegram_source_contexts (
+    raw_intake_record_id INTEGER PRIMARY KEY,
+    authenticated_actor_id TEXT NOT NULL CHECK (length(trim(authenticated_actor_id)) > 0),
+    telegram_account_id TEXT NOT NULL CHECK (length(trim(telegram_account_id)) > 0),
+    telegram_conversation_id TEXT NOT NULL CHECK (length(trim(telegram_conversation_id)) > 0),
+    conversation_binding_id TEXT NOT NULL CHECK (length(trim(conversation_binding_id)) > 0),
+    source_message_id TEXT NOT NULL CHECK (length(trim(source_message_id)) > 0),
+    source_identity_sha256 TEXT NOT NULL UNIQUE CHECK (
+        length(source_identity_sha256) = 64
+        AND source_identity_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    captured_at TEXT NOT NULL,
+    FOREIGN KEY (raw_intake_record_id) REFERENCES raw_intake_records(id),
+    UNIQUE (telegram_account_id, telegram_conversation_id, source_message_id),
+    UNIQUE (
+        raw_intake_record_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id, source_message_id,
+        source_identity_sha256
+    )
+) STRICT;
+
+CREATE TRIGGER trg_d2_telegram_source_contexts_no_update
+BEFORE UPDATE ON d2_telegram_source_contexts BEGIN
+    SELECT RAISE(ABORT, 'D2 Telegram source contexts are append-only');
+END;
+CREATE TRIGGER trg_d2_telegram_source_contexts_no_insert_collision
+BEFORE INSERT ON d2_telegram_source_contexts
+WHEN EXISTS (
+    SELECT 1 FROM d2_telegram_source_contexts AS existing
+    WHERE existing.raw_intake_record_id = NEW.raw_intake_record_id
+       OR existing.source_identity_sha256 = NEW.source_identity_sha256
+       OR (existing.telegram_account_id = NEW.telegram_account_id
+           AND existing.telegram_conversation_id = NEW.telegram_conversation_id
+           AND existing.source_message_id = NEW.source_message_id)
+) BEGIN
+    SELECT RAISE(ABORT, 'D2 Telegram source context identity collision');
+END;
+CREATE TRIGGER trg_d2_telegram_source_contexts_no_delete
+BEFORE DELETE ON d2_telegram_source_contexts BEGIN
+    SELECT RAISE(ABORT, 'D2 Telegram source contexts are append-only');
+END;
+
 CREATE TABLE d2_initial_proposal_cards (
     initial_card_public_id TEXT PRIMARY KEY CHECK (
         length(initial_card_public_id) = 39
@@ -45,6 +87,15 @@ CREATE TABLE d2_initial_proposal_cards (
     created_at TEXT NOT NULL,
     FOREIGN KEY (parser_output_id) REFERENCES parser_outputs(id),
     FOREIGN KEY (raw_intake_record_id) REFERENCES raw_intake_records(id),
+    FOREIGN KEY (
+        raw_intake_record_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id,
+        admitted_source_message_id, admitted_source_identity_sha256
+    ) REFERENCES d2_telegram_source_contexts (
+        raw_intake_record_id, authenticated_actor_id, telegram_account_id,
+        telegram_conversation_id, conversation_binding_id,
+        source_message_id, source_identity_sha256
+    ),
     UNIQUE (
         parser_output_id, proposal_version, proposal_content_hash,
         authenticated_actor_id, telegram_account_id,

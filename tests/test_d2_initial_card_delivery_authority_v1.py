@@ -42,6 +42,10 @@ from finance_core.reconciliation.migrations import (
     MigrationExecutionError,
     apply_migration_paths,
 )
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    record_telegram_source_context,
+)
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
@@ -54,7 +58,36 @@ def _connection() -> sqlite3.Connection:
     return conn
 
 
-def _seed_initial_text(conn: sqlite3.Connection) -> str:
+def _bind_source_context(
+    conn: sqlite3.Connection,
+    *,
+    parser_output_id: int,
+    message_id: str,
+    actor_id: str = "111",
+    account_id: str = "acct",
+    conversation_id: str = "111",
+    binding_id: str = "binding",
+) -> None:
+    intake = conn.execute(
+        "SELECT id FROM raw_intake_records WHERE parser_output_id = ?",
+        (parser_output_id,),
+    ).fetchone()
+    assert intake is not None
+    record_telegram_source_context(
+        conn,
+        raw_intake_record_id=int(intake["id"]),
+        context=TelegramSourceContext(
+            authenticated_actor_id=actor_id,
+            account_id=account_id,
+            conversation_id=conversation_id,
+            binding_id=binding_id,
+            message_id=message_id,
+        ),
+        captured_at="2026-09-21T00:00:00Z",
+    )
+
+
+def _seed_initial_text(conn: sqlite3.Connection, *, bind_source_context: bool = True) -> str:
     payload = {
         "intent": "personal_expense_log",
         "transaction_type": "personal_expense",
@@ -95,6 +128,8 @@ def _seed_initial_text(conn: sqlite3.Connection) -> str:
         """,
         (hashlib.sha256(b"lunch 12.50").hexdigest(), parser_output_id),
     )
+    if bind_source_context:
+        _bind_source_context(conn, parser_output_id=parser_output_id, message_id="77")
     conn.commit()
     return "prop_d2_initial_text"
 
@@ -486,6 +521,38 @@ def test_initial_review_accepts_description_when_merchant_is_unset() -> None:
     assert "Description: Lunch" in review.presentation_text
 
 
+@pytest.mark.parametrize(
+    "context",
+    [
+        HumanActionContext("111", "other-account", "111", "binding"),
+        HumanActionContext("111", "acct", "111", "other-binding"),
+    ],
+)
+def test_initial_review_rejects_capture_context_transplant(
+    context: HumanActionContext,
+) -> None:
+    conn = _connection()
+    proposal_public_id = _seed_initial_text(conn)
+    with pytest.raises(PostingAuthorityError, match="source context"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key="d2-initial-source-context-transplant",
+            proposal_public_id=proposal_public_id,
+            admitted_source_message_id="77",
+            context=context,
+            clock=lambda: 1000,
+        )
+    for table in (
+        "d2_initial_proposal_cards",
+        "d2_posting_reviews",
+        "openclaw_human_action_references",
+        "openclaw_human_action_redemptions",
+        "d2_posting_decisions",
+        "transactions",
+    ):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
 def test_initial_review_and_confirm_reject_source_conversation_transplant() -> None:
     conn = _connection()
     proposal_public_id = _seed_initial_text(conn)
@@ -795,6 +862,7 @@ def test_migration_050_identity_rows_resist_insert_or_replace() -> None:
 
     assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
     populated_identity_tables = (
+        "d2_telegram_source_contexts",
         "d2_initial_proposal_cards",
         "d2_posting_reviews",
         "openclaw_human_action_reference_purposes",
@@ -1050,6 +1118,7 @@ def test_initial_personal_total_receipt_one_confirm_runs_full_financial_chain(
         "external_source_id = 'telegram:111:78' WHERE parser_output_id = ?",
         (parser_output_id,),
     )
+    _bind_source_context(conn, parser_output_id=parser_output_id, message_id="78")
     conn.commit()
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
@@ -1139,14 +1208,52 @@ def test_initial_receipt_requires_conversion_ready_merchant_before_card(tmp_path
         "external_source_id = 'telegram:111:79' WHERE parser_output_id = ?",
         (parser_output_id,),
     )
+    _bind_source_context(conn, parser_output_id=parser_output_id, message_id="79")
     conn.commit()
     context = HumanActionContext("111", "acct", "111", "binding")
-    with pytest.raises(PostingAuthorityError, match="requires merchant"):
+    with pytest.raises(PostingAuthorityError, match="not eligible"):
         prepare_posting_review(
             conn,
             review_idempotency_key="d2-initial-receipt-missing-merchant",
             proposal_public_id=proposal_public_id,
             admitted_source_message_id="79",
+            context=context,
+            receipt_payer_participant_public_id="person_owner",
+            clock=lambda: 1100,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM d2_initial_proposal_cards").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM d2_posting_reviews").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("field", ["description", "category"])
+def test_initial_receipt_rejects_unpersistable_metadata_before_card(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    conn = _connection()
+    seed_people(conn)
+    parser_output_id, proposal_public_id = seed_receipt_proposal(
+        conn, tmp_path, f"d2_initial_receipt_{field}"
+    )
+    conn.execute(
+        f"UPDATE parser_outputs SET parsed_payload = "
+        f"json_set(parsed_payload, '$.{field}', 'Dinner') WHERE id = ?",
+        (parser_output_id,),
+    )
+    conn.execute(
+        "UPDATE raw_intake_records SET source_message_id = '80', "
+        "external_source_id = 'telegram:111:80' WHERE parser_output_id = ?",
+        (parser_output_id,),
+    )
+    _bind_source_context(conn, parser_output_id=parser_output_id, message_id="80")
+    conn.commit()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    with pytest.raises(PostingAuthorityError, match="not eligible"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key=f"d2-initial-receipt-{field}",
+            proposal_public_id=proposal_public_id,
+            admitted_source_message_id="80",
             context=context,
             receipt_payer_participant_public_id="person_owner",
             clock=lambda: 1100,
@@ -1184,7 +1291,7 @@ def test_migration_050_fences_unbound_unredeemed_legacy_confirm() -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:49])
-    proposal_public_id = _seed_initial_text(conn)
+    proposal_public_id = _seed_initial_text(conn, bind_source_context=False)
     parser_output_id = int(
         conn.execute(
             "SELECT id FROM parser_outputs WHERE public_id = ?", (proposal_public_id,)
