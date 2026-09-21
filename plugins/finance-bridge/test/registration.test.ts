@@ -46,6 +46,7 @@ import {
 } from "../src/operator-cli-v1.js";
 import type { CompatibilityArtifactEvidenceV1 } from "../src/model-compatibility-operator-v1.js";
 import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.js";
+import { BridgeCliRunner } from "../src/subprocess.js";
 
 const FINANCE_PLUGIN_ROOT = "/repo/plugins/finance-bridge";
 const CODEX_PLUGIN_ROOT = "/openclaw/node_modules/@openclaw/codex";
@@ -511,6 +512,78 @@ test("receipt proof preflight failure keeps registration unhealthy before health
     /consumer is unavailable/u,
   );
   assert.equal(recordCalls, 0);
+});
+
+test("missing receipt key keeps registration unhealthy through the real loader", async () => {
+  const fixture = fakeApi();
+  const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "finance-registration-key-")));
+  const workspaceRoot = join(temporaryRoot, "workspace");
+  await mkdir(join(workspaceRoot, "runtime"), { recursive: true, mode: 0o700 });
+  const config = {
+    ...(fixture.api as unknown as { pluginConfig: FinanceBridgeConfig }).pluginConfig,
+    workspaceRoot,
+  };
+  let healthCalls = 0;
+  let recordCalls = 0;
+  try {
+    registerFinanceBridge(fixture.api, {
+      ...dependencies,
+      async validateConfig() { return config; },
+      createRunner(validatedConfig) {
+        const actual = new BridgeCliRunner(
+          validatedConfig,
+          () => { throw new Error("receipt preflight must not spawn"); },
+          1_000,
+          () => undefined,
+          async () => undefined,
+        );
+        return {
+          validateFinanceDeliveryReceiptCapability:
+            actual.validateFinanceDeliveryReceiptCapability.bind(actual),
+          async recordFinanceDeliveryReceipt(
+            material: FinanceDeliveryMaterialV1,
+            deadlineMs: number,
+          ): Promise<void> {
+            recordCalls += 1;
+            await actual.recordFinanceDeliveryReceipt(material, deadlineMs);
+          },
+          async run(request: BridgeRequest): Promise<BridgeResponse> {
+            healthCalls += 1;
+            return registrationOk(request, {
+              workspace_verified: true,
+              database_verified: true,
+              callback_key_status: "present",
+            });
+          },
+        };
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(healthCalls, 0);
+    const material: FinanceDeliveryMaterialV1 = {
+      capability: "telegram.finance-delivery-material-v1",
+      deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+      attemptNonce: `d2nonce_${"1".repeat(32)}`,
+      deliveryMaterialSha256: "2".repeat(64),
+      providerMessageId: "200",
+      receiptTokenSha256: "3".repeat(64),
+      channel: "telegram",
+      accountId: "finance-account",
+      conversationId: "111",
+      sessionKey: "binding-1",
+      sourceIdentitySha256: "4".repeat(64),
+    };
+    await assert.rejects(
+      async () => await fixture.deliveryReceiptConsumers[0]!({
+        version: "finance_delivery_receipt_v1",
+        async consume(consumer) { await consumer(material); },
+      }),
+      /consumer is unavailable/u,
+    );
+    assert.equal(recordCalls, 0);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("full registration refuses a host without the terminal Finance delivery capability", () => {

@@ -1292,22 +1292,33 @@ def record_posting_review_delivery(
     if main_database is None:
         raise PostingAuthorityError("delivery receipt database identity is unavailable")
     database_path = str(main_database[2] or "")
-    if database_path:
-        expected_database = Path(verified.workspace_path) / "database" / "staging.sqlite"
-        try:
-            if expected_database.is_symlink():
-                raise OSError("workspace database is a symlink")
-            expected_identity = os.stat(expected_database, follow_symlinks=False)
-            opened_identity = os.stat(database_path, follow_symlinks=False)
-        except OSError as exc:
-            raise PostingAuthorityError(
-                "delivery receipt workspace database identity is unavailable"
-            ) from exc
-        if (expected_identity.st_dev, expected_identity.st_ino) != (
-            opened_identity.st_dev,
-            opened_identity.st_ino,
+    if not database_path:
+        raise PostingAuthorityError("delivery receipt database identity is unavailable")
+    expected_database = Path(verified.workspace_path) / "database" / "staging.sqlite"
+    opened_database = Path(database_path)
+    try:
+        if (
+            not opened_database.is_absolute()
+            or opened_database.is_symlink()
+            or expected_database.is_symlink()
+            or opened_database.resolve(strict=True) != opened_database
+            or expected_database.resolve(strict=True) != expected_database
         ):
-            raise PostingAuthorityError("delivery receipt workspace database identity mismatch")
+            raise OSError("workspace database path is unsafe")
+        expected_identity = os.stat(expected_database, follow_symlinks=False)
+        opened_identity = os.stat(opened_database, follow_symlinks=False)
+    except OSError as exc:
+        raise PostingAuthorityError(
+            "delivery receipt workspace database identity is unavailable"
+        ) from exc
+    if (
+        opened_database != expected_database
+        or (expected_identity.st_dev, expected_identity.st_ino)
+        != (opened_identity.st_dev, opened_identity.st_ino)
+        or expected_identity.st_nlink != 1
+        or opened_identity.st_nlink != 1
+    ):
+        raise PostingAuthorityError("delivery receipt workspace database identity mismatch")
     if capability != DELIVERY_MATERIAL_CAPABILITY:
         raise PostingAuthorityError("terminal delivery capability is invalid")
     if delivery_material_version != DELIVERY_MATERIAL_VERSION:

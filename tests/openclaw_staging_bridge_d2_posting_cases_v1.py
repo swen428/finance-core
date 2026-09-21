@@ -305,8 +305,17 @@ def test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant
     other = support.create_bridge_workspace(tmp_path, name="proof-transplant")
     invalid_payloads = [
         {**payload, "receipt_proof_sha256": "0" * 64},
+        {**payload, "attempt_nonce": "d2nonce_" + "9" * 32},
+        {**payload, "capability": "telegram.other-delivery-material-v1"},
+        {**payload, "delivery_material_version": "finance_d2_delivery_material_v2"},
+        {**payload, "delivery_material_sha256": "0" * 64},
         {**payload, "provider_message_id": "300"},
+        {**payload, "receipt_token_sha256": "1" * 64},
+        {**payload, "channel": "other"},
+        {**payload, "account_id": "other-account"},
+        {**payload, "conversation_id": "222"},
         {**payload, "session_key": "other-binding"},
+        {**payload, "source_identity_sha256": "2" * 64},
         {**payload, "workspace_path": str(other.workspace_path)},
     ]
     for invalid in invalid_payloads:
