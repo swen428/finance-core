@@ -370,9 +370,7 @@ def _record_delivery(
         ),
         channel=channel,
         account_id=context.account_id if account_id is None else account_id,
-        conversation_id=(
-            context.conversation_id if conversation_id is None else conversation_id
-        ),
+        conversation_id=(context.conversation_id if conversation_id is None else conversation_id),
         session_key=context.binding_id if session_key is None else session_key,
         source_identity_sha256=source_identity_sha256,
         clock=lambda: now,
@@ -427,7 +425,8 @@ def test_initial_review_replay_keeps_the_original_expiry_and_identity() -> None:
     (("transaction_type", "income"), ("transaction_date", "2026-02-30")),
 )
 def test_initial_review_rejects_unsupported_or_invalid_conversion_before_card(
-    field: str, value: str,
+    field: str,
+    value: str,
 ) -> None:
     conn = _connection()
     proposal_public_id = _seed_initial_text(conn)
@@ -542,9 +541,7 @@ def test_initial_review_and_confirm_reject_source_conversation_transplant() -> N
             callback_message_id=899,
             clock=lambda: 1003,
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM openclaw_human_action_redemptions"
-    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0] == 0
 
 
 def test_initial_text_requires_terminal_activation_and_posts_once_without_d1_edit() -> None:
@@ -579,9 +576,10 @@ def test_initial_text_requires_terminal_activation_and_posts_once_without_d1_edi
             route + ":",
             posting_authority_module._callback_value_digest(control.callback_value).hex(),
         )
-    assert get_status(
-        conn, review_public_id=review.review_public_id, context=context
-    ).attention_reason == "delivery_not_activated"
+    assert (
+        get_status(conn, review_public_id=review.review_public_id, context=context).attention_reason
+        == "delivery_not_activated"
+    )
 
     with pytest.raises(PostingAuthorityError, match="not bound"):
         confirm_and_post(
@@ -668,9 +666,10 @@ def test_delivery_receipt_and_generic_confirm_are_single_purpose_fail_closed() -
             context=context,
             now=1002,
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM d2_posting_review_delivery_activations"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
     _record_delivery(
         conn,
         manifest=manifest,
@@ -719,9 +718,10 @@ def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> No
             context=context,
             now=1002,
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM d2_posting_review_delivery_activations"
-    ).fetchone()[0] == 0
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
 
     first_observation = _record_delivery(
         conn,
@@ -739,9 +739,10 @@ def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> No
         now=1004,
     )
     assert replay_observation == first_observation
-    assert conn.execute(
-        "SELECT COUNT(*) FROM d2_posting_review_delivery_observations"
-    ).fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_observations").fetchone()[0]
+        == 1
+    )
 
     with pytest.raises(PostingAuthorityError, match="multiple provider messages conflict"):
         _record_delivery(
@@ -754,8 +755,7 @@ def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> No
     assert [
         str(row[0])
         for row in conn.execute(
-            "SELECT outcome FROM d2_posting_review_delivery_observations "
-            "ORDER BY observed_at"
+            "SELECT outcome FROM d2_posting_review_delivery_observations ORDER BY observed_at"
         ).fetchall()
     ] == ["success", "conflict"]
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
@@ -771,9 +771,7 @@ def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> No
             callback_message_id=912,
             clock=lambda: 1006,
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM openclaw_human_action_redemptions"
-    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0] == 0
 
 
 def test_migration_050_identity_rows_resist_insert_or_replace() -> None:
@@ -842,8 +840,7 @@ def test_delivery_activation_cannot_cross_wire_another_attempt_observation() -> 
         now=1002,
     )
     original_observation = conn.execute(
-        "SELECT * FROM d2_posting_review_delivery_observations "
-        "WHERE observation_public_id = ?",
+        "SELECT * FROM d2_posting_review_delivery_observations WHERE observation_public_id = ?",
         (observation_public_id,),
     ).fetchone()
     cross_wire_observation_id = "d2dobs_" + "a" * 32
@@ -917,8 +914,7 @@ def test_delivery_activation_cannot_cross_wire_another_attempt_observation() -> 
         ),
     )
     observation = conn.execute(
-        "SELECT * FROM d2_posting_review_delivery_observations "
-        "WHERE observation_public_id = ?",
+        "SELECT * FROM d2_posting_review_delivery_observations WHERE observation_public_id = ?",
         (cross_wire_observation_id,),
     ).fetchone()
     with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
@@ -995,9 +991,10 @@ def test_lost_delivery_receipt_replacement_has_one_current_successor() -> None:
     assert replay.delivery_attempt_public_id == successor.delivery_attempt_public_id
     assert replay.finance_delivery_material_sha256 == successor.finance_delivery_material_sha256
     assert replay.idempotent is True
-    assert get_status(
-        conn, review_public_id=review.review_public_id, context=context
-    ).attention_reason == "review_superseded"
+    assert (
+        get_status(conn, review_public_id=review.review_public_id, context=context).attention_reason
+        == "review_superseded"
+    )
     with pytest.raises(PostingAuthorityError, match="superseded"):
         _record_delivery(
             conn,
@@ -1110,12 +1107,10 @@ def test_initial_personal_total_receipt_one_confirm_runs_full_financial_chain(
     assert result.transaction_public_id is not None
     assert conn.execute("SELECT COUNT(*) FROM receipt_item_allocation_fact_sets").fetchone()[0] == 1
     assert (
-        conn.execute("SELECT COUNT(*) FROM authoritative_calculation_snapshots").fetchone()[0]
-        == 1
+        conn.execute("SELECT COUNT(*) FROM authoritative_calculation_snapshots").fetchone()[0] == 1
     )
     assert (
-        conn.execute("SELECT COUNT(*) FROM d2_conditional_authorization_proofs").fetchone()[0]
-        == 1
+        conn.execute("SELECT COUNT(*) FROM d2_conditional_authorization_proofs").fetchone()[0] == 1
     )
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM parser_human_drafts").fetchone()[0] == 0
@@ -1127,12 +1122,43 @@ def test_initial_personal_total_receipt_one_confirm_runs_full_financial_chain(
     ] == ["Receipt total"]
 
 
+def test_initial_receipt_requires_conversion_ready_merchant_before_card(tmp_path: Path) -> None:
+    conn = _connection()
+    seed_people(conn)
+    parser_output_id, proposal_public_id = seed_receipt_proposal(
+        conn, tmp_path, "d2_initial_receipt_missing_merchant"
+    )
+    conn.execute(
+        "UPDATE parser_outputs SET parsed_payload = "
+        "json_set(json_remove(parsed_payload, '$.merchant'), '$.description', 'Receipt') "
+        "WHERE id = ?",
+        (parser_output_id,),
+    )
+    conn.execute(
+        "UPDATE raw_intake_records SET source_message_id = '79', "
+        "external_source_id = 'telegram:111:79' WHERE parser_output_id = ?",
+        (parser_output_id,),
+    )
+    conn.commit()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    with pytest.raises(PostingAuthorityError, match="requires merchant"):
+        prepare_posting_review(
+            conn,
+            review_idempotency_key="d2-initial-receipt-missing-merchant",
+            proposal_public_id=proposal_public_id,
+            admitted_source_message_id="79",
+            context=context,
+            receipt_payer_participant_public_id="person_owner",
+            clock=lambda: 1100,
+        )
+    assert conn.execute("SELECT COUNT(*) FROM d2_initial_proposal_cards").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM d2_posting_reviews").fetchone()[0] == 0
+
+
 def test_migration_050_fences_unredeemed_049_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, review_public_id, reference_id = _migration_049_d1_review(
-        monkeypatch, redeemed=False
-    )
+    conn, review_public_id, reference_id = _migration_049_d1_review(monkeypatch, redeemed=False)
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     purpose = conn.execute(
         "SELECT purpose FROM openclaw_human_action_reference_purposes WHERE reference_id = ?",
@@ -1164,9 +1190,7 @@ def test_migration_050_fences_unbound_unredeemed_legacy_confirm() -> None:
             "SELECT id FROM parser_outputs WHERE public_id = ?", (proposal_public_id,)
         ).fetchone()[0]
     )
-    content_hash = compute_effective_proposal_content_hash(
-        conn, {"id": parser_output_id}
-    )
+    content_hash = compute_effective_proposal_content_hash(conn, {"id": parser_output_id})
     reference = "fha1_legacyUnboundConfirm0001"
     reference_id = int(
         conn.execute(
@@ -1192,10 +1216,13 @@ def test_migration_050_fences_unbound_unredeemed_legacy_confirm() -> None:
     )
     conn.commit()
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
-    assert conn.execute(
-        "SELECT purpose FROM openclaw_human_action_reference_purposes WHERE reference_id = ?",
-        (reference_id,),
-    ).fetchone()[0] == "d2_post_fenced_pre050_v1"
+    assert (
+        conn.execute(
+            "SELECT purpose FROM openclaw_human_action_reference_purposes WHERE reference_id = ?",
+            (reference_id,),
+        ).fetchone()[0]
+        == "d2_post_fenced_pre050_v1"
+    )
     context = HumanActionContext("111", "acct", "111", "binding")
     with pytest.raises(HumanActionReferenceError, match="requires_d2_redemption"):
         redeem_human_action_reference(
@@ -1218,30 +1245,32 @@ def test_migration_050_fences_unbound_unredeemed_legacy_confirm() -> None:
             callback_message_id=77,
             clock=lambda: 1001,
         )
-    assert conn.execute(
-        "SELECT COUNT(*) FROM openclaw_human_action_redemptions"
-    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0] == 0
 
 
 def test_migration_050_preserves_accepted_049_chain_as_recovery_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, review_public_id, reference_id = _migration_049_d1_review(
-        monkeypatch, redeemed=True
-    )
+    conn, review_public_id, reference_id = _migration_049_d1_review(monkeypatch, redeemed=True)
     attempt_before = tuple(conn.execute("SELECT * FROM d2_posting_attempts").fetchone())
     decision_before = tuple(conn.execute("SELECT * FROM d2_posting_decisions").fetchone())
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
-    assert conn.execute(
-        "SELECT purpose FROM openclaw_human_action_reference_purposes WHERE reference_id = ?",
-        (reference_id,),
-    ).fetchone()[0] == "d2_post_accepted_pre050_v1"
+    assert (
+        conn.execute(
+            "SELECT purpose FROM openclaw_human_action_reference_purposes WHERE reference_id = ?",
+            (reference_id,),
+        ).fetchone()[0]
+        == "d2_post_accepted_pre050_v1"
+    )
     assert tuple(conn.execute("SELECT * FROM d2_posting_attempts").fetchone()) == attempt_before
     assert tuple(conn.execute("SELECT * FROM d2_posting_decisions").fetchone()) == decision_before
-    assert conn.execute(
-        "SELECT source_kind FROM d2_posting_reviews WHERE review_public_id = ?",
-        (review_public_id,),
-    ).fetchone()[0] == "d1_human_card"
+    assert (
+        conn.execute(
+            "SELECT source_kind FROM d2_posting_reviews WHERE review_public_id = ?",
+            (review_public_id,),
+        ).fetchone()[0]
+        == "d1_human_card"
+    )
     changes_before_replay = conn.total_changes
     replay = confirm_and_post(
         conn,
@@ -1266,9 +1295,7 @@ def test_migration_050_preserves_accepted_049_chain_as_recovery_only(
 def test_migration_050_aborts_on_partial_redeemed_049_chain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, _review_public_id, reference_id = _migration_049_d1_review(
-        monkeypatch, redeemed=False
-    )
+    conn, _review_public_id, reference_id = _migration_049_d1_review(monkeypatch, redeemed=False)
     conn.execute(
         "INSERT INTO openclaw_human_action_redemptions "
         "(reference_id, callback_id_sha256, callback_message_id, redeemed_at) "
@@ -1336,8 +1363,7 @@ def test_delivery_attempt_transaction_rolls_back_or_replays_after_lost_response(
     assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_references").fetchone()[0] == 3
     assert conn.execute("SELECT COUNT(*) FROM d2_posting_review_controls").fetchone()[0] == 3
     assert (
-        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_attempts").fetchone()[0]
-        == 1
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_attempts").fetchone()[0] == 1
     )
     monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
     replay = begin_posting_review_delivery(

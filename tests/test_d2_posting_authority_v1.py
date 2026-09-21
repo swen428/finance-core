@@ -75,9 +75,7 @@ def _issue_and_activate(
         delivery_material_version="finance_d2_delivery_material_v1",
         finance_delivery_material_sha256=manifest.finance_delivery_material_sha256,
         provider_message_id=provider_message_id,
-        receipt_token_sha256=hashlib.sha256(
-            f"receipt:{provider_message_id}".encode()
-        ).hexdigest(),
+        receipt_token_sha256=hashlib.sha256(f"receipt:{provider_message_id}".encode()).hexdigest(),
         channel="telegram",
         account_id=context.account_id,
         conversation_id=context.conversation_id,

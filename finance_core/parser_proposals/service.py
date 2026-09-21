@@ -192,8 +192,7 @@ def _require_current_initial_proposal_review_in_transaction(
         decision_binding.conversation_binding_id,
     )
     expected_source_identity = (
-        f"telegram:{decision_binding.telegram_conversation_id}:"
-        f"{row['admitted_source_message_id']}"
+        f"telegram:{decision_binding.telegram_conversation_id}:{row['admitted_source_message_id']}"
     )
     if (
         int(row["parser_output_id"]) != parser_output_id

@@ -591,8 +591,7 @@ def issue_human_action_references(
                 )
             reference_id = int(
                 conn.execute(
-                    "SELECT id FROM openclaw_human_action_references "
-                    "WHERE reference_public_id = ?",
+                    "SELECT id FROM openclaw_human_action_references WHERE reference_public_id = ?",
                     (public_id,),
                 ).fetchone()[0]
             )

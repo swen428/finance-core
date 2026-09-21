@@ -198,12 +198,7 @@ def _telegram_message_id(value: int | str) -> int:
         raise PostingAuthorityError("provider message identity is invalid")
     if isinstance(value, int):
         result = value
-    elif (
-        isinstance(value, str)
-        and len(value) <= 20
-        and value.isascii()
-        and value.isdigit()
-    ):
+    elif isinstance(value, str) and len(value) <= 20 and value.isascii() and value.isdigit():
         if value != str(int(value)):
             raise PostingAuthorityError("provider message identity is invalid")
         result = int(value)
@@ -231,10 +226,7 @@ def _long_identity(prefix: str, *parts: object) -> str:
 def _framed_field(name: str, value: bytes) -> bytes:
     encoded_name = name.encode("ascii")
     return (
-        len(encoded_name).to_bytes(2, "big")
-        + encoded_name
-        + len(value).to_bytes(4, "big")
-        + value
+        len(encoded_name).to_bytes(2, "big") + encoded_name + len(value).to_bytes(4, "big") + value
     )
 
 
@@ -244,9 +236,7 @@ def _callback_value_digest(value: str) -> bytes:
     return hashlib.sha256(material).digest()
 
 
-def finance_delivery_material_digest(
-    text: str, controls: tuple[PostingReviewControl, ...]
-) -> str:
+def finance_delivery_material_digest(text: str, controls: tuple[PostingReviewControl, ...]) -> str:
     """Hash exact text and ordered Telegram callback controls."""
     rows: dict[int, list[PostingReviewControl]] = {}
     for control in controls:
@@ -263,9 +253,7 @@ def finance_delivery_material_digest(
         material += _framed_field("row_index", row_index.to_bytes(4, "big"))
         material += _framed_field("button_count", len(ordered).to_bytes(4, "big"))
         for control in ordered:
-            material += _framed_field(
-                "column_index", control.column_index.to_bytes(4, "big")
-            )
+            material += _framed_field("column_index", control.column_index.to_bytes(4, "big"))
             material += _framed_field("label", control.label.encode("utf-8"))
             material += _framed_field("kind", b"callback_data")
             material += _framed_field(
@@ -319,8 +307,7 @@ def _projection_for_review(
 ) -> tuple[str, dict[str, object], dict[str, object] | None]:
     required = ("amount", "currency", "transaction_date")
     if any(
-        not isinstance(fields.get(name), str) or not str(fields[name]).strip()
-        for name in required
+        not isinstance(fields.get(name), str) or not str(fields[name]).strip() for name in required
     ):
         raise PostingAuthorityError("proposal is incomplete for D2 posting")
     merchant = fields.get("merchant")
@@ -338,12 +325,17 @@ def _projection_for_review(
         "merchant": merchant,
         "account": "unspecified",
     }
-    is_receipt = conn.execute(
-        "SELECT 1 FROM receipt_ocr_proposal_links WHERE parser_output_id = ?",
-        (parser_output_id,),
-    ).fetchone() is not None
+    is_receipt = (
+        conn.execute(
+            "SELECT 1 FROM receipt_ocr_proposal_links WHERE parser_output_id = ?",
+            (parser_output_id,),
+        ).fetchone()
+        is not None
+    )
     if not is_receipt:
         return "text", base_projection, None
+    if not isinstance(merchant, str) or not merchant.strip():
+        raise PostingAuthorityError("personal receipt proposal requires merchant")
     if not receipt_payer_participant_public_id or not receipt_payer_participant_public_id.strip():
         raise PostingAuthorityError("personal receipt requires the authenticated payer participant")
     payer = receipt_payer_participant_public_id.strip()
@@ -362,16 +354,20 @@ def _projection_for_review(
             "currency": currency,
             "participants": [payer],
             "payer": payer,
-            "receipts": [{
-                "merchant": fields.get("merchant") or "Receipt total",
-                "paid_by": payer,
-                "net_paid": amount,
-                "items": [{
-                    "description": "Receipt total",
-                    "amount": amount,
-                    "owners": [payer],
-                }],
-            }],
+            "receipts": [
+                {
+                    "merchant": fields.get("merchant") or "Receipt total",
+                    "paid_by": payer,
+                    "net_paid": amount,
+                    "items": [
+                        {
+                            "description": "Receipt total",
+                            "amount": amount,
+                            "owners": [payer],
+                        }
+                    ],
+                }
+            ],
         }
     )
     projection = {
@@ -540,25 +536,32 @@ def prepare_posting_review(
                 or intake["status"] != "parsed_pending_confirmation"
             ):
                 raise PostingAuthorityError("initial proposal source evidence is unavailable")
-            if conn.execute(
-                "SELECT 1 FROM parser_human_drafts WHERE decision_target_parser_output_id = ? "
-                "AND state = 'active' LIMIT 1",
-                (parser_output_id,),
-            ).fetchone() is not None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM parser_human_drafts WHERE decision_target_parser_output_id = ? "
+                    "AND state = 'active' LIMIT 1",
+                    (parser_output_id,),
+                ).fetchone()
+                is not None
+            ):
                 raise PostingAuthorityError("initial proposal was replaced by human edit authority")
             resolved_proposal_public_id = str(proposal["public_id"])
             initial_card_public_id = _long_identity(
-                "d2card", resolved_proposal_public_id, version, content_hash,
-                context.actor_id, context.account_id, context.conversation_id,
-                context.binding_id, admitted_source_message_id,
+                "d2card",
+                resolved_proposal_public_id,
+                version,
+                content_hash,
+                context.actor_id,
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
+                admitted_source_message_id,
             )
             expires_at = now + 3600
             card_ref = initial_card_public_id
 
         try:
-            fields: Mapping[str, object] = resolve_simple_expense_conversion_fields(
-                conn, proposal
-            )
+            fields: Mapping[str, object] = resolve_simple_expense_conversion_fields(conn, proposal)
         except ParserConfirmationError as exc:
             raise PostingAuthorityError("proposal is not eligible for D2 posting") from exc
         if display_fields is None:
@@ -595,13 +598,24 @@ def prepare_posting_review(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        initial_card_public_id, f"initial:{review_idempotency_key}",
-                        parser_output_id, version, content_hash, int(intake["id"]),
-                        admitted_source_message_id, _sha256_text(expected_source_identity),
-                        context.actor_id, context.account_id,
-                        context.conversation_id, context.binding_id, projection_json,
-                        projection_hash, presentation, _sha256_text(presentation),
-                        expires_at, created_at,
+                        initial_card_public_id,
+                        f"initial:{review_idempotency_key}",
+                        parser_output_id,
+                        version,
+                        content_hash,
+                        int(intake["id"]),
+                        admitted_source_message_id,
+                        _sha256_text(expected_source_identity),
+                        context.actor_id,
+                        context.account_id,
+                        context.conversation_id,
+                        context.binding_id,
+                        projection_json,
+                        projection_hash,
+                        presentation,
+                        _sha256_text(presentation),
+                        expires_at,
+                        created_at,
                     ),
                 )
             else:
@@ -611,21 +625,40 @@ def prepare_posting_review(
                 if expires_at <= now:
                     raise PostingAuthorityError("initial card expired")
                 expected_card = (
-                    parser_output_id, version, content_hash, int(intake["id"]),
-                    admitted_source_message_id, _sha256_text(expected_source_identity),
-                    context.actor_id, context.account_id,
-                    context.conversation_id, context.binding_id, projection_json,
-                    projection_hash, presentation, _sha256_text(presentation), expires_at,
+                    parser_output_id,
+                    version,
+                    content_hash,
+                    int(intake["id"]),
+                    admitted_source_message_id,
+                    _sha256_text(expected_source_identity),
+                    context.actor_id,
+                    context.account_id,
+                    context.conversation_id,
+                    context.binding_id,
+                    projection_json,
+                    projection_hash,
+                    presentation,
+                    _sha256_text(presentation),
+                    expires_at,
                 )
                 actual_card = tuple(
-                    existing_card[name] for name in (
-                        "parser_output_id", "proposal_version", "proposal_content_hash",
-                        "raw_intake_record_id", "admitted_source_message_id",
+                    existing_card[name]
+                    for name in (
+                        "parser_output_id",
+                        "proposal_version",
+                        "proposal_content_hash",
+                        "raw_intake_record_id",
+                        "admitted_source_message_id",
                         "admitted_source_identity_sha256",
-                        "authenticated_actor_id", "telegram_account_id",
-                        "telegram_conversation_id", "conversation_binding_id",
-                        "visible_projection_json", "visible_projection_hash",
-                        "presentation_text", "presentation_text_hash", "expires_at",
+                        "authenticated_actor_id",
+                        "telegram_account_id",
+                        "telegram_conversation_id",
+                        "conversation_binding_id",
+                        "visible_projection_json",
+                        "visible_projection_hash",
+                        "presentation_text",
+                        "presentation_text_hash",
+                        "expires_at",
                     )
                 )
                 if actual_card != expected_card:
@@ -655,32 +688,66 @@ def prepare_posting_review(
                 ) VALUES (?, ?, ?, 1, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    review_public_id, review_idempotency_key, source_kind,
-                    card_generation_public_id, initial_card_public_id, parser_output_id,
-                    version, content_hash, posting_path, context.actor_id,
-                    context.account_id, context.conversation_id, context.binding_id,
-                    projection_json, projection_hash,
+                    review_public_id,
+                    review_idempotency_key,
+                    source_kind,
+                    card_generation_public_id,
+                    initial_card_public_id,
+                    parser_output_id,
+                    version,
+                    content_hash,
+                    posting_path,
+                    context.actor_id,
+                    context.account_id,
+                    context.conversation_id,
+                    context.binding_id,
+                    projection_json,
+                    projection_hash,
                     None if candidate is None else _canonical(candidate),
-                    expires_at, created_at,
+                    expires_at,
+                    created_at,
                 ),
             )
         durable = _review_row(conn, review_public_id)
         expected = (
-            review_idempotency_key, source_kind, 1, card_generation_public_id,
-            initial_card_public_id, parser_output_id, version, content_hash,
-            posting_path, context.actor_id, context.account_id,
-            context.conversation_id, context.binding_id, projection_json,
-            projection_hash, None if candidate is None else _canonical(candidate), expires_at,
+            review_idempotency_key,
+            source_kind,
+            1,
+            card_generation_public_id,
+            initial_card_public_id,
+            parser_output_id,
+            version,
+            content_hash,
+            posting_path,
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+            projection_json,
+            projection_hash,
+            None if candidate is None else _canonical(candidate),
+            expires_at,
         )
         actual = tuple(
-            durable[name] for name in (
-                "review_idempotency_key", "source_kind", "source_generation",
-                "card_generation_public_id", "initial_card_public_id", "parser_output_id",
-                "proposal_version", "proposal_content_hash", "posting_path",
-                "authenticated_actor_id", "telegram_account_id",
-                "telegram_conversation_id", "conversation_binding_id",
-                "visible_projection_json", "visible_projection_hash",
-                "receipt_fact_candidate_json", "expires_at",
+            durable[name]
+            for name in (
+                "review_idempotency_key",
+                "source_kind",
+                "source_generation",
+                "card_generation_public_id",
+                "initial_card_public_id",
+                "parser_output_id",
+                "proposal_version",
+                "proposal_content_hash",
+                "posting_path",
+                "authenticated_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+                "visible_projection_json",
+                "visible_projection_hash",
+                "receipt_fact_candidate_json",
+                "expires_at",
             )
         )
         if actual != expected:
@@ -744,11 +811,13 @@ def begin_posting_review_delivery(
         if existing_ttl_row is not None
         else min(3600, remaining)
     )
-    if conn.execute(
-        "SELECT 1 FROM d2_posting_review_supersessions "
-        "WHERE predecessor_review_public_id = ?",
-        (review_public_id,),
-    ).fetchone() is not None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM d2_posting_review_supersessions WHERE predecessor_review_public_id = ?",
+            (review_public_id,),
+        ).fetchone()
+        is not None
+    ):
         raise PostingAuthorityError("posting review was superseded")
     card_ref = (
         str(review["card_generation_public_id"])
@@ -785,12 +854,9 @@ def begin_posting_review_delivery(
             "FROM d2_initial_proposal_cards WHERE initial_card_public_id = ?",
             (review["initial_card_public_id"],),
         ).fetchone()
-        if (
-            initial is None
-            or not hmac.compare_digest(
-                str(initial["presentation_text_hash"]),
-                _sha256_text(str(initial["presentation_text"])),
-            )
+        if initial is None or not hmac.compare_digest(
+            str(initial["presentation_text_hash"]),
+            _sha256_text(str(initial["presentation_text"])),
         ):
             raise PostingAuthorityError("initial card presentation integrity mismatch")
         presentation = str(initial["presentation_text"])
@@ -849,9 +915,7 @@ def begin_posting_review_delivery(
         nonce_material = _framed_field("version", b"finance_d2_delivery_attempt_nonce_v1")
         nonce_material += _framed_field("attempt", delivery_id.encode("ascii"))
         nonce_material += _framed_field("digest", bytes.fromhex(material_digest))
-        attempt_nonce = "d2nonce_" + hmac.new(
-            key, nonce_material, hashlib.sha256
-        ).hexdigest()[:32]
+        attempt_nonce = "d2nonce_" + hmac.new(key, nonce_material, hashlib.sha256).hexdigest()[:32]
         for control in controls:
             row = row_by_action[control.action]
             durable = locked.execute(
@@ -859,13 +923,22 @@ def begin_posting_review_delivery(
                 "WHERE (review_public_id = ? AND action = ?) OR reference_id = ? "
                 "OR (review_public_id = ? AND row_index = ? AND column_index = ?)",
                 (
-                    review_public_id, control.action, row["id"], review_public_id,
-                    control.row_index, control.column_index,
+                    review_public_id,
+                    control.action,
+                    row["id"],
+                    review_public_id,
+                    control.row_index,
+                    control.column_index,
                 ),
             ).fetchall()
             expected_control = (
-                review_public_id, control.action, int(row["id"]), str(row["purpose"]),
-                control.row_index, control.column_index, control.label,
+                review_public_id,
+                control.action,
+                int(row["id"]),
+                str(row["purpose"]),
+                control.row_index,
+                control.column_index,
+                control.label,
                 layouts[control.action][1],
                 _callback_value_digest(control.callback_value).hex(),
             )
@@ -882,19 +955,28 @@ def begin_posting_review_delivery(
                     "WHERE review_public_id = ? AND action = ?",
                     (review_public_id, control.action),
                 ).fetchall()
-            actual_control = tuple(
-                durable[0][name]
-                for name in (
-                    "review_public_id", "action", "reference_id", "purpose",
-                    "row_index", "column_index", "label", "callback_route",
-                    "callback_value_sha256",
+            actual_control = (
+                tuple(
+                    durable[0][name]
+                    for name in (
+                        "review_public_id",
+                        "action",
+                        "reference_id",
+                        "purpose",
+                        "row_index",
+                        "column_index",
+                        "label",
+                        "callback_route",
+                        "callback_value_sha256",
+                    )
                 )
-            ) if len(durable) == 1 else ()
+                if len(durable) == 1
+                else ()
+            )
             if actual_control != expected_control:
                 raise PostingAuthorityError("posting review control binding conflict")
         attempt = locked.execute(
-            "SELECT * FROM d2_posting_review_delivery_attempts "
-            "WHERE review_public_id = ?",
+            "SELECT * FROM d2_posting_review_delivery_attempts WHERE review_public_id = ?",
             (review_public_id,),
         ).fetchone()
         if attempt is None:
@@ -906,23 +988,43 @@ def begin_posting_review_delivery(
                 "telegram_conversation_id, conversation_binding_id, attempted_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    delivery_id, review_public_id, DELIVERY_MANIFEST_VERSION, presentation,
-                    material_digest, _sha256_text(attempt_nonce), context.actor_id,
-                    context.account_id, context.conversation_id, context.binding_id, bound_at,
+                    delivery_id,
+                    review_public_id,
+                    DELIVERY_MANIFEST_VERSION,
+                    presentation,
+                    material_digest,
+                    _sha256_text(attempt_nonce),
+                    context.actor_id,
+                    context.account_id,
+                    context.conversation_id,
+                    context.binding_id,
+                    bound_at,
                 ),
             )
         else:
             expected_attempt = (
-                delivery_id, DELIVERY_MANIFEST_VERSION, presentation, material_digest,
-                _sha256_text(attempt_nonce), context.actor_id, context.account_id,
-                context.conversation_id, context.binding_id,
+                delivery_id,
+                DELIVERY_MANIFEST_VERSION,
+                presentation,
+                material_digest,
+                _sha256_text(attempt_nonce),
+                context.actor_id,
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
             )
             actual_attempt = tuple(
-                attempt[name] for name in (
-                    "delivery_attempt_public_id", "manifest_version", "presentation_text",
-                    "finance_delivery_material_sha256", "attempt_nonce_sha256",
-                    "authenticated_actor_id", "telegram_account_id",
-                    "telegram_conversation_id", "conversation_binding_id",
+                attempt[name]
+                for name in (
+                    "delivery_attempt_public_id",
+                    "manifest_version",
+                    "presentation_text",
+                    "finance_delivery_material_sha256",
+                    "attempt_nonce_sha256",
+                    "authenticated_actor_id",
+                    "telegram_account_id",
+                    "telegram_conversation_id",
+                    "conversation_binding_id",
                 )
             )
             if actual_attempt != expected_attempt:
@@ -953,9 +1055,7 @@ def begin_posting_review_delivery(
         context=context,
         ttl_seconds=issuance_ttl,
         allowed_actions=("confirm", "edit", "reject"),
-        action_purposes={
-            "confirm": "d2_post_v1", "edit": "edit_v1", "reject": "reject_v1"
-        },
+        action_purposes={"confirm": "d2_post_v1", "edit": "edit_v1", "reject": "reject_v1"},
         card_generation_public_id=(
             None
             if review["card_generation_public_id"] is None
@@ -1000,14 +1100,14 @@ def issue_posting_review_actions(
     )
 
 
-def _require_current_review(
-    conn: sqlite3.Connection, review: sqlite3.Row, *, now: int
-) -> None:
-    if conn.execute(
-        "SELECT 1 FROM d2_posting_review_supersessions "
-        "WHERE predecessor_review_public_id = ?",
-        (review["review_public_id"],),
-    ).fetchone() is not None:
+def _require_current_review(conn: sqlite3.Connection, review: sqlite3.Row, *, now: int) -> None:
+    if (
+        conn.execute(
+            "SELECT 1 FROM d2_posting_review_supersessions WHERE predecessor_review_public_id = ?",
+            (review["review_public_id"],),
+        ).fetchone()
+        is not None
+    ):
         raise PostingAuthorityError("posting review was superseded")
     if int(review["expires_at"]) <= now:
         raise PostingAuthorityError("posting review expired")
@@ -1056,8 +1156,9 @@ def _require_current_review(
         (review["initial_card_public_id"],),
     ).fetchone()
     expected_source_identity = (
-        "" if initial is None else
-        f"telegram:{review['telegram_conversation_id']}:"
+        ""
+        if initial is None
+        else f"telegram:{review['telegram_conversation_id']}:"
         f"{initial['admitted_source_message_id']}"
     )
     active_draft = conn.execute(
@@ -1069,8 +1170,7 @@ def _require_current_review(
         initial is None
         or int(initial["parser_output_id"]) != int(review["parser_output_id"])
         or int(initial["intake_parser_output_id"]) != int(review["parser_output_id"])
-        or str(initial["source_message_id"] or "")
-        != str(initial["admitted_source_message_id"])
+        or str(initial["source_message_id"] or "") != str(initial["admitted_source_message_id"])
         or initial["source_channel"] != "telegram"
         or str(initial["external_source_id"] or "") != expected_source_identity
         or not hmac.compare_digest(
@@ -1175,15 +1275,17 @@ def record_posting_review_delivery(
                 and hmac.compare_digest(
                     str(token_owner["finance_delivery_material_sha256"]), material_sha256
                 )
-                and hmac.compare_digest(
-                    str(token_owner["source_identity_sha256"]), source_sha256
-                )
+                and hmac.compare_digest(str(token_owner["source_identity_sha256"]), source_sha256)
             ):
                 conn.rollback()
                 return str(token_owner["observation_public_id"])
             raise PostingAuthorityError("terminal delivery receipt token was already consumed")
         observation_id = _long_identity(
-            "d2dobs", delivery_attempt_public_id, message_id, material_sha256, receipt_sha256,
+            "d2dobs",
+            delivery_attempt_public_id,
+            message_id,
+            material_sha256,
+            receipt_sha256,
         )
         activated_message_id = row["activated_message_id"]
         if activated_message_id is not None and int(activated_message_id) == message_id:
@@ -1198,9 +1300,7 @@ def record_posting_review_delivery(
                 and hmac.compare_digest(
                     str(activation["finance_delivery_material_sha256"]), material_sha256
                 )
-                and hmac.compare_digest(
-                    str(activation["source_identity_sha256"]), source_sha256
-                )
+                and hmac.compare_digest(str(activation["source_identity_sha256"]), source_sha256)
             ):
                 conn.rollback()
                 return str(activation["observation_public_id"])
@@ -1218,9 +1318,16 @@ def record_posting_review_delivery(
                 "error_code, observed_at) VALUES (?, ?, 'conflict', ?, ?, ?, ?, "
                 "'telegram', ?, ?, ?, 'multiple_provider_messages', ?)",
                 (
-                    observation_id, delivery_attempt_public_id, message_id, material_sha256,
-                    receipt_sha256, source_sha256, account_id, conversation_id,
-                    session_key, now,
+                    observation_id,
+                    delivery_attempt_public_id,
+                    message_id,
+                    material_sha256,
+                    receipt_sha256,
+                    source_sha256,
+                    account_id,
+                    conversation_id,
+                    session_key,
+                    now,
                 ),
             )
             conn.execute(
@@ -1234,10 +1341,20 @@ def record_posting_review_delivery(
                 "telegram_conversation_id, conversation_binding_id, observed_at) "
                 "VALUES (?, ?, ?, ?, ?, 'conflict', ?, ?, ?, ?, ?, 'telegram', ?, ?, ?, ?)",
                 (
-                    conflict_id, row["review_public_id"], delivery_attempt_public_id,
-                    row["activated_observation_id"], observation_id,
-                    activated_message_id, message_id, material_sha256, receipt_sha256,
-                    source_sha256, account_id, conversation_id, session_key, now,
+                    conflict_id,
+                    row["review_public_id"],
+                    delivery_attempt_public_id,
+                    row["activated_observation_id"],
+                    observation_id,
+                    activated_message_id,
+                    message_id,
+                    material_sha256,
+                    receipt_sha256,
+                    source_sha256,
+                    account_id,
+                    conversation_id,
+                    session_key,
+                    now,
                 ),
             )
             conflict = True
@@ -1252,9 +1369,16 @@ def record_posting_review_delivery(
                 "error_code, observed_at) VALUES (?, ?, 'success', ?, ?, ?, ?, "
                 "'telegram', ?, ?, ?, NULL, ?)",
                 (
-                    observation_id, delivery_attempt_public_id, message_id, material_sha256,
-                    receipt_sha256, source_sha256, account_id, conversation_id,
-                    session_key, now,
+                    observation_id,
+                    delivery_attempt_public_id,
+                    message_id,
+                    material_sha256,
+                    receipt_sha256,
+                    source_sha256,
+                    account_id,
+                    conversation_id,
+                    session_key,
+                    now,
                 ),
             )
             conn.execute(
@@ -1266,9 +1390,17 @@ def record_posting_review_delivery(
                 "source_identity_sha256, activated_at) "
                 "VALUES (?, ?, ?, 'success', ?, 'telegram', ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    row["review_public_id"], delivery_attempt_public_id, observation_id,
-                    message_id, account_id, conversation_id, session_key,
-                    material_sha256, receipt_sha256, source_sha256, now,
+                    row["review_public_id"],
+                    delivery_attempt_public_id,
+                    observation_id,
+                    message_id,
+                    account_id,
+                    conversation_id,
+                    session_key,
+                    material_sha256,
+                    receipt_sha256,
+                    source_sha256,
+                    now,
                 ),
             )
         conn.commit()
@@ -1317,10 +1449,13 @@ def replace_posting_review_delivery(
             or predecessor["conversation_binding_id"] != context.binding_id
         ):
             raise PostingAuthorityError("replacement context mismatch")
-        if conn.execute(
-            "SELECT 1 FROM d2_posting_attempts WHERE review_public_id = ?",
-            (predecessor_review_public_id,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM d2_posting_attempts WHERE review_public_id = ?",
+                (predecessor_review_public_id,),
+            ).fetchone()
+            is not None
+        ):
             raise PostingAuthorityError("accepted review cannot be replaced")
         existing = conn.execute(
             "SELECT * FROM d2_posting_review_supersessions "
@@ -1328,7 +1463,9 @@ def replace_posting_review_delivery(
             (predecessor_review_public_id, replacement_idempotency_key),
         ).fetchone()
         successor_id = _identity(
-            "d2rev", predecessor_review_public_id, replacement_idempotency_key,
+            "d2rev",
+            predecessor_review_public_id,
+            replacement_idempotency_key,
             replacement_material_hash,
         )
         if existing is not None:
@@ -1344,11 +1481,14 @@ def replace_posting_review_delivery(
                 raise PostingAuthorityError("replacement compare-and-swap conflict")
             conn.commit()
         else:
-            if conn.execute(
-                "SELECT 1 FROM d2_posting_review_supersessions "
-                "WHERE predecessor_review_public_id = ?",
-                (predecessor_review_public_id,),
-            ).fetchone() is not None:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM d2_posting_review_supersessions "
+                    "WHERE predecessor_review_public_id = ?",
+                    (predecessor_review_public_id,),
+                ).fetchone()
+                is not None
+            ):
                 raise PostingAuthorityError("replacement compare-and-swap conflict")
             now = clock()
             remaining = max(60, int(predecessor["expires_at"]) - now)
@@ -1367,16 +1507,25 @@ def replace_posting_review_delivery(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    successor_id, f"replacement:{replacement_idempotency_key}",
-                    predecessor["source_kind"], int(predecessor["source_generation"]) + 1,
+                    successor_id,
+                    f"replacement:{replacement_idempotency_key}",
+                    predecessor["source_kind"],
+                    int(predecessor["source_generation"]) + 1,
                     predecessor["card_generation_public_id"],
-                    predecessor["initial_card_public_id"], predecessor_review_public_id,
-                    predecessor["parser_output_id"], predecessor["proposal_version"],
-                    predecessor["proposal_content_hash"], predecessor["posting_path"],
-                    context.actor_id, context.account_id, context.conversation_id,
-                    context.binding_id, predecessor["visible_projection_json"],
+                    predecessor["initial_card_public_id"],
+                    predecessor_review_public_id,
+                    predecessor["parser_output_id"],
+                    predecessor["proposal_version"],
+                    predecessor["proposal_content_hash"],
+                    predecessor["posting_path"],
+                    context.actor_id,
+                    context.account_id,
+                    context.conversation_id,
+                    context.binding_id,
+                    predecessor["visible_projection_json"],
                     predecessor["visible_projection_hash"],
-                    predecessor["receipt_fact_candidate_json"], successor_expires_at,
+                    predecessor["receipt_fact_candidate_json"],
+                    successor_expires_at,
                     _now_text(now),
                 ),
             )
@@ -1386,8 +1535,11 @@ def replace_posting_review_delivery(
                 "replacement_idempotency_key, replacement_material_hash, reason, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    predecessor_review_public_id, successor_id,
-                    replacement_idempotency_key, replacement_material_hash, reason,
+                    predecessor_review_public_id,
+                    successor_id,
+                    replacement_idempotency_key,
+                    replacement_material_hash,
+                    reason,
                     _now_text(now),
                 ),
             )
@@ -1455,17 +1607,35 @@ def _has_valid_delivery_authority(
     row: sqlite3.Row, *, allow_post_decision_conflict: bool = False
 ) -> bool:
     required = (
-        "delivery_attempt_id", "delivery_review_id", "delivery_material_sha256",
-        "delivery_actor_id", "delivery_account_id", "delivery_conversation_id",
-        "delivery_binding_id", "activation_attempt_id", "activation_review_id",
-        "activation_observation_id", "activation_message_id", "activation_channel",
-        "activation_account_id", "activation_conversation_id", "activation_binding_id",
-        "activation_material_sha256", "activation_receipt_sha256",
-        "activation_source_sha256", "observation_id", "observation_attempt_id",
-        "observation_outcome", "observation_message_id", "observation_channel",
-        "observation_account_id", "observation_conversation_id",
-        "observation_binding_id", "observation_material_sha256",
-        "observation_receipt_sha256", "observation_source_sha256",
+        "delivery_attempt_id",
+        "delivery_review_id",
+        "delivery_material_sha256",
+        "delivery_actor_id",
+        "delivery_account_id",
+        "delivery_conversation_id",
+        "delivery_binding_id",
+        "activation_attempt_id",
+        "activation_review_id",
+        "activation_observation_id",
+        "activation_message_id",
+        "activation_channel",
+        "activation_account_id",
+        "activation_conversation_id",
+        "activation_binding_id",
+        "activation_material_sha256",
+        "activation_receipt_sha256",
+        "activation_source_sha256",
+        "observation_id",
+        "observation_attempt_id",
+        "observation_outcome",
+        "observation_message_id",
+        "observation_channel",
+        "observation_account_id",
+        "observation_conversation_id",
+        "observation_binding_id",
+        "observation_material_sha256",
+        "observation_receipt_sha256",
+        "observation_source_sha256",
     )
     if any(row[name] is None for name in required):
         return False
@@ -1486,8 +1656,7 @@ def _has_valid_delivery_authority(
         and str(row["activation_attempt_id"]) == str(row["delivery_attempt_id"])
         and str(row["activation_channel"]) == "telegram"
         and str(row["activation_account_id"]) == str(row["delivery_account_id"])
-        and str(row["activation_conversation_id"])
-        == str(row["delivery_conversation_id"])
+        and str(row["activation_conversation_id"]) == str(row["delivery_conversation_id"])
         and str(row["activation_binding_id"]) == str(row["delivery_binding_id"])
         and str(row["observation_id"]) == str(row["activation_observation_id"])
         and str(row["observation_attempt_id"]) == str(row["delivery_attempt_id"])
@@ -1495,8 +1664,7 @@ def _has_valid_delivery_authority(
         and int(row["observation_message_id"]) == int(row["activation_message_id"])
         and str(row["observation_channel"]) == "telegram"
         and str(row["observation_account_id"]) == str(row["activation_account_id"])
-        and str(row["observation_conversation_id"])
-        == str(row["activation_conversation_id"])
+        and str(row["observation_conversation_id"]) == str(row["activation_conversation_id"])
         and str(row["observation_binding_id"]) == str(row["activation_binding_id"])
         and all(
             hmac.compare_digest(str(row[left]), str(row[right]))
@@ -1510,9 +1678,7 @@ def _has_valid_delivery_authority(
     )
 
 
-def _review_has_valid_delivery_authority(
-    conn: sqlite3.Connection, review_public_id: str
-) -> bool:
+def _review_has_valid_delivery_authority(conn: sqlite3.Connection, review_public_id: str) -> bool:
     row = conn.execute(
         """
         SELECT reviews.review_public_id,
@@ -2651,7 +2817,9 @@ def get_status(
         attention_reason=(
             attention_reason
             if attention_reason is not None
-            else None if row["attention_reason"] is None else str(row["attention_reason"])
+            else None
+            if row["attention_reason"] is None
+            else str(row["attention_reason"])
         ),
     )
 
