@@ -12,9 +12,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Callable, Mapping
 
 from finance_core.calculation.authoritative_snapshot import (
@@ -1285,6 +1287,27 @@ def record_posting_review_delivery(
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
+    database_rows = conn.execute("PRAGMA database_list").fetchall()
+    main_database = next((row for row in database_rows if str(row[1]) == "main"), None)
+    if main_database is None:
+        raise PostingAuthorityError("delivery receipt database identity is unavailable")
+    database_path = str(main_database[2] or "")
+    if database_path:
+        expected_database = Path(verified.workspace_path) / "database" / "staging.sqlite"
+        try:
+            if expected_database.is_symlink():
+                raise OSError("workspace database is a symlink")
+            expected_identity = os.stat(expected_database, follow_symlinks=False)
+            opened_identity = os.stat(database_path, follow_symlinks=False)
+        except OSError as exc:
+            raise PostingAuthorityError(
+                "delivery receipt workspace database identity is unavailable"
+            ) from exc
+        if (expected_identity.st_dev, expected_identity.st_ino) != (
+            opened_identity.st_dev,
+            opened_identity.st_ino,
+        ):
+            raise PostingAuthorityError("delivery receipt workspace database identity mismatch")
     if capability != DELIVERY_MATERIAL_CAPABILITY:
         raise PostingAuthorityError("terminal delivery capability is invalid")
     if delivery_material_version != DELIVERY_MATERIAL_VERSION:

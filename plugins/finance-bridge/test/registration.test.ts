@@ -465,6 +465,54 @@ test("host-owned Finance delivery receipt is consumed once by the closed Python 
   assert.deepEqual(recorded, [material]);
 });
 
+test("receipt proof preflight failure keeps registration unhealthy before health or record", async () => {
+  const fixture = fakeApi();
+  let healthCalls = 0;
+  let recordCalls = 0;
+  registerFinanceBridge(fixture.api, {
+    ...dependencies,
+    createRunner() {
+      return {
+        async validateFinanceDeliveryReceiptCapability(): Promise<void> {
+          throw new Error("synthetic unsafe receipt key");
+        },
+        async recordFinanceDeliveryReceipt(): Promise<void> { recordCalls += 1; },
+        async run(request: BridgeRequest): Promise<BridgeResponse> {
+          healthCalls += 1;
+          return registrationOk(request, {
+            workspace_verified: true,
+            database_verified: true,
+            callback_key_status: "present",
+          });
+        },
+      };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(healthCalls, 0);
+  const material: FinanceDeliveryMaterialV1 = {
+    capability: "telegram.finance-delivery-material-v1",
+    deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+    attemptNonce: `d2nonce_${"1".repeat(32)}`,
+    deliveryMaterialSha256: "2".repeat(64),
+    providerMessageId: "200",
+    receiptTokenSha256: "3".repeat(64),
+    channel: "telegram",
+    accountId: "finance-account",
+    conversationId: "111",
+    sessionKey: "binding-1",
+    sourceIdentitySha256: "4".repeat(64),
+  };
+  await assert.rejects(
+    async () => await fixture.deliveryReceiptConsumers[0]!({
+      version: "finance_delivery_receipt_v1",
+      async consume(consumer) { await consumer(material); },
+    }),
+    /consumer is unavailable/u,
+  );
+  assert.equal(recordCalls, 0);
+});
+
 test("full registration refuses a host without the terminal Finance delivery capability", () => {
   const fixture = fakeApi();
   delete (fixture.api as unknown as {financeDeliveryCapabilities?: unknown})

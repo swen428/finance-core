@@ -38,6 +38,16 @@ def test_d2_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
     )
 
 
+def test_d2_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    d2_posting_cases.test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
+        workspace, monkeypatch, tmp_path
+    )
+
+
 def test_d2_one_confirm_posts_once_and_status_recovers_same_result(
     workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,

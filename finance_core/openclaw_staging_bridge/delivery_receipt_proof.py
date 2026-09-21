@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 from dataclasses import dataclass
+from pathlib import Path
+
+from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 
 PROOF_VERSION = "finance_delivery_receipt_proof_v1"
 _CAPABILITY = object()
@@ -80,13 +83,24 @@ class VerifiedDeliveryReceipt:
 
 def authenticate_delivery_receipt(
     *,
-    signing_key: bytes,
     receipt_proof_sha256_value: str,
     **fields: object,
 ) -> VerifiedDeliveryReceipt:
-    """Authenticate all frozen receipt fields before authority code can see them."""
+    """Authenticate all fields with the key owned by the bound workspace."""
     if not isinstance(receipt_proof_sha256_value, str) or len(receipt_proof_sha256_value) != 64:
         raise ValueError("delivery receipt proof is malformed")
+    workspace_path = fields.get("workspace_path")
+    if not isinstance(workspace_path, str) or not workspace_path:
+        raise ValueError("delivery receipt workspace is malformed")
+    workspace = Path(workspace_path)
+    if (
+        not workspace.is_absolute()
+        or workspace.is_symlink()
+        or not workspace.is_dir()
+        or workspace.resolve(strict=True) != workspace
+    ):
+        raise ValueError("delivery receipt workspace is unsafe")
+    signing_key = load_delivery_receipt_signing_key(str(workspace / "runtime"))
     expected = receipt_proof_sha256(signing_key=signing_key, **fields)
     if not hmac.compare_digest(expected, receipt_proof_sha256_value):
         raise ValueError("delivery receipt proof is invalid")

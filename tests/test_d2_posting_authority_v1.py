@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,35 +75,49 @@ def _issue_and_activate(
         context=context,
         clock=lambda: issue_time,
     )
-    fields = {
-        "workspace_path": "/synthetic/d2-posting-authority",
-        "attempt_nonce": manifest.delivery_attempt_nonce,
-        "capability": "telegram.finance-delivery-material-v1",
-        "delivery_material_version": "finance_d2_delivery_material_v1",
-        "delivery_material_sha256": manifest.finance_delivery_material_sha256,
-        "provider_message_id": provider_message_id,
-        "receipt_token_sha256": hashlib.sha256(
-            f"receipt:{provider_message_id}".encode()
-        ).hexdigest(),
-        "channel": "telegram",
-        "account_id": context.account_id,
-        "conversation_id": context.conversation_id,
-        "session_key": context.binding_id,
-        "source_identity_sha256": "b" * 64,
-    }
     signing_key = b"p" * 32
-    record_posting_review_delivery(
-        conn,
-        receipt=authenticate_delivery_receipt(
-            signing_key=signing_key,
-            receipt_proof_sha256_value=receipt_proof_sha256(
-                signing_key=signing_key,
+    with tempfile.TemporaryDirectory(prefix="finance-d2-proof-") as raw_workspace:
+        workspace = Path(raw_workspace).resolve()
+        runtime = workspace / "runtime"
+        runtime.mkdir(mode=0o700)
+        key_path = runtime / "delivery_receipt_signing.key"
+        key_path.write_bytes(signing_key)
+        key_path.chmod(0o600)
+        database_path = str(
+            next(row for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main")[2]
+            or ""
+        )
+        if database_path:
+            database = workspace / "database"
+            database.mkdir(mode=0o700)
+            os.link(database_path, database / "staging.sqlite")
+        fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": manifest.delivery_attempt_nonce,
+            "capability": "telegram.finance-delivery-material-v1",
+            "delivery_material_version": "finance_d2_delivery_material_v1",
+            "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+            "provider_message_id": provider_message_id,
+            "receipt_token_sha256": hashlib.sha256(
+                f"receipt:{provider_message_id}".encode()
+            ).hexdigest(),
+            "channel": "telegram",
+            "account_id": context.account_id,
+            "conversation_id": context.conversation_id,
+            "session_key": context.binding_id,
+            "source_identity_sha256": "b" * 64,
+        }
+        record_posting_review_delivery(
+            conn,
+            receipt=authenticate_delivery_receipt(
+                receipt_proof_sha256_value=receipt_proof_sha256(
+                    signing_key=signing_key,
+                    **fields,
+                ),
                 **fields,
             ),
-            **fields,
-        ),
-        clock=lambda: issue_time + 1,
-    )
+            clock=lambda: issue_time + 1,
+        )
     confirm = next(control for control in manifest.controls if control.action == "confirm")
     return (
         SimpleNamespace(reference=confirm.callback_value.removeprefix("post:")),

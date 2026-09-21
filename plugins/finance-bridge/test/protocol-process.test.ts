@@ -10,6 +10,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -42,6 +43,7 @@ import {
 } from "../src/subprocess.js";
 import type { FinanceDeliveryMaterialV1 } from "../src/delivery-receipt.js";
 import {
+  financeDeliveryReceiptProofProvider,
   financeDeliveryReceiptProofSha256,
   type FinanceDeliveryReceiptProofProvider,
 } from "../src/delivery-receipt-proof.js";
@@ -330,6 +332,37 @@ test("delivery receipt proof matches the Python authority vector", () => {
     financeDeliveryReceiptProofSha256(Buffer.alloc(32, "k"), "/tmp/workspace", material),
     "c747dd610a43d562c380a71aafb704c3f7a4706e758120b5c2a42a9e9bd170ca",
   );
+});
+
+test("delivery receipt proof provider fails closed on unsafe workspace keys", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "finance-delivery-proof-")));
+  const runtime = join(root, "runtime");
+  const keyPath = join(runtime, "delivery_receipt_signing.key");
+  const targetPath = join(root, "outside.key");
+  const config = {
+    repoRoot: "/repo",
+    coreDistributionRoot: "/core-distribution",
+    pythonExecutable: "/repo/.venv/bin/python",
+    workspaceRoot: root,
+    agentProfileV2: AGENT_PROFILE_V2,
+  };
+  try {
+    await mkdir(runtime, { mode: 0o700 });
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await writeFile(keyPath, Buffer.alloc(32, "k"), { mode: 0o644 });
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await chmod(keyPath, 0o600);
+    await writeFile(keyPath, Buffer.alloc(31, "k"));
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await writeFile(keyPath, Buffer.alloc(32, "k"));
+    await financeDeliveryReceiptProofProvider.validate(config);
+    await rm(keyPath);
+    await writeFile(targetPath, Buffer.alloc(32, "k"), { mode: 0o600 });
+    await symlink(targetPath, keyPath);
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("closed delivery receipt runner invokes only the dedicated consumer module", async () => {

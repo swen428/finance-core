@@ -19,7 +19,6 @@ from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
     authenticate_delivery_receipt,
 )
 from finance_core.receipt_staging_runner.models import RunnerWorkspaceError
-from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 
 MAX_REQUEST_BYTES = 16_384
 MAX_RESPONSE_BYTES = 1_024
@@ -80,7 +79,6 @@ def execute_stream(stdin: BinaryIO, stdout: TextIO, stderr: TextIO) -> int:
             "source_identity_sha256": payload["source_identity_sha256"],
         }
         receipt = authenticate_delivery_receipt(
-            signing_key=load_delivery_receipt_signing_key(str(workspace / "runtime")),
             receipt_proof_sha256_value=payload["receipt_proof_sha256"],
             **proof_fields,
         )

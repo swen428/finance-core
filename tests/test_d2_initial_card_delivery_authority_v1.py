@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -405,49 +407,63 @@ def _record_delivery(
     now: int,
 ) -> str:
     delivery_attempt_public_id = str(getattr(manifest, "delivery_attempt_public_id"))
-    fields = {
-        "workspace_path": "/synthetic/d2-initial-card-authority",
-        "attempt_nonce": (
-            str(getattr(manifest, "delivery_attempt_nonce"))
-            if attempt_nonce is None
-            else attempt_nonce
-        ),
-        "capability": capability,
-        "delivery_material_version": delivery_material_version,
-        "delivery_material_sha256": (
-            str(getattr(manifest, "finance_delivery_material_sha256"))
-            if material_sha256 is None
-            else material_sha256
-        ),
-        "provider_message_id": provider_message_id,
-        "receipt_token_sha256": (
-            hashlib.sha256(
-                f"receipt:{delivery_attempt_public_id}:{provider_message_id}".encode()
-            ).hexdigest()
-            if receipt_token_sha256 is None
-            else receipt_token_sha256
-        ),
-        "channel": channel,
-        "account_id": context.account_id if account_id is None else account_id,
-        "conversation_id": (
-            context.conversation_id if conversation_id is None else conversation_id
-        ),
-        "session_key": context.binding_id if session_key is None else session_key,
-        "source_identity_sha256": source_identity_sha256,
-    }
     signing_key = b"i" * 32
-    return record_posting_review_delivery(
-        conn,
-        receipt=authenticate_delivery_receipt(
-            signing_key=signing_key,
-            receipt_proof_sha256_value=receipt_proof_sha256(
-                signing_key=signing_key,
+    with tempfile.TemporaryDirectory(prefix="finance-d2-proof-") as raw_workspace:
+        workspace = Path(raw_workspace).resolve()
+        runtime = workspace / "runtime"
+        runtime.mkdir(mode=0o700)
+        key_path = runtime / "delivery_receipt_signing.key"
+        key_path.write_bytes(signing_key)
+        key_path.chmod(0o600)
+        database_path = str(
+            next(row for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main")[2]
+            or ""
+        )
+        if database_path:
+            database = workspace / "database"
+            database.mkdir(mode=0o700)
+            os.link(database_path, database / "staging.sqlite")
+        fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": (
+                str(getattr(manifest, "delivery_attempt_nonce"))
+                if attempt_nonce is None
+                else attempt_nonce
+            ),
+            "capability": capability,
+            "delivery_material_version": delivery_material_version,
+            "delivery_material_sha256": (
+                str(getattr(manifest, "finance_delivery_material_sha256"))
+                if material_sha256 is None
+                else material_sha256
+            ),
+            "provider_message_id": provider_message_id,
+            "receipt_token_sha256": (
+                hashlib.sha256(
+                    f"receipt:{delivery_attempt_public_id}:{provider_message_id}".encode()
+                ).hexdigest()
+                if receipt_token_sha256 is None
+                else receipt_token_sha256
+            ),
+            "channel": channel,
+            "account_id": context.account_id if account_id is None else account_id,
+            "conversation_id": (
+                context.conversation_id if conversation_id is None else conversation_id
+            ),
+            "session_key": context.binding_id if session_key is None else session_key,
+            "source_identity_sha256": source_identity_sha256,
+        }
+        return record_posting_review_delivery(
+            conn,
+            receipt=authenticate_delivery_receipt(
+                receipt_proof_sha256_value=receipt_proof_sha256(
+                    signing_key=signing_key,
+                    **fields,
+                ),
                 **fields,
             ),
-            **fields,
-        ),
-        clock=lambda: now,
-    )
+            clock=lambda: now,
+        )
 
 
 def test_delivery_material_shared_golden_vector() -> None:
@@ -484,6 +500,58 @@ def test_delivery_writer_refuses_raw_field_only_module_call() -> None:
             session_key="binding",
             source_identity_sha256="4" * 64,
         )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
+
+
+def test_delivery_authenticator_refuses_caller_selected_key() -> None:
+    conn = _connection()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    proposal_public_id = _seed_initial_text(conn)
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-attacker-key-review",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-attacker-key-actions",
+        context=context,
+        clock=lambda: 1001,
+    )
+    with tempfile.TemporaryDirectory(prefix="finance-d2-proof-") as raw_workspace:
+        workspace = Path(raw_workspace).resolve()
+        runtime = workspace / "runtime"
+        runtime.mkdir(mode=0o700)
+        key_path = runtime / "delivery_receipt_signing.key"
+        key_path.write_bytes(b"R" * 32)
+        key_path.chmod(0o600)
+        fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": manifest.delivery_attempt_nonce,
+            "capability": "telegram.finance-delivery-material-v1",
+            "delivery_material_version": "finance_d2_delivery_material_v1",
+            "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+            "provider_message_id": 299,
+            "receipt_token_sha256": "3" * 64,
+            "channel": "telegram",
+            "account_id": context.account_id,
+            "conversation_id": context.conversation_id,
+            "session_key": context.binding_id,
+            "source_identity_sha256": "4" * 64,
+        }
+        forged_proof = receipt_proof_sha256(signing_key=b"A" * 32, **fields)
+        with pytest.raises(ValueError, match="proof is invalid"):
+            authenticate_delivery_receipt(
+                receipt_proof_sha256_value=forged_proof,
+                **fields,
+            )
     assert (
         conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
         == 0

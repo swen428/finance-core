@@ -15,12 +15,17 @@ from finance_core.openclaw_staging_bridge import delivery_receipt_cli
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
 from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
     PROOF_VERSION,
+    authenticate_delivery_receipt,
     receipt_proof_sha256,
 )
 from finance_core.parser_proposals import human_drafts
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 from finance_core.parser_proposals.human_revision import publish_human_revision_in_transaction
+from finance_core.posting_authority import (
+    PostingAuthorityError,
+    record_posting_review_delivery,
+)
 from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
@@ -264,6 +269,103 @@ def test_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
         )
     finally:
         conn.close()
+
+
+def test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    card_id, _proposal_id, _version, _content_hash, _batch_id = _published_text_card(
+        workspace, monkeypatch
+    )
+    context = _context(workspace)
+    prepared = support.run_cli(
+        support.make_request(
+            "prepare_posting_review",
+            {**context, "card_generation_public_id": card_id},
+            idempotency_key=support.canonical_prepare_posting_review_key(card_id),
+        )
+    )
+    review_id = str(prepared.response["result"]["review_public_id"])
+    issued = support.run_cli(
+        support.make_request(
+            "issue_posting_review_actions",
+            {**context, "posting_review_public_id": review_id},
+            idempotency_key=support.canonical_issue_posting_review_actions_key(review_id),
+        )
+    )
+    payload = _delivery_receipt_payload(
+        workspace,
+        issued.response["result"],
+        provider_message_id="299",
+        receipt_token_sha256=hashlib.sha256(b"real-receipt").hexdigest(),
+        source_identity_sha256="f" * 64,
+    )
+    other = support.create_bridge_workspace(tmp_path, name="proof-transplant")
+    invalid_payloads = [
+        {**payload, "receipt_proof_sha256": "0" * 64},
+        {**payload, "provider_message_id": "300"},
+        {**payload, "session_key": "other-binding"},
+        {**payload, "workspace_path": str(other.workspace_path)},
+    ]
+    for invalid in invalid_payloads:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        assert (
+            delivery_receipt_cli.execute_stream(
+                io.BytesIO(json.dumps(invalid).encode()), stdout, stderr
+            )
+            == bridge_errors.EXIT_AUTHORITY_REFUSED
+        )
+    transplant_fields = {
+        "workspace_path": str(other.workspace_path),
+        "attempt_nonce": payload["attempt_nonce"],
+        "capability": payload["capability"],
+        "delivery_material_version": payload["delivery_material_version"],
+        "delivery_material_sha256": payload["delivery_material_sha256"],
+        "provider_message_id": payload["provider_message_id"],
+        "receipt_token_sha256": payload["receipt_token_sha256"],
+        "channel": payload["channel"],
+        "account_id": payload["account_id"],
+        "conversation_id": payload["conversation_id"],
+        "session_key": payload["session_key"],
+        "source_identity_sha256": payload["source_identity_sha256"],
+    }
+    other_key = load_delivery_receipt_signing_key(str(other.workspace_path / "runtime"))
+    transplanted_receipt = authenticate_delivery_receipt(
+        receipt_proof_sha256_value=receipt_proof_sha256(
+            signing_key=other_key,
+            **transplant_fields,
+        ),
+        **transplant_fields,
+    )
+    original_conn = support.open_database(workspace)
+    try:
+        with pytest.raises(PostingAuthorityError, match="workspace database identity mismatch"):
+            record_posting_review_delivery(original_conn, receipt=transplanted_receipt)
+    finally:
+        original_conn.close()
+    key_path = workspace.workspace_path / "runtime" / "delivery_receipt_signing.key"
+    key_path.write_bytes(b"N" * 32)
+    key_path.chmod(0o600)
+    assert (
+        delivery_receipt_cli.execute_stream(
+            io.BytesIO(json.dumps(payload).encode()), io.StringIO(), io.StringIO()
+        )
+        == bridge_errors.EXIT_AUTHORITY_REFUSED
+    )
+    for target in (workspace, other):
+        conn = support.open_database(target)
+        try:
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) FROM d2_posting_review_delivery_activations"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            conn.close()
 
 
 def test_one_confirm_posts_once_and_status_recovers_same_result(
