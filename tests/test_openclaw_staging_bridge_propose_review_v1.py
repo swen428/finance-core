@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import openclaw_staging_bridge_d2_posting_cases_v1 as d2_posting_cases
 import openclaw_staging_bridge_support_v1 as support
 import pytest
 
@@ -26,6 +27,47 @@ from finance_core.openclaw_staging_bridge import ocr_boundary
 @pytest.fixture()
 def workspace(tmp_path: Path) -> support.BridgeWorkspace:
     return support.create_bridge_workspace(tmp_path)
+
+
+def test_d2_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d2_posting_cases.test_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
+        workspace, monkeypatch
+    )
+
+
+def test_d2_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    d2_posting_cases.test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
+        workspace, monkeypatch, tmp_path
+    )
+
+
+def test_d2_one_confirm_posts_once_and_status_recovers_same_result(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d2_posting_cases.test_one_confirm_posts_once_and_status_recovers_same_result(
+        workspace, monkeypatch
+    )
+
+
+def test_d2_personal_total_receipt_uses_python_card_and_posts_once(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    d2_posting_cases.test_personal_total_receipt_uses_python_card_and_posts_once(workspace)
+
+
+def test_d2_posting_status_reference_is_context_bound(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    d2_posting_cases.test_posting_status_reference_is_context_bound(workspace, monkeypatch)
 
 
 def capture_text(workspace: support.BridgeWorkspace, text: str, key: str) -> dict:
@@ -319,6 +361,21 @@ class TestGetReview:
         self, workspace: support.BridgeWorkspace
     ) -> None:
         capture = capture_text(workspace, "taxi to airport 35.50", "review-text-1")
+        conn = support.open_database(workspace)
+        try:
+            row = conn.execute(
+                "SELECT parsed_payload FROM parser_outputs WHERE public_id = ?",
+                (capture["proposal_public_id"],),
+            ).fetchone()
+            payload = json.loads(str(row[0]))
+            payload["category"] = "transport"
+            conn.execute(
+                "UPDATE parser_outputs SET parsed_payload = ? WHERE public_id = ?",
+                (json.dumps(payload), capture["proposal_public_id"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
         outcome = support.run_cli(
             support.make_request(
                 "get_review",
@@ -338,6 +395,7 @@ class TestGetReview:
         assert card["currency"] is None
         assert card["transaction_date"] is None
         assert card["merchant"] == "taxi"
+        assert card["category"] == "transport"
         assert card["account"] is None
         assert card["account_status"] in {"present", "absent"}
         assert card["classification"] in {"personal", "shared"}

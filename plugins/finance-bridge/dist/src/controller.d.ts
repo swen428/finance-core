@@ -65,6 +65,7 @@ export declare class FinanceInboundController {
     private runTextTurn;
     private proposeAndReviewCaptured;
     private proposeAndReview;
+    private deliverHumanDraftPostingReview;
     private reviewProposal;
     private processingFooter;
     private runAiFallback;

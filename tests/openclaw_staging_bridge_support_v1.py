@@ -76,6 +76,23 @@ def canonical_human_action_redemption_key(callback_id: str) -> str:
     return f"bridge-human-action-redeem:{digest}"
 
 
+def canonical_prepare_posting_review_key(card_generation_public_id: str) -> str:
+    return f"bridge-d2-prepare:{card_generation_public_id}"
+
+
+def canonical_issue_posting_review_actions_key(review_public_id: str) -> str:
+    return f"bridge-d2-issue:{review_public_id}"
+
+
+def canonical_confirm_and_post_key(callback_id: str) -> str:
+    digest = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()[:32]
+    return f"bridge-d2-confirm:{digest}"
+
+
+def canonical_resume_posting_key(attempt_public_id: str) -> str:
+    return f"bridge-d2-resume:{attempt_public_id}"
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 

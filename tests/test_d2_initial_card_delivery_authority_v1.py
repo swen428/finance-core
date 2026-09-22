@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 from pathlib import Path
 
 import pytest
 
 from finance_core import posting_authority as posting_authority_module
+from finance_core.calculation.authoritative_snapshot import canonical_json_text
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    authenticate_delivery_receipt,
+    receipt_proof_sha256,
+)
 from finance_core.openclaw_staging_bridge.human_actions import (
     HumanActionContext,
     HumanActionReferenceError,
@@ -37,11 +44,13 @@ from finance_core.posting_authority import (
     replace_posting_review_delivery,
     resume_posting,
 )
+from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 from finance_core.reconciliation.migrations import (
     TEMP_DB_MIGRATION_PATHS,
     MigrationExecutionError,
     apply_migration_paths,
 )
+from finance_core.staging_guard import create_staging_database
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     record_telegram_source_context,
@@ -56,6 +65,42 @@ def _connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     return conn
+
+
+def _file_connection(tmp_path: Path) -> sqlite3.Connection:
+    workspace = (tmp_path / "workspace").resolve()
+    runtime = workspace / "runtime"
+    database = workspace / "database"
+    runtime.mkdir(parents=True, mode=0o700)
+    database.mkdir(mode=0o700)
+    key_path = runtime / "delivery_receipt_signing.key"
+    key_path.write_bytes(b"i" * 32)
+    key_path.chmod(0o600)
+    return create_staging_database(
+        database / "staging.sqlite",
+        migration_paths=TEMP_DB_MIGRATION_PATHS,
+    )
+
+
+def test_delivery_receipt_proof_matches_bridge_vector() -> None:
+    assert (
+        receipt_proof_sha256(
+            signing_key=b"k" * 32,
+            workspace_path="/tmp/workspace",
+            attempt_nonce=f"d2nonce_{'1' * 32}",
+            capability="telegram.finance-delivery-material-v1",
+            delivery_material_version="finance_d2_delivery_material_v1",
+            delivery_material_sha256="2" * 64,
+            provider_message_id="200",
+            receipt_token_sha256="3" * 64,
+            channel="telegram",
+            account_id="finance-account",
+            conversation_id="111",
+            session_key="binding-1",
+            source_identity_sha256="4" * 64,
+        )
+        == "c747dd610a43d562c380a71aafb704c3f7a4706e758120b5c2a42a9e9bd170ca"
+    )
 
 
 def _bind_source_context(
@@ -238,16 +283,14 @@ def _migration_049_d1_review(
         ),
     )
     review_public_id = "d2rev_" + "8" * 30
-    projection = json.dumps(
+    projection = canonical_json_text(
         {
             "account": "unspecified",
             "amount": "12.50",
             "currency": "SGD",
-            "merchant": "Kopitiam",
+            "merchant": "Cafe",
             "transaction_date": "2026-09-21",
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+        }
     )
     conn.execute(
         """
@@ -381,33 +424,48 @@ def _record_delivery(
     now: int,
 ) -> str:
     delivery_attempt_public_id = str(getattr(manifest, "delivery_attempt_public_id"))
-    return record_posting_review_delivery(
-        conn,
-        attempt_nonce=(
+    database_path = Path(
+        str(next(row for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main")[2])
+    )
+    workspace = database_path.parent.parent
+    signing_key = load_delivery_receipt_signing_key(str(workspace / "runtime"))
+    fields = {
+        "workspace_path": str(workspace),
+        "attempt_nonce": (
             str(getattr(manifest, "delivery_attempt_nonce"))
             if attempt_nonce is None
             else attempt_nonce
         ),
-        capability=capability,
-        delivery_material_version=delivery_material_version,
-        finance_delivery_material_sha256=(
+        "capability": capability,
+        "delivery_material_version": delivery_material_version,
+        "delivery_material_sha256": (
             str(getattr(manifest, "finance_delivery_material_sha256"))
             if material_sha256 is None
             else material_sha256
         ),
-        provider_message_id=provider_message_id,
-        receipt_token_sha256=(
+        "provider_message_id": provider_message_id,
+        "receipt_token_sha256": (
             hashlib.sha256(
                 f"receipt:{delivery_attempt_public_id}:{provider_message_id}".encode()
             ).hexdigest()
             if receipt_token_sha256 is None
             else receipt_token_sha256
         ),
-        channel=channel,
-        account_id=context.account_id if account_id is None else account_id,
-        conversation_id=(context.conversation_id if conversation_id is None else conversation_id),
-        session_key=context.binding_id if session_key is None else session_key,
-        source_identity_sha256=source_identity_sha256,
+        "channel": channel,
+        "account_id": context.account_id if account_id is None else account_id,
+        "conversation_id": context.conversation_id if conversation_id is None else conversation_id,
+        "session_key": context.binding_id if session_key is None else session_key,
+        "source_identity_sha256": source_identity_sha256,
+    }
+    return record_posting_review_delivery(
+        conn,
+        receipt=authenticate_delivery_receipt(
+            receipt_proof_sha256_value=receipt_proof_sha256(
+                signing_key=signing_key,
+                **fields,
+            ),
+            **fields,
+        ),
         clock=lambda: now,
     )
 
@@ -426,6 +484,210 @@ def test_delivery_material_shared_golden_vector() -> None:
     )
     assert finance_delivery_material_digest("D2 test €", mutated) != (
         "33133daf947b4c35586040a8d9aa702ffe2da8f7336723ab6e2c481bab9cd290"
+    )
+
+
+def test_delivery_writer_refuses_raw_field_only_module_call() -> None:
+    conn = _connection()
+    with pytest.raises(TypeError):
+        record_posting_review_delivery(  # type: ignore[call-arg]
+            conn,
+            attempt_nonce="d2nonce_" + "1" * 32,
+            capability="telegram.finance-delivery-material-v1",
+            delivery_material_version="finance_d2_delivery_material_v1",
+            finance_delivery_material_sha256="2" * 64,
+            provider_message_id=1,
+            receipt_token_sha256="3" * 64,
+            channel="telegram",
+            account_id="acct",
+            conversation_id="111",
+            session_key="binding",
+            source_identity_sha256="4" * 64,
+        )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
+
+
+def test_delivery_authenticator_refuses_caller_selected_key() -> None:
+    conn = _connection()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    proposal_public_id = _seed_initial_text(conn)
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-attacker-key-review",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-attacker-key-actions",
+        context=context,
+        clock=lambda: 1001,
+    )
+    with tempfile.TemporaryDirectory(prefix="finance-d2-proof-") as raw_workspace:
+        workspace = Path(raw_workspace).resolve()
+        runtime = workspace / "runtime"
+        runtime.mkdir(mode=0o700)
+        key_path = runtime / "delivery_receipt_signing.key"
+        key_path.write_bytes(b"R" * 32)
+        key_path.chmod(0o600)
+        fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": manifest.delivery_attempt_nonce,
+            "capability": "telegram.finance-delivery-material-v1",
+            "delivery_material_version": "finance_d2_delivery_material_v1",
+            "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+            "provider_message_id": 299,
+            "receipt_token_sha256": "3" * 64,
+            "channel": "telegram",
+            "account_id": context.account_id,
+            "conversation_id": context.conversation_id,
+            "session_key": context.binding_id,
+            "source_identity_sha256": "4" * 64,
+        }
+        forged_proof = receipt_proof_sha256(signing_key=b"A" * 32, **fields)
+        with pytest.raises(ValueError, match="proof is invalid"):
+            authenticate_delivery_receipt(
+                receipt_proof_sha256_value=forged_proof,
+                **fields,
+            )
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
+
+
+def test_delivery_writer_refuses_alternate_workspace_hard_link(tmp_path: Path) -> None:
+    legitimate_workspace = (tmp_path / "legitimate-workspace").resolve()
+    legitimate_runtime = legitimate_workspace / "runtime"
+    legitimate_database_dir = legitimate_workspace / "database"
+    legitimate_runtime.mkdir(parents=True, mode=0o700)
+    legitimate_database_dir.mkdir(mode=0o700)
+    legitimate_key_path = legitimate_runtime / "delivery_receipt_signing.key"
+    legitimate_key_path.write_bytes(b"L" * 32)
+    legitimate_key_path.chmod(0o600)
+    legitimate_database_path = legitimate_database_dir / "staging.sqlite"
+    conn = create_staging_database(
+        legitimate_database_path,
+        migration_paths=TEMP_DB_MIGRATION_PATHS,
+    )
+    context = HumanActionContext("111", "acct", "111", "binding")
+    proposal_public_id = _seed_initial_text(conn)
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-hard-link-review",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-hard-link-actions",
+        context=context,
+        clock=lambda: 1001,
+    )
+
+    attacker_workspace = (tmp_path / "attacker-workspace").resolve()
+    attacker_runtime = attacker_workspace / "runtime"
+    attacker_database_dir = attacker_workspace / "database"
+    attacker_runtime.mkdir(parents=True, mode=0o700)
+    attacker_database_dir.mkdir(mode=0o700)
+    attacker_key = b"A" * 32
+    attacker_key_path = attacker_runtime / "delivery_receipt_signing.key"
+    attacker_key_path.write_bytes(attacker_key)
+    attacker_key_path.chmod(0o600)
+    os.link(legitimate_database_path, attacker_database_dir / "staging.sqlite")
+    fields = {
+        "workspace_path": str(attacker_workspace),
+        "attempt_nonce": manifest.delivery_attempt_nonce,
+        "capability": "telegram.finance-delivery-material-v1",
+        "delivery_material_version": "finance_d2_delivery_material_v1",
+        "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+        "provider_message_id": 299,
+        "receipt_token_sha256": "3" * 64,
+        "channel": "telegram",
+        "account_id": context.account_id,
+        "conversation_id": context.conversation_id,
+        "session_key": context.binding_id,
+        "source_identity_sha256": "4" * 64,
+    }
+    receipt = authenticate_delivery_receipt(
+        receipt_proof_sha256_value=receipt_proof_sha256(
+            signing_key=attacker_key,
+            **fields,
+        ),
+        **fields,
+    )
+
+    with pytest.raises(PostingAuthorityError, match="workspace database identity mismatch"):
+        record_posting_review_delivery(conn, receipt=receipt, clock=lambda: 1002)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
+    )
+    conn.close()
+
+
+def test_delivery_writer_refuses_in_memory_database() -> None:
+    conn = _connection()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    proposal_public_id = _seed_initial_text(conn)
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-memory-database-review",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-memory-database-actions",
+        context=context,
+        clock=lambda: 1001,
+    )
+    signing_key = b"M" * 32
+    with tempfile.TemporaryDirectory(prefix="finance-d2-proof-") as raw_workspace:
+        workspace = Path(raw_workspace).resolve()
+        runtime = workspace / "runtime"
+        runtime.mkdir(mode=0o700)
+        key_path = runtime / "delivery_receipt_signing.key"
+        key_path.write_bytes(signing_key)
+        key_path.chmod(0o600)
+        fields = {
+            "workspace_path": str(workspace),
+            "attempt_nonce": manifest.delivery_attempt_nonce,
+            "capability": "telegram.finance-delivery-material-v1",
+            "delivery_material_version": "finance_d2_delivery_material_v1",
+            "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+            "provider_message_id": 299,
+            "receipt_token_sha256": "3" * 64,
+            "channel": "telegram",
+            "account_id": context.account_id,
+            "conversation_id": context.conversation_id,
+            "session_key": context.binding_id,
+            "source_identity_sha256": "4" * 64,
+        }
+        receipt = authenticate_delivery_receipt(
+            receipt_proof_sha256_value=receipt_proof_sha256(
+                signing_key=signing_key,
+                **fields,
+            ),
+            **fields,
+        )
+        with pytest.raises(PostingAuthorityError, match="database identity is unavailable"):
+            record_posting_review_delivery(conn, receipt=receipt, clock=lambda: 1002)
+    assert (
+        conn.execute("SELECT COUNT(*) FROM d2_posting_review_delivery_activations").fetchone()[0]
+        == 0
     )
 
 
@@ -521,6 +783,70 @@ def test_initial_review_accepts_description_when_merchant_is_unset() -> None:
     assert "Description: Lunch" in review.presentation_text
 
 
+def test_description_only_initial_card_recovers_one_final_transaction(tmp_path: Path) -> None:
+    conn = _file_connection(tmp_path)
+    proposal_public_id = _seed_initial_text(conn)
+    row = conn.execute(
+        "SELECT parsed_payload FROM parser_outputs WHERE public_id = ?",
+        (proposal_public_id,),
+    ).fetchone()
+    payload = json.loads(str(row[0]))
+    payload["merchant"] = None
+    conn.execute(
+        "UPDATE parser_outputs SET parsed_payload = ? WHERE public_id = ?",
+        (json.dumps(payload), proposal_public_id),
+    )
+    conn.commit()
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-initial-description-only-final",
+        proposal_public_id=proposal_public_id,
+        admitted_source_message_id="77",
+        context=context,
+        clock=lambda: 1000,
+    )
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-description-only-key",
+        context=context,
+        clock=lambda: 1001,
+    )
+    _record_delivery(
+        conn,
+        manifest=manifest,
+        context=context,
+        provider_message_id=901,
+        now=1002,
+    )
+    confirm = next(control for control in manifest.controls if control.action == "confirm")
+    confirmed = confirm_and_post(
+        conn,
+        key=b"d2-description-only-key",
+        reference=confirm.callback_value.removeprefix("post:"),
+        context=context,
+        callback_id="description-only-confirm",
+        callback_message_id=901,
+        clock=lambda: 1003,
+    )
+    assert confirmed.state == "finalized"
+    assert confirmed.merchant == ""
+    assert confirmed.transaction_public_id is not None
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
+    assert status.state == "finalized"
+    assert status.transaction_public_id == confirmed.transaction_public_id
+    resumed = resume_posting(
+        conn,
+        attempt_public_id=str(confirmed.attempt_public_id),
+        context=context,
+    )
+    assert resumed.state == "finalized"
+    assert resumed.transaction_public_id == confirmed.transaction_public_id
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert conn.execute("SELECT merchant FROM transactions").fetchone()[0] is None
+
+
 @pytest.mark.parametrize(
     "context",
     [
@@ -553,8 +879,10 @@ def test_initial_review_rejects_capture_context_transplant(
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
-def test_initial_review_and_confirm_reject_source_conversation_transplant() -> None:
-    conn = _connection()
+def test_initial_review_and_confirm_reject_source_conversation_transplant(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     proposal_public_id = _seed_initial_text(conn)
     with pytest.raises(PostingAuthorityError, match="source evidence"):
         prepare_posting_review(
@@ -611,8 +939,10 @@ def test_initial_review_and_confirm_reject_source_conversation_transplant() -> N
     assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0] == 0
 
 
-def test_initial_text_requires_terminal_activation_and_posts_once_without_d1_edit() -> None:
-    conn = _connection()
+def test_initial_text_requires_terminal_activation_and_posts_once_without_d1_edit(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, reference = _manifest(conn)
     assert review.source_kind == "initial_proposal_card"
     assert review.card_generation_public_id is None
@@ -721,8 +1051,10 @@ def test_initial_text_requires_terminal_activation_and_posts_once_without_d1_edi
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
 
 
-def test_delivery_receipt_and_generic_confirm_are_single_purpose_fail_closed() -> None:
-    conn = _connection()
+def test_delivery_receipt_and_generic_confirm_are_single_purpose_fail_closed(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, reference = _manifest(conn)
     with pytest.raises(PostingAuthorityError, match="does not match"):
         _record_delivery(
@@ -773,8 +1105,10 @@ def test_delivery_receipt_and_generic_confirm_are_single_purpose_fail_closed() -
     )
 
 
-def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> None:
-    conn = _connection()
+def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, reference = _manifest(conn)
     with pytest.raises(PostingAuthorityError, match="capability is invalid"):
         _record_delivery(
@@ -841,8 +1175,8 @@ def test_host_receipt_replay_and_duplicate_delivery_conflict_fail_closed() -> No
     assert conn.execute("SELECT COUNT(*) FROM openclaw_human_action_redemptions").fetchone()[0] == 0
 
 
-def test_migration_050_identity_rows_resist_insert_or_replace() -> None:
-    conn = _connection()
+def test_migration_050_identity_rows_resist_insert_or_replace(tmp_path: Path) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, _reference = _manifest(conn)
     _record_delivery(
         conn,
@@ -897,8 +1231,10 @@ def test_migration_050_identity_rows_resist_insert_or_replace() -> None:
     conn.rollback()
 
 
-def test_delivery_activation_cannot_cross_wire_another_attempt_observation() -> None:
-    conn = _connection()
+def test_delivery_activation_cannot_cross_wire_another_attempt_observation(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, _reference = _manifest(conn)
     observation_public_id = _record_delivery(
         conn,
@@ -1032,8 +1368,8 @@ def test_raw_callback_values_are_absent_from_durable_d2_rows() -> None:
     assert manifest.delivery_attempt_nonce not in durable_text
 
 
-def test_lost_delivery_receipt_replacement_has_one_current_successor() -> None:
-    conn = _connection()
+def test_lost_delivery_receipt_replacement_has_one_current_successor(tmp_path: Path) -> None:
+    conn = _file_connection(tmp_path)
     context, review, predecessor, _reference = _manifest(conn)
     material_hash = hashlib.sha256(b"replacement-query-proof").hexdigest()
     successor = replace_posting_review_delivery(
@@ -1108,7 +1444,7 @@ def test_lost_delivery_receipt_replacement_has_one_current_successor() -> None:
 def test_initial_personal_total_receipt_one_confirm_runs_full_financial_chain(
     tmp_path: Path,
 ) -> None:
-    conn = _connection()
+    conn = _file_connection(tmp_path)
     seed_people(conn)
     parser_output_id, proposal_public_id = seed_receipt_proposal(
         conn, tmp_path, "d2_initial_receipt"
@@ -1491,8 +1827,10 @@ def test_delivery_attempt_transaction_rolls_back_or_replays_after_lost_response(
     assert replay_again.delivery_attempt_nonce == replay.delivery_attempt_nonce
 
 
-def test_initial_edit_wins_before_confirm_without_fabricating_financial_authority() -> None:
-    conn = _connection()
+def test_initial_edit_wins_before_confirm_without_fabricating_financial_authority(
+    tmp_path: Path,
+) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, confirm_reference = _manifest(conn)
     _record_delivery(
         conn,
@@ -1549,8 +1887,8 @@ def test_initial_edit_wins_before_confirm_without_fabricating_financial_authorit
     assert stale.attention_reason == "review_stale_after_edit"
 
 
-def test_initial_reject_wins_before_confirm_and_creates_no_transaction() -> None:
-    conn = _connection()
+def test_initial_reject_wins_before_confirm_and_creates_no_transaction(tmp_path: Path) -> None:
+    conn = _file_connection(tmp_path)
     context, review, manifest, confirm_reference = _manifest(conn)
     _record_delivery(
         conn,

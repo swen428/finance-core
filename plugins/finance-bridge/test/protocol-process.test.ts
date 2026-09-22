@@ -10,6 +10,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -40,6 +41,12 @@ import {
   type ChildProcessLike,
   type SpawnProcess,
 } from "../src/subprocess.js";
+import type { FinanceDeliveryMaterialV1 } from "../src/delivery-receipt.js";
+import {
+  financeDeliveryReceiptProofProvider,
+  financeDeliveryReceiptProofSha256,
+  type FinanceDeliveryReceiptProofProvider,
+} from "../src/delivery-receipt-proof.js";
 
 const execFile = promisify(execFileCallback);
 const CURRENT_REPOSITORY_ROOT = resolve("../..");
@@ -285,6 +292,10 @@ const AGENT_PROFILE_V2 = {
   executionClass: "cloud_projection" as const,
 };
 const ACCEPT_TEST_EXECUTABLE = async (): Promise<void> => undefined;
+const ACCEPT_TEST_RECEIPT_PROOF: FinanceDeliveryReceiptProofProvider = {
+  async validate() {},
+  async authenticate() { return "5".repeat(64); },
+};
 
 class FakeChild extends EventEmitter implements ChildProcessLike {
   readonly stdin = new PassThrough();
@@ -298,6 +309,188 @@ class FakeChild extends EventEmitter implements ChildProcessLike {
     return true;
   }
 }
+
+function deliveryReceiptMaterial(): FinanceDeliveryMaterialV1 {
+  return {
+    capability: "telegram.finance-delivery-material-v1",
+    deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+    attemptNonce: `d2nonce_${"1".repeat(32)}`,
+    deliveryMaterialSha256: "2".repeat(64),
+    providerMessageId: "200",
+    receiptTokenSha256: "3".repeat(64),
+    channel: "telegram",
+    accountId: "finance-account",
+    conversationId: "111",
+    sessionKey: "binding-1",
+    sourceIdentitySha256: "4".repeat(64),
+  };
+}
+
+test("delivery receipt proof matches the Python authority vector", () => {
+  const material = deliveryReceiptMaterial();
+  assert.equal(
+    financeDeliveryReceiptProofSha256(Buffer.alloc(32, "k"), "/tmp/workspace", material),
+    "c747dd610a43d562c380a71aafb704c3f7a4706e758120b5c2a42a9e9bd170ca",
+  );
+});
+
+test("delivery receipt proof provider fails closed on unsafe workspace keys", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "finance-delivery-proof-")));
+  const runtime = join(root, "runtime");
+  const keyPath = join(runtime, "delivery_receipt_signing.key");
+  const targetPath = join(root, "outside.key");
+  const config = {
+    repoRoot: "/repo",
+    coreDistributionRoot: "/core-distribution",
+    pythonExecutable: "/repo/.venv/bin/python",
+    workspaceRoot: root,
+    agentProfileV2: AGENT_PROFILE_V2,
+  };
+  try {
+    await mkdir(runtime, { mode: 0o700 });
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await writeFile(keyPath, Buffer.alloc(32, "k"), { mode: 0o644 });
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await chmod(keyPath, 0o600);
+    await writeFile(keyPath, Buffer.alloc(31, "k"));
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+    await writeFile(keyPath, Buffer.alloc(32, "k"));
+    await financeDeliveryReceiptProofProvider.validate(config);
+    await rm(keyPath);
+    await writeFile(targetPath, Buffer.alloc(32, "k"), { mode: 0o600 });
+    await symlink(targetPath, keyPath);
+    await assert.rejects(financeDeliveryReceiptProofProvider.validate(config));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("closed delivery receipt runner invokes only the dedicated consumer module", async () => {
+  const child = new FakeChild();
+  let args: readonly string[] = [];
+  const input: Buffer[] = [];
+  child.stdin.on("data", (chunk: Buffer | string) => {
+    input.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  child.stdin.on("finish", () => {
+    child.stdout.end(JSON.stringify({
+      observation_public_id: `d2dobs_${"9".repeat(32)}`,
+      status: "ok",
+    }));
+    child.emit("close", 0, null);
+  });
+  const runner = new BridgeCliRunner(
+    {
+      repoRoot: "/repo",
+      coreDistributionRoot: "/core-distribution",
+      pythonExecutable: "/repo/.venv/bin/python",
+      workspaceRoot: "/tmp/workspace",
+      agentProfileV2: AGENT_PROFILE_V2,
+    },
+    (_executable, processArgs) => {
+      args = processArgs;
+      return child;
+    },
+    undefined,
+    undefined,
+    ACCEPT_TEST_EXECUTABLE,
+    ACCEPT_TEST_RECEIPT_PROOF,
+  );
+  const material = deliveryReceiptMaterial();
+  await runner.recordFinanceDeliveryReceipt(material, 1_000);
+  assert.match(String(args[3]), /delivery_receipt_cli/u);
+  const payload = JSON.parse(Buffer.concat(input).toString("utf8")) as Record<string, unknown>;
+  assert.equal(payload.workspace_path, "/tmp/workspace");
+  assert.equal(payload.attempt_nonce, material.attemptNonce);
+  assert.equal(payload.delivery_material_sha256, material.deliveryMaterialSha256);
+  assert.equal(payload.receipt_proof_version, "finance_delivery_receipt_proof_v1");
+  assert.equal(payload.receipt_proof_sha256, "5".repeat(64));
+  assert.equal("command" in payload, false);
+  assert.equal("idempotency_key" in payload, false);
+});
+
+test("delivery receipt deadline includes capability revalidation before spawn", async () => {
+  let spawnCalls = 0;
+  const runner = new BridgeCliRunner(
+    {
+      repoRoot: "/repo",
+      coreDistributionRoot: "/core-distribution",
+      pythonExecutable: "/repo/.venv/bin/python",
+      workspaceRoot: "/tmp/workspace",
+      agentProfileV2: AGENT_PROFILE_V2,
+    },
+    () => {
+      spawnCalls += 1;
+      return new FakeChild();
+    },
+    5,
+    undefined,
+    () => new Promise<void>(() => undefined),
+    ACCEPT_TEST_RECEIPT_PROOF,
+  );
+  await assert.rejects(
+    runner.recordFinanceDeliveryReceipt(deliveryReceiptMaterial(), 5),
+    (error: unknown) => bridgeProcessFailureCategory(error) === "BRIDGE_PROCESS_TIMEOUT",
+  );
+  assert.equal(spawnCalls, 0);
+});
+
+test("delivery receipt overflow terminates and reaps its consumer", async () => {
+  const child = new FakeChild();
+  child.stdin.on("finish", () => child.stdout.write(Buffer.alloc(1_025)));
+  const runner = new BridgeCliRunner(
+    {
+      repoRoot: "/repo",
+      coreDistributionRoot: "/core-distribution",
+      pythonExecutable: "/repo/.venv/bin/python",
+      workspaceRoot: "/tmp/workspace",
+      agentProfileV2: AGENT_PROFILE_V2,
+    },
+    () => child,
+    5,
+    undefined,
+    ACCEPT_TEST_EXECUTABLE,
+    ACCEPT_TEST_RECEIPT_PROOF,
+  );
+  await assert.rejects(
+    runner.recordFinanceDeliveryReceipt(deliveryReceiptMaterial(), 1_000),
+    (error: unknown) => bridgeProcessFailureCategory(error) === "BRIDGE_PROCESS_RESOURCE_LIMIT",
+  );
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+});
+
+test("unreaped delivery receipt consumer poisons the runner", async () => {
+  const child = new FakeChild();
+  child.kill = function kill(signal: NodeJS.Signals): boolean {
+    this.signals.push(signal);
+    return true;
+  };
+  let markedUnhealthy = 0;
+  const runner = new BridgeCliRunner(
+    {
+      repoRoot: "/repo",
+      coreDistributionRoot: "/core-distribution",
+      pythonExecutable: "/repo/.venv/bin/python",
+      workspaceRoot: "/tmp/workspace",
+      agentProfileV2: AGENT_PROFILE_V2,
+    },
+    () => child,
+    5,
+    () => { markedUnhealthy += 1; },
+    ACCEPT_TEST_EXECUTABLE,
+    ACCEPT_TEST_RECEIPT_PROOF,
+  );
+  await assert.rejects(
+    runner.recordFinanceDeliveryReceipt(deliveryReceiptMaterial(), 5),
+    (error: unknown) => bridgeProcessFailureCategory(error) === "BRIDGE_PROCESS_RESOURCE_LIMIT",
+  );
+  assert.equal(markedUnhealthy, 1);
+  assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  await assert.rejects(
+    runner.recordFinanceDeliveryReceipt(deliveryReceiptMaterial(), 5),
+    (error: unknown) => bridgeProcessFailureCategory(error) === "BRIDGE_PROCESS_RESOURCE_LIMIT",
+  );
+});
 
 type PythonFixtureMode =
   | "error"

@@ -2,6 +2,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { revalidatePythonExecutableForSpawn, } from "./config.js";
 import { verifyCoreDistributionV1 } from "./core-distribution-v1.js";
 import { expectedBridgeOperationId, MAX_RESPONSE_BYTES, parseBridgeResponse, safeModelEvaluationRefusalDetailsV1, serializeBridgeRequest, } from "./protocol.js";
+import { FINANCE_DELIVERY_RECEIPT_PROOF_VERSION, financeDeliveryReceiptProofProvider, } from "./delivery-receipt-proof.js";
 const DEFAULT_REAP_GRACE_MS = 1_000;
 const CORE_CLI_BOOTSTRAP = [
     "import importlib.util,pathlib,runpy,sys",
@@ -14,6 +15,18 @@ const CORE_CLI_BOOTSTRAP = [
     "assert len(origins)==2 and all(package==path.parent or package in path.parents for path in origins)",
     "sys.argv=['finance_core.openclaw_staging_bridge.cli']",
     "runpy.run_module('finance_core.openclaw_staging_bridge.cli',run_name='__main__',alter_sys=True)",
+].join(";");
+const DELIVERY_RECEIPT_CLI_BOOTSTRAP = [
+    "import importlib.util,pathlib,runpy,sys",
+    "root=pathlib.Path(sys.argv[1]).resolve(strict=True)",
+    "package=(root/'finance_core').resolve(strict=True)",
+    "sys.path.insert(0,str(root))",
+    "top=importlib.util.find_spec('finance_core')",
+    "module=importlib.util.find_spec('finance_core.openclaw_staging_bridge.delivery_receipt_cli')",
+    "origins=[pathlib.Path(spec.origin).resolve(strict=True) for spec in (top,module) if spec is not None and spec.origin is not None]",
+    "assert len(origins)==2 and all(package==path.parent or package in path.parents for path in origins)",
+    "sys.argv=['finance_core.openclaw_staging_bridge.delivery_receipt_cli']",
+    "runpy.run_module('finance_core.openclaw_staging_bridge.delivery_receipt_cli',run_name='__main__',alter_sys=True)",
 ].join(";");
 const BRIDGE_ERROR_CODES_BY_EXIT = new Map([
     [2, new Set(["WORKSPACE_MISSING"])],
@@ -127,13 +140,177 @@ export class BridgeCliRunner {
     reapGraceMs;
     markUnhealthy;
     revalidateExecutable;
+    receiptProofProvider;
     poisoned = false;
-    constructor(config, spawn = spawnProcess, reapGraceMs = DEFAULT_REAP_GRACE_MS, markUnhealthy = () => undefined, revalidateExecutable = revalidateRuntimeForSpawn) {
+    constructor(config, spawn = spawnProcess, reapGraceMs = DEFAULT_REAP_GRACE_MS, markUnhealthy = () => undefined, revalidateExecutable = revalidateRuntimeForSpawn, receiptProofProvider = financeDeliveryReceiptProofProvider) {
         this.config = config;
         this.spawn = spawn;
         this.reapGraceMs = reapGraceMs;
         this.markUnhealthy = markUnhealthy;
         this.revalidateExecutable = revalidateExecutable;
+        this.receiptProofProvider = receiptProofProvider;
+    }
+    async boundedReceiptPreparation(operation, deadlineMs) {
+        let timer;
+        try {
+            return await Promise.race([
+                operation,
+                new Promise((_resolve, reject) => {
+                    timer = setTimeout(() => reject(processFailure("BRIDGE_PROCESS_TIMEOUT")), deadlineMs);
+                }),
+            ]);
+        }
+        catch (error) {
+            if (error instanceof BridgeProcessFailure)
+                throw error;
+            throw processFailure("BRIDGE_PROCESS_STARTUP_FAILED");
+        }
+        finally {
+            if (timer !== undefined)
+                clearTimeout(timer);
+        }
+    }
+    async validateFinanceDeliveryReceiptCapability(deadlineMs) {
+        if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > 30_000) {
+            throw new Error("Delivery receipt deadline must be an integer from 1 through 30000 milliseconds.");
+        }
+        await this.boundedReceiptPreparation(Promise.all([
+            this.revalidateExecutable(this.config),
+            this.receiptProofProvider.validate(this.config),
+        ]).then(() => undefined), deadlineMs);
+    }
+    async recordFinanceDeliveryReceipt(material, deadlineMs) {
+        if (this.poisoned)
+            throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
+        if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > 30_000) {
+            throw new Error("Delivery receipt deadline must be an integer from 1 through 30000 milliseconds.");
+        }
+        if (!Number.isSafeInteger(this.reapGraceMs) || this.reapGraceMs <= 0 ||
+            this.reapGraceMs > DEFAULT_REAP_GRACE_MS) {
+            throw new Error("Bridge reap grace is invalid.");
+        }
+        const expiresAt = performance.now() + deadlineMs;
+        const receiptProofSha256 = await this.boundedReceiptPreparation(Promise.all([
+            this.revalidateExecutable(this.config),
+            this.receiptProofProvider.authenticate(this.config, material),
+        ]).then(([, proof]) => proof), deadlineMs);
+        const input = Buffer.from(JSON.stringify({
+            workspace_path: this.config.workspaceRoot,
+            attempt_nonce: material.attemptNonce,
+            capability: material.capability,
+            delivery_material_version: material.deliveryMaterialVersion,
+            delivery_material_sha256: material.deliveryMaterialSha256,
+            provider_message_id: material.providerMessageId,
+            receipt_token_sha256: material.receiptTokenSha256,
+            channel: material.channel,
+            account_id: material.accountId,
+            conversation_id: material.conversationId,
+            session_key: material.sessionKey,
+            source_identity_sha256: material.sourceIdentitySha256,
+            receipt_proof_version: FINANCE_DELIVERY_RECEIPT_PROOF_VERSION,
+            receipt_proof_sha256: receiptProofSha256,
+        }));
+        if (input.byteLength > 16_384)
+            throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
+        if (performance.now() >= expiresAt)
+            throw processFailure("BRIDGE_PROCESS_TIMEOUT");
+        const child = this.spawn(this.config.pythonExecutable, ["-I", "-B", "-c", DELIVERY_RECEIPT_CLI_BOOTSTRAP, this.config.coreDistributionRoot], {
+            cwd: this.config.coreDistributionRoot,
+            detached: false,
+            env: {
+                FINANCE_RUNTIME_ROOT: this.config.repoRoot,
+                LANG: "C.UTF-8",
+                LC_ALL: "C.UTF-8",
+                PYTHONDONTWRITEBYTECODE: "1",
+                PYTHONNOUSERSITE: "1",
+                PYTHONUTF8: "1",
+            },
+            shell: false,
+            stdio: ["pipe", "pipe", "pipe"],
+        });
+        await new Promise((resolve, reject) => {
+            const stdout = [];
+            let stdoutBytes = 0;
+            let terminalError;
+            let settled = false;
+            let killTimer;
+            let reapTimer;
+            const clearTimers = () => {
+                clearTimeout(timer);
+                if (killTimer !== undefined)
+                    clearTimeout(killTimer);
+                if (reapTimer !== undefined)
+                    clearTimeout(reapTimer);
+            };
+            const terminate = (error) => {
+                if (terminalError !== undefined || settled)
+                    return;
+                terminalError = error;
+                child.kill("SIGTERM");
+                killTimer = setTimeout(() => {
+                    if (settled)
+                        return;
+                    child.kill("SIGKILL");
+                    reapTimer = setTimeout(() => {
+                        if (settled)
+                            return;
+                        settled = true;
+                        this.poisoned = true;
+                        this.markUnhealthy();
+                        clearTimers();
+                        reject(processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT"));
+                    }, this.reapGraceMs);
+                }, this.reapGraceMs);
+            };
+            const timer = setTimeout(() => terminate(processFailure("BRIDGE_PROCESS_TIMEOUT")), Math.max(0, Math.floor(expiresAt - performance.now())));
+            child.stdout.on("data", (value) => {
+                const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+                stdoutBytes = appendBounded(stdout, chunk, stdoutBytes, 1_024);
+                if (stdoutBytes > 1_024) {
+                    terminate(processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT"));
+                }
+            });
+            child.stderr.on("data", (value) => { void value; });
+            child.stdin.on("error", () => {
+                terminate(processFailure("BRIDGE_PROCESS_IO_FAILURE"));
+            });
+            child.once("error", () => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimers();
+                reject(processFailure("BRIDGE_PROCESS_STARTUP_FAILED"));
+            });
+            child.once("close", (code, signal) => {
+                if (settled)
+                    return;
+                settled = true;
+                clearTimers();
+                if (terminalError !== undefined) {
+                    reject(terminalError);
+                    return;
+                }
+                if (signal !== null || code !== 0) {
+                    reject(processFailure("BRIDGE_PROCESS_NONZERO_UNVERIFIED"));
+                    return;
+                }
+                try {
+                    const response = JSON.parse(Buffer.concat(stdout).toString("utf8"));
+                    if (typeof response !== "object" || response === null || Array.isArray(response) ||
+                        Object.keys(response).sort().join(",") !== "observation_public_id,status" ||
+                        response.status !== "ok" ||
+                        typeof response.observation_public_id !== "string" ||
+                        !/^d2dobs_[0-9a-f]{32}$/u.test(response.observation_public_id)) {
+                        throw new Error("invalid response");
+                    }
+                    resolve();
+                }
+                catch {
+                    reject(processFailure("BRIDGE_PROCESS_PROTOCOL_INVALID"));
+                }
+            });
+            child.stdin.end(input);
+        });
     }
     async run(request, deadlineMs, inheritedFd) {
         if (this.poisoned) {

@@ -32,6 +32,11 @@ import {
 } from "../src/index.js";
 import type { FinanceBridgeConfig } from "../src/config.js";
 import type { BridgeRunner } from "../src/controller.js";
+import type {
+  FinanceDeliveryMaterialV1,
+  FinanceDeliveryReceiptConsumerV1,
+  FinanceDeliveryReceiptRecorder,
+} from "../src/delivery-receipt.js";
 import { computeBuildSourceIdentityV1 } from "../src/artifact-hash-v1.js";
 import { HandoffPublisher } from "../src/handoff.js";
 import { ReceiptMediaAdapter } from "../src/media.js";
@@ -41,6 +46,7 @@ import {
 } from "../src/operator-cli-v1.js";
 import type { CompatibilityArtifactEvidenceV1 } from "../src/model-compatibility-operator-v1.js";
 import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.js";
+import { BridgeCliRunner } from "../src/subprocess.js";
 
 const FINANCE_PLUGIN_ROOT = "/repo/plugins/finance-bridge";
 const CODEX_PLUGIN_ROOT = "/openclaw/node_modules/@openclaw/codex";
@@ -143,6 +149,7 @@ function fakeApi(
   const commands: OpenClawPluginCommandDefinition[] = [];
   const cli: unknown[] = [];
   const completions: unknown[] = [];
+  const deliveryReceiptConsumers: FinanceDeliveryReceiptConsumerV1[] = [];
   const currentConfig = runtimeHostConfig();
   const api = {
     id: "finance-bridge",
@@ -150,6 +157,10 @@ function fakeApi(
     rootDir: FINANCE_PLUGIN_ROOT,
     source: `${FINANCE_PLUGIN_ROOT}/dist/src/index.js`,
     registrationMode,
+    financeDeliveryCapabilities: ["telegram.finance-delivery-material-v1"],
+    registerFinanceDeliveryReceiptConsumerV1(consumer: FinanceDeliveryReceiptConsumerV1) {
+      deliveryReceiptConsumers.push(consumer);
+    },
     config: currentConfig,
     pluginConfig: {
       repoRoot: "/repo",
@@ -209,7 +220,9 @@ function fakeApi(
     registerCommand(command: OpenClawPluginCommandDefinition) { commands.push(command); },
     registerCli(registrar: unknown, options: unknown) { cli.push({ registrar, options }); },
   } as unknown as OpenClawPluginApi;
-  return { api, tools, hooks, interactive, commands, cli, completions };
+  return {
+    api, tools, hooks, interactive, commands, cli, completions, deliveryReceiptConsumers,
+  };
 }
 
 function compatibilityArtifact(
@@ -275,6 +288,8 @@ const dependencies: RegistrationDependencies = {
   },
   createRunner() {
     return {
+      async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+      async recordFinanceDeliveryReceipt(_material: FinanceDeliveryMaterialV1): Promise<void> {},
       async run(request: BridgeRequest): Promise<BridgeResponse> {
         return {
           envelopeVersion: "v1",
@@ -325,6 +340,7 @@ test("plugin registers the public pinned API surfaces and eight optional disable
     assert.deepEqual(tool.parameters, Type.Object({}, { additionalProperties: false }));
   }
   assert.equal(fixture.commands.length, 1);
+  assert.equal(fixture.deliveryReceiptConsumers.length, 1);
   assert.equal(fixture.cli.length, 1);
   assert.deepEqual((fixture.cli[0] as {options: unknown}).options, {
     commands: ["finance-compatibility"],
@@ -335,11 +351,15 @@ test("plugin registers the public pinned API surfaces and eight optional disable
     }],
   });
   assert.equal(fixture.commands[0]?.name, "finance");
-  assert.deepEqual(fixture.interactive, [{
-    channel: "telegram",
-    namespace: "finance-bridge",
-    handler: (fixture.interactive[0] as {handler: unknown}).handler,
-  }]);
+  assert.equal(fixture.interactive.length, 4);
+  assert.deepEqual(
+    fixture.interactive.map((entry) => (entry as {namespace: string}).namespace),
+    ["finance-bridge", "post", "edit", "reject"],
+  );
+  assert.ok(fixture.interactive.every((entry) =>
+    (entry as {channel: string}).channel === "telegram" &&
+    (entry as {handler: unknown}).handler ===
+      (fixture.interactive[0] as {handler: unknown}).handler));
 
   const claim = fixture.hooks[0]?.handler as (
     event: PluginHookInboundClaimEvent,
@@ -397,6 +417,183 @@ test("plugin registers the public pinned API surfaces and eight optional disable
     handled: true,
     reply: { text: "Finance intake could not be processed safely. Please retry." },
   });
+});
+
+test("host-owned Finance delivery receipt is consumed once by the closed Python recorder", async () => {
+  const fixture = fakeApi();
+  const recorded: FinanceDeliveryMaterialV1[] = [];
+  registerFinanceBridge(fixture.api, {
+    ...dependencies,
+    createRunner() {
+      return {
+        async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+        async recordFinanceDeliveryReceipt(material: FinanceDeliveryMaterialV1) {
+          recorded.push(material);
+        },
+        async run(request: BridgeRequest): Promise<BridgeResponse> {
+          return registrationOk(request, {
+            workspace_verified: true,
+            database_verified: true,
+            callback_key_status: "present",
+          });
+        },
+      };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const material: FinanceDeliveryMaterialV1 = {
+    capability: "telegram.finance-delivery-material-v1",
+    deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+    attemptNonce: `d2nonce_${"1".repeat(32)}`,
+    deliveryMaterialSha256: "2".repeat(64),
+    providerMessageId: "200",
+    receiptTokenSha256: "3".repeat(64),
+    channel: "telegram",
+    accountId: "finance-account",
+    conversationId: "111",
+    sessionKey: "binding-1",
+    sourceIdentitySha256: "4".repeat(64),
+  };
+  let consumeCalls = 0;
+  await fixture.deliveryReceiptConsumers[0]!({
+    version: "finance_delivery_receipt_v1",
+    async consume(consumer) {
+      consumeCalls += 1;
+      await consumer(material);
+    },
+  });
+  assert.equal(consumeCalls, 1);
+  assert.deepEqual(recorded, [material]);
+});
+
+test("receipt proof preflight failure keeps registration unhealthy before health or record", async () => {
+  const fixture = fakeApi();
+  let healthCalls = 0;
+  let recordCalls = 0;
+  registerFinanceBridge(fixture.api, {
+    ...dependencies,
+    createRunner() {
+      return {
+        async validateFinanceDeliveryReceiptCapability(): Promise<void> {
+          throw new Error("synthetic unsafe receipt key");
+        },
+        async recordFinanceDeliveryReceipt(): Promise<void> { recordCalls += 1; },
+        async run(request: BridgeRequest): Promise<BridgeResponse> {
+          healthCalls += 1;
+          return registrationOk(request, {
+            workspace_verified: true,
+            database_verified: true,
+            callback_key_status: "present",
+          });
+        },
+      };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(healthCalls, 0);
+  const material: FinanceDeliveryMaterialV1 = {
+    capability: "telegram.finance-delivery-material-v1",
+    deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+    attemptNonce: `d2nonce_${"1".repeat(32)}`,
+    deliveryMaterialSha256: "2".repeat(64),
+    providerMessageId: "200",
+    receiptTokenSha256: "3".repeat(64),
+    channel: "telegram",
+    accountId: "finance-account",
+    conversationId: "111",
+    sessionKey: "binding-1",
+    sourceIdentitySha256: "4".repeat(64),
+  };
+  await assert.rejects(
+    async () => await fixture.deliveryReceiptConsumers[0]!({
+      version: "finance_delivery_receipt_v1",
+      async consume(consumer) { await consumer(material); },
+    }),
+    /consumer is unavailable/u,
+  );
+  assert.equal(recordCalls, 0);
+});
+
+test("missing receipt key keeps registration unhealthy through the real loader", async () => {
+  const fixture = fakeApi();
+  const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "finance-registration-key-")));
+  const workspaceRoot = join(temporaryRoot, "workspace");
+  await mkdir(join(workspaceRoot, "runtime"), { recursive: true, mode: 0o700 });
+  const config = {
+    ...(fixture.api as unknown as { pluginConfig: FinanceBridgeConfig }).pluginConfig,
+    workspaceRoot,
+  };
+  let healthCalls = 0;
+  let recordCalls = 0;
+  try {
+    registerFinanceBridge(fixture.api, {
+      ...dependencies,
+      async validateConfig() { return config; },
+      createRunner(validatedConfig) {
+        const actual = new BridgeCliRunner(
+          validatedConfig,
+          () => { throw new Error("receipt preflight must not spawn"); },
+          1_000,
+          () => undefined,
+          async () => undefined,
+        );
+        return {
+          validateFinanceDeliveryReceiptCapability:
+            actual.validateFinanceDeliveryReceiptCapability.bind(actual),
+          async recordFinanceDeliveryReceipt(
+            material: FinanceDeliveryMaterialV1,
+            deadlineMs: number,
+          ): Promise<void> {
+            recordCalls += 1;
+            await actual.recordFinanceDeliveryReceipt(material, deadlineMs);
+          },
+          async run(request: BridgeRequest): Promise<BridgeResponse> {
+            healthCalls += 1;
+            return registrationOk(request, {
+              workspace_verified: true,
+              database_verified: true,
+              callback_key_status: "present",
+            });
+          },
+        };
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(healthCalls, 0);
+    const material: FinanceDeliveryMaterialV1 = {
+      capability: "telegram.finance-delivery-material-v1",
+      deliveryMaterialVersion: "finance_d2_delivery_material_v1",
+      attemptNonce: `d2nonce_${"1".repeat(32)}`,
+      deliveryMaterialSha256: "2".repeat(64),
+      providerMessageId: "200",
+      receiptTokenSha256: "3".repeat(64),
+      channel: "telegram",
+      accountId: "finance-account",
+      conversationId: "111",
+      sessionKey: "binding-1",
+      sourceIdentitySha256: "4".repeat(64),
+    };
+    await assert.rejects(
+      async () => await fixture.deliveryReceiptConsumers[0]!({
+        version: "finance_delivery_receipt_v1",
+        async consume(consumer) { await consumer(material); },
+      }),
+      /consumer is unavailable/u,
+    );
+    assert.equal(recordCalls, 0);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("full registration refuses a host without the terminal Finance delivery capability", () => {
+  const fixture = fakeApi();
+  delete (fixture.api as unknown as {financeDeliveryCapabilities?: unknown})
+    .financeDeliveryCapabilities;
+  assert.throws(
+    () => registerFinanceBridge(fixture.api, dependencies),
+    /terminal-delivery capability/u,
+  );
 });
 
 test("operator CLI emits only the strict structured envelope for a refused register", async () => {
@@ -821,7 +1018,9 @@ test("cross-path build removes its staging directory when a required build fails
 test("registration injects the typed host runtime into one inbound fallback call", async () => {
   const fixture = fakeApi();
   const runnerRequests: BridgeRequest[] = [];
-  const runner: BridgeRunner = {
+  const runner: BridgeRunner & FinanceDeliveryReceiptRecorder = {
+    async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+    async recordFinanceDeliveryReceipt(): Promise<void> {},
     async run(request) {
       runnerRequests.push(request);
       if (request.command === "health") {
@@ -998,7 +1197,9 @@ test("registered inbound claim routes one whole card without model or intake fal
   const card0 = `d1card_${"a".repeat(32)}`;
   const card1 = `d1card_${"b".repeat(32)}`;
   const proposal = `po_d1_${"c".repeat(32)}`;
-  const runner: BridgeRunner = {
+  const runner: BridgeRunner & FinanceDeliveryReceiptRecorder = {
+    async validateFinanceDeliveryReceiptCapability(): Promise<void> {},
+    async recordFinanceDeliveryReceipt(): Promise<void> {},
     async run(request) {
       requests.push(request);
       if (request.command === "health") {
@@ -1044,6 +1245,56 @@ test("registered inbound claim routes one whole card without model or intake fal
           final_transaction_created: false,
         });
       }
+      if (request.command === "prepare_posting_review") {
+        return registrationOk(request, {
+          review_public_id: `d2rev_${"8".repeat(30)}`,
+          card_generation_public_id: card1,
+          proposal_public_id: proposal,
+          proposal_version: 0,
+          proposal_content_hash: "6".repeat(64),
+          posting_path: "text",
+          visible_projection: {
+            amount: "12.50",
+            currency: "SGD",
+            transaction_date: "2026-09-19",
+            merchant: "Cafe",
+            account: "unspecified",
+          },
+          visible_projection_hash: "9".repeat(64),
+          expires_at: 2_000_000_000,
+          final_transaction_created: false,
+        });
+      }
+      if (request.command === "issue_posting_review_actions") {
+        const text = [
+          `Card Ref: ${card1}`,
+          "Amount: 12.50",
+          "Currency: SGD",
+          "Date: 2026-09-19",
+          "Merchant: Cafe",
+          "Description: Lunch",
+          "Category: Food",
+          "Account: Not specified",
+          "No account or shared-expense details will be inferred.",
+        ].join("\n");
+        return registrationOk(request, {
+          posting_review_public_id: `d2rev_${"8".repeat(30)}`,
+          delivery_attempt_public_id: `d2send_${"1".repeat(32)}`,
+          delivery_manifest_version: "finance_d2_controls_v1",
+          text,
+          controls: [
+            { action: "confirm", label: "Confirm", row_index: 0, column_index: 0,
+              callback_value: `post:fha1_${"A".repeat(24)}` },
+            { action: "edit", label: "Edit", row_index: 1, column_index: 0,
+              callback_value: `edit:fha1_${"C".repeat(24)}` },
+            { action: "reject", label: "Reject", row_index: 1, column_index: 1,
+              callback_value: `reject:fha1_${"B".repeat(24)}` },
+          ],
+          finance_delivery_material_sha256: "2".repeat(64),
+          delivery_attempt_nonce: `d2nonce_${"3".repeat(32)}`,
+          final_transaction_created: false,
+        });
+      }
       if (request.command === "issue_human_actions") {
         return registrationOk(request, {
           proposal_public_id: proposal,
@@ -1051,7 +1302,6 @@ test("registered inbound claim routes one whole card without model or intake fal
           content_hash: "6".repeat(64),
           card_generation_public_id: card1,
           actions: {
-            confirm: { reference: `fha1_${"A".repeat(24)}`, expiry: 2_000_000_000 },
             edit: { reference: `fha1_${"C".repeat(24)}`, expiry: 2_000_000_000 },
             reject: { reference: `fha1_${"B".repeat(24)}`, expiry: 2_000_000_000 },
           },
@@ -1082,12 +1332,12 @@ test("registered inbound claim routes one whole card without model or intake fal
   const result = await claim({
     content, timestamp: 1_750_000_000_000, channel: "telegram",
     accountId: "finance-account", conversationId: "111", parentConversationId: "111",
-    senderId: "111", messageId: "30", replyToId: "20", isGroup: false,
+    senderId: "111", messageId: "30", replyToId: "20", sessionKey: "binding-1", isGroup: false,
     commandAuthorized: true, senderIsOwner: true,
     metadata: { from: "telegram:111", to: "telegram:111", provider: "telegram", surface: "telegram" },
   }, {
     channelId: "telegram", accountId: "finance-account", conversationId: "111",
-    senderId: "111", messageId: "30", replyToId: "20",
+    senderId: "111", messageId: "30", replyToId: "20", sessionKey: "binding-1",
     pluginBinding: {
       bindingId: "binding-1", pluginId: "finance-bridge", pluginRoot: "/plugin",
       channel: "telegram", accountId: "finance-account", conversationId: "111",
@@ -1095,14 +1345,18 @@ test("registered inbound claim routes one whole card without model or intake fal
     },
   });
   assert.deepEqual(requests.map((request) => request.command), [
-    "health", "apply_human_draft_card", "issue_human_actions",
-    "begin_human_draft_card_delivery", "record_human_draft_card_delivery_outcome",
+    "health", "apply_human_draft_card", "prepare_posting_review",
+    "issue_posting_review_actions",
   ]);
   assert.equal(fixture.completions.length, 0);
-  const textBlock = result.reply?.presentation?.blocks[0];
-  assert.equal(textBlock?.type, "text");
-  if (textBlock?.type !== "text") throw new Error("whole-card text missing");
-  assert.match(textBlock.text, new RegExp(card1, "u"));
+  assert.match(result.reply?.text ?? "", new RegExp(card1, "u"));
+  assert.equal(result.reply?.presentation, undefined);
+  assert.equal(
+    (result.reply?.channelData?.telegram as {
+      financeDeliveryMaterialV1?: {attemptNonce?: string};
+    } | undefined)?.financeDeliveryMaterialV1?.attemptNonce,
+    `d2nonce_${"3".repeat(32)}`,
+  );
 });
 
 test("host policy requires exclusive plugin allowlist and exact root/agent denies", () => {

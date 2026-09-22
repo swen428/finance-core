@@ -318,6 +318,29 @@ def canonical_human_action_redemption_key(callback_id: str) -> str:
     return f"bridge-human-action-redeem:{digest}"
 
 
+def canonical_prepare_posting_review_key(card_generation_public_id: str) -> str:
+    return f"bridge-d2-prepare:{card_generation_public_id}"
+
+
+def canonical_prepare_initial_posting_review_key(
+    proposal_public_id: str, admitted_source_message_id: str
+) -> str:
+    return f"bridge-d2-prepare-initial:{proposal_public_id}:{admitted_source_message_id}"
+
+
+def canonical_issue_posting_review_actions_key(review_public_id: str) -> str:
+    return f"bridge-d2-issue:{review_public_id}"
+
+
+def canonical_confirm_and_post_key(callback_id: str) -> str:
+    digest = hashlib.sha256(callback_id.encode("utf-8")).hexdigest()[:32]
+    return f"bridge-d2-confirm:{digest}"
+
+
+def canonical_resume_posting_key(attempt_public_id: str) -> str:
+    return f"bridge-d2-resume:{attempt_public_id}"
+
+
 def canonical_guided_edit_update_key(session_public_id: str, message_id: int) -> str:
     return f"bridge-guided-edit-update:{session_public_id}:{message_id}"
 
@@ -868,19 +891,90 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
     _require_exact_arguments(
         request.arguments,
         required=frozenset({"workspace_path"}),
-        optional=frozenset({"intake_public_id", "proposal_public_id"}),
+        optional=frozenset(
+            {
+                "intake_public_id",
+                "proposal_public_id",
+                "posting_review_public_id",
+                "short_reference",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            }
+        ),
     )
     intake_public_id = request.arguments.get("intake_public_id")
     proposal_public_id = request.arguments.get("proposal_public_id")
-    if (intake_public_id is None) == (proposal_public_id is None):
+    posting_review_public_id = request.arguments.get("posting_review_public_id")
+    short_reference = request.arguments.get("short_reference")
+    identities = tuple(
+        value
+        for value in (
+            intake_public_id,
+            proposal_public_id,
+            posting_review_public_id,
+            short_reference,
+        )
+        if value is not None
+    )
+    if len(identities) != 1:
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
-            "Provide exactly one of intake_public_id or proposal_public_id.",
+            "Provide exactly one supported status identity.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    posting_lookup = posting_review_public_id is not None or short_reference is not None
+    context_fields = {
+        "operator_actor_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+    supplied_context = context_fields & set(request.arguments)
+    if (posting_lookup and supplied_context != context_fields) or (
+        not posting_lookup and supplied_context
+    ):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Posting status requires the complete authenticated Telegram context.",
             errors.EXIT_VALIDATION_REFUSED,
         )
     workspace, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("status read")
+        if posting_lookup:
+            from finance_core import posting_authority
+
+            context = _require_telegram_human_context(request.arguments)
+            try:
+                status = (
+                    posting_authority.get_status(
+                        conn,
+                        review_public_id=_require_string(
+                            posting_review_public_id,
+                            "posting_review_public_id",
+                            max_length=64,
+                        ),
+                        context=context,
+                    )
+                    if posting_review_public_id is not None
+                    else posting_authority.get_status_by_reference(
+                        conn,
+                        reference=_require_string(
+                            short_reference,
+                            "short_reference",
+                            max_length=64,
+                        ),
+                        context=context,
+                    )
+                )
+            except posting_authority.PostingAuthorityError as exc:
+                _raise_posting_authority_error(exc)
+            return {
+                "identity_kind": "posting_review",
+                **_posting_status_payload(status),
+            }, False
         if proposal_public_id is not None:
             proposal = _fetch_proposal_by_public_id(
                 conn, _require_string(proposal_public_id, "proposal_public_id", max_length=200)
@@ -2214,8 +2308,9 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         description, description_truncated = _bounded_review_scalar(
             "description", payload.get("description")
         )
+        category, category_truncated = _bounded_review_scalar("category", payload.get("category"))
         ambiguity_indicators = _ambiguity_indicators(conn, proposal, payload)
-        if merchant_truncated or description_truncated or account_truncated:
+        if merchant_truncated or description_truncated or category_truncated or account_truncated:
             ambiguity_indicators = sorted([*ambiguity_indicators, "oversized_display_field"])
         if classification_unknown:
             ambiguity_indicators = sorted([*ambiguity_indicators, "unknown_classification"])
@@ -2240,6 +2335,7 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "transaction_date": _bounded_review_scalar("transaction_date", transaction_date)[0],
             "merchant": merchant,
             "description": description,
+            "category": category,
             "account": account,
             "account_status": account_status,
             "classification": classification,
@@ -2592,6 +2688,292 @@ def _raise_human_action_error(exc: human_actions.HumanActionReferenceError) -> N
     ) from exc
 
 
+def _raise_posting_authority_error(exc: Exception) -> None:
+    raise errors.bridge_error(
+        errors.FINALIZATION_REFUSED,
+        "D2 posting authority was refused.",
+        errors.EXIT_AUTHORITY_REFUSED,
+    ) from exc
+
+
+def _raise_posting_sqlite_error(exc: sqlite3.OperationalError) -> None:
+    if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+        raise errors.bridge_error(
+            errors.FINALIZATION_LOCKED,
+            "D2 posting is temporarily locked; query status before resuming.",
+            errors.EXIT_AUTHORITY_REFUSED,
+            retryable=True,
+        ) from exc
+    raise exc
+
+
+def _posting_status_payload(status: Any) -> dict[str, Any]:
+    result = asdict(status)
+    result["final_transaction_created"] = (
+        status.state == "finalized" and status.transaction_public_id is not None
+    )
+    return result
+
+
+def handle_prepare_posting_review(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            }
+        ),
+        optional=frozenset(
+            {"card_generation_public_id", "proposal_public_id", "admitted_source_message_id"}
+        ),
+    )
+    has_card = "card_generation_public_id" in request.arguments
+    has_initial = (
+        "proposal_public_id" in request.arguments
+        or "admitted_source_message_id" in request.arguments
+    )
+    if has_card == has_initial or (
+        has_initial
+        and not {
+            "proposal_public_id",
+            "admitted_source_message_id",
+        }.issubset(request.arguments)
+    ):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "prepare_posting_review requires exactly one card or initial proposal source.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    card_generation_public_id = (
+        _require_card_generation_public_id(request.arguments["card_generation_public_id"])
+        if has_card
+        else None
+    )
+    proposal_public_id = (
+        _require_string(
+            request.arguments["proposal_public_id"], "proposal_public_id", max_length=80
+        )
+        if has_initial
+        else None
+    )
+    admitted_source_message_id = (
+        _require_string(
+            request.arguments["admitted_source_message_id"],
+            "admitted_source_message_id",
+            max_length=32,
+        )
+        if has_initial
+        else None
+    )
+    context = _require_telegram_human_context(request.arguments)
+    canonical_key = (
+        canonical_prepare_posting_review_key(card_generation_public_id)
+        if card_generation_public_id is not None
+        else canonical_prepare_initial_posting_review_key(
+            proposal_public_id or "", admitted_source_message_id or ""
+        )
+    )
+    _require_canonical_idempotency_key(request, canonical_key)
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        from finance_core import posting_authority
+
+        deadline.check("D2 posting review preparation")
+        try:
+            prepared = posting_authority.prepare_posting_review(
+                conn,
+                review_idempotency_key=request.idempotency_key or "",
+                card_generation_public_id=card_generation_public_id,
+                proposal_public_id=proposal_public_id,
+                admitted_source_message_id=admitted_source_message_id,
+                context=context,
+            )
+        except posting_authority.PostingAuthorityError as exc:
+            _raise_posting_authority_error(exc)
+        except sqlite3.OperationalError as exc:
+            _raise_posting_sqlite_error(exc)
+        return {
+            "review_public_id": prepared.review_public_id,
+            "card_generation_public_id": prepared.card_generation_public_id,
+            "initial_card_public_id": prepared.initial_card_public_id,
+            "proposal_public_id": prepared.proposal_public_id,
+            "proposal_version": prepared.proposal_version,
+            "proposal_content_hash": prepared.proposal_content_hash,
+            "posting_path": prepared.posting_path,
+            "visible_projection": dict(prepared.visible_projection),
+            "visible_projection_hash": prepared.visible_projection_hash,
+            "presentation_text": prepared.presentation_text,
+            "expires_at": prepared.expires_at,
+            "final_transaction_created": False,
+        }, prepared.idempotent
+    finally:
+        conn.close()
+
+
+def handle_issue_posting_review_actions(
+    request: BridgeRequest, deadline: Deadline
+) -> HandlerResult:
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "posting_review_public_id",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            }
+        ),
+    )
+    review_public_id = _require_string(
+        request.arguments["posting_review_public_id"],
+        "posting_review_public_id",
+        max_length=64,
+    )
+    context = _require_telegram_human_context(request.arguments)
+    _require_canonical_idempotency_key(
+        request, canonical_issue_posting_review_actions_key(review_public_id)
+    )
+    workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        from finance_core import posting_authority
+
+        key = _load_callback_key(workspace)
+        deadline.check("D2 Confirm action issuance")
+        try:
+            manifest = posting_authority.begin_posting_review_delivery(
+                conn,
+                review_public_id=review_public_id,
+                key=key,
+                context=context,
+            )
+        except posting_authority.PostingAuthorityError as exc:
+            _raise_posting_authority_error(exc)
+        except human_actions.HumanActionReferenceError as exc:
+            _raise_human_action_error(exc)
+        except sqlite3.OperationalError as exc:
+            _raise_posting_sqlite_error(exc)
+        return {
+            "posting_review_public_id": review_public_id,
+            "delivery_attempt_public_id": manifest.delivery_attempt_public_id,
+            "delivery_manifest_version": manifest.version,
+            "text": manifest.text,
+            "controls": [
+                {
+                    "action": control.action,
+                    "label": control.label,
+                    "row_index": control.row_index,
+                    "column_index": control.column_index,
+                    "callback_value": control.callback_value,
+                }
+                for control in manifest.controls
+            ],
+            "finance_delivery_material_sha256": manifest.finance_delivery_material_sha256,
+            "delivery_attempt_nonce": manifest.delivery_attempt_nonce,
+            "final_transaction_created": False,
+        }, manifest.idempotent
+    finally:
+        conn.close()
+
+
+def handle_confirm_and_post(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "short_reference",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+                "callback_id",
+                "callback_message_id",
+            }
+        ),
+    )
+    reference = _require_string(
+        request.arguments["short_reference"], "short_reference", max_length=64
+    )
+    context = _require_telegram_human_context(request.arguments)
+    callback_id = _require_string(request.arguments["callback_id"], "callback_id", max_length=200)
+    callback_message_id = _require_positive_int(
+        request.arguments["callback_message_id"], "callback_message_id", maximum=2**63 - 1
+    )
+    _require_canonical_idempotency_key(request, canonical_confirm_and_post_key(callback_id))
+    workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        from finance_core import posting_authority
+
+        key = _load_callback_key(workspace)
+        try:
+            prior = posting_authority.get_status_by_reference(
+                conn, reference=reference, context=context
+            )
+            deadline.check("D2 Confirm and post")
+            status = posting_authority.confirm_and_post(
+                conn,
+                key=key,
+                reference=reference,
+                context=context,
+                callback_id=callback_id,
+                callback_message_id=callback_message_id,
+            )
+        except posting_authority.PostingAuthorityError as exc:
+            _raise_posting_authority_error(exc)
+        except human_actions.HumanActionReferenceError as exc:
+            _raise_human_action_error(exc)
+        except sqlite3.OperationalError as exc:
+            _raise_posting_sqlite_error(exc)
+        return _posting_status_payload(status), prior.state != "awaiting_confirmation"
+    finally:
+        conn.close()
+
+
+def handle_resume_posting(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "attempt_public_id",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            }
+        ),
+    )
+    attempt_public_id = _require_string(
+        request.arguments["attempt_public_id"], "attempt_public_id", max_length=64
+    )
+    context = _require_telegram_human_context(request.arguments)
+    _require_canonical_idempotency_key(request, canonical_resume_posting_key(attempt_public_id))
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        from finance_core import posting_authority
+
+        deadline.check("D2 posting resume")
+        try:
+            status = posting_authority.resume_posting(
+                conn,
+                attempt_public_id=attempt_public_id,
+                context=context,
+            )
+        except posting_authority.PostingAuthorityError as exc:
+            _raise_posting_authority_error(exc)
+        except sqlite3.OperationalError as exc:
+            _raise_posting_sqlite_error(exc)
+        return _posting_status_payload(status), False
+    finally:
+        conn.close()
+
+
 def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(
         request.arguments,
@@ -2614,6 +2996,7 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 "minimum_remaining_seconds",
                 "require_unconsumed_replay",
                 "card_generation_public_id",
+                "requested_actions",
             }
         ),
     )
@@ -2725,6 +3108,22 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 )
             if authority.result_completeness != "complete":
                 allowed_actions = (human_actions.callback_tokens.ACTION_REJECT,)
+        requested_actions = request.arguments.get("requested_actions")
+        if requested_actions is not None:
+            if (
+                not isinstance(requested_actions, list)
+                or not requested_actions
+                or len(requested_actions) > len(human_actions.REFERENCE_ACTIONS)
+                or any(not isinstance(action, str) for action in requested_actions)
+                or len(set(requested_actions)) != len(requested_actions)
+                or any(action not in allowed_actions for action in requested_actions)
+            ):
+                raise errors.bridge_error(
+                    errors.ARGUMENTS_REFUSED,
+                    "requested_actions are not available for the current durable card.",
+                    errors.EXIT_AUTHORITY_REFUSED,
+                )
+            allowed_actions = tuple(requested_actions)
         key = _load_callback_key(workspace)
         persisted_issuance_keys = _persisted_human_action_issuance_keys(reference_batch_id, key=key)
         deadline.check("human action reference issuance")
@@ -3685,6 +4084,42 @@ def _guided_session_payload(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _guided_completion_payload(
+    conn: sqlite3.Connection,
+    session: dict[str, Any],
+    *,
+    context: human_actions.HumanActionContext,
+    review_batch_id: str,
+) -> dict[str, Any]:
+    """Return completion state plus its authoritative current D1 card."""
+
+    card_generation_public_id = guided_edit.active_d1_card_for_session(conn, session)
+    if card_generation_public_id is None:
+        raise errors.bridge_error(
+            errors.LIFECYCLE_CONFLICT,
+            "Guided edit completion has no authoritative D1 card.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    try:
+        card = get_human_draft_card(
+            conn,
+            context=HumanDraftContext(
+                authenticated_actor_id=context.actor_id,
+                telegram_account_id=context.account_id,
+                telegram_conversation_id=context.conversation_id,
+                conversation_binding_id=context.binding_id,
+            ),
+            card_generation_public_id=card_generation_public_id,
+        )
+    except HumanDraftError as exc:
+        _raise_human_draft_error(exc)
+    return {
+        **_guided_session_payload(session),
+        "review_batch_id": review_batch_id,
+        "human_draft_card": _human_draft_result_payload(conn, card),
+    }
+
+
 def _raise_guided_edit_error(exc: guided_edit.GuidedEditError) -> None:
     code, exit_code = {
         "context_mismatch": (errors.ACTOR_MISMATCH, errors.EXIT_AUTHORITY_REFUSED),
@@ -4119,10 +4554,12 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
                 )
             except guided_edit.GuidedEditError as exc:
                 _raise_guided_edit_error(exc)
-            return {
-                **_guided_session_payload(session),
-                "review_batch_id": review_batch_id,
-            }, True
+            return _guided_completion_payload(
+                conn,
+                session,
+                context=context,
+                review_batch_id=review_batch_id,
+            ), True
         if session["status"] != "active":
             raise errors.bridge_error(
                 errors.PROPOSAL_TERMINAL_STATE,
@@ -4148,10 +4585,12 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
             )
         except guided_edit.GuidedEditError as exc:
             _raise_guided_edit_error(exc)
-        return {
-            **_guided_session_payload(completed),
-            "review_batch_id": review_batch_id,
-        }, False
+        return _guided_completion_payload(
+            conn,
+            completed,
+            context=context,
+            review_batch_id=review_batch_id,
+        ), False
     finally:
         conn.close()
 
@@ -5678,6 +6117,10 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             handle_record_human_draft_card_delivery_outcome
         ),
         envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD: handle_reissue_human_draft_card,
+        envelope.COMMAND_PREPARE_POSTING_REVIEW: handle_prepare_posting_review,
+        envelope.COMMAND_ISSUE_POSTING_REVIEW_ACTIONS: handle_issue_posting_review_actions,
+        envelope.COMMAND_CONFIRM_AND_POST: handle_confirm_and_post,
+        envelope.COMMAND_RESUME_POSTING: handle_resume_posting,
         envelope.COMMAND_FINALIZE: handle_finalize,
         envelope.COMMAND_PREPARE_RECEIPT_COMPLETION: handle_prepare_receipt_completion,
         envelope.COMMAND_GET_FINALIZATION_SNAPSHOT_REVIEW: handle_get_finalization_snapshot_review,
@@ -5718,6 +6161,11 @@ __all__ = [
     "canonical_prepare_receipt_completion_key",
     "canonical_human_action_issuance_key",
     "canonical_human_action_redemption_key",
+    "canonical_prepare_posting_review_key",
+    "canonical_prepare_initial_posting_review_key",
+    "canonical_issue_posting_review_actions_key",
+    "canonical_confirm_and_post_key",
+    "canonical_resume_posting_key",
     "canonical_guided_edit_update_key",
     "canonical_guided_edit_complete_key",
     "canonical_human_draft_apply_key",
@@ -5749,6 +6197,10 @@ __all__ = [
     "handle_get_status",
     "handle_health",
     "handle_issue_human_actions",
+    "handle_prepare_posting_review",
+    "handle_issue_posting_review_actions",
+    "handle_confirm_and_post",
+    "handle_resume_posting",
     "handle_propose",
     "handle_prepare_ai_fallback",
     "handle_record_ai_fallback_result",

@@ -6,10 +6,15 @@ import hashlib
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 
 from finance_core import posting_authority as posting_authority_module
+from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+    authenticate_delivery_receipt,
+    receipt_proof_sha256,
+)
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.parser_proposals import human_drafts
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
@@ -26,6 +31,7 @@ from finance_core.posting_authority import (
     begin_posting_review_delivery,
     confirm_and_post,
     get_status,
+    get_status_by_reference,
     issue_posting_review_actions,
     prepare_posting_review,
     record_posting_review_delivery,
@@ -37,9 +43,10 @@ from finance_core.receipt_finalization.fact_set_bridge import (
     authorize_receipt_finalization,
     prepare_receipt_calculation,
 )
+from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from finance_core.sqlite_connection import ForeignKeysDisabledError
-from finance_core.staging_guard import StagingDatabaseError
+from finance_core.staging_guard import StagingDatabaseError, create_staging_database
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
@@ -50,6 +57,30 @@ def _connection() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     return conn
+
+
+def _file_connection(tmp_path: Path) -> sqlite3.Connection:
+    workspace = (tmp_path / "workspace").resolve()
+    runtime = workspace / "runtime"
+    database = workspace / "database"
+    runtime.mkdir(parents=True, mode=0o700)
+    database.mkdir(mode=0o700)
+    key_path = runtime / "delivery_receipt_signing.key"
+    key_path.write_bytes(b"p" * 32)
+    key_path.chmod(0o600)
+    return create_staging_database(
+        database / "staging.sqlite",
+        migration_paths=TEMP_DB_MIGRATION_PATHS,
+    )
+
+
+@pytest.fixture()
+def migrated_temp_db_connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = _file_connection(tmp_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _issue_and_activate(
@@ -68,19 +99,36 @@ def _issue_and_activate(
         context=context,
         clock=lambda: issue_time,
     )
+    database_path = Path(
+        str(next(row for row in conn.execute("PRAGMA database_list") if str(row[1]) == "main")[2])
+    )
+    workspace = database_path.parent.parent
+    signing_key = load_delivery_receipt_signing_key(str(workspace / "runtime"))
+    fields = {
+        "workspace_path": str(workspace),
+        "attempt_nonce": manifest.delivery_attempt_nonce,
+        "capability": "telegram.finance-delivery-material-v1",
+        "delivery_material_version": "finance_d2_delivery_material_v1",
+        "delivery_material_sha256": manifest.finance_delivery_material_sha256,
+        "provider_message_id": provider_message_id,
+        "receipt_token_sha256": hashlib.sha256(
+            f"receipt:{provider_message_id}".encode()
+        ).hexdigest(),
+        "channel": "telegram",
+        "account_id": context.account_id,
+        "conversation_id": context.conversation_id,
+        "session_key": context.binding_id,
+        "source_identity_sha256": "b" * 64,
+    }
     record_posting_review_delivery(
         conn,
-        attempt_nonce=manifest.delivery_attempt_nonce,
-        capability="telegram.finance-delivery-material-v1",
-        delivery_material_version="finance_d2_delivery_material_v1",
-        finance_delivery_material_sha256=manifest.finance_delivery_material_sha256,
-        provider_message_id=provider_message_id,
-        receipt_token_sha256=hashlib.sha256(f"receipt:{provider_message_id}".encode()).hexdigest(),
-        channel="telegram",
-        account_id=context.account_id,
-        conversation_id=context.conversation_id,
-        session_key=context.binding_id,
-        source_identity_sha256="b" * 64,
+        receipt=authenticate_delivery_receipt(
+            receipt_proof_sha256_value=receipt_proof_sha256(
+                signing_key=signing_key,
+                **fields,
+            ),
+            **fields,
+        ),
         clock=lambda: issue_time + 1,
     )
     confirm = next(control for control in manifest.controls if control.action == "confirm")
@@ -142,8 +190,11 @@ def test_migration_050_missing_trigger_fails_closed() -> None:
     conn.close()
 
 
-def _published_text_card(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Connection, object]:
-    conn = _connection()
+def _published_text_card(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[sqlite3.Connection, object]:
+    conn = _file_connection(tmp_path)
     started = _start(
         conn,
         payload={
@@ -190,9 +241,10 @@ def _published_text_card(monkeypatch: pytest.MonkeyPatch) -> tuple[sqlite3.Conne
 
 
 def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -235,6 +287,20 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
     )
     assert status.state == "finalized"
     assert status.transaction_public_id is not None
+    assert (
+        status.amount,
+        status.currency,
+        status.transaction_date,
+        status.merchant,
+        status.account,
+    ) == (
+        "12.50",
+        "SGD",
+        "2026-09-13",
+        "Cafe",
+        "unspecified",
+    )
+    assert get_status_by_reference(conn, reference=issued.reference, context=context) == status
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM d2_posting_decisions").fetchone()[0] == 1
 
@@ -253,9 +319,10 @@ def test_text_confirm_posts_once_and_exact_replay_returns_same_transaction(
 
 
 def test_changed_callback_cannot_reuse_an_accepted_confirm(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -296,9 +363,10 @@ def test_changed_callback_cannot_reuse_an_accepted_confirm(
 
 
 def test_text_committed_result_is_visible_before_attempt_catchup(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -351,9 +419,10 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
 
 
 def test_text_status_detects_canonical_transaction_drift_without_writes(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -392,9 +461,10 @@ def test_text_status_detects_canonical_transaction_drift_without_writes(
 
 
 def test_finalized_catchup_revalidates_under_write_lock_before_event(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -456,9 +526,10 @@ def test_finalized_catchup_revalidates_under_write_lock_before_event(
 
 
 def test_initial_text_finalization_uses_atomic_verified_catchup(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -505,9 +576,10 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
 
 
 def test_resume_requires_complete_d2_decision_before_text_financial_write(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -580,9 +652,10 @@ def test_resume_requires_complete_d2_decision_before_text_financial_write(
 
 
 def test_status_refuses_finalized_coordination_row_with_wrong_transaction(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -647,9 +720,10 @@ def test_status_refuses_finalized_coordination_row_with_wrong_transaction(
 
 
 def test_exact_confirm_replay_inside_redemption_transaction_is_idempotent(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -704,9 +778,10 @@ def test_exact_confirm_replay_inside_redemption_transaction_is_idempotent(
 
 
 def test_status_and_resume_reject_cross_context_without_writes(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -760,7 +835,7 @@ def test_issue_actions_requires_staging_and_foreign_keys(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    conn, published = _published_text_card(monkeypatch)
+    conn, published = _published_text_card(tmp_path, monkeypatch)
     context = HumanActionContext("111", "acct", "111", "binding")
     review = prepare_posting_review(
         conn,
@@ -1028,7 +1103,6 @@ def test_personal_receipt_one_confirm_binds_d1b_snapshot_d2b_and_finalizes_once(
         review_idempotency_key="d2-personal-receipt-review",
         card_generation_public_id=published.card_generation_public_id,
         context=context,
-        receipt_payer_participant_public_id="person_owner",
         clock=lambda: 1002,
     )
     assert review.posting_path == "personal_receipt"

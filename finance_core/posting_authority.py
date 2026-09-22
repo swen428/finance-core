@@ -12,9 +12,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Callable, Mapping
 
 from finance_core.calculation.authoritative_snapshot import (
@@ -177,6 +179,11 @@ class PostingStatus:
     attempt_public_id: str | None
     transaction_public_id: str | None
     attention_reason: str | None
+    amount: str | None = None
+    currency: str | None = None
+    transaction_date: str | None = None
+    merchant: str | None = None
+    account: str | None = None
 
 
 def _now_epoch() -> int:
@@ -344,9 +351,20 @@ def _projection_for_review(
         return "text", base_projection, None
     if not isinstance(merchant, str) or not merchant.strip():
         raise PostingAuthorityError("personal receipt proposal requires merchant")
-    if not receipt_payer_participant_public_id or not receipt_payer_participant_public_id.strip():
-        raise PostingAuthorityError("personal receipt requires the authenticated payer participant")
-    payer = receipt_payer_participant_public_id.strip()
+    if receipt_payer_participant_public_id is None:
+        participants = conn.execute(
+            "SELECT public_id FROM participants "
+            "WHERE is_self = 1 AND is_active = 1 ORDER BY public_id"
+        ).fetchall()
+        if len(participants) != 1:
+            raise PostingAuthorityError(
+                "personal receipt requires exactly one active self participant"
+            )
+        payer = str(participants[0]["public_id"])
+    else:
+        payer = receipt_payer_participant_public_id.strip()
+        if not payer:
+            raise PostingAuthorityError("personal receipt payer participant must not be empty")
     _require_active_self_participant(conn, payer)
     candidate: dict[str, object] = {
         "payer_participant_public_id": payer,
@@ -1243,23 +1261,64 @@ def _require_current_review(conn: sqlite3.Connection, review: sqlite3.Row, *, no
 def record_posting_review_delivery(
     conn: sqlite3.Connection,
     *,
-    attempt_nonce: str,
-    capability: str,
-    delivery_material_version: str,
-    finance_delivery_material_sha256: str,
-    provider_message_id: int | str,
-    receipt_token_sha256: str,
-    channel: str,
-    account_id: str,
-    conversation_id: str,
-    session_key: str,
-    source_identity_sha256: str,
+    receipt: object,
     clock: Callable[[], int] = _now_epoch,
 ) -> str:
     """Record material exposed only while consuming one host-owned receipt."""
+    from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
+        require_verified_delivery_receipt,
+    )
+
+    try:
+        verified = require_verified_delivery_receipt(receipt)
+    except ValueError as exc:
+        raise PostingAuthorityError("host-authenticated delivery receipt is required") from exc
+    attempt_nonce = verified.attempt_nonce
+    capability = verified.capability
+    delivery_material_version = verified.delivery_material_version
+    finance_delivery_material_sha256 = verified.delivery_material_sha256
+    provider_message_id = verified.provider_message_id
+    receipt_token_sha256 = verified.receipt_token_sha256
+    channel = verified.channel
+    account_id = verified.account_id
+    conversation_id = verified.conversation_id
+    session_key = verified.session_key
+    source_identity_sha256 = verified.source_identity_sha256
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
+    database_rows = conn.execute("PRAGMA database_list").fetchall()
+    main_database = next((row for row in database_rows if str(row[1]) == "main"), None)
+    if main_database is None:
+        raise PostingAuthorityError("delivery receipt database identity is unavailable")
+    database_path = str(main_database[2] or "")
+    if not database_path:
+        raise PostingAuthorityError("delivery receipt database identity is unavailable")
+    expected_database = Path(verified.workspace_path) / "database" / "staging.sqlite"
+    opened_database = Path(database_path)
+    try:
+        if (
+            not opened_database.is_absolute()
+            or opened_database.is_symlink()
+            or expected_database.is_symlink()
+            or opened_database.resolve(strict=True) != opened_database
+            or expected_database.resolve(strict=True) != expected_database
+        ):
+            raise OSError("workspace database path is unsafe")
+        expected_identity = os.stat(expected_database, follow_symlinks=False)
+        opened_identity = os.stat(opened_database, follow_symlinks=False)
+    except OSError as exc:
+        raise PostingAuthorityError(
+            "delivery receipt workspace database identity is unavailable"
+        ) from exc
+    if (
+        opened_database != expected_database
+        or (expected_identity.st_dev, expected_identity.st_ino)
+        != (opened_identity.st_dev, opened_identity.st_ino)
+        or expected_identity.st_nlink != 1
+        or opened_identity.st_nlink != 1
+    ):
+        raise PostingAuthorityError("delivery receipt workspace database identity mismatch")
     if capability != DELIVERY_MATERIAL_CAPABILITY:
         raise PostingAuthorityError("terminal delivery capability is invalid")
     if delivery_material_version != DELIVERY_MATERIAL_VERSION:
@@ -2697,7 +2756,7 @@ def get_status(
         "WHERE active_drafts.decision_target_parser_output_id = reviews.parser_output_id "
         "AND active_drafts.state = 'active') AS initial_replaced_by_edit, "
         "reviews.posting_path, reviews.parser_output_id, reviews.proposal_content_hash, "
-        "reviews.authenticated_actor_id "
+        "reviews.authenticated_actor_id, reviews.visible_projection_json "
         "FROM d2_posting_reviews AS reviews "
         "JOIN parser_outputs AS proposals ON proposals.id = reviews.parser_output_id "
         "LEFT JOIN d2_posting_attempts AS attempts "
@@ -2845,13 +2904,52 @@ def get_status(
             if row["transaction_public_id"] not in {None, authoritative_transaction}:
                 integrity_error = True
             else:
-                return PostingStatus(
-                    review_public_id=review_public_id,
-                    state="finalized",
-                    attempt_public_id=str(row["attempt_public_id"]),
-                    transaction_public_id=authoritative_transaction,
-                    attention_reason=None,
-                )
+                transaction = conn.execute(
+                    "SELECT amount, currency, transaction_date, merchant, account_id "
+                    "FROM transactions WHERE public_id = ?",
+                    (authoritative_transaction,),
+                ).fetchone()
+                try:
+                    projection = canonical_json_value(
+                        str(row["visible_projection_json"]),
+                        label="D2 visible projection",
+                    )
+                    if not isinstance(projection, dict) or transaction is None:
+                        raise ValueError("missing D2 result projection")
+                    currency = normalize_currency(str(transaction["currency"] or ""))
+                    amount = canonical_money_str(
+                        money_decimal(str(transaction["amount"]), label="D2 result amount"),
+                        currency,
+                    )
+                    transaction_date = str(transaction["transaction_date"] or "")[:10]
+                    authoritative_merchant = (
+                        None if transaction["merchant"] is None else str(transaction["merchant"])
+                    )
+                    if (
+                        projection.get("amount") != amount
+                        or projection.get("currency") != currency
+                        or projection.get("transaction_date") != transaction_date
+                        or projection.get("merchant") != authoritative_merchant
+                        or projection.get("account") != "unspecified"
+                        or transaction["account_id"] is not None
+                    ):
+                        raise ValueError("D2 result differs from confirmed projection")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    integrity_error = True
+                else:
+                    merchant = authoritative_merchant or ""
+                    return PostingStatus(
+                        review_public_id=review_public_id,
+                        state="finalized",
+                        attempt_public_id=str(row["attempt_public_id"]),
+                        transaction_public_id=authoritative_transaction,
+                        attention_reason=None,
+                        amount=amount,
+                        currency=currency,
+                        transaction_date=transaction_date,
+                        merchant=merchant,
+                        account="unspecified",
+                    )
         if integrity_error or stage == "finalized":
             return PostingStatus(
                 review_public_id=review_public_id,
@@ -2880,6 +2978,49 @@ def get_status(
     )
 
 
+def get_status_by_reference(
+    conn: sqlite3.Connection,
+    *,
+    reference: str,
+    context: HumanActionContext,
+) -> PostingStatus:
+    """Resolve a D2 review from its opaque Confirm capability using SELECTs only."""
+    require_staging_database(conn)
+    _require_d2_schema(conn)
+    _require_context(context)
+    if not isinstance(reference, str) or not reference.strip():
+        raise PostingAuthorityError("posting authority unavailable")
+    row = conn.execute(
+        "SELECT bindings.review_public_id "
+        "FROM openclaw_human_action_references AS refs "
+        "JOIN d2_posting_review_action_bindings AS bindings "
+        "ON bindings.reference_id = refs.id "
+        "JOIN d2_posting_reviews AS reviews "
+        "ON reviews.review_public_id = bindings.review_public_id "
+        "WHERE refs.reference_sha256 = ? AND refs.action = 'confirm' "
+        "AND refs.authenticated_actor_id = ? AND refs.channel_account_id = ? "
+        "AND refs.channel_conversation_id = ? AND refs.conversation_binding_id = ? "
+        "AND reviews.authenticated_actor_id = refs.authenticated_actor_id "
+        "AND reviews.telegram_account_id = refs.channel_account_id "
+        "AND reviews.telegram_conversation_id = refs.channel_conversation_id "
+        "AND reviews.conversation_binding_id = refs.conversation_binding_id",
+        (
+            _sha256_text(reference),
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise PostingAuthorityError("posting authority unavailable")
+    return get_status(
+        conn,
+        review_public_id=str(row["review_public_id"]),
+        context=context,
+    )
+
+
 __all__ = [
     "CALLBACK_VALUE_VERSION",
     "DELIVERY_MANIFEST_VERSION",
@@ -2894,6 +3035,7 @@ __all__ = [
     "confirm_and_post",
     "finance_delivery_material_digest",
     "get_status",
+    "get_status_by_reference",
     "issue_posting_review_actions",
     "prepare_posting_review",
     "record_posting_review_delivery",
