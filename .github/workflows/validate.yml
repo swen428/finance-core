@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  CANDIDATE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+  CANDIDATE_PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
+
 concurrency:
   group: finance-core-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,12 +24,23 @@ jobs:
     timeout-minutes: 5
     outputs:
       bridge: ${{ steps.scope.outputs.bridge }}
+      identity: ${{ steps.identity.outputs.identity }}
     steps:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Classify Bridge scope
         id: scope
@@ -41,8 +57,8 @@ jobs:
             exit 0
           fi
           changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
-          git diff --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
-          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|intake/macos_vision_receipt_ocr|parser_proposals/ai_))' "$changed_paths"; then
+          git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr)|parser_proposals/(__init__\.py$|ai_)))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
@@ -55,12 +71,18 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Install locked development dependencies
         run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
@@ -82,6 +104,7 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -89,6 +112,10 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Install locked development dependencies
         run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
@@ -152,12 +179,18 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Install locked Python dependencies
         run: |
@@ -182,7 +215,7 @@ jobs:
 
       - name: Require exact reviewed Bridge build output
         env:
-          REVIEWED_CHECKOUT_SHA: ${{ github.sha }}
+          REVIEWED_CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           git diff --exit-code "$REVIEWED_CHECKOUT_SHA" -- \
             plugins/finance-bridge/dist/src \
@@ -206,6 +239,7 @@ jobs:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -213,6 +247,10 @@ jobs:
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Recreate deterministic shard plan
         run: |
@@ -252,6 +290,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
       - name: Require all applicable validation
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -273,3 +323,16 @@ jobs:
             test "$BRIDGE_SCOPE" = true
             test "$BRIDGE_RESULT" = success
           fi
+
+      - name: Bind candidate validation evidence
+        env:
+          VALIDATION_NEEDS: ${{ toJSON(needs) }}
+        run: python .github/scripts/candidate_identity.py --summarize --output /tmp/candidate-validation-v1.json
+
+      - name: Upload candidate validation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: candidate-validation-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/candidate-validation-v1.json
+          retention-days: 90
+          if-no-files-found: error

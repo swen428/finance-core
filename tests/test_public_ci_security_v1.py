@@ -40,7 +40,9 @@ def test_bridge_lane_is_conditional_and_uses_exact_runtime() -> None:
     assert "matrix:\n        os: [ubuntu-latest, macos-15]" in source
     assert "PYTHON_EXECUTABLE: ${{ github.workspace }}/.venv/bin/python" in source
     assert "Require exact reviewed Bridge build output" in source
-    assert "REVIEWED_CHECKOUT_SHA: ${{ github.sha }}" in source
+    assert (
+        "REVIEWED_CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in source
+    )
     assert 'git diff --exit-code "$REVIEWED_CHECKOUT_SHA" --' in source
     assert "git ls-files --others --exclude-standard --" in source
     assert "plugins/finance-bridge/dist/src" in source
@@ -129,6 +131,9 @@ def _step_script(name: str) -> str:
         ("workflow_dispatch", "README.md", "true"),
         ("pull_request", "README.md", "false"),
         ("pull_request", "finance_core/money.py", "false"),
+        ("pull_request", "finance_core/application/review.py", "true"),
+        ("pull_request", "finance_core/intake/__init__.py", "true"),
+        ("pull_request", "finance_core/parser_proposals/__init__.py", "true"),
         ("pull_request", "plugins/finance-bridge/src/index.ts", "true"),
         ("pull_request", "requirements-dev.txt", "true"),
         ("pull_request", "pyproject.toml", "true"),
@@ -195,3 +200,36 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         text=True,
     )
     assert (completed.returncode == 0) is accepted, completed.stderr
+
+
+def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
+
+    git("init", "-q")
+    old = tmp_path / "plugins/finance-bridge/src/controller.ts"
+    old.parent.mkdir(parents=True)
+    old.write_text("export const marker = 1;\n", encoding="utf-8")
+    git("add", ".")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    old.rename(tmp_path / "archived-controller.ts")
+    git("add", "-A")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "rename")
+    output = tmp_path / "output"
+    completed = subprocess.run(
+        ["bash", "-c", _step_script("Classify Bridge scope")],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "BASE_SHA": base,
+            "HEAD_SHA": git("rev-parse", "HEAD"),
+            "EVENT_NAME": "pull_request",
+            "GITHUB_OUTPUT": str(output),
+            "RUNNER_TEMP": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert output.read_text(encoding="utf-8") == "bridge=true\n"
