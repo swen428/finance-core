@@ -12,6 +12,7 @@ import argparse
 import ast
 import json
 from collections import defaultdict, deque
+from importlib.util import resolve_name
 from pathlib import Path
 from typing import Any
 
@@ -138,14 +139,58 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             called = dotted(node.func) or ""
             first, *rest = called.split(".")
             called = ".".join([aliases.get(first, first), *rest])
+            if called == "builtins.__import__":
+                called = "__import__"
             if called not in {"importlib.import_module", "__import__"}:
                 continue
-            if (
-                node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)
-            ):
-                resolve(source, node.args[0].value)
+            keywords = {item.arg: item.value for item in node.keywords}
+            if None in keywords:
+                problems.append(f"unresolved dynamic import arguments: {source}:{node.lineno}")
+                continue
+            name_arg = node.args[0] if node.args else keywords.get("name")
+            if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
+                target = name_arg.value
+                if called == "importlib.import_module" and target.startswith("."):
+                    package_arg = node.args[1] if len(node.args) > 1 else keywords.get("package")
+                    if isinstance(package_arg, ast.Constant) and isinstance(package_arg.value, str):
+                        package = package_arg.value
+                    elif isinstance(package_arg, ast.Name) and package_arg.id == "__package__":
+                        package = (
+                            source
+                            if files[source].name == "__init__.py"
+                            else source.rsplit(".", 1)[0]
+                        )
+                    else:
+                        problems.append(
+                            f"unresolved dynamic import package: {source}:{node.lineno}"
+                        )
+                        continue
+                    try:
+                        target = resolve_name(target, package)
+                    except (ImportError, ValueError):
+                        problems.append(f"invalid relative dynamic import: {source}:{node.lineno}")
+                        continue
+                if called == "__import__":
+                    level_arg = node.args[4] if len(node.args) > 4 else keywords.get("level")
+                    if level_arg is not None and not (
+                        isinstance(level_arg, ast.Constant) and level_arg.value == 0
+                    ):
+                        problems.append(f"unresolved builtin import level: {source}:{node.lineno}")
+                        continue
+                    from_arg = node.args[3] if len(node.args) > 3 else keywords.get("fromlist")
+                    if from_arg is not None:
+                        try:
+                            imported = ast.literal_eval(from_arg)
+                        except (ValueError, TypeError, SyntaxError):
+                            imported = None
+                        if not isinstance(imported, (list, tuple)) or any(
+                            not isinstance(item, str) or item == "*" for item in imported
+                        ):
+                            problems.append(f"unresolved builtin fromlist: {source}:{node.lineno}")
+                            continue
+                        for symbol in imported:
+                            resolve(source, target, symbol)
+                resolve(source, target)
             elif not (
                 source in LAZY_PACKAGES
                 and source in lazy

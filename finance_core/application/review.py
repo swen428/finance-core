@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from types import TracebackType
 from typing import Any
 
 from finance_core.intake.receipt_ocr_proposal import get_receipt_ocr_extraction_status_for_proposal
@@ -44,6 +45,35 @@ class ReviewNotFoundError(ReviewError):
 
 class ReviewUnavailableError(ReviewError):
     """Persisted review material is unavailable or cannot be represented safely."""
+
+
+class review_snapshot:
+    """Keep all review reads on one version, preserving caller-owned work.
+
+    BEGIN is deferred and acquires no writer reservation. A transaction owned
+    here contains only reads and is ended even on refusal; an existing caller
+    transaction is neither committed nor rolled back.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn = conn
+        self.owned = False
+
+    def __enter__(self) -> None:
+        self.owned = not self.conn.in_transaction
+        if self.owned:
+            self.conn.execute("BEGIN")
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        # A class context manager also preserves frozen adapter exceptions;
+        # generator context managers assign their __traceback__ on propagation.
+        if self.owned:
+            self.conn.rollback()
 
 
 @dataclass(frozen=True)
@@ -316,4 +346,5 @@ def project_proposal_review(
 
 def get_proposal_review(conn: sqlite3.Connection, proposal_public_id: str) -> dict[str, Any]:
     """Read and validate review content without any platform interaction."""
-    return project_proposal_review(conn, prepare_proposal_review(conn, proposal_public_id))
+    with review_snapshot(conn):
+        return project_proposal_review(conn, prepare_proposal_review(conn, proposal_public_id))

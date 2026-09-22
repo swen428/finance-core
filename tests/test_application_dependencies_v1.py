@@ -52,6 +52,21 @@ def test_existing_exceptions_are_exact_and_application_has_no_platform_path() ->
             "from importlib import import_module as load\n"
             "load('finance_core.telegram_source_context')\n",
         ),
+        (
+            "finance_core/application/review.py",
+            "from importlib import import_module\n"
+            "import_module('.telegram_source_context', 'finance_core')\n",
+        ),
+        (
+            "finance_core/application/review.py",
+            "import importlib\n"
+            "importlib.import_module(name='..telegram_source_context', package=__package__)\n",
+        ),
+        (
+            "finance_core/application/review.py",
+            "from builtins import __import__ as load\n"
+            "load('finance_core.telegram_source_context')\n",
+        ),
     ],
 )
 def test_direct_indirect_initializer_and_literal_dynamic_imports_are_rejected(
@@ -107,6 +122,8 @@ def test_historical_symbols_cannot_expand_and_removed_exceptions_are_stale(tmp_p
         "from finance_core.intake import Client\n",
         "import finance_core.intake as intake\nclient = intake.Client\n",
         "import finance_core.intake\nclient = finance_core.intake.Client\n",
+        "from builtins import __import__ as load\n"
+        "load('finance_core.intake', fromlist=['Client'])\n",
     ],
 )
 def test_explicit_lazy_platform_export_is_followed(tmp_path: Path, source: str) -> None:
@@ -129,13 +146,21 @@ def test_explicit_lazy_platform_export_is_followed(tmp_path: Path, source: str) 
     )
 
 
-def test_computed_imports_fail_closed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "call",
+    [
+        "import_module(name)",
+        "import_module('.telegram_source_context', package=name)",
+        "import_module('.telegram_source_context', **options)",
+        "__import__('telegram_source_context', globals(), level=1)",
+        "__import__('finance_core.intake', fromlist=names)",
+    ],
+)
+def test_computed_imports_fail_closed(tmp_path: Path, call: str) -> None:
     registry = scaffold(tmp_path)
     write(
         tmp_path,
         "finance_core/helper.py",
-        "from importlib import import_module\nname = 'anything'\nimport_module(name)\n",
+        "from importlib import import_module\nname = 'anything'\n" + call + "\n",
     )
-    assert any(
-        "unresolved dynamic import" in error for error in GUARD.check_boundaries(tmp_path, registry)
-    )
+    assert any("unresolved" in error for error in GUARD.check_boundaries(tmp_path, registry))

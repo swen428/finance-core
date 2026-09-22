@@ -3,7 +3,9 @@
 `finance_core.application.review.get_proposal_review(connection, proposal_id)`
 is the internal, read-only business entry for a financial proposal review.
 Supply a migrated Finance SQLite connection with `sqlite3.Row` as its row
-factory; the caller owns the connection and transaction. It works on a
+factory; the caller owns the connection. The entry reuses a caller transaction
+or opens a deferred read transaction that it ends on success or refusal. It
+never commits or rolls back caller-owned work. It works on a
 read-only connection and does not open a workspace, create a key, start a
 host, call a network/provider API, or issue an approval/posting capability.
 The public `finance-core-api-v1` and Bridge envelope version are unchanged.
@@ -17,6 +19,11 @@ The existing Bridge `get_review` uses the same implementation in two stages:
    ambiguity and AI flags and produce the financial review projection.
 4. The adapter applies the existing AI-ambiguity token suppression and wraps
    the response, mapping neutral review exceptions to existing Bridge errors.
+
+Both stages and the intervening adapter key/token work share one SQLite read
+snapshot. A concurrent completion cannot combine old displayed fields/version
+with a new content hash. Internal staged callers must use `review_snapshot`
+around both stages; a prepared object must not outlive that read scope.
 
 The ordering is intentional. A malformed account is refused before a missing
 key; a malformed merchant is refused after the missing-key check. A single

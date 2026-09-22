@@ -344,3 +344,86 @@ def test_source_refusal_precedes_key_and_display_validation(
     outcome = adapter_review(workspace, public_id)
     assert outcome.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
     assert outcome.response["error"]["message"] == "source lineage refused"
+
+
+@pytest.mark.parametrize("adapter", [False, True])
+def test_concurrent_completion_cannot_mix_review_versions(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch, adapter: bool
+) -> None:
+    from finance_core.parser_proposals.completion import complete_proposal
+
+    public_id = capture(workspace)
+    with support.open_database(workspace) as setup:
+        setup.execute("PRAGMA journal_mode = WAL")
+        before = review.get_proposal_review(setup, public_id)
+    writer = support.open_database(workspace)
+    original = review.resolve_effective_payload
+    committed = False
+
+    def complete_between_reads(conn, proposal):
+        nonlocal committed
+        result = original(conn, proposal)
+        if not committed:
+            committed = True
+            complete_proposal(
+                writer,
+                proposal["id"],
+                actor="owner-authenticated",
+                expected_content_hash=before["effective_content_hash"],
+                field_updates={"merchant": "Corrected merchant"},
+                completion_public_id="pco_concurrent_application_review",
+            )
+        return result
+
+    monkeypatch.setattr(review, "resolve_effective_payload", complete_between_reads)
+    try:
+        if adapter:
+            response = adapter_review(workspace, public_id)
+            assert response.exit_code == errors.EXIT_OK
+            actual = response.response["result"].copy()
+            tokens = actual.pop("callback_tokens")
+            assert tokens is not None
+            for action, token in tokens.items():
+                assert callback_tokens.verify_token(
+                    (workspace.workspace_path / "runtime/callback_signing.key").read_bytes(),
+                    token=token["token"],
+                    proposal_public_id=public_id,
+                    version=before["proposal_version"],
+                    content_hash=before["effective_content_hash"],
+                    action=action,
+                    expiry=token["expiry"],
+                )
+        else:
+            with support.open_database(workspace) as reader:
+                actual = review.get_proposal_review(reader, public_id)
+                assert not reader.in_transaction
+        assert committed
+        assert actual == before
+        after = review.get_proposal_review(writer, public_id)
+        assert after["merchant"] == "Corrected merchant"
+        assert after["proposal_version"] == before["proposal_version"] + 1
+        assert after["effective_content_hash"] != before["effective_content_hash"]
+    finally:
+        writer.close()
+
+
+def test_review_preserves_caller_transaction_and_ends_owned_transaction_on_refusal(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    public_id = capture(workspace)
+    with support.open_database(workspace) as conn:
+        conn.execute("CREATE TEMP TABLE caller_work (value TEXT)")
+        conn.execute("INSERT INTO caller_work VALUES ('pending')")
+        assert conn.in_transaction
+        changed = conn.total_changes
+        review.get_proposal_review(conn, public_id)
+        with pytest.raises(review.ReviewNotFoundError):
+            review.get_proposal_review(conn, "missing")
+        assert conn.in_transaction
+        assert conn.total_changes == changed
+        assert conn.execute("SELECT value FROM caller_work").fetchone()[0] == "pending"
+        conn.rollback()
+        assert conn.execute("SELECT COUNT(*) FROM caller_work").fetchone()[0] == 0
+        with pytest.raises(review.ReviewNotFoundError):
+            review.get_proposal_review(conn, "missing")
+        assert not conn.in_transaction

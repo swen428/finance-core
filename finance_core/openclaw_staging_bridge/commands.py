@@ -2167,30 +2167,35 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
 
     workspace, conn = _open_context(request.arguments, deadline)
     try:
-        deadline.check("review read")
-        prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
-        proposal, version, content_hash = prepared.proposal, prepared.version, prepared.content_hash
-        callback_tokens_payload: dict[str, dict[str, object]] | None = None
-        parse_status = str(proposal["parse_status"])
-        if parse_status not in TERMINAL_STATUSES:
-            deadline.check("callback token issuance")
-            # get_review is strictly read-only: a missing or unsafe callback
-            # key fails closed instead of creating or repairing the key.
-            key = _load_callback_key(workspace)
-            expiry = int(datetime.now(UTC).timestamp()) + token_ttl
-            callback_tokens_payload = callback_tokens.issue_callback_tokens(
-                key,
-                proposal_public_id=proposal["public_id"],
-                version=version,
-                content_hash=content_hash,
-                expiry=expiry,
+        with application_review.review_snapshot(conn):
+            deadline.check("review read")
+            prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
+            proposal, version, content_hash = (
+                prepared.proposal,
+                prepared.version,
+                prepared.content_hash,
             )
+            callback_tokens_payload: dict[str, dict[str, object]] | None = None
+            parse_status = str(proposal["parse_status"])
+            if parse_status not in TERMINAL_STATUSES:
+                deadline.check("callback token issuance")
+                # get_review is strictly read-only: a missing or unsafe callback
+                # key fails closed instead of creating or repairing the key.
+                key = _load_callback_key(workspace)
+                expiry = int(datetime.now(UTC).timestamp()) + token_ttl
+                callback_tokens_payload = callback_tokens.issue_callback_tokens(
+                    key,
+                    proposal_public_id=proposal["public_id"],
+                    version=version,
+                    content_hash=content_hash,
+                    expiry=expiry,
+                )
 
-        result = application_review.project_proposal_review(conn, prepared)
-        if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
-            callback_tokens_payload = None
-        result["callback_tokens"] = callback_tokens_payload
-        return result, False
+            result = application_review.project_proposal_review(conn, prepared)
+            if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
+                callback_tokens_payload = None
+            result["callback_tokens"] = callback_tokens_payload
+            return result, False
     except application_review.ReviewError as exc:
         raise _map_review_error(exc) from exc
     finally:
