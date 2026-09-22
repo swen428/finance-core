@@ -290,3 +290,50 @@ def test_external_lazy_table_access_is_rejected(tmp_path: Path, source: str) -> 
         "external lazy table access" in error
         for error in GUARD.check_boundaries(tmp_path, registry)
     )
+
+
+@pytest.mark.parametrize(
+    "importer,call",
+    [
+        (
+            "from importlib import import_module as load",
+            "load('finance_core.telegram_source_context')",
+        ),
+        ("from builtins import __import__ as load", "load('finance_core.telegram_source_context')"),
+        ("import importlib as load", "load.import_module('finance_core.telegram_source_context')"),
+        ("import builtins as load", "load.__import__('finance_core.telegram_source_context')"),
+    ],
+)
+@pytest.mark.parametrize("global_importer", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_conflicting_importer_bindings_cannot_hide_cross_scope_calls(
+    tmp_path: Path, importer: str, call: str, global_importer: bool, reverse: bool
+) -> None:
+    registry = scaffold(tmp_path)
+    controlled = importer + "\n" + call + "\n"
+    if not global_importer:
+        controlled = "def controlled():\n" + "".join(
+            "    " + line + "\n" for line in controlled.splitlines()
+        )
+    unrelated = "def unrelated():\n    from finance_core import helper as load\n    return load\n"
+    source = unrelated + controlled if reverse else controlled + unrelated
+    write(tmp_path, "finance_core/application/review.py", source)
+    assert any(
+        "conflicting importer binding" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+def test_local_import_cannot_hide_implicit_builtin_importer(tmp_path: Path) -> None:
+    registry = scaffold(tmp_path)
+    write(
+        tmp_path,
+        "finance_core/application/review.py",
+        "__import__('finance_core.telegram_source_context')\n"
+        "def unrelated():\n    from finance_core import helper as __import__\n"
+        "    return __import__\n",
+    )
+    assert any(
+        "conflicting importer binding" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )

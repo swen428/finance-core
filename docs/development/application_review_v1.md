@@ -50,6 +50,8 @@ importer modules likewise cannot escape direct attribute access. Compatibility
 export tables have one literal definition and may only be read by the exact
 reviewed loader and directory functions. Table mutation, external access and
 value escape are rejected.
+Conflicting importer aliases across scopes are refused conservatively, so an
+unrelated local import cannot hide another scope's platform dependency.
 Whole lazy-package imports conservatively include all their exports; use an
 explicit neutral submodule or symbol to keep a dependency narrow.
 Mutation tests cover new direct/indirect dependencies, package

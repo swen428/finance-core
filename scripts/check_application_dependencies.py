@@ -167,13 +167,23 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             )
         for target, symbol in lazy.get(source, {}).values():
             add(source, target, symbol, eager=False)
-        aliases: dict[str, str] = {}
+        aliases: dict[str, str] = {"__import__": "__import__"}
+
+        def bind_alias(local: str, resolved: str) -> None:
+            previous = aliases.get(local)
+            controlled = IMPORTERS | IMPORTER_MODULES
+            if previous != resolved and (previous in controlled or resolved in controlled):
+                if previous is not None:
+                    problems.append(f"conflicting importer binding: {source}.{local}")
+            aliases[local] = resolved
+
         # Conservatively inspect imports inside functions and conditionals too.
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    aliases[alias.asname or alias.name.split(".")[0]] = (
-                        alias.name if alias.asname else alias.name.split(".")[0]
+                    bind_alias(
+                        alias.asname or alias.name.split(".")[0],
+                        alias.name if alias.asname else alias.name.split(".")[0],
                     )
                     resolve(source, alias.name)
             elif isinstance(node, ast.ImportFrom):
@@ -189,7 +199,7 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
                 for alias in node.names:
                     if alias.name == "*":
                         problems.append(f"wildcard import: {source} -> {module}")
-                    aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
+                    bind_alias(alias.asname or alias.name, f"{module}.{alias.name}")
                     resolve(source, module, alias.name)
         for node in ast.walk(tree):
             if (
