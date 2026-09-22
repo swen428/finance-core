@@ -57,12 +57,13 @@ MIN_SOURCE_RUNS = 3
 MAX_BASELINE_AGE_DAYS = 30
 MAX_UNKNOWN_FILE_PERCENT = 5
 
-# Bootstrap timing samples were measured before the public repository split.
-# Source-repository identifiers are deliberately redacted from the public
-# baseline; future public timing refreshes replace this bootstrap provenance.
-TRUSTED_REPOSITORY = "private-source-redacted"
-TRUSTED_WORKFLOW_PATH = "private-workflow-redacted"
-TRUSTED_WORKFLOW_EVENT = "workflow_dispatch"
+# Rolling timing samples come from successful first-attempt public main pushes.
+# Retired private bootstrap identities are not eligible refresh evidence.
+# GitHub's immutable public repository ID preserves verifiable provenance
+# without introducing an owner-name exception to the source privacy checks.
+TRUSTED_REPOSITORY = "github-repository-id:1375123906"
+TRUSTED_WORKFLOW_PATH = ".github/workflows/validate.yml"
+TRUSTED_WORKFLOW_EVENT = "push"
 TRUSTED_RUN_STATUS = "completed"
 TRUSTED_RUN_CONCLUSION = "success"
 TRUSTED_ARTIFACT_KIND = "pytest-timing-v1"
