@@ -124,6 +124,8 @@ def test_historical_symbols_cannot_expand_and_removed_exceptions_are_stale(tmp_p
         "import finance_core.intake\nclient = finance_core.intake.Client\n",
         "from builtins import __import__ as load\n"
         "load('finance_core.intake', fromlist=['Client'])\n",
+        "from importlib import import_module\nimport_module('finance_core.intake').Client\n",
+        "from finance_core import intake\nother = intake\nother.Client\n",
     ],
 )
 def test_explicit_lazy_platform_export_is_followed(tmp_path: Path, source: str) -> None:
@@ -164,3 +166,57 @@ def test_computed_imports_fail_closed(tmp_path: Path, call: str) -> None:
         "from importlib import import_module\nname = 'anything'\n" + call + "\n",
     )
     assert any("unresolved" in error for error in GUARD.check_boundaries(tmp_path, registry))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import importlib\nload = importlib.import_module\n"
+        "load('finance_core.telegram_source_context')\n",
+        "load = __import__\nload('finance_core.telegram_source_context')\n",
+        "from importlib import import_module\nconsume(import_module)\n",
+        "import builtins\nconsume(builtins.__import__)\n",
+        "from importlib import import_module\ndef factory():\n    return import_module\n",
+    ],
+)
+def test_importer_values_cannot_escape_analyzed_calls(tmp_path: Path, source: str) -> None:
+    registry = scaffold(tmp_path)
+    write(tmp_path, "finance_core/application/review.py", source)
+    assert any("escaped importer" in error for error in GUARD.check_boundaries(tmp_path, registry))
+
+
+@pytest.mark.parametrize("package", ["intake", "parser_proposals"])
+@pytest.mark.parametrize("change", ["extra_helper", "changed_loader"])
+def test_computed_loader_exception_is_bound_to_exact_function(
+    tmp_path: Path, package: str, change: str
+) -> None:
+    scaffold(tmp_path)
+    write(tmp_path, "finance_core/intake/telegram_client.py")
+    loader = (ROOT / "finance_core/intake/__init__.py").read_text().split("def __getattr__", 1)[1]
+    loader = "def __getattr__" + loader.split("\n\ndef __dir__", 1)[0]
+    source = (
+        "from importlib import import_module\n"
+        "_LAZY_EXPORTS = {'Client': ('finance_core.intake.telegram_client', 'Client')}\n" + loader
+    )
+    path = f"finance_core/{package}/__init__.py"
+    write(tmp_path, path, source)
+    old = GUARD.dependency_inventory(tmp_path)
+    registry = {"schema_version": 1, "direct": old["direct"], "indirect": old["indirect"]}
+    assert GUARD.check_boundaries(tmp_path, registry) == []
+    if change == "extra_helper":
+        source += "\ndef load_any(module_name):\n    return import_module(module_name)\n"
+        write(
+            tmp_path,
+            "finance_core/application/review.py",
+            f"from finance_core.{package} import load_any\n"
+            "load_any('finance_core.telegram_source_context')\n",
+        )
+    else:
+        source = source.replace(
+            "module_name, attribute = target",
+            "module_name, attribute = target\n    module_name = 'arbitrary'",
+        )
+    write(tmp_path, path, source)
+    assert any(
+        "unresolved dynamic import" in error for error in GUARD.check_boundaries(tmp_path, registry)
+    )

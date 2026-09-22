@@ -43,8 +43,12 @@ Application nor the adapter silently repairs malformed stored content.
 Run `python scripts/check_application_dependencies.py`; the Python test suite
 runs the same guard. It follows absolute/relative imports, package initializers,
 explicit lazy reexports, common attribute access and literal dynamic imports.
-Unresolved computed imports are rejected except the two registered compatibility
-export loaders. Mutation tests cover new direct/indirect dependencies, package
+Unresolved computed imports are rejected except the exact reviewed `__getattr__`
+AST bodies in the two registered compatibility packages. Importer function
+values cannot escape analyzed calls through assignment, passing or return.
+Whole lazy-package imports conservatively include all their exports; use an
+explicit neutral submodule or symbol to keep a dependency narrow.
+Mutation tests cover new direct/indirect dependencies, package
 initializer imports, lazy exports, dynamic imports and enlarged/stale exceptions.
 A cold-process import plus real synthetic SQLite read also blocks platform
 imports at runtime. Static analysis is an architecture check, not a sandbox

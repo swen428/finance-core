@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 from collections import defaultdict, deque
 from importlib.util import resolve_name
@@ -17,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 LAZY_PACKAGES = frozenset({"finance_core.intake", "finance_core.parser_proposals"})
+# Python 3.12 AST identity of the complete reviewed __getattr__ implementation,
+# excluding line locations. This allowance cannot spread to a second helper or
+# silently change how module_name is selected from the literal export table.
+LAZY_LOADER_AST_SHA256 = "0eb011250aee3b7f690ea6da4c8d4a0f1795ec72efc881603e231cca2e5c290c"
+IMPORTERS = frozenset({"importlib.import_module", "__import__", "builtins.__import__"})
 
 
 def is_platform(module: str) -> bool:
@@ -96,11 +102,37 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             add(source, module, "<package>")
             add(source, target, attribute)
         elif symbol is not None and f"{module}.{symbol}" in files:
-            add(source, f"{module}.{symbol}", "<module>")
+            resolve(source, f"{module}.{symbol}")
         else:
             add(source, module, symbol or "<module>")
+            if symbol is None and module in lazy:
+                # Whole-package values may be assigned/passed before attribute
+                # access. Conservatively include their possible lazy exports;
+                # explicit neutral submodule/symbol imports stay narrow.
+                for exported in lazy[module]:
+                    resolve(source, module, exported)
 
     for source, tree in trees.items():
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        permitted_computed_calls: set[ast.Call] = set()
+        for function in tree.body:
+            if (
+                source in LAZY_PACKAGES
+                and source in lazy
+                and isinstance(function, ast.FunctionDef)
+                and function.name == "__getattr__"
+                and hashlib.sha256(
+                    ast.dump(function, include_attributes=False).encode()
+                ).hexdigest()
+                == LAZY_LOADER_AST_SHA256
+            ):
+                permitted_computed_calls.update(
+                    node
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Call) and dotted(node.func) == "import_module"
+                )
         for target, symbol in lazy.get(source, {}).values():
             add(source, target, symbol, eager=False)
         aliases: dict[str, str] = {}
@@ -128,6 +160,14 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
                     aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
                     resolve(source, module, alias.name)
         for node in ast.walk(tree):
+            if isinstance(node, (ast.Name, ast.Attribute)) and (name := dotted(node)):
+                first, *rest = name.split(".")
+                expanded = ".".join([aliases.get(first, first), *rest])
+                parent = parents.get(node)
+                if expanded in IMPORTERS and not (
+                    isinstance(parent, ast.Call) and parent.func is node
+                ):
+                    problems.append(f"escaped importer value: {source}:{node.lineno}")
             if isinstance(node, ast.Attribute) and (name := dotted(node)):
                 first, *rest = name.split(".")
                 expanded = ".".join([aliases.get(first, first), *rest])
@@ -192,8 +232,7 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
                             resolve(source, target, symbol)
                 resolve(source, target)
             elif not (
-                source in LAZY_PACKAGES
-                and source in lazy
+                node in permitted_computed_calls
                 and called == "importlib.import_module"
                 and len(node.args) == 1
                 and isinstance(node.args[0], ast.Name)
