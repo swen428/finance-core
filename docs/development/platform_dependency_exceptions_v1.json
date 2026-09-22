@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "300127aef6122cb69c7c67dc65cc8f422771bd47",
+  "scope": "Exact existing source/approval and compatibility-export debt; remove during the corresponding authority/source adapter extraction. No application dependency exception is permitted. Import timing of the two existing export packages is lazy; their exported names and target objects are unchanged.",
+  "direct": [
+    {
+      "source": "finance_core.intake",
+      "target": "finance_core.intake.macos_vision_receipt_ocr",
+      "symbols": [
+        "HELPER_NAME",
+        "HELPER_PROTOCOL_VERSION",
+        "MAX_LANGUAGE_COUNT",
+        "MacOSVisionOcrEngine",
+        "OcrProcessCleanupError",
+        "RECOGNITION_LEVEL",
+        "USES_LANGUAGE_CORRECTION",
+        "VISION_REQUEST_REVISION",
+        "convert_vision_bounding_box",
+        "convert_vision_observations",
+        "scale_vision_confidence"
+      ]
+    },
+    {
+      "source": "finance_core.intake",
+      "target": "finance_core.intake.telegram_attachment_acquisition",
+      "symbols": [
+        "AcquisitionReplayConflictError",
+        "AcquisitionReplayIntegrityError",
+        "AttachmentEvidenceHandoffConflictError",
+        "CallerOwnedTransactionError",
+        "ContentSignatureMismatchError",
+        "DurableFileIntegrityConflictError",
+        "DurablePublicationError",
+        "InvalidAcquisitionConfigurationError",
+        "InvalidRemoteFilePathError",
+        "InvalidTelegramIdentityError",
+        "MalformedTelegramMetadataError",
+        "RawIntakeNotFoundError",
+        "StagingDatabaseRejectedError",
+        "TelegramAttachmentAcquisitionError",
+        "TelegramAttachmentAcquisitionLimits",
+        "TelegramAttachmentAcquisitionResult",
+        "TelegramAttachmentTransport",
+        "TelegramDeclaredFileTooLargeError",
+        "TelegramDownloadResponse",
+        "TelegramDownloadTimeoutError",
+        "TelegramFileMetadata",
+        "TelegramHttpResponseError",
+        "TelegramMetadataRequestError",
+        "TelegramRedirectError",
+        "TelegramStreamedFileTooLargeError",
+        "TelegramTruncatedDownloadError",
+        "TemporaryFileCleanupError",
+        "TemporaryFileError",
+        "UnexpectedAttachmentPersistenceError",
+        "UnsafeStorageRootError",
+        "UnsupportedFilenameExtensionError",
+        "UnsupportedMimeTypeError",
+        "acquire_and_persist_telegram_attachment"
+      ]
+    },
+    {
+      "source": "finance_core.intake",
+      "target": "finance_core.intake.telegram_bot_api_transport",
+      "symbols": [
+        "TelegramBotApiTransport"
+      ]
+    },
+    {
+      "source": "finance_core.parser_proposals.service",
+      "target": "finance_core.telegram_source_context",
+      "symbols": [
+        "TelegramSourceContext",
+        "TelegramSourceContextError",
+        "require_telegram_source_context"
+      ]
+    },
+    {
+      "source": "finance_core.posting_authority",
+      "target": "finance_core.openclaw_staging_bridge.delivery_receipt_proof",
+      "symbols": [
+        "require_verified_delivery_receipt"
+      ]
+    },
+    {
+      "source": "finance_core.posting_authority",
+      "target": "finance_core.openclaw_staging_bridge.human_actions",
+      "symbols": [
+        "HumanActionContext",
+        "IssuedHumanActionReference",
+        "issue_human_action_references",
+        "redeem_human_action_reference"
+      ]
+    },
+    {
+      "source": "finance_core.posting_authority",
+      "target": "finance_core.telegram_source_context",
+      "symbols": [
+        "TelegramSourceContext",
+        "TelegramSourceContextError",
+        "require_telegram_source_context"
+      ]
+    }
+  ],
+  "indirect": [
+    [
+      "finance_core.intake.raw_intake_review_cli",
+      "finance_core.telegram_source_context"
+    ],
+    [
+      "finance_core.parser_proposals.confirmation",
+      "finance_core.telegram_source_context"
+    ],
+    [
+      "finance_core.parser_proposals.conversion",
+      "finance_core.telegram_source_context"
+    ],
+    [
+      "finance_core.parser_proposals.service",
+      "finance_core.telegram_source_context"
+    ],
+    [
+      "finance_core.posting_authority",
+      "finance_core.openclaw_staging_bridge"
+    ],
+    [
+      "finance_core.posting_authority",
+      "finance_core.openclaw_staging_bridge.delivery_receipt_proof"
+    ],
+    [
+      "finance_core.posting_authority",
+      "finance_core.openclaw_staging_bridge.human_actions"
+    ],
+    [
+      "finance_core.posting_authority",
+      "finance_core.telegram_source_context"
+    ]
+  ]
+}

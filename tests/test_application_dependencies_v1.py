@@ -1,0 +1,141 @@
+"""Architecture guard mutations, including package and lazy-import bypass paths."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "application_dependency_guard", ROOT / "scripts/check_application_dependencies.py"
+)
+assert SPEC and SPEC.loader
+GUARD = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(GUARD)
+
+
+def write(root: Path, name: str, content: str = "") -> None:
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def scaffold(root: Path) -> dict:
+    write(root, "finance_core/__init__.py")
+    write(root, "finance_core/application/__init__.py")
+    write(root, "finance_core/application/review.py", "from finance_core import helper\n")
+    write(root, "finance_core/helper.py")
+    write(root, "finance_core/telegram_source_context.py")
+    return {"schema_version": 1, "direct": [], "indirect": []}
+
+
+def test_existing_exceptions_are_exact_and_application_has_no_platform_path() -> None:
+    registry = json.loads(
+        (ROOT / "docs/development/platform_dependency_exceptions_v1.json").read_text()
+    )
+    assert GUARD.check_boundaries(ROOT, registry) == []
+    assert registry["direct"] and registry["indirect"]
+    assert not any("*" in json.dumps(edge) for edge in registry["direct"])
+
+
+@pytest.mark.parametrize(
+    "path,source",
+    [
+        ("finance_core/application/review.py", "import finance_core.telegram_source_context\n"),
+        ("finance_core/helper.py", "from finance_core.telegram_source_context import Context\n"),
+        ("finance_core/__init__.py", "from . import telegram_source_context\n"),
+        (
+            "finance_core/helper.py",
+            "from importlib import import_module as load\n"
+            "load('finance_core.telegram_source_context')\n",
+        ),
+    ],
+)
+def test_direct_indirect_initializer_and_literal_dynamic_imports_are_rejected(
+    tmp_path: Path, path: str, source: str
+) -> None:
+    registry = scaffold(tmp_path)
+    write(tmp_path, path, source)
+    errors = GUARD.check_boundaries(tmp_path, registry)
+    assert any("application reaches platform" in error for error in errors)
+    # Even copying the newly observed dependency set cannot waive Application.
+    inventory = GUARD.dependency_inventory(tmp_path)
+    registry.update({key: inventory[key] for key in ("direct", "indirect")})
+    assert any(
+        "application reaches platform" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+def test_new_generic_caller_cannot_inherit_an_old_platform_exception(tmp_path: Path) -> None:
+    scaffold(tmp_path)
+    write(tmp_path, "finance_core/legacy.py", "import finance_core.telegram_source_context\n")
+    old = GUARD.dependency_inventory(tmp_path)
+    registry = {"schema_version": 1, "direct": old["direct"], "indirect": old["indirect"]}
+    assert GUARD.check_boundaries(tmp_path, registry) == []
+    write(tmp_path, "finance_core/new_business.py", "from finance_core import legacy\n")
+    assert any(
+        "historical indirect" in error for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+def test_historical_symbols_cannot_expand_and_removed_exceptions_are_stale(tmp_path: Path) -> None:
+    scaffold(tmp_path)
+    write(
+        tmp_path,
+        "finance_core/legacy.py",
+        "from finance_core.telegram_source_context import Context\n",
+    )
+    old = GUARD.dependency_inventory(tmp_path)
+    registry = {"schema_version": 1, "direct": old["direct"], "indirect": old["indirect"]}
+    write(
+        tmp_path,
+        "finance_core/legacy.py",
+        "from finance_core.telegram_source_context import Context, new_write\n",
+    )
+    assert any("historical direct" in error for error in GUARD.check_boundaries(tmp_path, registry))
+    write(tmp_path, "finance_core/legacy.py")
+    assert any("historical direct" in error for error in GUARD.check_boundaries(tmp_path, registry))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from finance_core.intake import Client\n",
+        "import finance_core.intake as intake\nclient = intake.Client\n",
+        "import finance_core.intake\nclient = finance_core.intake.Client\n",
+    ],
+)
+def test_explicit_lazy_platform_export_is_followed(tmp_path: Path, source: str) -> None:
+    scaffold(tmp_path)
+    write(tmp_path, "finance_core/intake/telegram_client.py")
+    write(tmp_path, "finance_core/intake/neutral.py")
+    write(
+        tmp_path,
+        "finance_core/intake/__init__.py",
+        "_LAZY_EXPORTS = {'Client': ('finance_core.intake.telegram_client', 'Client')}\n",
+    )
+    old = GUARD.dependency_inventory(tmp_path)
+    registry = {"schema_version": 1, "direct": old["direct"], "indirect": old["indirect"]}
+    write(tmp_path, "finance_core/helper.py", "from finance_core.intake import neutral\n")
+    assert GUARD.check_boundaries(tmp_path, registry) == []
+    write(tmp_path, "finance_core/helper.py", source)
+    assert any(
+        "application reaches platform" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+def test_computed_imports_fail_closed(tmp_path: Path) -> None:
+    registry = scaffold(tmp_path)
+    write(
+        tmp_path,
+        "finance_core/helper.py",
+        "from importlib import import_module\nname = 'anything'\nimport_module(name)\n",
+    )
+    assert any(
+        "unresolved dynamic import" in error for error in GUARD.check_boundaries(tmp_path, registry)
+    )
