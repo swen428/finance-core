@@ -22,7 +22,9 @@ LAZY_PACKAGES = frozenset({"finance_core.intake", "finance_core.parser_proposals
 # excluding line locations. This allowance cannot spread to a second helper or
 # silently change how module_name is selected from the literal export table.
 LAZY_LOADER_AST_SHA256 = "0eb011250aee3b7f690ea6da4c8d4a0f1795ec72efc881603e231cca2e5c290c"
+LAZY_DIR_AST_SHA256 = "ad4667879f6d29771ebe579b938b50b57d53ef1ac4c3fd7c06733c9422e9e2c0"
 IMPORTERS = frozenset({"importlib.import_module", "__import__", "builtins.__import__"})
+IMPORTER_MODULES = frozenset({"importlib", "builtins"})
 
 
 def is_platform(module: str) -> bool:
@@ -51,7 +53,9 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
     }
     trees = {name: ast.parse(path.read_text(encoding="utf-8")) for name, path in files.items()}
     lazy: dict[str, dict[str, tuple[str, str]]] = {}
+    table_definitions: dict[str, set[ast.Name]] = defaultdict(set)
     problems: list[str] = []
+    node: ast.AST
     for name, tree in trees.items():
         for node in tree.body:
             if not isinstance(node, ast.Assign) or not any(
@@ -62,6 +66,11 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             if name not in LAZY_PACKAGES:
                 problems.append(f"unregistered lazy export table: {name}")
                 continue
+            if table_definitions[name] or len(node.targets) != 1:
+                problems.append(f"lazy export table needs one sole literal definition: {name}")
+            table_definitions[name].update(
+                target for target in node.targets if isinstance(target, ast.Name)
+            )
             try:
                 values = ast.literal_eval(node.value)
             except (ValueError, TypeError, SyntaxError):
@@ -97,6 +106,9 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             )
 
     def resolve(source: str, module: str, symbol: str | None = None) -> None:
+        if module in LAZY_PACKAGES and symbol == "_LAZY_EXPORTS":
+            problems.append(f"external lazy table access: {source} -> {module}")
+            return
         if symbol is not None and symbol in lazy.get(module, {}):
             target, attribute = lazy[module][symbol]
             add(source, module, "<package>")
@@ -117,22 +129,42 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
             child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
         }
         permitted_computed_calls: set[ast.Call] = set()
-        for function in tree.body:
-            if (
-                source in LAZY_PACKAGES
-                and source in lazy
-                and isinstance(function, ast.FunctionDef)
-                and function.name == "__getattr__"
-                and hashlib.sha256(
-                    ast.dump(function, include_attributes=False).encode()
-                ).hexdigest()
-                == LAZY_LOADER_AST_SHA256
-            ):
-                permitted_computed_calls.update(
-                    node
-                    for node in ast.walk(function)
-                    if isinstance(node, ast.Call) and dotted(node.func) == "import_module"
-                )
+        permitted_table_names: set[ast.Name] = set(table_definitions[source])
+        functions = {
+            name: [
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            ]
+            for name in ("__getattr__", "__dir__")
+        }
+        for name, expected_hash in (
+            ("__getattr__", LAZY_LOADER_AST_SHA256),
+            ("__dir__", LAZY_DIR_AST_SHA256),
+        ):
+            matches = functions[name]
+            if source not in LAZY_PACKAGES or source not in lazy:
+                continue
+            if len(matches) > 1:
+                problems.append(f"duplicate lazy function definition: {source}.{name}")
+            if len(matches) != 1:
+                continue
+            function = matches[0]
+            observed_hash = hashlib.sha256(
+                ast.dump(function, include_attributes=False).encode()
+            ).hexdigest()
+            if observed_hash != expected_hash:
+                continue
+            permitted_table_names.update(
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name) and node.id == "_LAZY_EXPORTS"
+            )
+            permitted_computed_calls.update(
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call) and dotted(node.func) == "import_module"
+            )
         for target, symbol in lazy.get(source, {}).values():
             add(source, target, symbol, eager=False)
         aliases: dict[str, str] = {}
@@ -160,16 +192,28 @@ def dependency_inventory(root: Path) -> dict[str, Any]:
                     aliases[alias.asname or alias.name] = f"{module}.{alias.name}"
                     resolve(source, module, alias.name)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.Name, ast.Attribute)) and (name := dotted(node)):
-                first, *rest = name.split(".")
+            if (
+                isinstance(node, ast.Name)
+                and node.id == "_LAZY_EXPORTS"
+                and node not in permitted_table_names
+            ):
+                problems.append(f"lazy table mutation or escape: {source}:{node.lineno}")
+            if isinstance(node, ast.Attribute) and node.attr == "_LAZY_EXPORTS":
+                problems.append(f"external lazy table access: {source}:{node.lineno}")
+            if isinstance(node, (ast.Name, ast.Attribute)) and (dotted_name := dotted(node)):
+                first, *rest = dotted_name.split(".")
                 expanded = ".".join([aliases.get(first, first), *rest])
                 parent = parents.get(node)
                 if expanded in IMPORTERS and not (
                     isinstance(parent, ast.Call) and parent.func is node
                 ):
                     problems.append(f"escaped importer value: {source}:{node.lineno}")
-            if isinstance(node, ast.Attribute) and (name := dotted(node)):
-                first, *rest = name.split(".")
+                if expanded in IMPORTER_MODULES and not (
+                    isinstance(parent, ast.Attribute) and parent.value is node
+                ):
+                    problems.append(f"escaped importer module: {source}:{node.lineno}")
+            if isinstance(node, ast.Attribute) and (dotted_name := dotted(node)):
+                first, *rest = dotted_name.split(".")
                 expanded = ".".join([aliases.get(first, first), *rest])
                 module, _, attribute = expanded.rpartition(".")
                 if attribute in lazy.get(module, {}):

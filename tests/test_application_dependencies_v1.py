@@ -220,3 +220,73 @@ def test_computed_loader_exception_is_bound_to_exact_function(
     assert any(
         "unresolved dynamic import" in error for error in GUARD.check_boundaries(tmp_path, registry)
     )
+
+
+@pytest.mark.parametrize("module", ["importlib", "builtins"])
+@pytest.mark.parametrize(
+    "escape", ["other = {module}", "consume({module})", "def value():\n    return {module}"]
+)
+def test_importer_module_values_cannot_escape(tmp_path: Path, module: str, escape: str) -> None:
+    registry = scaffold(tmp_path)
+    write(
+        tmp_path,
+        "finance_core/application/review.py",
+        f"import {module}\n" + escape.format(module=module),
+    )
+    assert any(
+        "escaped importer module" in error for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+@pytest.mark.parametrize("package", ["intake", "parser_proposals"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "_LAZY_EXPORTS['Client'] = ('finance_core.intake.telegram_client', 'Client')",
+        "_LAZY_EXPORTS.update({'Client': ('finance_core.intake.telegram_client', 'Client')})",
+        "other = _LAZY_EXPORTS",
+        "consume(_LAZY_EXPORTS)",
+        "def value():\n    return _LAZY_EXPORTS",
+        "_LAZY_EXPORTS = {}",
+    ],
+)
+def test_literal_lazy_table_cannot_be_mutated_or_escape(
+    tmp_path: Path, package: str, mutation: str
+) -> None:
+    registry = scaffold(tmp_path)
+    write(tmp_path, "finance_core/intake/neutral.py")
+    write(tmp_path, "finance_core/intake/telegram_client.py")
+    real = (ROOT / f"finance_core/{package}/__init__.py").read_text()
+    loader = "def __getattr__" + real.split("def __getattr__", 1)[1]
+    source = (
+        "from importlib import import_module\nfrom typing import Any\n"
+        "_LAZY_EXPORTS = {'Neutral': ('finance_core.intake.neutral', 'Neutral')}\n" + loader
+    )
+    path = f"finance_core/{package}/__init__.py"
+    write(tmp_path, path, source)
+    assert GUARD.check_boundaries(tmp_path, registry) == []
+    write(tmp_path, path, source + "\n" + mutation + "\n")
+    write(
+        tmp_path,
+        "finance_core/application/review.py",
+        f"from finance_core.{package} import Client\n",
+    )
+    assert GUARD.check_boundaries(tmp_path, registry)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from finance_core.intake import _LAZY_EXPORTS as table\n",
+        "import finance_core.intake as package\ntable = package._LAZY_EXPORTS\n",
+        "import finance_core.intake as package\nother = package\ntable = other._LAZY_EXPORTS\n",
+    ],
+)
+def test_external_lazy_table_access_is_rejected(tmp_path: Path, source: str) -> None:
+    registry = scaffold(tmp_path)
+    write(tmp_path, "finance_core/intake/__init__.py", "_LAZY_EXPORTS = {}\n")
+    write(tmp_path, "finance_core/application/review.py", source)
+    assert any(
+        "external lazy table access" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )

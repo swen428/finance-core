@@ -45,7 +45,11 @@ runs the same guard. It follows absolute/relative imports, package initializers,
 explicit lazy reexports, common attribute access and literal dynamic imports.
 Unresolved computed imports are rejected except the exact reviewed `__getattr__`
 AST bodies in the two registered compatibility packages. Importer function
-values cannot escape analyzed calls through assignment, passing or return.
+values cannot escape analyzed calls through assignment, passing or return;
+importer modules likewise cannot escape direct attribute access. Compatibility
+export tables have one literal definition and may only be read by the exact
+reviewed loader and directory functions. Table mutation, external access and
+value escape are rejected.
 Whole lazy-package imports conservatively include all their exports; use an
 explicit neutral submodule or symbol to keep a dependency narrow.
 Mutation tests cover new direct/indirect dependencies, package
