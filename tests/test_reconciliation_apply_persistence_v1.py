@@ -520,6 +520,35 @@ def test_bound_apply_rejects_incompatible_success_and_reader_detects_it(
     assert error.value.classification == "UNKNOWN_INTEGRITY"
 
 
+def test_bound_apply_rejects_conflicting_audit_identity_and_reader_detects_it(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    ap = ApplyPersistence(conn)
+    with pytest.raises(ValueError, match="source identity changed"):
+        ap.save_apply_result(replace(result, reviewer="Alice", note="different note"))
+    forged_evidence = {
+        **result.audit_evidence,
+        "decision_id": "forged-other-decision",
+        "reviewer": "Alice",
+        "issue_type": "matched",
+    }
+    with pytest.raises(ValueError, match="source identity changed"):
+        ap.save_apply_result(replace(result, audit_evidence=forged_evidence))
+    assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
+
+    assert ap.save_apply_result(result)
+    conn.execute(
+        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+        (json.dumps(forged_evidence), result.apply_id),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "app-three-c")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
 def test_bound_apply_result_missing_third_target_is_unknown_integrity(
     migrated_temp_db_connection,
 ) -> None:

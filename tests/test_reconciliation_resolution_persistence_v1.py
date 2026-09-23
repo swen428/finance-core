@@ -536,6 +536,51 @@ def test_bound_resolution_rejects_forged_success_for_incompatible_issue(
     assert error.value.classification == "UNKNOWN_INTEGRITY"
 
 
+def test_direct_success_result_requires_exact_persisted_decision(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    result = ResolutionRuntime().resolve(item, decision)
+    ignore = replace(decision, action=ResolutionAction.IGNORE)
+    assert rp.persist_decision(ignore)
+    with pytest.raises(ValueError, match="conflicts with persisted decision"):
+        rp.persist_result(result)
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+def test_direct_success_result_and_reader_verify_human_attribution(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    bob = replace(decision, reviewer="Bob")
+    alice = replace(decision, reviewer="Alice")
+    assert rp.persist_decision(bob)
+    with pytest.raises(ValueError, match="conflicts with persisted decision"):
+        rp.persist_result(ResolutionRuntime().resolve(item, alice))
+    result = ResolutionRuntime().resolve(item, bob)
+    with pytest.raises(ValueError, match="evidence source identity changed"):
+        rp.persist_result(
+            replace(result, audit_evidence={**result.audit_evidence, "reviewer": "Alice"})
+        )
+    assert rp.persist_result(result)
+    row = rp.list_results_for_queue_item(item.queue_item_id)[0]
+    evidence = json.loads(row["audit_evidence_json"])
+    evidence["reviewer"] = "Alice"
+    conn.execute(
+        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
+        (json.dumps(evidence), row["public_id"]),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _resolution_relationships(conn, "app-res-c")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(ValueError, match="decision evidence changed"):
+        rp.persist_decision(bob)
+
+
 def test_bound_three_app_result_missing_third_is_unknown_and_replay_refused(
     migrated_temp_db_connection,
 ) -> None:

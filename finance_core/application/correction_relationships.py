@@ -179,6 +179,25 @@ def _settlement_relationships(conn: sqlite3.Connection, receipt_id: str | None) 
         _refuse(classification, f"settlement-obligation:{row['public_id']}")
 
 
+def _resolution_decision_evidence_matches(
+    conn: sqlite3.Connection, decision_id: str, evidence: dict[str, object], issue_type: str
+) -> bool:
+    try:
+        decision = conn.execute(
+            "SELECT reviewer, decision_note, resolved_at "
+            "FROM reconciliation_resolution_decisions WHERE public_id = ?",
+            (decision_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return decision is not None and (
+        evidence.get("issue_type") == issue_type
+        and evidence.get("reviewer") == decision[0]
+        and (evidence.get("note") or None) == decision[1]
+        and (decision[2] is None or evidence.get("resolved_at") == decision[2])
+    )
+
+
 def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
     results = _rows(
         conn,
@@ -254,6 +273,9 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or kept != bound.app_transaction_ref
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
+                or not _resolution_decision_evidence_matches(
+                    conn, row["decision_public_id"], evidence, bound.issue_type.value
+                )
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if target_id in cast(list[str], duplicates):
@@ -280,6 +302,9 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or queue_ref != bound.app_transaction_ref
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
+                or not _resolution_decision_evidence_matches(
+                    conn, row["decision_public_id"], evidence, bound.issue_type.value
+                )
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if target_id == queue_ref:
@@ -301,6 +326,18 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
             _refuse("UNKNOWN_INTEGRITY", label)
         # These successful decisions did not classify an app transaction.
         # Queue status can change after a later, independent decision.
+
+
+def _apply_evidence_matches(
+    row: dict[str, object], evidence: dict[str, object], issue_type: str
+) -> bool:
+    return (
+        type(row.get("decision_id")) is str
+        and evidence.get("decision_id") == row["decision_id"]
+        and evidence.get("reviewer") == row.get("reviewer")
+        and (evidence.get("note") or None) == row.get("note")
+        and evidence.get("issue_type") == issue_type
+    )
 
 
 def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
@@ -367,6 +404,7 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
                 or evidence_action != action
+                or not _apply_evidence_matches(row, evidence, bound.issue_type.value)
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             ids = set(cast(list[str], duplicates))
@@ -416,6 +454,7 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
                 or evidence_action != action
+                or not _apply_evidence_matches(row, evidence, bound.issue_type.value)
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if target_id not in (canonical_id, app_ref, evidence_ref):

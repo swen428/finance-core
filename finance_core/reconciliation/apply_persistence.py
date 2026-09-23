@@ -40,6 +40,20 @@ class ApplyPersistenceConflictError(Exception):
     """Raised when a persisted apply result conflicts with an existing row."""
 
 
+def _reject_source_identity(conn: sqlite3.Connection, result: ResolutionApplyResult) -> None:
+    if conn.execute(
+        "SELECT 1 FROM reconciliation_apply_results WHERE apply_id = ?", (result.apply_id,)
+    ).fetchone():
+        raise ApplyPersistenceConflictError(f"Conflicting apply_id '{result.apply_id}'")
+    existing_decision = conn.execute(
+        "SELECT 1 FROM reconciliation_apply_results WHERE decision_id = ?",
+        (result.decision_id,),
+    ).fetchone()
+    if existing_decision is not None:
+        raise ApplyPersistenceConflictError(f"Conflicting decision_id '{result.decision_id}'")
+    raise ValueError("successful reconciliation apply source identity changed")
+
+
 @contextmanager
 def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
     if conn.in_transaction:
@@ -102,8 +116,12 @@ def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyRes
             or result.audit_evidence.get("queue_item_id") != bound.queue_item_id
             or result.audit_evidence.get("candidate_id") != bound.candidate_id
             or result.audit_evidence.get("resolution_action") != result.action.value
+            or result.audit_evidence.get("issue_type") != bound.issue_type.value
+            or result.audit_evidence.get("decision_id") != result.decision_id
+            or result.audit_evidence.get("reviewer") != result.reviewer
+            or (result.audit_evidence.get("note") or None) != (result.note or None)
         ):
-            raise ValueError("successful reconciliation apply source identity changed")
+            _reject_source_identity(conn, result)
         if result.action.value == "mark_duplicate":
             if (
                 payload.get("duplicate_app_txn_ids")

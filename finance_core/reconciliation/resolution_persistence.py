@@ -119,6 +119,13 @@ def _bound_successful_classification(
             evidence.get("queue_item_id") != bound.queue_item_id
             or evidence.get("candidate_id") != bound.candidate_id
             or evidence.get("resolution_action") != result.decision.action.value
+            or evidence.get("issue_type") != bound.issue_type.value
+            or evidence.get("reviewer") != result.decision.reviewer
+            or (evidence.get("note") or None) != (result.decision.note or None)
+            or (
+                result.decision.resolved_at is not None
+                and evidence.get("resolved_at") != result.decision.resolved_at
+            )
         ):
             raise ValueError("successful reconciliation evidence source identity changed")
     return bound
@@ -201,6 +208,23 @@ def _guard_successful_decision_replay(
         raise ValueError("successful reconciliation evidence is incomplete") from exc
     if not isinstance(evidence, dict):
         raise ValueError("successful reconciliation evidence is incomplete")
+    if bound is not None:
+        stored_decision = conn.execute(
+            "SELECT * FROM reconciliation_resolution_decisions WHERE public_id = ?",
+            (decision.decision_id,),
+        ).fetchone()
+        if (
+            stored_decision is None
+            or not _decision_row_matches(stored_decision, decision)
+            or evidence.get("issue_type") != bound.issue_type.value
+            or evidence.get("reviewer") != stored_decision["reviewer"]
+            or (evidence.get("note") or None) != stored_decision["decision_note"]
+            or (
+                stored_decision["resolved_at"] is not None
+                and evidence.get("resolved_at") != stored_decision["resolved_at"]
+            )
+        ):
+            raise ValueError("successful reconciliation replay decision evidence changed")
     canonical = prior[1]
     target = evidence.get("app_txn_id")
     if not isinstance(canonical, str) or not canonical or target != canonical:
@@ -313,6 +337,11 @@ class ResolutionPersistence:
         """
         with _owned_write(self._conn):
             _guard_successful_resolution(self._conn, result)
+            stored_decision = self._get_decision_by_public_id(result.decision.decision_id)
+            if stored_decision is None or not _decision_row_matches(
+                stored_decision, result.decision
+            ):
+                raise ValueError("reconciliation result conflicts with persisted decision")
             return self._insert_result(_complete_success_evidence(self._conn, result))
 
     def _insert_result(self, result: ResolutionResult) -> bool:
