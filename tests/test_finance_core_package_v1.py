@@ -48,7 +48,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "089d2d50782a6ab7913a8df208ec8bcca598502a76d1cd86e54a92c85794be8a"
+EXPECTED_LEDGER_DIGEST = "62f0e2b51324c2c75f81843a8b146280f11654fe36337dd521465836222204f3"
 
 
 def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:

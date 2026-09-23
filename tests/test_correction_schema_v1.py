@@ -23,17 +23,19 @@ def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(
-        """CREATE TABLE transactions(public_id TEXT PRIMARY KEY);
+        """CREATE TABLE transactions(id INTEGER PRIMARY KEY, public_id TEXT UNIQUE, amount NUMERIC);
         CREATE TABLE authoritative_calculation_snapshots(
             snapshot_public_id TEXT PRIMARY KEY,combined_snapshot_hash TEXT,
             created_at TEXT,authorization_reference TEXT,previous_snapshot_public_id TEXT);
         CREATE TABLE d2_posting_attempts(transaction_public_id TEXT,stage TEXT);
+        CREATE TABLE parser_proposal_conversion_audit(transaction_id INTEGER);
+        CREATE TABLE receipt_finalization_audit(transaction_public_id TEXT,status TEXT);
         CREATE TABLE schema_migrations(
             migration_id TEXT, migration_filename TEXT,
             migration_sequence INTEGER, checksum_sha256 TEXT);
         CREATE TABLE financial_audit_events(
             aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
-        INSERT INTO transactions VALUES ('txn-1');"""
+        INSERT INTO transactions VALUES (1,'txn-1',10);"""
     )
     conn.execute(
         "INSERT INTO schema_migrations VALUES (?,?,?,?)",
@@ -93,7 +95,7 @@ def test_schema_refuses_changed_trigger_literal(altered_literal: str) -> None:
             "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
             (trigger,),
         ).fetchone()[0]
-        assert original_sql.count("a.stage = 'finalized'") == 1
+        assert original_sql.count("a.stage = 'finalized'") == 2
         conn.execute(f"DROP TRIGGER {trigger}")
         conn.execute(original_sql.replace("a.stage = 'finalized'", f"a.stage = {altered_literal}"))
 
@@ -101,6 +103,44 @@ def test_schema_refuses_changed_trigger_literal(altered_literal: str) -> None:
             verify_correction_schema(conn)
         conn.execute("UPDATE transactions SET public_id = 'changed' WHERE public_id = 'txn-1'")
         assert conn.execute("SELECT public_id FROM transactions").fetchone()[0] == "changed"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("evidence", ("d2", "text", "receipt", "receipt_replay"))
+def test_committed_original_rejects_mutation_and_identity_collisions(evidence: str) -> None:
+    conn = _db()
+    try:
+        conn.execute("PRAGMA recursive_triggers = OFF")
+        if evidence == "d2":
+            conn.execute("INSERT INTO d2_posting_attempts VALUES ('txn-1', 'finalized')")
+        elif evidence == "text":
+            conn.execute("INSERT INTO parser_proposal_conversion_audit VALUES (1)")
+        else:
+            status = "already_finalized" if evidence == "receipt_replay" else "finalized"
+            conn.execute("INSERT INTO receipt_finalization_audit VALUES ('txn-1', ?)", (status,))
+        conn.execute("INSERT INTO transactions VALUES (2,'other',20)")
+        conn.commit()
+
+        statements = (
+            "UPDATE transactions SET amount=99 WHERE id=1",
+            "DELETE FROM transactions WHERE id=1",
+            "INSERT OR REPLACE INTO transactions VALUES (1,'replacement-id',99)",
+            "INSERT OR REPLACE INTO transactions VALUES (3,'txn-1',99)",
+            "INSERT OR IGNORE INTO transactions VALUES (1,'replacement-id',99)",
+            "INSERT OR IGNORE INTO transactions VALUES (3,'txn-1',99)",
+            "UPDATE OR REPLACE transactions SET id=1 WHERE id=2",
+            "UPDATE OR REPLACE transactions SET public_id='txn-1' WHERE id=2",
+        )
+        for statement in statements:
+            with pytest.raises(sqlite3.IntegrityError, match="immutable|identity collision"):
+                conn.execute(statement)
+            assert conn.execute(
+                "SELECT id,public_id,amount FROM transactions ORDER BY id"
+            ).fetchall() == [(1, "txn-1", 10), (2, "other", 20)]
+
+        conn.execute("UPDATE transactions SET amount=21 WHERE id=2")
+        assert conn.execute("SELECT amount FROM transactions WHERE id=2").fetchone()[0] == 21
     finally:
         conn.close()
 

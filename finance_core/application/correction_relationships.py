@@ -179,7 +179,7 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         """SELECT results.public_id AS result_id, results.audit_evidence_json,
         results.decision_public_id, results.review_queue_public_id,
         decisions.decision_action, decisions.review_queue_public_id AS decision_queue_id,
-        queues.app_transaction_ref, queues.status AS queue_status
+        queues.public_id AS queue_id, queues.app_transaction_ref
         FROM reconciliation_resolution_results AS results
         LEFT JOIN reconciliation_resolution_decisions AS decisions
           ON decisions.public_id = results.decision_public_id
@@ -197,23 +197,30 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         canonical_ref = evidence.get("canonical_app_transaction_ref")
         payload_target = evidence.get("payload_target_app_txn_id")
         evidence_action = evidence.get("resolution_action")
-        ids = {
-            value
-            for value in (queue_ref, evidence_ref, canonical_ref, payload_target)
-            if type(value) is str and value
-        }
-        duplicate_claim = (
-            action == "mark_duplicate"
-            or evidence_action == "mark_duplicate"
-            or any(
-                key in evidence
-                for key in ("duplicate_app_txn_ids", "kept_app_txn_id", "audit_only")
-            )
+        duplicate_fields = ("duplicate_app_txn_ids", "kept_app_txn_id", "audit_only")
+        classification_fields = (
+            "canonical_app_transaction_ref",
+            "payload_target_app_txn_id",
+            *duplicate_fields,
         )
-        if duplicate_claim:
+        if (
+            type(row["decision_public_id"]) is not str
+            or not row["decision_public_id"]
+            or type(row["review_queue_public_id"]) is not str
+            or not row["review_queue_public_id"]
+            or row["decision_queue_id"] != row["review_queue_public_id"]
+            or row["queue_id"] != row["review_queue_public_id"]
+            or ("queue_item_id" in evidence and evidence["queue_item_id"] != row["queue_id"])
+            or (queue_ref is not None and (type(queue_ref) is not str or not queue_ref))
+            or (evidence_ref is not None and (type(evidence_ref) is not str or not evidence_ref))
+            or queue_ref != evidence_ref
+        ):
+            _refuse("UNKNOWN_INTEGRITY", label)
+
+        if action == "mark_duplicate":
             duplicates = evidence.get("duplicate_app_txn_ids")
             kept = evidence.get("kept_app_txn_id")
-            complete = (
+            if not (
                 type(duplicates) is list
                 and len(duplicates) >= 2
                 and all(type(value) is str and value for value in duplicates)
@@ -221,60 +228,46 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 and type(kept) is str
                 and kept in duplicates
                 and evidence.get("audit_only") is True
+                and (evidence_action == action or "resolution_action" not in evidence)
                 and canonical_ref == kept
                 and payload_target == kept
                 and queue_ref == kept
-            )
-            if not complete:
+            ):
                 # Old success rows may omit secondary duplicate IDs. Their
                 # relationship to any target cannot be disproved safely.
                 _refuse("UNKNOWN_INTEGRITY", label)
-            ids.update(cast(list[str], duplicates))
-            ids.add(cast(str, kept))
-        if target_id not in ids:
+            if target_id in cast(list[str], duplicates):
+                _refuse("ACTIVE_RELATIONSHIP", label)
             continue
+
+        if action == "confirm_match":
+            if (
+                (evidence_action != action and "resolution_action" in evidence)
+                or any(key in evidence for key in duplicate_fields)
+                or type(queue_ref) is not str
+                or canonical_ref != queue_ref
+                or payload_target != queue_ref
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            if target_id == queue_ref:
+                _refuse("ACTIVE_RELATIONSHIP", label)
+            continue
+
         if (
             action
-            in {
+            not in {
                 "adjust_app_transaction",
                 "create_missing_app_transaction",
                 "mark_statement_only",
                 "ignore",
                 "needs_more_info",
             }
-            and evidence_action == action
-            and row["decision_queue_id"] == row["review_queue_public_id"]
-            and row["queue_status"]
-            == (
-                "ignored"
-                if action == "ignore"
-                else "needs_more_info"
-                if action == "needs_more_info"
-                else "resolved"
-            )
-            and type(queue_ref) is str
-            and queue_ref == evidence_ref
-            and canonical_ref is None
-            and payload_target is None
-            and not duplicate_claim
-        ):
-            # A coherent non-classification success can mention the target
-            # without creating a finalized relationship.
-            continue
-        if (
-            action not in {"confirm_match", "mark_duplicate"}
-            or (evidence_action is not None and evidence_action != action)
-            or duplicate_claim != (action == "mark_duplicate")
-            or row["decision_queue_id"] != row["review_queue_public_id"]
-            or row["queue_status"] != "resolved"
-            or type(queue_ref) is not str
-            or type(evidence_ref) is not str
-            or queue_ref != evidence_ref
-            or canonical_ref != queue_ref
-            or payload_target != queue_ref
+            or evidence_action != action
+            or any(key in evidence for key in classification_fields)
         ):
             _refuse("UNKNOWN_INTEGRITY", label)
-        _refuse("ACTIVE_RELATIONSHIP", label)
+        # These successful decisions did not classify an app transaction.
+        # Queue status can change after a later, independent decision.
 
 
 def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:

@@ -165,14 +165,40 @@ BEGIN
     );
 END;
 
+-- Financial commit can precede D2 coordination catch-up. Protect its audited
+-- transaction before SQLite's REPLACE handling can remove the original row.
 CREATE TRIGGER trg_correction_transactions_no_update BEFORE UPDATE ON transactions
-WHEN EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = OLD.public_id AND a.stage = 'finalized')
-BEGIN SELECT RAISE(ABORT, 'finalized D2 transaction is immutable'); END;
+WHEN (
+    EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = OLD.public_id AND a.stage = 'finalized')
+    OR EXISTS (SELECT 1 FROM parser_proposal_conversion_audit c WHERE c.transaction_id = OLD.id)
+    OR EXISTS (SELECT 1 FROM receipt_finalization_audit r WHERE r.transaction_public_id = OLD.public_id AND r.status IN ('finalized', 'already_finalized'))
+  ) OR EXISTS (
+    SELECT 1 FROM transactions t
+    WHERE t.id <> OLD.id AND (t.id = NEW.id OR t.public_id = NEW.public_id)
+      AND (
+          EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = t.public_id AND a.stage = 'finalized')
+          OR EXISTS (SELECT 1 FROM parser_proposal_conversion_audit c WHERE c.transaction_id = t.id)
+          OR EXISTS (SELECT 1 FROM receipt_finalization_audit r WHERE r.transaction_public_id = t.public_id AND r.status IN ('finalized', 'already_finalized'))
+      )
+  )
+BEGIN SELECT RAISE(ABORT, 'finalized D2 transaction is immutable or identity collision'); END;
 CREATE TRIGGER trg_correction_transactions_no_delete BEFORE DELETE ON transactions
-WHEN EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = OLD.public_id AND a.stage = 'finalized')
+WHEN (
+    EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = OLD.public_id AND a.stage = 'finalized')
+    OR EXISTS (SELECT 1 FROM parser_proposal_conversion_audit c WHERE c.transaction_id = OLD.id)
+    OR EXISTS (SELECT 1 FROM receipt_finalization_audit r WHERE r.transaction_public_id = OLD.public_id AND r.status IN ('finalized', 'already_finalized'))
+)
 BEGIN SELECT RAISE(ABORT, 'finalized D2 transaction is immutable'); END;
 CREATE TRIGGER trg_correction_transactions_no_insert_collision BEFORE INSERT ON transactions
-WHEN EXISTS (SELECT 1 FROM transactions t JOIN d2_posting_attempts a ON a.transaction_public_id = t.public_id WHERE t.public_id = NEW.public_id AND a.stage = 'finalized')
+WHEN EXISTS (
+    SELECT 1 FROM transactions t
+    WHERE (t.id = NEW.id OR t.public_id = NEW.public_id)
+      AND (
+          EXISTS (SELECT 1 FROM d2_posting_attempts a WHERE a.transaction_public_id = t.public_id AND a.stage = 'finalized')
+          OR EXISTS (SELECT 1 FROM parser_proposal_conversion_audit c WHERE c.transaction_id = t.id)
+          OR EXISTS (SELECT 1 FROM receipt_finalization_audit r WHERE r.transaction_public_id = t.public_id AND r.status IN ('finalized', 'already_finalized'))
+      )
+)
 BEGIN SELECT RAISE(ABORT, 'finalized D2 transaction identity collision'); END;
 
 CREATE TRIGGER trg_correction_targets_no_update BEFORE UPDATE ON correction_targets BEGIN SELECT RAISE(ABORT, 'correction targets are append-only'); END;

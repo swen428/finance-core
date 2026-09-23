@@ -412,6 +412,12 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
     attempt_id = str(
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
+    assert conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()[0] == "accepted"
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("DELETE FROM transactions")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
@@ -727,22 +733,22 @@ def test_finalized_catchup_revalidates_under_write_lock_before_event(
 
     def drift_before_lock(stage: str) -> None:
         if stage == "before_finalized_catchup_lock":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", drift_before_lock)
     status = resume_posting(conn, attempt_public_id=attempt_id, context=context)
-    assert status.state == "needs_attention"
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert status.state == "finalized"
     attempt = conn.execute(
         "SELECT stage, transaction_public_id FROM d2_posting_attempts WHERE attempt_public_id = ?",
         (attempt_id,),
     ).fetchone()
-    assert attempt["stage"] == "accepted"
-    assert attempt["transaction_public_id"] is None
+    assert attempt["stage"] == "finalized"
+    assert attempt["transaction_public_id"] == status.transaction_public_id
     assert (
         conn.execute("SELECT COUNT(*) FROM d2_posting_attempt_events").fetchone()[0]
-        == events_before
+        == events_before + 1
     )
 
 
@@ -770,8 +776,9 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
 
     def drift_after_financial_commit(stage: str) -> None:
         if stage == "after_text_finalization_commit":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(
         posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
@@ -785,14 +792,14 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
         callback_message_id=214,
         clock=lambda: 1004,
     )
-    assert status.state == "needs_attention"
+    assert status.state == "finalized"
     attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
-    assert attempt["stage"] == "accepted"
+    assert attempt["stage"] == "finalized"
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
         ).fetchone()[0]
-        == 0
+        == 1
     )
 
 
@@ -1618,8 +1625,9 @@ def test_initial_receipt_finalization_uses_atomic_verified_catchup(
 
     def drift_after_financial_commit(stage: str) -> None:
         if stage == "after_receipt_finalization_commit":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(
         posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
@@ -1633,14 +1641,14 @@ def test_initial_receipt_finalization_uses_atomic_verified_catchup(
         callback_message_id=313,
         clock=lambda: 1004,
     )
-    assert status.state == "needs_attention"
+    assert status.state == "finalized"
     attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
-    assert attempt["stage"] == "conditional_authorization_persisted"
+    assert attempt["stage"] == "finalized"
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
         ).fetchone()[0]
-        == 0
+        == 1
     )
 
 
@@ -1700,6 +1708,15 @@ def test_receipt_crash_boundaries_resume_without_second_confirmation_or_duplicat
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
     if failure_stage == "after_receipt_finalization_commit":
+        assert (
+            conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()[0]
+            == "conditional_authorization_persisted"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE transactions SET amount = 99.99")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("DELETE FROM transactions")
+        conn.rollback()
         before = conn.total_changes
         committed = get_status(conn, review_public_id=review.review_public_id, context=context)
         assert conn.total_changes == before
