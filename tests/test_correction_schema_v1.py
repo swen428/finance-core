@@ -246,7 +246,10 @@ def test_051_reconciliation_audit_explicit_rowid_collision_is_rejected(
     [
         f"trg_correction_{name}_{operation}"
         for name in (
-            "resolution_decisions", "resolution_results", "apply_results", "final_mutation_audit"
+            "resolution_decisions",
+            "resolution_results",
+            "apply_results",
+            "final_mutation_audit",
         )
         for operation in ("no_update", "no_delete", "no_insert_collision")
     ],

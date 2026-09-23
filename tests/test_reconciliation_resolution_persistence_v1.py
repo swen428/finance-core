@@ -561,9 +561,10 @@ def test_051_resolution_rejects_extra_audit_fields_before_and_after_persistence(
             "SET audit_evidence_json = ? WHERE public_id = ?",
             (json.dumps(stored_audit), row["public_id"]),
         )
-    assert rp.list_results_for_queue_item(item.queue_item_id)[0]["audit_evidence_json"] == row[
-        "audit_evidence_json"
-    ]
+    assert (
+        rp.list_results_for_queue_item(item.queue_item_id)[0]["audit_evidence_json"]
+        == row["audit_evidence_json"]
+    )
     _resolution_relationships(conn, "unrelated-app")
 
 

@@ -257,11 +257,21 @@ class ApplyPersistence:
             # audit JSON.  Replay requires the complete stored claim; only
             # the runtime's replay flag may differ.
             columns = (
-                "apply_id", "decision_id", "queue_item_id", "candidate_id",
-                "action", "success", "idempotent", "payload_json",
-                "audit_evidence_json", "statement_reference_json",
-                "app_transaction_reference_json", "reviewer", "note",
-                "fingerprint", "applied_at",
+                "apply_id",
+                "decision_id",
+                "queue_item_id",
+                "candidate_id",
+                "action",
+                "success",
+                "idempotent",
+                "payload_json",
+                "audit_evidence_json",
+                "statement_reference_json",
+                "app_transaction_reference_json",
+                "reviewer",
+                "note",
+                "fingerprint",
+                "applied_at",
             )
             same_claim = all(
                 existing[column] == value
