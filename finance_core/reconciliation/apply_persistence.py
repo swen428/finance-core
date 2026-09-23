@@ -28,10 +28,17 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Sequence
 
-from finance_core.application.correction_schema import has_committed_correction
+from finance_core.application.correction_schema import (
+    has_committed_correction,
+    verify_correction_schema,
+)
 from finance_core.reconciliation.models import (
     ResolutionApplyResult,
     validate_resolution_decision,
+)
+from finance_core.reconciliation.resolution_integrity import (
+    assert_apply_basic,
+    assert_apply_envelope,
 )
 from finance_core.reconciliation.source_binding import load_bound_queue
 
@@ -68,9 +75,31 @@ def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyResult) -> None:
+    if type(result.success) is not bool or type(result.idempotent) is not bool:
+        raise ValueError("reconciliation apply success and idempotent must be boolean")
+    if result.success and verify_correction_schema(conn):
+        try:
+            assert_apply_basic(result)
+        except ValueError:
+            if conn.execute(
+                "SELECT 1 FROM reconciliation_apply_results WHERE apply_id = ? OR decision_id = ?",
+                (result.apply_id, result.decision_id),
+            ).fetchone():
+                _reject_source_identity(conn, result)
+            raise
     if not result.success or result.action.value not in {"confirm_match", "mark_duplicate"}:
         return
     bound = load_bound_queue(conn, result.queue_item_id)
+    if bound is not None:
+        try:
+            assert_apply_envelope(result, bound)
+        except ValueError:
+            if conn.execute(
+                "SELECT 1 FROM reconciliation_apply_results WHERE apply_id = ? OR decision_id = ?",
+                (result.apply_id, result.decision_id),
+            ).fetchone():
+                _reject_source_identity(conn, result)
+            raise
     payload = result.payload
     targets: set[str] = set()
     if result.action.value == "confirm_match":
@@ -247,8 +276,33 @@ class ApplyPersistence:
             else:
                 conflict_id = f"apply_id '{result.apply_id}'"
 
-            if existing["fingerprint"] == fingerprint:
-                return False  # Idempotent
+            # The historical fingerprint intentionally omits source refs,
+            # timestamps and audit JSON.  A replay is safe only when every
+            # persisted claim matches; the runtime's replay flag may differ.
+            columns = (
+                "apply_id",
+                "decision_id",
+                "queue_item_id",
+                "candidate_id",
+                "action",
+                "success",
+                "idempotent",
+                "payload_json",
+                "audit_evidence_json",
+                "statement_reference_json",
+                "app_transaction_reference_json",
+                "reviewer",
+                "note",
+                "fingerprint",
+                "applied_at",
+            )
+            same_claim = all(
+                existing[column] == value
+                for column, value in zip(columns, values, strict=True)
+                if column not in {"idempotent", "fingerprint"}
+            )
+            if existing["fingerprint"] == fingerprint and same_claim:
+                return False
 
             raise ApplyPersistenceConflictError(
                 f"Conflicting {conflict_id}: "

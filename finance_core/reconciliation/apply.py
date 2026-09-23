@@ -39,6 +39,11 @@ from finance_core.reconciliation.models import (
     ReviewQueueItem,
     validate_resolution_decision,
 )
+from finance_core.reconciliation.resolution_integrity import (
+    require_aware_time,
+    require_nonempty,
+    require_note,
+)
 
 # ---------------------------------------------------------------------------
 # Required reference fields per action
@@ -53,6 +58,13 @@ _ACTION_REQUIRED_REFERENCES: dict[ResolutionAction, tuple[str, ...]] = {
     ResolutionAction.IGNORE: (),
     ResolutionAction.NEEDS_MORE_INFO: (),
 }
+
+
+def _instruction_source_fingerprint(item: ReviewQueueItem) -> str:
+    """Tie an in-memory instruction to the exact item it was built from."""
+    return hashlib.sha256(repr(item).encode("utf-8")).hexdigest()
+
+
 """Required candidate fields for each resolution action.
 
 The apply runtime checks that the queue item's candidate has a non-None
@@ -97,6 +109,18 @@ def build_apply_instruction(
     Raises:
         ApplyInstructionError: When any validation rule fails.
     """
+    # A dataclass may be constructed by a caller without validation.  Check
+    # success metadata before it can become an auditable instruction.
+    try:
+        require_nonempty(decision.decision_id, "decision_id")
+        require_nonempty(decision.queue_item_id, "queue_item_id")
+        require_nonempty(decision.reviewer, "reviewer")
+        require_note(decision.note)
+        if decision.resolved_at is not None:
+            require_aware_time(decision.resolved_at, "resolved_at")
+    except ValueError as exc:
+        raise ApplyInstructionError(str(exc)) from exc
+
     # -- Rule 1: queue_item_id match --
     if decision.queue_item_id != item.queue_item_id:
         raise ApplyInstructionError(
@@ -156,6 +180,7 @@ def build_apply_instruction(
             "build_version": "v1",
             "source": "build_apply_instruction",
             "instruction_id": instruction_id,
+            "item_sha256": _instruction_source_fingerprint(item),
         },
         _item=item,
     )
@@ -341,6 +366,7 @@ class ResolutionApplyRuntime:
                 "All apply input must pass through build_apply_instruction(). "
                 f"Received '{type(instruction).__name__}' instead."
             )
+        self._validate_instruction(instruction)
         now_iso = datetime.now(timezone.utc).isoformat()
 
         # -- Idempotency check --
@@ -384,6 +410,48 @@ class ResolutionApplyRuntime:
         self._item_to_decision[instruction.queue_item_id] = instruction.decision_id
 
         return result
+
+    @staticmethod
+    def _validate_instruction(instruction: ApplyInstruction) -> None:
+        """A directly constructed frozen dataclass has no validation badge."""
+        item = instruction._item
+        if item is None:
+            raise ApplyInstructionError("apply instruction has no review queue source")
+        try:
+            require_nonempty(instruction.instruction_id, "instruction_id")
+            require_nonempty(instruction.decision_id, "decision_id")
+            require_nonempty(instruction.queue_item_id, "queue_item_id")
+            require_nonempty(instruction.candidate_id, "candidate_id")
+            require_nonempty(instruction.reviewer, "reviewer")
+            require_note(instruction.note)
+            if instruction.resolved_at is not None:
+                require_aware_time(instruction.resolved_at, "resolved_at")
+        except ValueError as exc:
+            raise ApplyInstructionError(str(exc)) from exc
+        if (
+            type(instruction.evidence_refs) is not tuple
+            or any(type(ref) is not str or not ref.strip() for ref in instruction.evidence_refs)
+            or type(instruction.audit_metadata) is not dict
+            or instruction.audit_metadata
+            != {
+                "build_version": "v1",
+                "source": "build_apply_instruction",
+                "instruction_id": instruction.instruction_id,
+                "item_sha256": _instruction_source_fingerprint(item),
+            }
+        ):
+            raise ApplyInstructionError("apply instruction audit metadata is invalid")
+        decision = ResolutionDecision(
+            decision_id=instruction.decision_id,
+            queue_item_id=instruction.queue_item_id,
+            action=instruction.action,
+            note=instruction.note,
+            reviewer=instruction.reviewer,
+            resolved_at=instruction.resolved_at,
+        )
+        expected = build_apply_instruction(item, decision, evidence_refs=instruction.evidence_refs)
+        if instruction != expected or instruction._item != item:
+            raise ApplyInstructionError("apply instruction differs from validated review source")
 
     # ------------------------------------------------------------------
     # Idempotency

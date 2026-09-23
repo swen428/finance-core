@@ -31,6 +31,11 @@ from finance_core.reconciliation.models import (
     ReviewQueueItem,
     validate_resolution_decision,
 )
+from finance_core.reconciliation.resolution_integrity import (
+    require_aware_time,
+    require_nonempty,
+    require_note,
+)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -106,6 +111,24 @@ class ResolutionRuntime:
                     "issue_type": item.issue_type.value,
                 },
                 error_message=error,
+            )
+
+        # -- Only well-formed decisions may produce a successful audit. --
+        try:
+            require_nonempty(decision.decision_id, "decision_id")
+            require_nonempty(decision.queue_item_id, "queue_item_id")
+            require_nonempty(decision.reviewer, "reviewer")
+            require_note(decision.note)
+            if decision.resolved_at is not None:
+                require_aware_time(decision.resolved_at, "resolved_at")
+        except ValueError as exc:
+            return ResolutionResult(
+                result_id=_make_result_id(item, decision),
+                decision=decision,
+                queue_item=item,
+                success=False,
+                audit_evidence={"validation_error": str(exc)},
+                error_message=str(exc),
             )
 
         # -- Build success result --

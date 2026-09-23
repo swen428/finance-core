@@ -466,6 +466,72 @@ def test_bound_three_app_resolution_checks_corrected_third_target(
     assert rp.list_results_for_queue_item(item.queue_item_id) == []
 
 
+@pytest.mark.parametrize(
+    ("decision_changes", "audit_changes"),
+    [
+        ({"decision_id": ""}, {}),
+        ({"reviewer": ""}, {}),
+        ({"reviewer": 1}, {}),
+        ({"note": []}, {}),
+        ({"resolved_at": "2024-12-01T00:00:00"}, {}),
+        ({}, {"resolved_at": []}),
+        ({}, {"reviewer": "other"}),
+        ({}, {"statement_amount": "999.00"}),
+    ],
+)
+def test_bound_resolution_rejects_malformed_success_envelope(
+    migrated_temp_db_connection, decision_changes, audit_changes
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    forged_decision = replace(decision, **decision_changes)
+    result = ResolutionRuntime().resolve(item, decision)
+    forged = replace(
+        result,
+        decision=forged_decision,
+        audit_evidence={**result.audit_evidence, **audit_changes},
+    )
+    with pytest.raises(ValueError):
+        rp.apply_resolution(item, forged_decision, forged)
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+def test_bound_resolution_rejects_success_with_error_message(migrated_temp_db_connection) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    result = ResolutionRuntime().resolve(item, decision)
+    with pytest.raises(ValueError):
+        rp.apply_resolution(item, decision, replace(result, error_message="failed"))
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("forged_success", [0, 1, []])
+def test_resolution_rejects_non_boolean_success_before_status_change(
+    migrated_temp_db_connection, forged_success
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    result = ResolutionRuntime().resolve(item, decision)
+    with pytest.raises(ValueError, match="success must be boolean"):
+        rp.apply_resolution(item, decision, replace(result, success=forged_success))
+    assert ReviewQueuePersistence(conn).get_by_public_id(item.queue_item_id)["status"] == "pending"
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+def test_051_neutral_resolution_keeps_nonclassification_contract(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    ignore = replace(decision, decision_id="dec-neutral-051", action=ResolutionAction.IGNORE)
+    result = rp.apply_resolution(item, ignore)
+    assert result.success
+    _resolution_relationships(conn, "unrelated-app")
+
+
 def test_bound_resolution_rejects_provided_result_with_different_decision(
     migrated_temp_db_connection,
 ) -> None:

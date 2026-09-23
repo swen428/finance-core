@@ -466,6 +466,154 @@ def test_bound_three_app_apply_rejects_short_payload_and_rolls_back(
     assert not conn.in_transaction
 
 
+@pytest.mark.parametrize(
+    ("changes", "audit_changes"),
+    [
+        ({"success": 1}, {}),
+        ({"success": 0}, {}),
+        ({"success": []}, {}),
+        ({"idempotent": 1}, {}),
+        ({"apply_id": ""}, {}),
+        ({"decision_id": ""}, {}),
+        ({"reviewer": ""}, {}),
+        ({"reviewer": 1}, {}),
+        ({"note": []}, {}),
+        ({"error_message": "failed"}, {}),
+        ({"applied_at": "2024-12-01T00:00:00"}, {}),
+        ({}, {"applied_timestamp": []}),
+        ({}, {"note": []}),
+    ],
+)
+def test_bound_apply_rejects_malformed_success_envelope(
+    migrated_temp_db_connection, changes, audit_changes
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    forged = replace(result, **changes, audit_evidence={**result.audit_evidence, **audit_changes})
+    with pytest.raises(ValueError):
+        ApplyPersistence(conn).save_apply_result(forged)
+    assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize(
+    ("payload_key", "forged_value"),
+    [
+        ("statement_amount", "999.00"),
+        ("confidence_score", "0.01"),
+        ("note", "forged decision note"),
+    ],
+)
+def test_bound_duplicate_apply_rejects_forged_payload_and_history(
+    migrated_temp_db_connection, payload_key, forged_value
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    payload = {**result.payload, payload_key: forged_value}
+    forged = replace(result, payload=payload)
+    with pytest.raises(ValueError, match="frozen queue source"):
+        ApplyPersistence(conn).save_apply_result(forged)
+    assert ApplyPersistence(conn).save_apply_result(result)
+    conn.execute(
+        "UPDATE reconciliation_apply_results SET payload_json = ? WHERE apply_id = ?",
+        (json.dumps(payload), result.apply_id),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "unrelated-app")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
+@pytest.mark.parametrize(
+    ("audit_key", "forged_value"),
+    [
+        ("statement_amount", "999.00"),
+        ("statement_currency", "USD"),
+        ("app_amount", "999.00"),
+        ("confidence_score", "0.01"),
+        ("evidence_summary", "forged summary"),
+        ("reason_codes", ["forged"]),
+    ],
+)
+def test_bound_apply_source_audit_is_checked_before_target_filter(
+    migrated_temp_db_connection, audit_key, forged_value
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    audit = {**result.audit_evidence, audit_key: forged_value}
+    ap = ApplyPersistence(conn)
+    with pytest.raises(ValueError):
+        ap.save_apply_result(replace(result, audit_evidence=audit))
+    assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert ap.save_apply_result(result)
+    conn.execute(
+        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+        (json.dumps(audit), result.apply_id),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "unrelated-app")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
+def test_bound_apply_batch_rolls_back_prior_success_on_bad_second_envelope(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    bad = replace(
+        result,
+        apply_id="apply-bad-second",
+        decision_id="dec-bad-second",
+        audit_evidence={**result.audit_evidence, "decision_id": "dec-bad-second", "note": []},
+    )
+    with pytest.raises(ValueError):
+        ApplyPersistence(conn).persist_apply_results([result, bad])
+    assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
+def test_same_apply_identity_cannot_replace_valid_audit_timestamp(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    _item, result = _bound_three_app_duplicate(conn)
+    ap = ApplyPersistence(conn)
+    assert ap.save_apply_result(result)
+    changed = replace(
+        result,
+        applied_at="2024-12-01T00:00:00+00:00",
+        audit_evidence={**result.audit_evidence, "applied_timestamp": "2024-12-01T00:00:00+00:00"},
+    )
+    with pytest.raises(ApplyPersistenceConflictError):
+        ap.save_apply_result(changed)
+    row = ap.get_apply_result_by_apply_id(result.apply_id)
+    assert row is not None and row["applied_at"] == result.applied_at
+
+
+def test_051_neutral_apply_keeps_nonclassification_contract(migrated_temp_db_connection) -> None:
+    conn = migrated_temp_db_connection
+    item, _result = _bound_three_app_duplicate(conn)
+    decision = ResolutionDecision(
+        decision_id="dec-neutral-051",
+        queue_item_id=item.queue_item_id,
+        action=ResolutionAction.IGNORE,
+    )
+    result = ResolutionApplyRuntime().apply(item, decision)
+    assert result.success
+    assert ApplyPersistence(conn).save_apply_result(result)
+    _apply_relationships(conn, "unrelated-app")
+    bad = replace(
+        result,
+        apply_id="apply-neutral-bad",
+        decision_id="dec-neutral-bad",
+        reviewer="",
+        audit_evidence={**result.audit_evidence, "decision_id": "dec-neutral-bad"},
+    )
+    with pytest.raises(ValueError):
+        ApplyPersistence(conn).save_apply_result(bad)
+
+
 def test_bound_three_app_apply_checks_third_corrected_target(
     migrated_temp_db_connection, monkeypatch: pytest.MonkeyPatch
 ) -> None:

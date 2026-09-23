@@ -35,6 +35,11 @@ from finance_core.reconciliation.models import (
     validate_resolution_decision,
 )
 from finance_core.reconciliation.resolution import ResolutionRuntime
+from finance_core.reconciliation.resolution_integrity import (
+    assert_resolution_basic,
+    assert_resolution_envelope,
+    assert_resolution_row,
+)
 from finance_core.reconciliation.source_binding import (
     BoundQueue,
     assert_candidate_matches_bound,
@@ -109,6 +114,7 @@ def _bound_successful_classification(
         raise ValueError("successful reconciliation action is incompatible with issue type")
     if bound is not None:
         assert_candidate_matches_bound(bound, result.queue_item)
+        assert_resolution_envelope(result, bound)
         compatible, _ = validate_resolution_decision(result.decision.action, bound.issue_type)
         if not compatible or result.queue_item.issue_type != bound.issue_type:
             raise ValueError("successful reconciliation action conflicts with frozen queue issue")
@@ -154,9 +160,16 @@ def _complete_success_evidence(
     evidence = dict(result.audit_evidence)
     if evidence.get("app_txn_id") not in {None, canonical}:
         raise ValueError("successful reconciliation payload target differs from canonical app ref")
+    for key in ("canonical_app_transaction_ref", "payload_target_app_txn_id"):
+        if key in evidence and evidence[key] != canonical:
+            raise ValueError("successful reconciliation evidence source identity changed")
     evidence["app_txn_id"] = canonical
     evidence["canonical_app_transaction_ref"] = canonical
     evidence["payload_target_app_txn_id"] = best.app_txn_id
+    if result.decision.action == ResolutionAction.CONFIRM_MATCH and any(
+        key in evidence for key in ("duplicate_app_txn_ids", "kept_app_txn_id", "audit_only")
+    ):
+        raise ValueError("successful match evidence claims duplicate classification")
     if result.decision.action == ResolutionAction.MARK_DUPLICATE:
         duplicates = [
             app.app_txn_id
@@ -190,7 +203,8 @@ def _guard_successful_decision_replay(
         return
     prior = conn.execute(
         "SELECT results.audit_evidence_json, queue.app_transaction_ref, "
-        "results.review_queue_public_id "
+        "results.review_queue_public_id, results.public_id AS result_id, "
+        "results.decision_public_id, results.success, results.error_message "
         "FROM reconciliation_resolution_results AS results "
         "JOIN reconciliation_review_queue AS queue "
         "ON queue.public_id = results.review_queue_public_id "
@@ -225,6 +239,21 @@ def _guard_successful_decision_replay(
             )
         ):
             raise ValueError("successful reconciliation replay decision evidence changed")
+        try:
+            assert_resolution_row(
+                {
+                    "result_id": prior[3],
+                    "decision_public_id": prior[4],
+                    "review_queue_public_id": prior[2],
+                    "success": prior[5],
+                    "error_message": prior[6],
+                },
+                dict(stored_decision),
+                evidence,
+                bound,
+            )
+        except ValueError as exc:
+            raise ValueError("successful reconciliation replay decision evidence changed") from exc
     canonical = prior[1]
     target = evidence.get("app_txn_id")
     if not isinstance(canonical, str) or not canonical or target != canonical:
@@ -336,7 +365,11 @@ class ResolutionPersistence:
         when the duplicate public_id carries identical data.
         """
         with _owned_write(self._conn):
+            if type(result.success) is not bool:
+                raise ValueError("reconciliation result success must be boolean")
             _guard_successful_resolution(self._conn, result)
+            if result.success and verify_correction_schema(self._conn):
+                assert_resolution_basic(result)
             stored_decision = self._get_decision_by_public_id(result.decision.decision_id)
             if stored_decision is None or not _decision_row_matches(
                 stored_decision, result.decision
@@ -390,6 +423,8 @@ class ResolutionPersistence:
             result = self._runtime.resolve(item, decision)
 
         with _owned_write(self._conn):
+            if type(result.success) is not bool:
+                raise ValueError("reconciliation result success must be boolean")
             if result.decision != decision or result.queue_item != item:
                 raise ValueError("reconciliation caller and result disagree")
             if result.success and result.decision.action in {
@@ -400,6 +435,8 @@ class ResolutionPersistence:
                 if bound is not None:
                     assert_candidate_matches_bound(bound, item)
             _guard_successful_resolution(self._conn, result)
+            if result.success and verify_correction_schema(self._conn):
+                assert_resolution_basic(result)
             self._insert_decision(decision)
             self._insert_result(_complete_success_evidence(self._conn, result))
 

@@ -18,6 +18,12 @@ from finance_core.application.correction_schema import (
 from finance_core.calculation.authoritative_snapshot import canonical_json_value
 from finance_core.financial_audit import verify_financial_audit_chain
 from finance_core.reconciliation.models import ResolutionAction, validate_resolution_decision
+from finance_core.reconciliation.resolution_integrity import (
+    assert_apply_row,
+    assert_apply_row_basic,
+    assert_resolution_row,
+    assert_resolution_row_basic,
+)
 from finance_core.reconciliation.source_binding import load_bound_queue
 
 
@@ -199,11 +205,18 @@ def _resolution_decision_evidence_matches(
 
 
 def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
+    try:
+        bound_required = verify_correction_schema(conn)
+    except CorrectionSchemaError:
+        _refuse("UNKNOWN_INTEGRITY", "reconciliation-resolution:schema")
     results = _rows(
         conn,
         """SELECT results.public_id AS result_id, results.audit_evidence_json,
+        results.success, results.error_message,
         results.decision_public_id, results.review_queue_public_id,
         decisions.decision_action, decisions.review_queue_public_id AS decision_queue_id,
+        decisions.public_id AS stored_decision_id, decisions.reviewer AS stored_reviewer,
+        decisions.decision_note AS stored_note, decisions.resolved_at AS stored_resolved_at,
         queues.public_id AS queue_id, queues.app_transaction_ref
         FROM reconciliation_resolution_results AS results
         LEFT JOIN reconciliation_resolution_decisions AS decisions
@@ -217,6 +230,41 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         action = row["decision_action"]
         label = f"resolution:{row['result_id']}"
         evidence = _object(row["audit_evidence_json"], label)
+        if bound_required:
+            try:
+                assert_resolution_row_basic(
+                    row,
+                    {
+                        "public_id": row["stored_decision_id"],
+                        "review_queue_public_id": row["decision_queue_id"],
+                        "decision_action": action,
+                        "reviewer": row["stored_reviewer"],
+                        "decision_note": row["stored_note"],
+                        "resolved_at": row["stored_resolved_at"],
+                    },
+                    evidence,
+                )
+            except ValueError:
+                _refuse("UNKNOWN_INTEGRITY", label)
+        if action in ("confirm_match", "mark_duplicate"):
+            try:
+                bound_source = load_bound_queue(conn, cast(str, row["review_queue_public_id"]))
+                if bound_source is not None:
+                    assert_resolution_row(
+                        row,
+                        {
+                            "public_id": row["stored_decision_id"],
+                            "review_queue_public_id": row["decision_queue_id"],
+                            "decision_action": action,
+                            "reviewer": row["stored_reviewer"],
+                            "decision_note": row["stored_note"],
+                            "resolved_at": row["stored_resolved_at"],
+                        },
+                        evidence,
+                        bound_source,
+                    )
+            except (ValueError, CorrectionSchemaError):
+                _refuse("UNKNOWN_INTEGRITY", label)
         queue_ref = row["app_transaction_ref"]
         evidence_ref = evidence.get("app_txn_id")
         canonical_ref = evidence.get("canonical_app_transaction_ref")
@@ -355,9 +403,22 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         label = f"reconciliation-apply:{row['apply_id']}"
         payload = _object(row["payload_json"], label)
         evidence = _object(row["audit_evidence_json"], label)
+        if bound_required:
+            try:
+                assert_apply_row_basic(row, evidence)
+            except ValueError:
+                _refuse("UNKNOWN_INTEGRITY", label)
         app_ref = _optional_ref(row["app_transaction_reference_json"], label)
         statement_ref = _optional_ref(row.get("statement_reference_json"), label)
         action = row["action"]
+        if bound_required and action in ("confirm_match", "mark_duplicate"):
+            try:
+                bound_source = load_bound_queue(conn, cast(str, row["queue_item_id"]))
+                if bound_source is None:
+                    raise ValueError("missing 051 bound queue")
+                assert_apply_row(row, payload, evidence, statement_ref, app_ref, bound_source)
+            except (ValueError, CorrectionSchemaError):
+                _refuse("UNKNOWN_INTEGRITY", label)
         payload_action = payload.get("action_type")
         evidence_action = evidence.get("resolution_action")
         evidence_ref = evidence.get("app_txn_id")

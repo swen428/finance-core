@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
@@ -30,9 +31,11 @@ from finance_core.reconciliation.apply import (
     ApplyConflictError,
     ResolutionApplyRuntime,
     apply_decisions,
+    build_apply_instruction,
 )
 from finance_core.reconciliation.matching import match_batch
 from finance_core.reconciliation.models import (
+    ApplyInstructionError,
     AppTransaction,
     IssueType,
     ResolutionAction,
@@ -91,6 +94,40 @@ def _make_matched_item() -> tuple[ResolutionApplyRuntime, ReviewQueueItem, Resol
     )
     runtime = ResolutionApplyRuntime()
     return runtime, item, decision
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "candidate_id",
+        "queue_item_id",
+        "issue_type",
+        "statement_ref",
+        "app_transaction_ref",
+        "audit_metadata",
+        "_item",
+    ],
+)
+def test_direct_apply_instruction_revalidates_frozen_review_source(changed_field: str) -> None:
+    runtime, item, decision = _make_matched_item()
+    instruction = build_apply_instruction(item, decision)
+    replacements = {
+        "candidate_id": "forged-candidate",
+        "queue_item_id": "forged-queue",
+        "issue_type": IssueType.POSSIBLE_DUPLICATE,
+        "statement_ref": "forged-statement",
+        "app_transaction_ref": "forged-app",
+        "audit_metadata": {"source": "forged"},
+        "_item": replace(
+            item,
+            candidate=replace(
+                item.candidate, statement=replace(item.candidate.statement, amount=Decimal("999"))
+            ),
+        ),
+    }
+    forged = replace(instruction, **{changed_field: replacements[changed_field]})
+    with pytest.raises(ApplyInstructionError):
+        runtime.apply_instruction(forged)
 
 
 def _make_duplicate_item() -> tuple[ResolutionApplyRuntime, ReviewQueueItem, ResolutionDecision]:
