@@ -865,6 +865,7 @@ def _execute_mutation(
     final_mutation_id = _derive_final_mutation_id(inp.idempotency_key)
     transaction_public_id: str | None = None
     previous_set = False
+    previous_values: dict[str, Any] | None = None
 
     if action_value == FinalMutationAction.CREATE_FINAL_TRANSACTION.value:
         if validated_create_money is None:
@@ -953,13 +954,12 @@ def _execute_mutation(
         target_transaction_id=inp.proposal.target_transaction_id,
         transaction_public_id=transaction_public_id,
         mutation_payload=mutation_payload,
+        previous_values=previous_values if previous_set else None,
         evidence_refs=inp.proposal.evidence_refs,
         audit_refs=audit_refs,
         created_at=created_at,
     )
 
-    if previous_set:
-        _store_previous_values(conn, final_mutation_id, previous_values)
     if transaction_public_id is None:
         raise FinalMutationPersistenceError("Final mutation produced no transaction identity")
     _append_final_mutation_chain_event(
@@ -1063,7 +1063,7 @@ def _execute_adjust(
 ) -> tuple[str, bool, dict[str, Any]]:
     """Execute ADJUST_FINAL_TRANSACTION: update allowed fields on one row.
 
-    Returns (transaction_public_id, previous_values_set).
+    Returns (transaction_public_id, previous_values_set, previous_values).
     """
     proposal = inp.proposal
     target_id = proposal.target_transaction_id
@@ -1173,22 +1173,6 @@ def _validate_adjust_fields(suggested_fields: dict[str, Any]) -> list[str]:
                 )
 
     return errors
-
-
-def _store_previous_values(
-    conn: sqlite3.Connection,
-    final_mutation_id: str,
-    previous: dict[str, Any],
-) -> None:
-    """Store previous values in the audit record for ADJUST traceability."""
-    conn.execute(
-        """
-        UPDATE reconciliation_final_mutation_audit
-        SET previous_values_json = ?
-        WHERE final_mutation_id = ?
-        """,
-        (_serialize_json(previous), final_mutation_id),
-    )
 
 
 def _append_final_mutation_chain_event(
@@ -1468,6 +1452,7 @@ def _insert_audit_record(
     target_transaction_id: str | None,
     transaction_public_id: str | None,
     mutation_payload: dict[str, object],
+    previous_values: dict[str, Any] | None = None,
     evidence_refs: tuple[str, ...],
     audit_refs: dict[str, object],
     created_at: str,
@@ -1485,9 +1470,9 @@ def _insert_audit_record(
             action, status, blocked_reasons_json,
             source_statement_ref, source_app_transaction_ref,
             target_transaction_id, transaction_public_id,
-            mutation_payload_json, evidence_refs_json,
+            mutation_payload_json, previous_values_json, evidence_refs_json,
             audit_refs_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             final_mutation_id,
@@ -1511,6 +1496,7 @@ def _insert_audit_record(
             target_transaction_id,
             transaction_public_id,
             _serialize_json(mutation_payload),
+            _serialize_json(previous_values) if previous_values is not None else None,
             _serialize_json(list(evidence_refs)),
             _serialize_json(audit_refs),
             created_at,

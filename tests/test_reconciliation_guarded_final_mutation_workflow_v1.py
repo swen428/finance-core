@@ -565,6 +565,7 @@ class TestCreateFinalTransaction:
         assert row["action"] == "create_final_transaction_proposal"
         assert row["human_confirmation_id"] == "hconfirm-001"
         assert row["actor_type"] == "system"
+        assert row["previous_values_json"] is None
 
     def test_create_and_chain_event_commit_together(self, conn):
         inp = _make_workflow_input()
@@ -707,6 +708,76 @@ class TestAdjustFinalTransaction:
         assert Decimal(str(prev["total_amount"])) == Decimal("100.00")
         assert prev["currency"] == "SGD"
 
+    def test_adjust_audit_is_insert_only_and_replay_preserves_previous_values(self, conn):
+        create_result = execute_guarded_final_mutation_workflow(
+            conn,
+            _make_workflow_input(idempotency_key="fm-create-insert-only-adjust"),
+            clock=_fixed_clock,
+        )
+        target_id = create_result.transaction_public_id
+        proposal = _adjust_proposal(target_transaction_id=target_id)
+        inp = _seed_persisted_authorization(
+            conn,
+            _make_workflow_input(
+                proposal=proposal,
+                guard_decision=_approved_guard(proposal),
+                idempotency_key="fm-key-insert-only-adjust",
+            ),
+        )
+        denied_audit_mutations: list[int] = []
+
+        def reject_audit_mutation(action: int, table: str, *_args: object) -> int:
+            if table == "reconciliation_final_mutation_audit" and action in (
+                sqlite3.SQLITE_UPDATE,
+                sqlite3.SQLITE_DELETE,
+            ):
+                denied_audit_mutations.append(action)
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(reject_audit_mutation)
+        try:
+            first = _execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
+            same = _execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
+            conflicting_proposal = _adjust_proposal(
+                target_transaction_id=target_id,
+                suggested_fields={"amount": "43.00"},
+            )
+            conflicting = _seed_persisted_authorization(
+                conn,
+                _make_workflow_input(
+                    proposal=conflicting_proposal,
+                    guard_decision=_approved_guard(conflicting_proposal),
+                    idempotency_key=inp.idempotency_key,
+                ),
+            )
+            conflict = _execute_guarded_final_mutation_workflow(
+                conn, conflicting, clock=_fixed_clock
+            )
+        finally:
+            conn.set_authorizer(None)
+
+        assert first.status == FinalMutationWorkflowStatus.FINALIZED
+        assert same.status == FinalMutationWorkflowStatus.ALREADY_FINALIZED
+        assert conflict.status == FinalMutationWorkflowStatus.CONFLICT
+        assert denied_audit_mutations == []
+        rows = conn.execute(
+            "SELECT previous_values_json FROM reconciliation_final_mutation_audit "
+            "WHERE idempotency_key = ?",
+            (inp.idempotency_key,),
+        ).fetchall()
+        assert len(rows) == 1
+        previous = json.loads(rows[0]["previous_values_json"])
+        assert Decimal(str(previous["amount"])) == Decimal("45.50")
+        assert Decimal(str(previous["total_amount"])) == Decimal("45.50")
+        assert previous["currency"] == "SGD"
+        current = conn.execute(
+            "SELECT amount, total_amount FROM transactions WHERE public_id = ?",
+            (target_id,),
+        ).fetchone()
+        assert Decimal(str(current["amount"])) == Decimal("42.00")
+        assert Decimal(str(current["total_amount"])) == Decimal("42.00")
+
     def test_adjust_rejects_forbidden_fields(self, conn):
         """Fields outside the allowed set are blocked by the workflow.
 
@@ -733,6 +804,14 @@ class TestAdjustFinalTransaction:
             FinalMutationWorkflowBlockReason.ADJUST_FIELD_NOT_ALLOWED.value
             in result.blocked_reasons
         )
+        audit_row = conn.execute(
+            "SELECT status, previous_values_json FROM reconciliation_final_mutation_audit "
+            "WHERE final_mutation_id = ?",
+            (result.final_mutation_id,),
+        ).fetchone()
+        assert audit_row is not None
+        assert audit_row["status"] == "blocked"
+        assert audit_row["previous_values_json"] is None
 
 
 class TestBlockingConditions:
@@ -784,13 +863,14 @@ class TestBlockingConditions:
 
         assert result.status == FinalMutationWorkflowStatus.BLOCKED
         audit_row = conn.execute(
-            "SELECT status, blocked_reasons_json, transaction_public_id "
+            "SELECT status, blocked_reasons_json, transaction_public_id, previous_values_json "
             "FROM reconciliation_final_mutation_audit WHERE idempotency_key = ?",
             ("fm-key-blocked-audit",),
         ).fetchone()
         assert audit_row is not None
         assert audit_row["status"] == "blocked"
         assert audit_row["transaction_public_id"] is None
+        assert audit_row["previous_values_json"] is None
         blocked_reasons = json.loads(audit_row["blocked_reasons_json"])
         assert FinalMutationWorkflowBlockReason.MISSING_HUMAN_CONFIRMATION.value in blocked_reasons
 
