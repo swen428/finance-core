@@ -228,7 +228,7 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 and type(kept) is str
                 and kept in duplicates
                 and evidence.get("audit_only") is True
-                and (evidence_action == action or "resolution_action" not in evidence)
+                and evidence_action == action
                 and canonical_ref == kept
                 and payload_target == kept
                 and queue_ref == kept
@@ -242,7 +242,7 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
 
         if action == "confirm_match":
             if (
-                (evidence_action != action and "resolution_action" in evidence)
+                evidence_action != action
                 or any(key in evidence for key in duplicate_fields)
                 or type(queue_ref) is not str
                 or canonical_ref != queue_ref
