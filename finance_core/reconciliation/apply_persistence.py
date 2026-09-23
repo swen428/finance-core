@@ -24,13 +24,67 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Sequence
 
+from finance_core.application.correction_schema import has_committed_correction
 from finance_core.reconciliation.models import ResolutionApplyResult
 
 
 class ApplyPersistenceConflictError(Exception):
     """Raised when a persisted apply result conflicts with an existing row."""
+
+
+@contextmanager
+def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
+    if conn.in_transaction:
+        raise RuntimeError("reconciliation apply requires a connection without caller-owned work")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyResult) -> None:
+    if not result.success or result.action.value not in {"confirm_match", "mark_duplicate"}:
+        return
+    payload = result.payload
+    targets: set[str] = set()
+    if result.action.value == "confirm_match":
+        target = payload.get("app_txn_id")
+        if (
+            not isinstance(target, str) or not target
+            or payload.get("action_type") != "confirm_match"
+            or result.app_transaction_reference != target
+        ):
+            raise ValueError("successful reconciliation has incomplete app target enumeration")
+        targets.add(target)
+    else:
+        duplicates = payload.get("duplicate_app_txn_ids")
+        kept = payload.get("kept_app_txn_id")
+        if (
+            not isinstance(duplicates, list)
+            or len(duplicates) < 2
+            or not all(isinstance(value, str) and value for value in duplicates)
+            or len(set(duplicates)) != len(duplicates)
+            or not isinstance(kept, str)
+            or kept not in duplicates
+            or payload.get("action_type") != "mark_duplicate"
+            or payload.get("audit_only") is not True
+            or (result.app_transaction_reference is not None
+                and result.app_transaction_reference not in duplicates)
+        ):
+            raise ValueError("successful duplicate classification has incomplete app targets")
+        targets.update(duplicates)
+        targets.add(kept)
+    if result.app_transaction_reference is not None:
+        targets.add(result.app_transaction_reference)
+    if any(has_committed_correction(conn, target) for target in sorted(targets)):
+        raise ValueError("corrected_transaction_requires_versioned_reconciliation")
 
 
 # ---------------------------------------------------------------------------
@@ -69,21 +123,22 @@ class ApplyPersistence:
         Raises ``ApplyPersistenceConflictError`` when the same ``apply_id``
         exists with a different fingerprint or payload.
         """
-        inserted = self._insert_result(result)
-        self._conn.commit()
-        return inserted
+        with _owned_write(self._conn):
+            _guard_successful_apply(self._conn, result)
+            return self._insert_result(result)
 
     def persist_apply_results(self, results: Sequence[ResolutionApplyResult]) -> int:
         """Persist a batch of apply results.
 
         Returns the number of newly inserted rows.
         """
-        count = 0
-        for result in results:
-            if self._insert_result(result):
-                count += 1
-        self._conn.commit()
-        return count
+        with _owned_write(self._conn):
+            count = 0
+            for result in results:
+                _guard_successful_apply(self._conn, result)
+                if self._insert_result(result):
+                    count += 1
+            return count
 
     def _insert_result(self, result: ResolutionApplyResult) -> bool:
         fingerprint = _build_fingerprint(result)

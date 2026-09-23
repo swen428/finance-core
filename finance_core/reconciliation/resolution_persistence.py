@@ -19,7 +19,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 
+from finance_core.application.correction_schema import (
+    has_committed_correction,
+    verify_correction_schema,
+)
 from finance_core.reconciliation.models import (
     ResolutionAction,
     ResolutionDecision,
@@ -31,6 +38,134 @@ from finance_core.reconciliation.resolution import ResolutionRuntime
 
 class DuplicateResolutionPersistenceError(Exception):
     """Raised when an existing resolution audit row conflicts with new data."""
+
+
+@contextmanager
+def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
+    if conn.in_transaction:
+        raise RuntimeError("reconciliation requires a connection without caller-owned work")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _guard_successful_resolution(conn: sqlite3.Connection, result: ResolutionResult) -> None:
+    if not result.success or result.decision.action not in {
+        ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE
+    }:
+        return
+    candidate = result.queue_item.candidate
+    targets: set[str] = set()
+    if candidate.best_app_transaction is not None:
+        targets.add(candidate.best_app_transaction.app_txn_id)
+    if result.decision.action == ResolutionAction.MARK_DUPLICATE:
+        targets.update(app.app_txn_id for app in candidate.all_app_transactions)
+    evidence_id = result.audit_evidence.get("app_txn_id")
+    if isinstance(evidence_id, str) and evidence_id:
+        targets.add(evidence_id)
+    if not targets:
+        raise ValueError("successful reconciliation has incomplete app target enumeration")
+    queue = conn.execute(
+        "SELECT app_transaction_ref FROM reconciliation_review_queue WHERE public_id = ?",
+        (result.queue_item.queue_item_id,),
+    ).fetchone()
+    if queue is None or not isinstance(queue[0], str) or not queue[0]:
+        raise ValueError("successful reconciliation has no canonical app reference")
+    targets.add(queue[0])
+    if any(has_committed_correction(conn, target) for target in sorted(targets)):
+        raise ValueError("corrected_transaction_requires_versioned_reconciliation")
+
+
+def _complete_success_evidence(
+    conn: sqlite3.Connection, result: ResolutionResult
+) -> ResolutionResult:
+    if not result.success or result.decision.action not in {
+        ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE
+    }:
+        return result
+    candidate = result.queue_item.candidate
+    queue = conn.execute(
+        "SELECT app_transaction_ref FROM reconciliation_review_queue WHERE public_id = ?",
+        (result.queue_item.queue_item_id,),
+    ).fetchone()
+    canonical = queue[0] if queue is not None else None
+    best = candidate.best_app_transaction
+    if not isinstance(canonical, str) or not canonical or best is None:
+        raise ValueError("successful reconciliation has incomplete canonical app evidence")
+    if canonical != best.app_txn_id:
+        raise ValueError("successful reconciliation canonical app reference changed")
+    evidence = dict(result.audit_evidence)
+    if evidence.get("app_txn_id") not in {None, canonical}:
+        raise ValueError("successful reconciliation payload target differs from canonical app ref")
+    evidence["app_txn_id"] = canonical
+    evidence["canonical_app_transaction_ref"] = canonical
+    evidence["payload_target_app_txn_id"] = best.app_txn_id
+    if result.decision.action == ResolutionAction.MARK_DUPLICATE:
+        duplicates = [app.app_txn_id for app in candidate.all_app_transactions]
+        if (
+            len(duplicates) < 2
+            or len(set(duplicates)) != len(duplicates)
+            or canonical not in duplicates
+        ):
+            raise ValueError("successful duplicate classification has incomplete app targets")
+        for key, value in (
+            ("duplicate_app_txn_ids", duplicates),
+            ("kept_app_txn_id", canonical),
+            ("audit_only", True),
+        ):
+            if key in evidence and evidence[key] != value:
+                raise ValueError("successful duplicate evidence conflicts with candidate")
+            evidence[key] = value
+    return replace(result, audit_evidence=evidence)
+
+
+def _guard_successful_decision_replay(
+    conn: sqlite3.Connection, decision: ResolutionDecision
+) -> None:
+    if decision.action not in {ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE}:
+        return
+    if not verify_correction_schema(conn):
+        return
+    prior = conn.execute(
+        "SELECT results.audit_evidence_json, queue.app_transaction_ref "
+        "FROM reconciliation_resolution_results AS results "
+        "JOIN reconciliation_review_queue AS queue "
+        "ON queue.public_id = results.review_queue_public_id "
+        "WHERE results.decision_public_id = ? AND results.success = 1",
+        (decision.decision_id,),
+    ).fetchone()
+    if prior is None:
+        return
+    try:
+        evidence = json.loads(prior[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("successful reconciliation evidence is incomplete") from exc
+    if not isinstance(evidence, dict):
+        raise ValueError("successful reconciliation evidence is incomplete")
+    canonical = prior[1]
+    target = evidence.get("app_txn_id")
+    if not isinstance(canonical, str) or not canonical or target != canonical:
+        raise ValueError("successful reconciliation evidence is incomplete")
+    targets = {canonical}
+    if decision.action == ResolutionAction.MARK_DUPLICATE:
+        duplicates = evidence.get("duplicate_app_txn_ids")
+        if (
+            not isinstance(duplicates, list)
+            or len(duplicates) < 2
+            or not all(isinstance(value, str) and value for value in duplicates)
+            or len(set(duplicates)) != len(duplicates)
+            or evidence.get("kept_app_txn_id") != canonical
+            or canonical not in duplicates
+            or evidence.get("audit_only") is not True
+        ):
+            raise ValueError("successful duplicate evidence is incomplete")
+        targets.update(duplicates)
+    if any(has_committed_correction(conn, ref) for ref in sorted(targets)):
+        raise ValueError("corrected_transaction_requires_versioned_reconciliation")
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +216,9 @@ class ResolutionPersistence:
         Returns True when a row is inserted and False when an identical row
         already exists.
         """
-        inserted = self._insert_decision(decision)
-        self._conn.commit()
-        return inserted
+        with _owned_write(self._conn):
+            _guard_successful_decision_replay(self._conn, decision)
+            return self._insert_decision(decision)
 
     def _insert_decision(self, decision: ResolutionDecision) -> bool:
         try:
@@ -117,9 +252,9 @@ class ResolutionPersistence:
         Serializes audit_evidence to JSON deterministically. Idempotent only
         when the duplicate public_id carries identical data.
         """
-        inserted = self._insert_result(result)
-        self._conn.commit()
-        return inserted
+        with _owned_write(self._conn):
+            _guard_successful_resolution(self._conn, result)
+            return self._insert_result(_complete_success_evidence(self._conn, result))
 
     def _insert_result(self, result: ResolutionResult) -> bool:
         try:
@@ -166,9 +301,10 @@ class ResolutionPersistence:
         if result is None:
             result = self._runtime.resolve(item, decision)
 
-        try:
+        with _owned_write(self._conn):
+            _guard_successful_resolution(self._conn, result)
             self._insert_decision(decision)
-            self._insert_result(result)
+            self._insert_result(_complete_success_evidence(self._conn, result))
 
             if result.success:
                 new_status = _SUCCESSFUL_STATUS_MAP.get(decision.action, "pending")
@@ -183,10 +319,6 @@ class ResolutionPersistence:
                 """,
                 (new_status, item.queue_item_id),
             )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
 
         return result
 

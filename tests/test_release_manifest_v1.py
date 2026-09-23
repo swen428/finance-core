@@ -481,9 +481,9 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
         lambda payload: payload.replace(
-            b'    "049_d2_one_confirmation_posting.sql",\n'
+            b'    "050_d2_initial_card_delivery_authority.sql",\n'
+            b'    "051_controlled_corrections.sql"\n',
             b'    "050_d2_initial_card_delivery_authority.sql"\n',
-            b'    "049_d2_one_confirmation_posting.sql"\n',
         ),
     ],
 )

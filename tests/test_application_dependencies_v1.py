@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -39,6 +41,41 @@ def test_existing_exceptions_are_exact_and_application_has_no_platform_path() ->
     assert GUARD.check_boundaries(ROOT, registry) == []
     assert registry["direct"] and registry["indirect"]
     assert not any("*" in json.dumps(edge) for edge in registry["direct"])
+
+
+def test_correction_adapter_package_is_a_platform_boundary(tmp_path: Path) -> None:
+    registry = scaffold(tmp_path)
+    write(tmp_path, "finance_core/correction_adapters/__init__.py")
+    write(tmp_path, "finance_core/correction_adapters/local_authority.py")
+    write(
+        tmp_path,
+        "finance_core/application/review.py",
+        "from finance_core.correction_adapters.local_authority import LocalApprovalAuthority\n",
+    )
+    assert any(
+        "application reaches platform" in error
+        for error in GUARD.check_boundaries(tmp_path, registry)
+    )
+
+
+def test_cold_correction_application_import_does_not_load_platform() -> None:
+    script = (
+        "import sys\n"
+        "import finance_core.application.corrections\n"
+        "import finance_core.application.correction_receipts\n"
+        "for name in sys.modules:\n"
+        "    assert not name.startswith('finance_core.correction_adapters')\n"
+        "    assert not name.startswith('finance_core.openclaw_staging_bridge')\n"
+        "    assert name != 'finance_core.telegram_source_context'\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(

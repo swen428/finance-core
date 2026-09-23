@@ -418,7 +418,7 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
     conn.close()
 
 
-def test_text_status_detects_canonical_transaction_drift_without_writes(
+def test_text_status_original_is_immutable_after_finalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,14 +450,56 @@ def test_text_status_detects_canonical_transaction_drift_without_writes(
         ).state
         == "finalized"
     )
-    conn.execute("UPDATE transactions SET amount = 99.99 WHERE parser_output_id IS NOT NULL")
-    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="finalized D2 transaction is immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99 WHERE parser_output_id IS NOT NULL")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
+    assert status.state == "finalized"
+    assert status.amount != "99.99"
+
+
+def test_text_status_never_returns_original_money_after_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, published = _published_text_card(tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-corrected-status",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = _issue_and_activate(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-text-corrected-status-key",
+        context=context,
+        provider_message_id=211,
+    )
+    original = confirm_and_post(
+        conn,
+        key=b"d2-text-corrected-status-key",
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-text-corrected-status-callback",
+        callback_message_id=211,
+        clock=lambda: 1004,
+    )
+    assert original.state == "finalized"
+    monkeypatch.setattr(
+        "finance_core.application.correction_schema.has_committed_correction",
+        lambda _conn, target: target == original.transaction_public_id,
+    )
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert status.state == "needs_attention"
+    assert status.attention_reason == "local_current_lookup_required"
     assert status.transaction_public_id is None
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert (status.amount, status.currency, status.transaction_date, status.merchant) == (
+        None, None, None, None
+    )
 
 
 def test_finalized_catchup_revalidates_under_write_lock_before_event(
@@ -1257,7 +1299,7 @@ def test_finalized_personal_receipt_uses_frozen_participant_authority(
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
 
 
-def test_receipt_status_detects_canonical_transaction_drift_without_writes(
+def test_receipt_status_original_is_immutable_after_finalization(
     migrated_temp_db_connection: sqlite3.Connection,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1292,14 +1334,14 @@ def test_receipt_status_detects_canonical_transaction_drift_without_writes(
         ).state
         == "finalized"
     )
-    conn.execute("UPDATE transactions SET amount = 99.99")
-    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="finalized D2 transaction is immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
-    assert status.state == "needs_attention"
-    assert status.transaction_public_id is None
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert status.state == "finalized"
+    assert status.amount != "99.99"
 
 
 def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(

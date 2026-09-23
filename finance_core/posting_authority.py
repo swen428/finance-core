@@ -2904,6 +2904,18 @@ def get_status(
             if row["transaction_public_id"] not in {None, authoritative_transaction}:
                 integrity_error = True
             else:
+                # D2 verifies historical posting authority.  Once a correction
+                # exists, its original projection must never be labelled current.
+                from finance_core.application.correction_schema import has_committed_correction
+
+                if has_committed_correction(conn, authoritative_transaction):
+                    return PostingStatus(
+                        review_public_id=review_public_id,
+                        state="needs_attention",
+                        attempt_public_id=str(row["attempt_public_id"]),
+                        transaction_public_id=None,
+                        attention_reason="local_current_lookup_required",
+                    )
                 transaction = conn.execute(
                     "SELECT amount, currency, transaction_date, merchant, account_id "
                     "FROM transactions WHERE public_id = ?",

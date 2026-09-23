@@ -105,8 +105,8 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
         if name.startswith(prefix) and name.endswith(".sql")
     }
     observed_numbers = [int(name[:3]) for name in sorted(migrations)]
-    if observed_numbers != list(range(1, 51)):
-        raise ValueError("wheel must contain the exact migration inventory 001-050")
+    if observed_numbers != list(range(1, 52)):
+        raise ValueError("wheel must contain the exact migration inventory 001-051")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]

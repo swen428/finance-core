@@ -21,8 +21,22 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
+from typing import Callable, Protocol, cast
 
+from finance_core.application.correction_schema import has_committed_correction
 from finance_core.reconciliation.models import InternalCandidate
+
+
+class _EffectiveFields(Protocol):
+    amount: str
+    currency: str
+    transaction_date: str
+    merchant: str | None
+
+
+class _EffectiveTransaction(Protocol):
+    target_id: str
+    fields: _EffectiveFields
 
 
 @dataclass(frozen=True)
@@ -67,13 +81,23 @@ class InternalCandidateAdapter:
           currency,
           source_channel,
           intent,
-          intent_type
+          intent_type,
+          status,
+          account_id
         FROM transactions
     """
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        effective_reader: Callable[[sqlite3.Connection, str], _EffectiveTransaction] | None = None,
+    ) -> None:
         conn.row_factory = sqlite3.Row
+        if not conn.in_transaction and conn.execute("PRAGMA foreign_keys").fetchone()[0] == 0:
+            conn.execute("PRAGMA foreign_keys = ON")
         self._conn = conn
+        self._effective_reader = effective_reader
 
     def fetch_candidates(
         self,
@@ -84,14 +108,66 @@ class InternalCandidateAdapter:
 
         Rows with a NULL ``amount`` are silently excluded.
         """
-        query, params = self._build_query(filters)
-        rows = self._conn.execute(query, params).fetchall()
-        candidates: list[InternalCandidate] = []
-        for row in rows:
-            cand = self._row_to_candidate(row)
-            if cand is not None:
-                candidates.append(cand)
-        return candidates
+        owns_snapshot = not self._conn.in_transaction
+        if owns_snapshot:
+            self._conn.execute("BEGIN")
+        try:
+            # Fetch every target before filtering: a corrected row must not be
+            # hidden by a predicate over its now historical original columns.
+            rows = self._conn.execute(self._BASE_SELECT).fetchall()
+            candidates: list[tuple[str, int, InternalCandidate]] = []
+            for row in rows:
+                values = dict(row)
+                target_id = str(values["public_id"])
+                if has_committed_correction(self._conn, target_id):
+                    if self._effective_reader is None:
+                        raise ValueError("corrected_transaction_requires_trusted_effective_reader")
+                    effective = self._effective_reader(self._conn, target_id)
+                    if getattr(effective, "target_id", None) != target_id:
+                        raise ValueError("effective reader returned another transaction")
+                    fields = effective.fields
+                    values.update(
+                        amount=fields.amount,
+                        currency=fields.currency,
+                        transaction_date=fields.transaction_date,
+                        merchant=fields.merchant,
+                    )
+                if not self._matches_filters(values, filters):
+                    continue
+                candidate = self._row_to_candidate(values)
+                if candidate is not None:
+                    candidates.append(
+                        (str(values["transaction_date"]), cast(int, values["id"]), candidate)
+                    )
+            candidates.sort(key=lambda pair: (pair[0], pair[1]))
+            return [candidate for _, _, candidate in candidates]
+        finally:
+            if owns_snapshot:
+                self._conn.rollback()
+
+    def _matches_filters(self, row: dict[str, object], filters: CandidateFilter | None) -> bool:
+        f = filters or CandidateFilter()
+        status = f.status if f.status is not None else self._DEFAULT_STATUS
+        if row["status"] != status:
+            return False
+        for field in ("intent", "intent_type", "source_channel", "account_id", "currency"):
+            expected = getattr(f, field)
+            if expected is not None and row[field] != expected:
+                return False
+        transaction_date = row["transaction_date"]
+        if transaction_date is None:
+            return False
+        if f.date_from is not None and str(transaction_date) < f.date_from:
+            return False
+        if f.date_to is not None and str(transaction_date) > f.date_to:
+            return False
+        if f.merchant_like is not None:
+            matched = self._conn.execute(
+                "SELECT ? LIKE ?", (row["merchant"], f.merchant_like)
+            ).fetchone()[0]
+            if matched != 1:
+                return False
+        return True
 
     def candidate_count(self, filters: CandidateFilter | None = None) -> int:
         """Return the number of candidates that would be fetched.
@@ -147,7 +223,7 @@ class InternalCandidateAdapter:
         query = f"{self._BASE_SELECT} {where} {order}"
         return query, tuple(params)
 
-    def _row_to_candidate(self, row: sqlite3.Row) -> InternalCandidate | None:
+    def _row_to_candidate(self, row: sqlite3.Row | dict[str, object]) -> InternalCandidate | None:
         """Convert a ``transactions`` row to an ``InternalCandidate``.
 
         Returns ``None`` when ``amount`` or ``transaction_date`` is
@@ -158,18 +234,21 @@ class InternalCandidateAdapter:
         if amount_raw is None:
             return None
 
-        txn_date = _parse_date(row["transaction_date"])
+        date_raw = row["transaction_date"]
+        txn_date = _parse_date(None if date_raw is None else str(date_raw))
         if txn_date is None:
             return None
 
         return InternalCandidate(
             internal_id=str(row["public_id"]),
             transaction_date=txn_date,
-            merchant=row["merchant"] or "",
+            merchant=str(row["merchant"] or ""),
             amount=Decimal(str(amount_raw)),
-            currency=row["currency"] or "",
-            source_type=row["intent"],
-            source_channel=row["source_channel"],
+            currency=str(row["currency"] or ""),
+            source_type=None if row["intent"] is None else str(row["intent"]),
+            source_channel=(
+                None if row["source_channel"] is None else str(row["source_channel"])
+            ),
             evidence_reference=str(row["id"]),
         )
 

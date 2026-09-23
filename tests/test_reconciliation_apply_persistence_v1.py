@@ -391,6 +391,80 @@ def test_audit_only_actions_no_mutation(migrated_temp_db_connection):
     assert tx_count == 0
 
 
+def test_successful_apply_replay_checks_corrected_secondary_duplicate(
+    migrated_temp_db_connection, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    stmt = _stmt(merchant_raw="Grab", statement_row_reference="guarded-dup")
+    apps = [_app("app-guard-a", merchant="Grab"), _app("app-guard-b", merchant="Grab")]
+    items, _ = generate_review_queue(match_batch([stmt], apps))
+    item = next(item for item in items if item.issue_type == IssueType.POSSIBLE_DUPLICATE)
+    decision = ResolutionDecision(
+        decision_id="dec-guarded-duplicate", queue_item_id=item.queue_item_id,
+        action=ResolutionAction.MARK_DUPLICATE,
+    )
+    result = ResolutionApplyRuntime().apply(item, decision)
+    ap = ApplyPersistence(conn)
+    assert ap.save_apply_result(result) is True
+    duplicates = result.payload["duplicate_app_txn_ids"]
+    secondary = next(value for value in duplicates if value != result.payload["kept_app_txn_id"])
+    monkeypatch.setattr(
+        "finance_core.reconciliation.apply_persistence.has_committed_correction",
+        lambda _conn, target: target == secondary,
+    )
+    with pytest.raises(ValueError, match="corrected_transaction_requires_versioned_reconciliation"):
+        ap.save_apply_result(result)
+    assert conn.in_transaction is False
+    assert ap.get_apply_result_by_apply_id(result.apply_id) is not None
+
+
+def test_apply_caller_transaction_is_left_unchanged(migrated_temp_db_connection) -> None:
+    conn = migrated_temp_db_connection
+    item, decision = _make_matched_item_and_decision()
+    result = ResolutionApplyRuntime().apply(item, decision)
+    ap = ApplyPersistence(conn)
+    conn.execute("CREATE TABLE caller_marker (value TEXT)")
+    conn.execute("BEGIN")
+    conn.execute("INSERT INTO caller_marker VALUES ('pending')")
+    with pytest.raises(RuntimeError, match="caller-owned"):
+        ap.save_apply_result(result)
+    assert conn.in_transaction is True
+    assert conn.execute("SELECT value FROM caller_marker").fetchone()[0] == "pending"
+    conn.rollback()
+    assert conn.execute("SELECT 1 FROM caller_marker").fetchone() is None
+
+
+def test_apply_correction_guard_runs_while_immediate_lock_is_held(
+    migrated_temp_db_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = sqlite3.connect(migrated_temp_db_path, timeout=0)
+    contender = sqlite3.connect(migrated_temp_db_path, timeout=0)
+    owner.row_factory = sqlite3.Row
+    owner.execute("PRAGMA foreign_keys = ON")
+    try:
+        item, decision = _make_matched_item_and_decision()
+        result = ResolutionApplyRuntime().apply(item, decision)
+        observed: list[str] = []
+
+        def check_locked(_conn: sqlite3.Connection, target: str) -> bool:
+            assert owner.in_transaction
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                contender.execute("BEGIN IMMEDIATE")
+            observed.append(target)
+            return False
+
+        monkeypatch.setattr(
+            "finance_core.reconciliation.apply_persistence.has_committed_correction",
+            check_locked,
+        )
+        assert ApplyPersistence(owner).save_apply_result(result) is True
+        assert observed == ["app-fp-match"]
+        assert owner.in_transaction is False
+    finally:
+        owner.close()
+        contender.close()
+
+
 # ============================================================================
 # 9. No test touches database/finance.db
 # ============================================================================

@@ -27,6 +27,9 @@ from finance_core.calculation.authoritative_snapshot import (
     SnapshotVerificationError,
     verify_snapshot_binding,
 )
+from finance_core.calculation.receipt_output_serialization import (
+    serialize_receipt_calculation_output,
+)
 from finance_core.calculation.run_persistence import CalculationRunRepository
 from finance_core.financial_audit import (
     AuditEventCommand,
@@ -3571,12 +3574,6 @@ def _snapshot_amount(
     return money_decimal(raw, label=f"calculation_snapshot.{key}")
 
 
-def _decimal_default(obj: object) -> str:
-    if isinstance(obj, Decimal):
-        return str(obj)
-    raise TypeError("Object of type {{obj.__class__.__name__}} is not JSON serializable")
-
-
 def _serialize_snapshot(snapshot: dict) -> dict:
     """Deep-convert Decimal values in a snapshot dict to JSON-safe strings."""
-    return json.loads(json.dumps(snapshot, default=_decimal_default, sort_keys=True))
+    return serialize_receipt_calculation_output(snapshot)

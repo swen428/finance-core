@@ -374,6 +374,87 @@ def test_audit_evidence_stored_and_reloadable():
         conn.close()
 
 
+def test_successful_duplicate_persists_every_app_target() -> None:
+    conn, rqp, rp = _setup_db()
+    try:
+        stmt = _make_stmt(merchant_raw="Grab")
+        apps = [_make_app("app-dup-a", merchant="Grab"), _make_app("app-dup-b", merchant="Grab")]
+        items, _ = generate_review_queue(match_batch([stmt], apps))
+        item = next(item for item in items if item.issue_type == IssueType.POSSIBLE_DUPLICATE)
+        rqp.persist_review_queue(items)
+        decision = ResolutionDecision(
+            decision_id="dec-complete-dup",
+            queue_item_id=item.queue_item_id,
+            action=ResolutionAction.MARK_DUPLICATE,
+        )
+        result = rp.apply_resolution(item, decision)
+        assert result.success
+        row = rp.list_results_for_queue_item(item.queue_item_id)[0]
+        evidence = json.loads(row["audit_evidence_json"])
+        assert set(evidence["duplicate_app_txn_ids"]) == {"app-dup-a", "app-dup-b"}
+        assert evidence["kept_app_txn_id"] == item.candidate.best_app_transaction.app_txn_id
+        assert evidence["audit_only"] is True
+        assert evidence["canonical_app_transaction_ref"] == evidence["app_txn_id"]
+        assert evidence["payload_target_app_txn_id"] == evidence["app_txn_id"]
+    finally:
+        conn.close()
+
+
+def test_successful_resolution_replay_refuses_corrected_target_under_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, rqp, rp = _setup_db()
+    try:
+        qid = _persist_matched_item(rqp)
+        item = _row_to_queue_item(rqp, qid)
+        decision = ResolutionDecision(
+            decision_id="dec-corrected-target", queue_item_id=qid,
+            action=ResolutionAction.CONFIRM_MATCH,
+        )
+        rp.apply_resolution(item, decision)
+        monkeypatch.setattr(
+            "finance_core.reconciliation.resolution_persistence.has_committed_correction",
+            lambda _conn, target: target == "app-res-persist",
+        )
+        monkeypatch.setattr(
+            "finance_core.reconciliation.resolution_persistence.verify_correction_schema",
+            lambda _conn: True,
+        )
+        with pytest.raises(
+            ValueError, match="corrected_transaction_requires_versioned_reconciliation"
+        ):
+            rp.apply_resolution(item, decision)
+        with pytest.raises(
+            ValueError, match="corrected_transaction_requires_versioned_reconciliation"
+        ):
+            rp.persist_decision(decision)
+        assert conn.in_transaction is False
+        assert len(rp.list_results_for_queue_item(qid)) == 1
+    finally:
+        conn.close()
+
+
+def test_resolution_caller_transaction_is_not_committed() -> None:
+    conn, rqp, rp = _setup_db()
+    try:
+        qid = _persist_matched_item(rqp)
+        conn.execute("CREATE TABLE caller_marker (value TEXT)")
+        conn.execute("BEGIN")
+        conn.execute("INSERT INTO caller_marker VALUES ('pending')")
+        decision = ResolutionDecision(
+            decision_id="dec-caller-owned", queue_item_id=qid,
+            action=ResolutionAction.CONFIRM_MATCH,
+        )
+        with pytest.raises(RuntimeError, match="caller-owned"):
+            rp.persist_decision(decision)
+        assert conn.in_transaction is True
+        assert conn.execute("SELECT value FROM caller_marker").fetchone()[0] == "pending"
+        conn.rollback()
+        assert conn.execute("SELECT 1 FROM caller_marker").fetchone() is None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # 8. No app transaction mutation
 # ---------------------------------------------------------------------------

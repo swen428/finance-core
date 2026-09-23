@@ -29,7 +29,9 @@ IMPORTER_MODULES = frozenset({"importlib", "builtins"})
 
 def is_platform(module: str) -> bool:
     return (
-        module == "finance_core.telegram_source_context"
+        module == "finance_core.correction_adapters"
+        or module.startswith("finance_core.correction_adapters.")
+        or module == "finance_core.telegram_source_context"
         or module.startswith("finance_core.openclaw_staging_bridge")
         or module.startswith("finance_core.receipt_staging_runner")
         or module.startswith("finance_core.intake.telegram_")

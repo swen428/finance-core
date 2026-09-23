@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, cast
 
+from finance_core.application.correction_schema import has_committed_correction
 from finance_core.financial_audit import (
     AuditEventCommand,
     FinancialAuditRepository,
@@ -122,6 +123,12 @@ class FinalMutationWorkflowBlockReason(str, Enum):
     EMPTY_IDEMPOTENCY_KEY = "empty_idempotency_key"
     TARGET_TRANSACTION_NOT_FOUND = "target_transaction_not_found"
     TARGET_TRANSACTION_AMBIGUOUS = "target_transaction_ambiguous"
+    CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION = (
+        "corrected_transaction_requires_versioned_reconciliation"
+    )
+    D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION = (
+        "d2_finalized_transaction_requires_controlled_correction"
+    )
     UNSAFE_DATABASE_TARGET = "unsafe_database_target"
     MISSING_PERSISTED_AUTHORIZATION = "missing_persisted_authorization"
     PERSISTED_AUTHORIZATION_DENIED = "persisted_authorization_denied"
@@ -392,6 +399,11 @@ def execute_guarded_final_mutation_workflow(
                 (FinalMutationWorkflowBlockReason.MISSING_SCHEMA.value,),
             )
 
+        legacy_block = _legacy_mutation_block_reason(conn, workflow_input)
+        if legacy_block is not None:
+            conn.rollback()
+            return _build_blocked_result(workflow_input, created_at, (legacy_block,))
+
         idem_check = _check_durable_idempotency(
             conn,
             workflow_input,
@@ -414,6 +426,63 @@ def execute_guarded_final_mutation_workflow(
         if conn.in_transaction:
             conn.rollback()
         raise
+
+
+def _legacy_mutation_block_reason(
+    conn: sqlite3.Connection, inp: FinalMutationWorkflowInput
+) -> str | None:
+    proposal = inp.proposal
+    refs = {ref for ref in (
+        proposal.target_transaction_id, proposal.source_app_transaction_ref
+    ) if ref}
+    # A completed CREATE replay can also expose its old result ID even when
+    # the incoming proposal only carries source references.
+    prior = conn.execute(
+        "SELECT transaction_public_id FROM reconciliation_final_mutation_audit "
+        "WHERE idempotency_key = ? AND status = 'finalized'",
+        (inp.idempotency_key,),
+    ).fetchone()
+    if prior is not None and prior[0]:
+        refs.add(str(prior[0]))
+    if any(has_committed_correction(conn, ref) for ref in sorted(refs)):
+        return (
+            FinalMutationWorkflowBlockReason
+            .CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION.value
+        )
+    if proposal.action == FinalMutationAction.ADJUST_FINAL_TRANSACTION:
+        target = proposal.target_transaction_id
+        if target and _is_d2_finalized_original(conn, target):
+            return (
+                FinalMutationWorkflowBlockReason
+                .D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION.value
+            )
+    return None
+
+
+def _is_d2_finalized_original(conn: sqlite3.Connection, target_id: str) -> bool:
+    if _table_exists(conn, "d2_posting_attempts"):
+        if conn.execute(
+            "SELECT 1 FROM d2_posting_attempts "
+            "WHERE transaction_public_id = ? AND stage = 'finalized' LIMIT 1",
+            (target_id,),
+        ).fetchone() is not None:
+            return True
+    if _table_exists(conn, "parser_proposal_conversion_audit"):
+        if conn.execute(
+            "SELECT 1 FROM parser_proposal_conversion_audit AS conversion "
+            "JOIN transactions AS txn ON txn.id = conversion.transaction_id "
+            "WHERE txn.public_id = ? LIMIT 1",
+            (target_id,),
+        ).fetchone() is not None:
+            return True
+    if _table_exists(conn, "receipt_finalization_audit"):
+        if conn.execute(
+            "SELECT 1 FROM receipt_finalization_audit "
+            "WHERE transaction_public_id = ? AND status = 'finalized' LIMIT 1",
+            (target_id,),
+        ).fetchone() is not None:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

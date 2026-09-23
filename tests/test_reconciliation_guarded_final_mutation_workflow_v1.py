@@ -232,6 +232,43 @@ def execute_guarded_final_mutation_workflow(
     )
 
 
+def test_source_bound_create_refuses_corrected_source_under_lock(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_id = "txn-corrected-source"
+    proposal = _create_proposal(source_app_transaction_ref=source_id)
+    inp = _make_workflow_input(proposal=proposal)
+    monkeypatch.setattr(
+        "finance_core.reconciliation.final_mutation_workflow.has_committed_correction",
+        lambda _conn, target: target == source_id,
+    )
+    result = execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
+    assert result.status == FinalMutationWorkflowStatus.BLOCKED
+    assert result.blocked_reasons == (
+        "corrected_transaction_requires_versioned_reconciliation",
+    )
+    assert conn.in_transaction is False
+    assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+
+def test_successful_create_replay_refuses_corrected_result(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inp = _make_workflow_input(idempotency_key="fm-corrected-replay")
+    first = execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
+    assert first.status == FinalMutationWorkflowStatus.FINALIZED
+    monkeypatch.setattr(
+        "finance_core.reconciliation.final_mutation_workflow.has_committed_correction",
+        lambda _conn, target: target == first.transaction_public_id,
+    )
+    replay = execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
+    assert replay.status == FinalMutationWorkflowStatus.BLOCKED
+    assert replay.blocked_reasons == (
+        "corrected_transaction_requires_versioned_reconciliation",
+    )
+    assert replay.transaction_public_id is None
+
+
 def test_authorization_row_without_confirmation_cannot_finalize(conn) -> None:
     """A binding row alone is never an authorization trust root."""
     inp = _seed_persisted_authorization(conn, _make_workflow_input())
