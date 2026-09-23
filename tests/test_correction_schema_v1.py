@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -27,9 +28,16 @@ def _db() -> sqlite3.Connection:
             snapshot_public_id TEXT PRIMARY KEY,combined_snapshot_hash TEXT,
             created_at TEXT,authorization_reference TEXT,previous_snapshot_public_id TEXT);
         CREATE TABLE d2_posting_attempts(transaction_public_id TEXT,stage TEXT);
-        CREATE TABLE schema_migrations(migration_filename TEXT);
-        INSERT INTO schema_migrations VALUES ('051_controlled_corrections.sql');
+        CREATE TABLE schema_migrations(
+            migration_id TEXT, migration_filename TEXT,
+            migration_sequence INTEGER, checksum_sha256 TEXT);
+        CREATE TABLE financial_audit_events(
+            aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
         INSERT INTO transactions VALUES ('txn-1');"""
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations VALUES (?,?,?,?)",
+        ("051", MIGRATION.name, 51, hashlib.sha256(MIGRATION.read_bytes()).hexdigest()),
     )
     conn.executescript(MIGRATION.read_text("utf-8"))
     return conn
@@ -64,6 +72,85 @@ def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:
         assert not has_committed_correction(conn, "txn-1")
         conn.execute("DROP TRIGGER trg_correction_versions_no_update")
         with pytest.raises(CorrectionSchemaError):
+            verify_correction_schema(conn)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    (
+        ("migration_id", "050"),
+        ("migration_filename", "050_wrong.sql"),
+        ("migration_sequence", 50),
+        ("checksum_sha256", "0" * 64),
+    ),
+)
+def test_schema_refuses_tampered_051_ledger_identity(
+    column: str, value: str | int
+) -> None:
+    conn = _db()
+    try:
+        conn.execute(f"UPDATE schema_migrations SET {column} = ?", (value,))
+        with pytest.raises(CorrectionSchemaError, match="051 identity or checksum"):
+            verify_correction_schema(conn)
+    finally:
+        conn.close()
+
+
+def test_orphan_correction_audit_still_marks_target_as_corrected() -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO financial_audit_events VALUES (?,?,?)",
+            ("transaction", "txn-1", "transaction_correction_applied"),
+        )
+        assert not conn.execute("SELECT 1 FROM correction_versions").fetchone()
+        assert has_committed_correction(conn, "txn-1")
+        assert not has_committed_correction(conn, "other")
+    finally:
+        conn.close()
+
+
+def test_missing_051_with_retained_audit_refuses_current_claim() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(
+            """CREATE TABLE schema_migrations(
+                   migration_id TEXT, migration_filename TEXT,
+                   migration_sequence INTEGER, checksum_sha256 TEXT);
+               CREATE TABLE financial_audit_events(
+                   aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
+               INSERT INTO financial_audit_events VALUES
+                   ('transaction','txn-1','transaction_correction_applied');"""
+        )
+        assert not verify_correction_schema(conn)
+        with pytest.raises(CorrectionSchemaError, match="audit exists without migration 051"):
+            has_committed_correction(conn, "txn-1")
+        assert not has_committed_correction(conn, "other")
+    finally:
+        conn.close()
+
+
+def test_deleted_051_ledger_row_with_retained_audit_refuses() -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO financial_audit_events VALUES (?,?,?)",
+            ("transaction", "txn-1", "transaction_correction_applied"),
+        )
+        conn.execute("DELETE FROM schema_migrations WHERE migration_id = '051'")
+        with pytest.raises(CorrectionSchemaError, match="without migration 051"):
+            has_committed_correction(conn, "txn-1")
+    finally:
+        conn.close()
+
+
+def test_missing_ledger_with_correction_schema_refuses() -> None:
+    conn = _db()
+    try:
+        conn.execute("DROP TABLE schema_migrations")
+        with pytest.raises(CorrectionSchemaError, match="without migration ledger"):
             verify_correction_schema(conn)
     finally:
         conn.close()

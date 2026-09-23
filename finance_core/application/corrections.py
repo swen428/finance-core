@@ -701,6 +701,7 @@ class CorrectionService:
                 (target_id,),
             )
         )
+        self._verify_correction_audit_inventory(conn, target_id, rows)
         if rows:
             instances = _rows(
                 conn.execute(
@@ -732,6 +733,46 @@ class CorrectionService:
             history=tuple(history),
             original_source=source,
         )
+
+    def _verify_correction_audit_inventory(
+        self,
+        conn: sqlite3.Connection,
+        target_id: str,
+        versions: list[dict[str, object]],
+    ) -> None:
+        """Cross-check the entire transaction audit chain, including zero versions."""
+        from finance_core.financial_audit import (
+            derive_audit_event_public_id,
+            verify_financial_audit_chain,
+        )
+
+        chain = verify_financial_audit_chain(
+            conn, aggregate_type="transaction", aggregate_public_id=target_id
+        )
+        if not chain.valid:
+            raise CorrectionIntegrityError("Transaction financial audit chain is invalid")
+        events = conn.execute(
+            "SELECT event_public_id, causation_public_id FROM financial_audit_events "
+            "WHERE aggregate_type='transaction' AND aggregate_public_id=? "
+            "AND event_type='transaction_correction_applied' ORDER BY sequence_number",
+            (target_id,),
+        ).fetchall()
+        expected = [
+            (
+                derive_audit_event_public_id(
+                    aggregate_type="transaction",
+                    aggregate_public_id=target_id,
+                    event_type="transaction_correction_applied",
+                    causation_public_id=str(row["correction_id"]),
+                ),
+                row["correction_id"],
+            )
+            for row in versions
+        ]
+        if [(row[0], row[1]) for row in events] != expected:
+            raise CorrectionIntegrityError(
+                "Transaction correction audit events do not match persisted versions"
+            )
 
     def read_plan(self, plan_id: str) -> CorrectionPlan:
         conn = self.connection

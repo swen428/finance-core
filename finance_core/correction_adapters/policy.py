@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, cast
 
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
 from finance_core.runtime_paths import require_runtime_root
 from finance_core.staging_guard import open_staging_database, require_staging_database
 
@@ -173,7 +174,7 @@ def _open_anchored_staging(
     try:
         if _anchor_witness(anchor_fd) != witness:
             raise LocalPolicyError("database instance changed before connection open")
-        conn = open_staging_database(path)
+        conn = open_staging_database(path, migration_paths=TEMP_DB_MIGRATION_PATHS)
         if (
             _connection_path(conn) != path
             or _anchor_witness(anchor_fd) != witness

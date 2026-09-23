@@ -40,7 +40,7 @@ from finance_core.correction_adapters.wire import (
     key_id,
     strict_object,
 )
-from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, MigrationChecksumError
 from finance_core.staging_guard import StagingDatabaseError, create_staging_database
 
 
@@ -114,9 +114,9 @@ def test_terminal_decision_reconstructs_display_then_seals_one_epoch(
         input_stream=terminal_in,
         output_stream=terminal_out,
     )
-    assert "Before amount: 12.50" in terminal_out.getvalue()
-    assert "After amount: 13.50" in terminal_out.getvalue()
-    assert "Before merchant: (unset)" in terminal_out.getvalue()
+    assert 'Before amount: "12.50"' in terminal_out.getvalue()
+    assert 'After amount: "13.50"' in terminal_out.getvalue()
+    assert "Before merchant: null" in terminal_out.getvalue()
     verified = authority.verify_fresh(signed, ExpectedDecision(plan, plan.expires_at_epoch))
     assert verified.checked_at_epoch == 1102
     assert verified.correction_id == plan.correction_id
@@ -168,8 +168,49 @@ def test_forged_display_hash_refuses_even_with_valid_hmac(monkeypatch: pytest.Mo
 def test_renderer_escapes_line_and_bidi_controls_without_truncation() -> None:
     plan = replace(_plan(_policy()), reason="first\nsecond\u202eright")
     rendered = render_plan(plan).decode()
-    assert "Complete reason: first\\u000asecond\\u202eright" in rendered
+    assert 'Complete reason: "first\\nsecond\\u202eright"' in rendered
     assert "Complete reason: first\nsecond" not in rendered
+
+
+def test_renderer_distinguishes_null_literal_sentinel_and_escape_text() -> None:
+    original = _plan(_policy())
+    literal = replace(original, before=replace(original.before, merchant="(unset)"))
+    escape_text = replace(original, reason=r"first\nsecond")
+    line_break = replace(original, reason="first\nsecond")
+    assert b"Before merchant: null\n" in render_plan(original)
+    assert b'Before merchant: "(unset)"\n' in render_plan(literal)
+    assert render_plan(original) != render_plan(literal)
+    assert b'Complete reason: "first\\\\nsecond"\n' in render_plan(escape_text)
+    assert b'Complete reason: "first\\nsecond"\n' in render_plan(line_break)
+    assert render_plan(escape_text) != render_plan(line_break)
+
+
+def test_renderer_keeps_chinese_readable_and_distinguishes_bidi_escape_text() -> None:
+    original = _plan(_policy())
+    readable = replace(
+        original,
+        before=replace(original.before, merchant="咖啡馆"),
+        reason="更正商户和金额",
+    )
+    rendered = render_plan(readable).decode("utf-8")
+    assert 'Before merchant: "咖啡馆"\n' in rendered
+    assert 'Complete reason: "更正商户和金额"\n' in rendered
+
+    actual_bidi = replace(original, reason="中文\u202e结束")
+    literal_escape = replace(original, reason=r"中文\u202e结束")
+    actual_display = render_plan(actual_bidi).decode("utf-8")
+    literal_display = render_plan(literal_escape).decode("utf-8")
+    assert 'Complete reason: "中文\\u202e结束"\n' in actual_display
+    assert 'Complete reason: "中文\\\\u202e结束"\n' in literal_display
+    assert actual_display != literal_display
+
+
+def test_renderer_escapes_line_separator_and_surrogate_after_json_quoting() -> None:
+    plan = replace(_plan(_policy()), reason="前\u2028中\ud800后")
+    rendered = render_plan(plan).decode("utf-8")
+    assert 'Complete reason: "前\\u2028中\\ud800后"\n' in rendered
+    assert "\u2028" not in rendered
+    assert "\ud800" not in rendered
 
 
 def _empty_file_staging(
@@ -260,8 +301,8 @@ def test_factory_rejects_path_replacement_in_open_window(
     replacement.chmod(0o600)
     original_open = policy_module.open_staging_database
 
-    def swap_after_sqlite_open(path: Path) -> sqlite3.Connection:
-        opened = original_open(path)
+    def swap_after_sqlite_open(path: Path, **kwargs: object) -> sqlite3.Connection:
+        opened = original_open(path, **kwargs)
         os.replace(replacement, path)
         return opened
 
@@ -287,6 +328,23 @@ def test_registered_connection_rechecks_retained_descriptor_and_path(
         os.replace(replacement, database)
         with pytest.raises(LocalPolicyError, match="unsafe|witness"):
             authority.current_binding(local, "original-actor")
+
+
+@pytest.mark.parametrize("migration_id", ("001", "050", "051"))
+def test_local_factory_refuses_tampered_migration_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, migration_id: str
+) -> None:
+    conn, database = _empty_file_staging(tmp_path, monkeypatch)
+    conn.close()
+    provision(database, "original-actor")
+    with sqlite3.connect(database) as tamper:
+        tamper.execute(
+            "UPDATE schema_migrations SET checksum_sha256 = ? WHERE migration_id = ?",
+            ("0" * 64, migration_id),
+        )
+    with pytest.raises(MigrationChecksumError, match="checksum changed"):
+        with open_local_authority_connection():
+            pass
 
 
 def test_incomplete_first_policy_can_only_be_quarantined_with_empty_ledger(

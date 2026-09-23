@@ -11,6 +11,7 @@ from finance_core.application.corrections import (
     ConsumptionSeal,
     CorrectionConflict,
     CorrectionFields,
+    CorrectionIntegrityError,
     CorrectionService,
     ExpectedDecision,
     ExpectedHistory,
@@ -25,6 +26,11 @@ from finance_core.calculation.authoritative_snapshot import (
     build_authoritative_snapshot,
     canonical_json_text,
     canonical_json_value,
+)
+from finance_core.financial_audit import (
+    AuditEventCommand,
+    append_financial_audit_event,
+    derive_audit_event_public_id,
 )
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 
@@ -298,6 +304,117 @@ def test_text_null_merchant_amount_correction_replay_and_append_only() -> None:
                 (plan.correction_id,),
             )
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def test_deleted_correction_rows_cannot_reveal_original_money() -> None:
+    conn, service, authority = _fixture()
+    try:
+        plan = service.preview("txn-1", {"amount": "15"}, "Correct amount")
+        authority.epoch = plan.created_at_epoch + 1
+        assert service.apply(plan.plan_id, _decision(plan, authority.epoch)).current.version == 1
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM financial_audit_events "
+                "WHERE aggregate_type='transaction' AND aggregate_public_id='txn-1' "
+                "AND event_type='transaction_correction_applied'"
+            ).fetchone()[0]
+            == 1
+        )
+        conn.execute("PRAGMA foreign_keys = OFF")
+        saved_triggers = []
+        for table in (
+            "correction_receipt_facts",
+            "correction_versions",
+            "correction_authorities",
+            "correction_plans",
+            "correction_targets",
+        ):
+            trigger = f"trg_{table}_no_delete"
+            definition = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (trigger,)
+            ).fetchone()[0]
+            saved_triggers.append(definition)
+            conn.execute(f"DROP TRIGGER {trigger}")
+            conn.execute(f"DELETE FROM {table}")
+        for definition in saved_triggers:
+            conn.execute(definition)
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(CorrectionIntegrityError, match="audit events"):
+            service.lookup("txn-1")
+    finally:
+        conn.close()
+
+
+def test_orphan_correction_audit_rejected_but_original_audit_preserved() -> None:
+    conn, service, _authority = _fixture()
+    try:
+        for event_type, causation in (
+            ("transaction_created", "original-txn-1"),
+            ("transaction_correction_applied", "orphan-correction"),
+        ):
+            command = AuditEventCommand(
+                event_public_id=derive_audit_event_public_id(
+                    aggregate_type="transaction",
+                    aggregate_public_id="txn-1",
+                    event_type=event_type,
+                    causation_public_id=causation,
+                ),
+                aggregate_type="transaction",
+                aggregate_public_id="txn-1",
+                event_type=event_type,
+                event_payload={"synthetic": True},
+                new_state={"amount": "12.34"},
+                actor_type="human",
+                actor_public_id="synthetic-actor",
+                correlation_public_id="txn-1",
+                causation_public_id=causation,
+                created_at="2026-09-23T00:00:00+00:00",
+            )
+            conn.execute("BEGIN")
+            append_financial_audit_event(conn, command)
+            conn.commit()
+            if event_type == "transaction_created":
+                assert service.lookup("txn-1").version == 0
+        with pytest.raises(CorrectionIntegrityError, match="audit events"):
+            service.lookup("txn-1")
+    finally:
+        conn.close()
+
+
+def test_extra_correction_audit_after_valid_version_is_rejected() -> None:
+    conn, service, authority = _fixture()
+    try:
+        plan = service.preview("txn-1", {"amount": "15"}, "Correct amount")
+        authority.epoch = plan.created_at_epoch + 1
+        service.apply(plan.plan_id, _decision(plan, authority.epoch))
+        assert service.lookup("txn-1").version == 1
+        orphan = "orphan-correction"
+        command = AuditEventCommand(
+            event_public_id=derive_audit_event_public_id(
+                aggregate_type="transaction",
+                aggregate_public_id="txn-1",
+                event_type="transaction_correction_applied",
+                causation_public_id=orphan,
+            ),
+            aggregate_type="transaction",
+            aggregate_public_id="txn-1",
+            event_type="transaction_correction_applied",
+            event_payload={"synthetic": True},
+            new_state={"amount": "15.00"},
+            actor_type="human",
+            actor_public_id="synthetic-actor",
+            correlation_public_id="txn-1",
+            causation_public_id=orphan,
+            created_at="2026-09-23T00:00:00+00:00",
+        )
+        conn.execute("BEGIN")
+        append_financial_audit_event(conn, command)
+        conn.commit()
+        with pytest.raises(CorrectionIntegrityError, match="audit events"):
+            service.lookup("txn-1")
     finally:
         conn.close()
 

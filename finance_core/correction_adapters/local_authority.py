@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 import sqlite3
 import sys
@@ -40,17 +41,16 @@ _MAX_DECISION_TTL = 300
 
 
 def _escaped(value: str | None) -> str:
+    """Render readable JSON, escaping invisible characters after JSON quoting."""
     if value is None:
-        return "(unset)"
-    out: list[str] = []
-    for char in value:
-        category = unicodedata.category(char)
-        if category in {"Cc", "Cf", "Cs"} or char in {"\u2028", "\u2029"}:
-            point = ord(char)
-            out.append(f"\\u{point:04x}" if point <= 0xFFFF else f"\\U{point:08x}")
-        else:
-            out.append(char)
-    return "".join(out)
+        return "null"
+    encoded = json.dumps(value, ensure_ascii=False)
+    return "".join(
+        json.dumps(char, ensure_ascii=True)[1:-1]
+        if unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        else char
+        for char in encoded
+    )
 
 
 def render_plan(plan: CorrectionPlan) -> bytes:
