@@ -13,6 +13,7 @@ import {
   DISABLED_ACTIONS,
   DISABLED_REPLY,
   EDIT_PRESENTATION_FAILURE_REPLY,
+  POSTING_LOCAL_LOOKUP_REPLY,
   POSTING_OUTCOME_UNKNOWN_REPLY,
   createHumanActionInteractiveHandler,
   createDisabledInteractiveHandler,
@@ -412,6 +413,49 @@ test("lost D2 response queries durable status and returns the original result", 
   assert.deepEqual(requests.map((request) => request.command), ["confirm_and_post", "get_status"]);
   assert.equal(replies, 0);
   assert.match(edits[0] ?? "", new RegExp(`Transaction ID: txn_${"3".repeat(32)}`, "u"));
+});
+
+test("corrected D2 status directs the operator to local verified lookup", async () => {
+  const reference = `fha1_${"S".repeat(24)}`;
+  const requests: BridgeRequest[] = [];
+  const replies: string[] = [];
+  const handler = createHumanActionInteractiveHandler(() => ({
+    workspaceRoot: "/tmp/workspace",
+    runner: {
+      async run(request: BridgeRequest): Promise<BridgeResponse> {
+        requests.push(request);
+        return ok(request, {
+          review_public_id: `d2rev_${"1".repeat(30)}`,
+          state: "needs_attention",
+          attempt_public_id: `d2att_${"2".repeat(30)}`,
+          transaction_public_id: null,
+          attention_reason: "local_current_lookup_required",
+          amount: null,
+          currency: null,
+          transaction_date: null,
+          merchant: null,
+          account: null,
+          final_transaction_created: false,
+        });
+      },
+    },
+  }));
+  await handler({
+    channel: "telegram", accountId: "finance-account", callbackId: "callback-d2-corrected",
+    conversationId: "111", parentConversationId: "111", senderId: "111",
+    isGroup: false, isForum: false, auth: { isAuthorizedSender: true },
+    callback: {
+      data: `post:${reference}`, namespace: "post", payload: reference,
+      messageId: 20, chatId: "111",
+    },
+    respond: {
+      async reply({ text }: {text: string}) { replies.push(text); },
+      async editMessage() { throw new Error("old amount must not be shown"); },
+    },
+    async getCurrentConversationBinding() { return binding; },
+  });
+  assert.deepEqual(requests.map((request) => request.command), ["confirm_and_post"]);
+  assert.deepEqual(replies, [POSTING_LOCAL_LOOKUP_REPLY]);
 });
 
 test("D2 production callback route rejects mismatched namespace, payload, or data", async () => {

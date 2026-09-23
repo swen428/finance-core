@@ -70,6 +70,7 @@ from finance_core.reconciliation.migrations import (
 )
 from finance_core.reconciliation.models import (
     ApplyConflictError,
+    AppTransaction,
     ResolutionAction,
     ResolutionDecision,
     ReviewQueueItem,
@@ -467,6 +468,7 @@ def _run_apply_resolve_command(args: argparse.Namespace) -> int:
         _structured_rows_to_statements,
     )
     from finance_core.reconciliation.matching import match_batch
+    from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
     from finance_core.reconciliation.review_queue import generate_review_queue
     from finance_core.reconciliation.run_summary import (
         format_run_summary,
@@ -515,6 +517,10 @@ def _run_apply_resolve_command(args: argparse.Namespace) -> int:
 
             # -- Generate review queue --
             queue_items, _summary = generate_review_queue(candidates)
+
+            # Register the exact matcher output before a successful apply can
+            # refer to it. Replaying the same source reuses its bound queue.
+            ReviewQueuePersistence(conn).persist_review_queue(queue_items)
 
             # -- Load decisions fixture --
             decisions = _load_decisions_from_json(decisions_path)
@@ -990,9 +996,8 @@ def _guard_db_path(db_arg: str | None, command_name: str) -> None:
 def _row_to_review_queue_item(row: sqlite3.Row) -> ReviewQueueItem:
     """Reconstruct a ReviewQueueItem from a reconciliation_review_queue row.
 
-    This is a lossy reconstruction from persisted data, sufficient for
-    the resolution workflow (which only needs queue_item_id, issue_type,
-    and candidate metadata).
+    Legacy rows retain their single-app reconstruction. New rows restore the
+    original app candidate set so duplicate decisions guard every target.
     """
     import json as _json
     from decimal import Decimal as _Decimal
@@ -1009,6 +1014,12 @@ def _row_to_review_queue_item(row: sqlite3.Row) -> ReviewQueueItem:
     )
 
     evidence = _json.loads(row["evidence_json"] or "{}")
+    if not isinstance(evidence, dict):
+        raise ValueError("review queue evidence must be an object")
+    if "source_binding" in evidence:
+        from finance_core.reconciliation.source_binding import restore_bound_review_queue_item
+
+        return restore_bound_review_queue_item(row)
     reason_codes_raw = _json.loads(row["reason_codes_json"] or "[]")
     reason_codes = tuple(
         ReasonCode(r) if r in {rc.value for rc in ReasonCode} else ReasonCode.NEEDS_REVIEW
@@ -1052,11 +1063,41 @@ def _row_to_review_queue_item(row: sqlite3.Row) -> ReviewQueueItem:
             transaction_type=evidence.get("candidate_transaction_type"),
         )
 
+    all_apps: tuple[AppTransaction, ...] = ()
+    if "all_app_transactions" in evidence:
+        raw_apps = evidence["all_app_transactions"]
+        if not isinstance(raw_apps, list):
+            raise ValueError("review queue app candidates must be a list")
+        all_apps = tuple(_restore_review_app_transaction(raw) for raw in raw_apps)
+        app_ids = [candidate.app_txn_id for candidate in all_apps]
+        if len(app_ids) != len(set(app_ids)):
+            raise ValueError("review queue app candidate IDs must be unique")
+        canonical = row["app_transaction_ref"]
+        if app is None:
+            if all_apps or canonical is not None:
+                raise ValueError("review queue best app and canonical reference disagree")
+        else:
+            matching = next(
+                (candidate for candidate in all_apps if candidate.app_txn_id == app.app_txn_id),
+                None,
+            )
+            if (
+                not isinstance(canonical, str)
+                or canonical != app.app_txn_id
+                or matching is None
+                or matching.transaction_date != app.transaction_date
+                or matching.merchant != app.merchant
+                or matching.amount != app.amount
+                or matching.currency != app.currency
+            ):
+                raise ValueError("review queue best app and canonical reference disagree")
+            app = matching
     confidence = _Decimal(row["confidence_score"] or "0")
 
     candidate = ReconciliationCandidate(
         statement=stmt,
         best_app_transaction=app,
+        all_app_transactions=all_apps,
         match_status=MatchStatus(_status_from_issue(row["issue_type"])),
         reason_codes=reason_codes,
         issue_type=IssueType(row["issue_type"]),
@@ -1072,6 +1113,51 @@ def _row_to_review_queue_item(row: sqlite3.Row) -> ReviewQueueItem:
         reason_codes=reason_codes,
         evidence_summary=f"reconstructed from persisted row {row['public_id']}",
         priority=row["priority"],
+    )
+
+
+def _restore_review_app_transaction(raw: object) -> AppTransaction:
+    """Validate one stored app snapshot before it can authorize a resolution."""
+    from datetime import date
+    from decimal import Decimal, InvalidOperation
+
+    if not isinstance(raw, dict):
+        raise ValueError("review queue app candidate must be an object")
+    for key in ("app_txn_id", "transaction_date", "merchant", "amount", "currency"):
+        if not isinstance(raw.get(key), str) or not raw[key]:
+            raise ValueError(f"review queue app candidate has invalid {key}")
+    if not raw["app_txn_id"].strip():
+        raise ValueError("review queue app candidate has empty ID")
+    for key in ("source_type", "source_channel", "normalized_merchant", "transaction_type"):
+        if key not in raw or (raw[key] is not None and not isinstance(raw[key], str)):
+            raise ValueError(f"review queue app candidate has invalid {key}")
+    posted = raw.get("posted_date")
+    if "posted_date" not in raw or (posted is not None and not isinstance(posted, str)):
+        raise ValueError("review queue app candidate has invalid posted_date")
+    try:
+        txn_date = date.fromisoformat(raw["transaction_date"])
+        posted_date = date.fromisoformat(posted) if posted is not None else None
+        amount = Decimal(raw["amount"])
+    except (ValueError, InvalidOperation) as exc:
+        raise ValueError("review queue app candidate has invalid date or amount") from exc
+    if (
+        txn_date.isoformat() != raw["transaction_date"]
+        or (posted_date is not None and posted_date.isoformat() != posted)
+        or not amount.is_finite()
+        or amount <= 0
+    ):
+        raise ValueError("review queue app candidate has invalid date or amount")
+    return AppTransaction(
+        app_txn_id=raw["app_txn_id"],
+        transaction_date=txn_date,
+        merchant=raw["merchant"],
+        amount=amount,
+        currency=raw["currency"],
+        source_type=raw["source_type"],
+        source_channel=raw["source_channel"],
+        normalized_merchant=raw["normalized_merchant"],
+        posted_date=posted_date,
+        transaction_type=raw["transaction_type"],
     )
 
 

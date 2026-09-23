@@ -6,6 +6,7 @@ export declare const ACTION_FAILURE_REPLY = "Finance action could not be applied
 export declare const ACTION_OUTCOME_UNKNOWN_REPLY: string;
 export declare const POSTING_OUTCOME_UNKNOWN_REPLY: string;
 export declare const POSTING_NEEDS_ATTENTION_REPLY: string;
+export declare const POSTING_LOCAL_LOOKUP_REPLY: string;
 export declare const EDIT_PRESENTATION_FAILURE_REPLY: string;
 export type DisabledAction = (typeof DISABLED_ACTIONS)[number];
 export type ActiveAction = (typeof ACTIVE_ACTIONS)[number];

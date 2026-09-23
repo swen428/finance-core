@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, cast
 
+from finance_core.application.correction_schema import has_committed_correction
 from finance_core.financial_audit import (
     AuditEventCommand,
     FinancialAuditRepository,
@@ -122,6 +123,12 @@ class FinalMutationWorkflowBlockReason(str, Enum):
     EMPTY_IDEMPOTENCY_KEY = "empty_idempotency_key"
     TARGET_TRANSACTION_NOT_FOUND = "target_transaction_not_found"
     TARGET_TRANSACTION_AMBIGUOUS = "target_transaction_ambiguous"
+    CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION = (
+        "corrected_transaction_requires_versioned_reconciliation"
+    )
+    D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION = (
+        "d2_finalized_transaction_requires_controlled_correction"
+    )
     UNSAFE_DATABASE_TARGET = "unsafe_database_target"
     MISSING_PERSISTED_AUTHORIZATION = "missing_persisted_authorization"
     PERSISTED_AUTHORIZATION_DENIED = "persisted_authorization_denied"
@@ -392,6 +399,11 @@ def execute_guarded_final_mutation_workflow(
                 (FinalMutationWorkflowBlockReason.MISSING_SCHEMA.value,),
             )
 
+        legacy_block = _legacy_mutation_block_reason(conn, workflow_input)
+        if legacy_block is not None:
+            conn.rollback()
+            return _build_blocked_result(workflow_input, created_at, (legacy_block,))
+
         idem_check = _check_durable_idempotency(
             conn,
             workflow_input,
@@ -414,6 +426,67 @@ def execute_guarded_final_mutation_workflow(
         if conn.in_transaction:
             conn.rollback()
         raise
+
+
+def _legacy_mutation_block_reason(
+    conn: sqlite3.Connection, inp: FinalMutationWorkflowInput
+) -> str | None:
+    proposal = inp.proposal
+    reason_type = FinalMutationWorkflowBlockReason
+    refs = {
+        ref for ref in (proposal.target_transaction_id, proposal.source_app_transaction_ref) if ref
+    }
+    # A completed CREATE replay can also expose its old result ID even when
+    # the incoming proposal only carries source references.
+    prior = conn.execute(
+        "SELECT transaction_public_id FROM reconciliation_final_mutation_audit "
+        "WHERE idempotency_key = ? AND status = 'finalized'",
+        (inp.idempotency_key,),
+    ).fetchone()
+    if prior is not None and prior[0]:
+        refs.add(str(prior[0]))
+    if any(has_committed_correction(conn, ref) for ref in sorted(refs)):
+        return reason_type.CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION.value
+    if proposal.action == FinalMutationAction.ADJUST_FINAL_TRANSACTION:
+        target = proposal.target_transaction_id
+        if target and _is_d2_finalized_original(conn, target):
+            return reason_type.D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION.value
+    return None
+
+
+def _is_d2_finalized_original(conn: sqlite3.Connection, target_id: str) -> bool:
+    if _table_exists(conn, "d2_posting_attempts"):
+        if (
+            conn.execute(
+                "SELECT 1 FROM d2_posting_attempts "
+                "WHERE transaction_public_id = ? AND stage = 'finalized' LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
+            return True
+    if _table_exists(conn, "parser_proposal_conversion_audit"):
+        if (
+            conn.execute(
+                "SELECT 1 FROM parser_proposal_conversion_audit AS conversion "
+                "JOIN transactions AS txn ON txn.id = conversion.transaction_id "
+                "WHERE txn.public_id = ? LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
+            return True
+    if _table_exists(conn, "receipt_finalization_audit"):
+        if (
+            conn.execute(
+                "SELECT 1 FROM receipt_finalization_audit "
+                "WHERE transaction_public_id = ? AND status = 'finalized' LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +865,7 @@ def _execute_mutation(
     final_mutation_id = _derive_final_mutation_id(inp.idempotency_key)
     transaction_public_id: str | None = None
     previous_set = False
+    previous_values: dict[str, Any] | None = None
 
     if action_value == FinalMutationAction.CREATE_FINAL_TRANSACTION.value:
         if validated_create_money is None:
@@ -880,13 +954,12 @@ def _execute_mutation(
         target_transaction_id=inp.proposal.target_transaction_id,
         transaction_public_id=transaction_public_id,
         mutation_payload=mutation_payload,
+        previous_values=previous_values if previous_set else None,
         evidence_refs=inp.proposal.evidence_refs,
         audit_refs=audit_refs,
         created_at=created_at,
     )
 
-    if previous_set:
-        _store_previous_values(conn, final_mutation_id, previous_values)
     if transaction_public_id is None:
         raise FinalMutationPersistenceError("Final mutation produced no transaction identity")
     _append_final_mutation_chain_event(
@@ -990,7 +1063,7 @@ def _execute_adjust(
 ) -> tuple[str, bool, dict[str, Any]]:
     """Execute ADJUST_FINAL_TRANSACTION: update allowed fields on one row.
 
-    Returns (transaction_public_id, previous_values_set).
+    Returns (transaction_public_id, previous_values_set, previous_values).
     """
     proposal = inp.proposal
     target_id = proposal.target_transaction_id
@@ -1100,22 +1173,6 @@ def _validate_adjust_fields(suggested_fields: dict[str, Any]) -> list[str]:
                 )
 
     return errors
-
-
-def _store_previous_values(
-    conn: sqlite3.Connection,
-    final_mutation_id: str,
-    previous: dict[str, Any],
-) -> None:
-    """Store previous values in the audit record for ADJUST traceability."""
-    conn.execute(
-        """
-        UPDATE reconciliation_final_mutation_audit
-        SET previous_values_json = ?
-        WHERE final_mutation_id = ?
-        """,
-        (_serialize_json(previous), final_mutation_id),
-    )
 
 
 def _append_final_mutation_chain_event(
@@ -1395,6 +1452,7 @@ def _insert_audit_record(
     target_transaction_id: str | None,
     transaction_public_id: str | None,
     mutation_payload: dict[str, object],
+    previous_values: dict[str, Any] | None = None,
     evidence_refs: tuple[str, ...],
     audit_refs: dict[str, object],
     created_at: str,
@@ -1412,9 +1470,9 @@ def _insert_audit_record(
             action, status, blocked_reasons_json,
             source_statement_ref, source_app_transaction_ref,
             target_transaction_id, transaction_public_id,
-            mutation_payload_json, evidence_refs_json,
+            mutation_payload_json, previous_values_json, evidence_refs_json,
             audit_refs_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             final_mutation_id,
@@ -1438,6 +1496,7 @@ def _insert_audit_record(
             target_transaction_id,
             transaction_public_id,
             _serialize_json(mutation_payload),
+            _serialize_json(previous_values) if previous_values is not None else None,
             _serialize_json(list(evidence_refs)),
             _serialize_json(audit_refs),
             created_at,

@@ -11,6 +11,12 @@ from typing import Iterator
 import pytest
 
 from finance_core import posting_authority as posting_authority_module
+from finance_core.application.correction_schema import has_committed_correction
+from finance_core.financial_audit import (
+    AuditEventCommand,
+    append_financial_audit_event,
+    derive_audit_event_public_id,
+)
 from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
     authenticate_delivery_receipt,
     receipt_proof_sha256,
@@ -46,7 +52,11 @@ from finance_core.receipt_finalization.fact_set_bridge import (
 from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from finance_core.sqlite_connection import ForeignKeysDisabledError
-from finance_core.staging_guard import StagingDatabaseError, create_staging_database
+from finance_core.staging_guard import (
+    StagingDatabaseError,
+    create_staging_database,
+    open_staging_database,
+)
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
@@ -402,6 +412,12 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
     attempt_id = str(
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
+    assert conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()[0] == "accepted"
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99")
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        conn.execute("DELETE FROM transactions")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
@@ -418,7 +434,7 @@ def test_text_committed_result_is_visible_before_attempt_catchup(
     conn.close()
 
 
-def test_text_status_detects_canonical_transaction_drift_without_writes(
+def test_text_status_original_is_immutable_after_finalization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,14 +466,225 @@ def test_text_status_detects_canonical_transaction_drift_without_writes(
         ).state
         == "finalized"
     )
-    conn.execute("UPDATE transactions SET amount = 99.99 WHERE parser_output_id IS NOT NULL")
-    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="finalized D2 transaction is immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99 WHERE parser_output_id IS NOT NULL")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
+    assert status.state == "finalized"
+    assert status.amount != "99.99"
+
+
+def test_text_status_never_returns_original_money_after_correction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn, published = _published_text_card(tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-text-corrected-status",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = _issue_and_activate(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-text-corrected-status-key",
+        context=context,
+        provider_message_id=211,
+    )
+    original = confirm_and_post(
+        conn,
+        key=b"d2-text-corrected-status-key",
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-text-corrected-status-callback",
+        callback_message_id=211,
+        clock=lambda: 1004,
+    )
+    assert original.state == "finalized"
+    monkeypatch.setattr(
+        "finance_core.application.correction_schema.has_committed_correction",
+        lambda _conn, target: target == original.transaction_public_id,
+    )
+    status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert status.state == "needs_attention"
+    assert status.attention_reason == "local_current_lookup_required"
     assert status.transaction_public_id is None
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert (status.amount, status.currency, status.transaction_date, status.merchant) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize("by_reference", [False, True])
+def test_status_uses_one_snapshot_across_concurrent_correction_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_reference: bool
+) -> None:
+    reader, published = _published_text_card(tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        reader,
+        review_idempotency_key="d2-status-snapshot",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = _issue_and_activate(
+        reader,
+        review_public_id=review.review_public_id,
+        key=b"d2-status-snapshot-key",
+        context=context,
+        provider_message_id=212,
+    )
+    original = confirm_and_post(
+        reader,
+        key=b"d2-status-snapshot-key",
+        reference=issued.reference,
+        context=context,
+        callback_id="d2-status-snapshot-callback",
+        callback_message_id=212,
+        clock=lambda: 1004,
+    )
+    assert original.state == "finalized"
+    target = original.transaction_public_id
+    assert target is not None
+    assert reader.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    database_path = Path(str(reader.execute("PRAGMA database_list").fetchone()[2]))
+    writer = open_staging_database(database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    try:
+
+        def commit_correction_evidence() -> None:
+            # The audit event is representative correction evidence, not a
+            # complete correction. The status guard must refuse it on a fresh read.
+            command = AuditEventCommand(
+                event_public_id=derive_audit_event_public_id(
+                    aggregate_type="transaction",
+                    aggregate_public_id=target,
+                    event_type="transaction_correction_applied",
+                    causation_public_id="d2-status-snapshot-race",
+                ),
+                aggregate_type="transaction",
+                aggregate_public_id=target,
+                event_type="transaction_correction_applied",
+                event_payload={"synthetic": "concurrent correction evidence"},
+                new_state={"amount": "999.00"},
+                actor_type="human",
+                actor_public_id="synthetic-actor",
+                correlation_public_id=target,
+                causation_public_id="d2-status-snapshot-race",
+                created_at="2026-09-23T00:00:00+00:00",
+            )
+            writer.execute("BEGIN IMMEDIATE")
+            append_financial_audit_event(writer, command)
+            writer.commit()
+
+        if by_reference:
+            original_status_read = posting_authority_module._get_status_in_snapshot
+
+            def after_reference_lookup(*args: object, **kwargs: object) -> object:
+                assert reader.in_transaction
+                commit_correction_evidence()
+                assert not has_committed_correction(reader, target)
+                return original_status_read(*args, **kwargs)
+
+            monkeypatch.setattr(
+                posting_authority_module, "_get_status_in_snapshot", after_reference_lookup
+            )
+            raced = get_status_by_reference(reader, reference=issued.reference, context=context)
+            monkeypatch.setattr(
+                posting_authority_module, "_get_status_in_snapshot", original_status_read
+            )
+        else:
+            original_correction_check = has_committed_correction
+
+            def after_correction_check(conn: sqlite3.Connection, target_id: str) -> bool:
+                before = original_correction_check(conn, target_id)
+                assert conn.in_transaction
+                assert not before
+                commit_correction_evidence()
+                assert not original_correction_check(conn, target_id)
+                return before
+
+            monkeypatch.setattr(
+                "finance_core.application.correction_schema.has_committed_correction",
+                after_correction_check,
+            )
+            raced = get_status(reader, review_public_id=review.review_public_id, context=context)
+            monkeypatch.setattr(
+                "finance_core.application.correction_schema.has_committed_correction",
+                original_correction_check,
+            )
+
+        # This call began on the pre-commit snapshot and may show original money.
+        assert raced == original
+        assert not reader.in_transaction
+        assert has_committed_correction(reader, target)
+        # The next call sees committed evidence and must not claim original money.
+        current = get_status(reader, review_public_id=review.review_public_id, context=context)
+        assert current.state == "needs_attention"
+        assert current.attention_reason == "local_current_lookup_required"
+        assert current.transaction_public_id is None
+        assert (current.amount, current.currency, current.transaction_date, current.merchant) == (
+            None,
+            None,
+            None,
+            None,
+        )
+    finally:
+        writer.close()
+        reader.close()
+
+
+@pytest.mark.parametrize("by_reference", [False, True])
+def test_status_joins_caller_transaction_without_ending_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_reference: bool
+) -> None:
+    conn, published = _published_text_card(tmp_path, monkeypatch)
+    context = HumanActionContext("111", "acct", "111", "binding")
+    review = prepare_posting_review(
+        conn,
+        review_idempotency_key="d2-status-caller-snapshot",
+        card_generation_public_id=published.card_generation_public_id,
+        context=context,
+        clock=lambda: 1002,
+    )
+    issued, _ = _issue_and_activate(
+        conn,
+        review_public_id=review.review_public_id,
+        key=b"d2-status-caller-snapshot-key",
+        context=context,
+        provider_message_id=213,
+    )
+    conn.execute("BEGIN")
+    try:
+        status = (
+            get_status_by_reference(conn, reference=issued.reference, context=context)
+            if by_reference
+            else get_status(conn, review_public_id=review.review_public_id, context=context)
+        )
+        assert status.state == "awaiting_confirmation"
+        assert conn.in_transaction
+        with pytest.raises(PostingAuthorityError, match="posting authority unavailable"):
+            if by_reference:
+                get_status_by_reference(conn, reference="invalid", context=context)
+            else:
+                get_status(conn, review_public_id="missing", context=context)
+        assert conn.in_transaction
+        conn.rollback()
+        with pytest.raises(PostingAuthorityError, match="posting authority unavailable"):
+            if by_reference:
+                get_status_by_reference(conn, reference="invalid", context=context)
+            else:
+                get_status(conn, review_public_id="missing", context=context)
+        assert not conn.in_transaction
+    finally:
+        conn.rollback()
+        conn.close()
 
 
 def test_finalized_catchup_revalidates_under_write_lock_before_event(
@@ -506,22 +733,22 @@ def test_finalized_catchup_revalidates_under_write_lock_before_event(
 
     def drift_before_lock(stage: str) -> None:
         if stage == "before_finalized_catchup_lock":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", drift_before_lock)
     status = resume_posting(conn, attempt_public_id=attempt_id, context=context)
-    assert status.state == "needs_attention"
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert status.state == "finalized"
     attempt = conn.execute(
         "SELECT stage, transaction_public_id FROM d2_posting_attempts WHERE attempt_public_id = ?",
         (attempt_id,),
     ).fetchone()
-    assert attempt["stage"] == "accepted"
-    assert attempt["transaction_public_id"] is None
+    assert attempt["stage"] == "finalized"
+    assert attempt["transaction_public_id"] == status.transaction_public_id
     assert (
         conn.execute("SELECT COUNT(*) FROM d2_posting_attempt_events").fetchone()[0]
-        == events_before
+        == events_before + 1
     )
 
 
@@ -549,8 +776,9 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
 
     def drift_after_financial_commit(stage: str) -> None:
         if stage == "after_text_finalization_commit":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(
         posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
@@ -564,14 +792,14 @@ def test_initial_text_finalization_uses_atomic_verified_catchup(
         callback_message_id=214,
         clock=lambda: 1004,
     )
-    assert status.state == "needs_attention"
+    assert status.state == "finalized"
     attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
-    assert attempt["stage"] == "accepted"
+    assert attempt["stage"] == "finalized"
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
         ).fetchone()[0]
-        == 0
+        == 1
     )
 
 
@@ -1257,7 +1485,7 @@ def test_finalized_personal_receipt_uses_frozen_participant_authority(
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
 
 
-def test_receipt_status_detects_canonical_transaction_drift_without_writes(
+def test_receipt_status_original_is_immutable_after_finalization(
     migrated_temp_db_connection: sqlite3.Connection,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1292,14 +1520,14 @@ def test_receipt_status_detects_canonical_transaction_drift_without_writes(
         ).state
         == "finalized"
     )
-    conn.execute("UPDATE transactions SET amount = 99.99")
-    conn.commit()
+    with pytest.raises(sqlite3.IntegrityError, match="finalized D2 transaction is immutable"):
+        conn.execute("UPDATE transactions SET amount = 99.99")
+    conn.rollback()
     before = conn.total_changes
     status = get_status(conn, review_public_id=review.review_public_id, context=context)
     assert conn.total_changes == before
-    assert status.state == "needs_attention"
-    assert status.transaction_public_id is None
-    assert status.attention_reason == "financial_authority_mismatch"
+    assert status.state == "finalized"
+    assert status.amount != "99.99"
 
 
 def test_receipt_finalization_catchup_ignores_later_participant_flag_changes(
@@ -1397,8 +1625,9 @@ def test_initial_receipt_finalization_uses_atomic_verified_catchup(
 
     def drift_after_financial_commit(stage: str) -> None:
         if stage == "after_receipt_finalization_commit":
-            conn.execute("UPDATE transactions SET amount = 99.99")
-            conn.commit()
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                conn.execute("UPDATE transactions SET amount = 99.99")
+            conn.rollback()
 
     monkeypatch.setattr(
         posting_authority_module, "_failure_injection_hook", drift_after_financial_commit
@@ -1412,14 +1641,14 @@ def test_initial_receipt_finalization_uses_atomic_verified_catchup(
         callback_message_id=313,
         clock=lambda: 1004,
     )
-    assert status.state == "needs_attention"
+    assert status.state == "finalized"
     attempt = conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()
-    assert attempt["stage"] == "conditional_authorization_persisted"
+    assert attempt["stage"] == "finalized"
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM d2_posting_attempt_events WHERE to_stage = 'finalized'"
         ).fetchone()[0]
-        == 0
+        == 1
     )
 
 
@@ -1479,6 +1708,15 @@ def test_receipt_crash_boundaries_resume_without_second_confirmation_or_duplicat
         conn.execute("SELECT attempt_public_id FROM d2_posting_attempts").fetchone()[0]
     )
     if failure_stage == "after_receipt_finalization_commit":
+        assert (
+            conn.execute("SELECT stage FROM d2_posting_attempts").fetchone()[0]
+            == "conditional_authorization_persisted"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE transactions SET amount = 99.99")
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("DELETE FROM transactions")
+        conn.rollback()
         before = conn.total_changes
         committed = get_status(conn, review_public_id=review.review_public_id, context=context)
         assert conn.total_changes == before

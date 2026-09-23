@@ -14,10 +14,11 @@ import hmac
 import json
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Iterator, Mapping
 
 from finance_core.calculation.authoritative_snapshot import (
     canonical_json_text,
@@ -2739,7 +2740,34 @@ def get_status(
     review_public_id: str,
     context: HumanActionContext,
 ) -> PostingStatus:
-    """Return stable D2 status using SELECTs only."""
+    """Return D2 status from one snapshot without taking a caller's transaction."""
+    with _status_read_snapshot(conn):
+        return _get_status_in_snapshot(conn, review_public_id=review_public_id, context=context)
+
+
+@contextmanager
+def _status_read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """Own a deferred read snapshot, or join an existing caller transaction."""
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN")
+    try:
+        yield
+        if owns_snapshot:
+            conn.commit()
+    except Exception:
+        if owns_snapshot and conn.in_transaction:
+            conn.rollback()
+        raise
+
+
+def _get_status_in_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    review_public_id: str,
+    context: HumanActionContext,
+) -> PostingStatus:
+    """Read all D2 and correction authority from the same SQLite snapshot."""
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
     _require_d2_schema(conn)
@@ -2904,6 +2932,18 @@ def get_status(
             if row["transaction_public_id"] not in {None, authoritative_transaction}:
                 integrity_error = True
             else:
+                # D2 verifies historical posting authority.  Once a correction
+                # exists, its original projection must never be labelled current.
+                from finance_core.application.correction_schema import has_committed_correction
+
+                if has_committed_correction(conn, authoritative_transaction):
+                    return PostingStatus(
+                        review_public_id=review_public_id,
+                        state="needs_attention",
+                        attempt_public_id=str(row["attempt_public_id"]),
+                        transaction_public_id=None,
+                        attention_reason="local_current_lookup_required",
+                    )
                 transaction = conn.execute(
                     "SELECT amount, currency, transaction_date, merchant, account_id "
                     "FROM transactions WHERE public_id = ?",
@@ -2984,7 +3024,17 @@ def get_status_by_reference(
     reference: str,
     context: HumanActionContext,
 ) -> PostingStatus:
-    """Resolve a D2 review from its opaque Confirm capability using SELECTs only."""
+    """Resolve a D2 review and its status from the same read snapshot."""
+    with _status_read_snapshot(conn):
+        return _get_status_by_reference_in_snapshot(conn, reference=reference, context=context)
+
+
+def _get_status_by_reference_in_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    reference: str,
+    context: HumanActionContext,
+) -> PostingStatus:
     require_staging_database(conn)
     _require_d2_schema(conn)
     _require_context(context)

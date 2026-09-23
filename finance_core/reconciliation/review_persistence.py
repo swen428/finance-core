@@ -18,8 +18,13 @@ import json
 import sqlite3
 from typing import Any, Sequence
 
+from finance_core.application.correction_schema import verify_correction_schema
 from finance_core.reconciliation.models import (
     ReviewQueueItem,
+)
+from finance_core.reconciliation.source_binding import (
+    build_source_binding,
+    load_bound_queue,
 )
 
 
@@ -54,8 +59,14 @@ class ReviewQueuePersistence:
     ) -> int:
         """Insert review queue items into reconciliation_review_queue.
 
-        Returns the number of rows inserted.
+        Returns the number of new rows. A replay of an identical 051-bound
+        source is a no-op. This method never commits a caller-owned transaction.
         """
+        bound_schema = verify_correction_schema(self._conn)
+        ids = [item.queue_item_id for item in items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("review queue IDs must be unique")
+        bindings = [build_source_binding(item) if bound_schema else None for item in items]
         rows = [
             (
                 item.queue_item_id,
@@ -68,24 +79,48 @@ class ReviewQueuePersistence:
                 _app_ref(item),
                 str(item.candidate.confidence_score),
                 _serialize_reason_codes(item),
-                _serialize_evidence(item),
+                _serialize_evidence(item, source_binding=binding),
             )
-            for item in items
+            for item, binding in zip(items, bindings, strict=True)
         ]
 
-        self._conn.executemany(
-            """
-            INSERT INTO reconciliation_review_queue (
-                public_id, run_public_id, candidate_id, issue_type,
-                suggested_action, priority, statement_transaction_ref,
-                app_transaction_ref, confidence_score,
-                reason_codes_json, evidence_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        self._conn.commit()
-        return len(rows)
+        self._conn.execute("SAVEPOINT review_queue_registration")
+        try:
+            inserted = 0
+            for row in rows:
+                existing = self._conn.execute(
+                    "SELECT run_public_id, candidate_id, issue_type, suggested_action, "
+                    "priority, statement_transaction_ref, app_transaction_ref, "
+                    "confidence_score, reason_codes_json, evidence_json "
+                    "FROM reconciliation_review_queue "
+                    "WHERE public_id = ?",
+                    (row[0],),
+                ).fetchone()
+                if existing is not None:
+                    if not bound_schema:
+                        raise sqlite3.IntegrityError("review queue ID already exists")
+                    bound = load_bound_queue(self._conn, row[0])
+                    assert bound is not None
+                    proposed = json.loads(row[10])["source_binding"]
+                    if bound.sha256 != proposed["sha256"] or tuple(existing) != row[1:11]:
+                        raise ValueError("review queue replay conflicts with bound source")
+                    continue
+                self._conn.execute(
+                    """INSERT INTO reconciliation_review_queue (
+                        public_id, run_public_id, candidate_id, issue_type,
+                        suggested_action, priority, statement_transaction_ref,
+                        app_transaction_ref, confidence_score,
+                        reason_codes_json, evidence_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    row,
+                )
+                inserted += 1
+            self._conn.execute("RELEASE SAVEPOINT review_queue_registration")
+            return inserted
+        except BaseException:
+            self._conn.execute("ROLLBACK TO SAVEPOINT review_queue_registration")
+            self._conn.execute("RELEASE SAVEPOINT review_queue_registration")
+            raise
 
     # ------------------------------------------------------------------
     # Read
@@ -185,7 +220,9 @@ def _serialize_reason_codes(item: ReviewQueueItem) -> str:
     return json.dumps(codes, sort_keys=True, separators=(",", ":"))
 
 
-def _serialize_evidence(item: ReviewQueueItem) -> str:
+def _serialize_evidence(
+    item: ReviewQueueItem, *, source_binding: dict[str, Any] | None = None
+) -> str:
     cand = item.candidate
     evidence: dict[str, Any] = {
         "candidate_id": cand.candidate_id,
@@ -209,7 +246,24 @@ def _serialize_evidence(item: ReviewQueueItem) -> str:
         evidence["app_amount"] = str(app.amount)
         evidence["app_currency"] = app.currency
         evidence["app_txn_date"] = app.transaction_date.isoformat()
-    return json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    evidence["all_app_transactions"] = [
+        {
+            "app_txn_id": app.app_txn_id,
+            "transaction_date": app.transaction_date.isoformat(),
+            "merchant": app.merchant,
+            "amount": str(app.amount),
+            "currency": app.currency,
+            "source_type": app.source_type,
+            "source_channel": app.source_channel,
+            "normalized_merchant": app.normalized_merchant,
+            "posted_date": app.posted_date.isoformat() if app.posted_date else None,
+            "transaction_type": app.transaction_type,
+        }
+        for app in cand.all_app_transactions
+    ]
+    if source_binding is not None:
+        evidence["source_binding"] = source_binding
+    return json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _statement_ref(item: ReviewQueueItem) -> str | None:

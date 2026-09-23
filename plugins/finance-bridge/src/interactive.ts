@@ -35,6 +35,10 @@ export const POSTING_OUTCOME_UNKNOWN_REPLY =
 export const POSTING_NEEDS_ATTENTION_REPLY =
   "Finance posting needs attention. No new confirmation was created; request the current " +
   "Finance record.";
+export const POSTING_LOCAL_LOOKUP_REPLY =
+  "This transaction has a later correction. The original posting card cannot show its " +
+  "current amount. Use the local Finance correction show command to view the verified " +
+  "current record and history.";
 export const EDIT_PRESENTATION_FAILURE_REPLY =
   "Finance edit session was started, but the updated card could not be displayed safely. " +
   "Request the current Finance record.";
@@ -476,6 +480,7 @@ interface PostingStatusResult {
   currency?: string;
   transactionDate?: string;
   merchant?: string;
+  attentionReason?: string;
 }
 
 function requirePostingStatus(result: JsonObject): PostingStatusResult {
@@ -502,8 +507,17 @@ function requirePostingStatus(result: JsonObject): PostingStatusResult {
     throw new Error("D2 final transaction status is inconsistent.");
   }
   if (!finalized) {
+    if (result.attention_reason === "local_current_lookup_required" &&
+        (result.state !== "needs_attention" || result.transaction_public_id !== null ||
+         result.amount !== null || result.currency !== null ||
+         result.transaction_date !== null || result.merchant !== null ||
+         result.account !== null || result.final_transaction_created)) {
+      throw new Error("D2 corrected status contains a stale transaction projection.");
+    }
     return {
       state: result.state as PostingStatusResult["state"],
+      ...(typeof result.attention_reason === "string"
+        ? { attentionReason: result.attention_reason } : {}),
       ...(typeof result.attempt_public_id === "string"
         ? { attemptPublicId: result.attempt_public_id } : {}),
     };
@@ -620,7 +634,8 @@ async function handlePostingAction(
     return { handled: true };
   }
   if (status?.state === "needs_attention" || status?.state === "rejected") {
-    await context.reply(POSTING_NEEDS_ATTENTION_REPLY).catch(() => undefined);
+    await context.reply(status.attentionReason === "local_current_lookup_required"
+      ? POSTING_LOCAL_LOOKUP_REPLY : POSTING_NEEDS_ATTENTION_REPLY).catch(() => undefined);
     return { handled: true };
   }
   await context.reply(POSTING_OUTCOME_UNKNOWN_REPLY).catch(() => undefined);

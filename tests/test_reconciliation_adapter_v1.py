@@ -25,7 +25,10 @@ import sqlite3
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
+
+import pytest
 
 from finance_core.reconciliation.adapter import CandidateFilter, InternalCandidateAdapter
 from finance_core.reconciliation.models import InternalCandidate
@@ -82,6 +85,45 @@ def _seed_transaction(
 
 def _make_adapter(conn: sqlite3.Connection) -> InternalCandidateAdapter:
     return InternalCandidateAdapter(conn)
+
+
+def test_effective_fields_are_verified_before_filter_order_and_count(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = migrated_temp_db_connection
+    _seed_transaction(
+        conn, "txn-corrected", merchant="Old", amount=Decimal("5.00"), transaction_date="2024-01-01"
+    )
+    _seed_transaction(
+        conn,
+        "txn-original",
+        merchant="Other",
+        amount=Decimal("7.00"),
+        transaction_date="2024-06-01",
+    )
+    monkeypatch.setattr(
+        "finance_core.reconciliation.adapter.has_committed_correction",
+        lambda _conn, target: target == "txn-corrected",
+    )
+    effective = SimpleNamespace(
+        target_id="txn-corrected",
+        fields=SimpleNamespace(
+            amount="12.34", currency="USD", transaction_date="2024-12-01", merchant="New Shop"
+        ),
+    )
+    adapter = InternalCandidateAdapter(conn, effective_reader=lambda _conn, _id: effective)
+    filters = CandidateFilter(merchant_like="new%", date_from="2024-11-01", currency="USD")
+    candidates = adapter.fetch_candidates(filters)
+    assert [candidate.internal_id for candidate in candidates] == ["txn-corrected"]
+    assert candidates[0].amount == Decimal("12.34")
+    assert adapter.candidate_count(filters) == 1
+    assert [candidate.internal_id for candidate in adapter.fetch_candidates()] == [
+        "txn-original",
+        "txn-corrected",
+    ]
+    with pytest.raises(ValueError, match="trusted_effective_reader"):
+        InternalCandidateAdapter(conn).fetch_candidates(CandidateFilter(merchant_like="no-match"))
 
 
 # ---------------------------------------------------------------------------
