@@ -45,14 +45,19 @@ def _expected_objects() -> dict[tuple[str, str], str]:
 
 def _normalize(sql: str) -> str:
     uncommented = re.sub(r"(?m)^\s*--[^\n]*", "", sql)
-    return re.sub(r"\s+", " ", uncommented.strip().rstrip(";")).lower()
+    # SQLite omits migration comments and the statement terminator in sqlite_master.
+    # Compare everything else exactly: literal case and whitespace affect predicates.
+    return uncommented.strip().rstrip(";").strip()
 
 
 def _has_correction_objects(conn: sqlite3.Connection) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE name LIKE 'correction_%' "
-        "OR name LIKE 'trg_correction_%' LIMIT 1"
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name LIKE 'correction_%' "
+            "OR name LIKE 'trg_correction_%' LIMIT 1"
+        ).fetchone()
+        is not None
+    )
 
 
 def verify_correction_schema(conn: sqlite3.Connection) -> bool:
@@ -110,17 +115,23 @@ def verify_correction_schema(conn: sqlite3.Connection) -> bool:
 
 def has_committed_correction(conn: sqlite3.Connection, target_id: str) -> bool:
     """Refuse orphan audit evidence; never expose an older value as current."""
-    audit_exists = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='financial_audit_events'"
-    ).fetchone() is not None
+    audit_exists = (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='financial_audit_events'"
+        ).fetchone()
+        is not None
+    )
     if audit_exists:
         try:
-            audit_present = conn.execute(
-                """SELECT 1 FROM financial_audit_events
+            audit_present = (
+                conn.execute(
+                    """SELECT 1 FROM financial_audit_events
                    WHERE aggregate_type = 'transaction' AND aggregate_public_id = ?
                      AND event_type = 'transaction_correction_applied' LIMIT 1""",
-                (target_id,),
-            ).fetchone() is not None
+                    (target_id,),
+                ).fetchone()
+                is not None
+            )
         except sqlite3.Error as exc:
             raise CorrectionSchemaError("Financial audit table is malformed") from exc
     else:

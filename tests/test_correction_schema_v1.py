@@ -77,6 +77,34 @@ def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:
         conn.close()
 
 
+@pytest.mark.parametrize("altered_literal", ("'FINALIZED'", "'finalized '"))
+def test_schema_refuses_changed_trigger_literal(altered_literal: str) -> None:
+    conn = _db()
+    try:
+        conn.execute("INSERT INTO d2_posting_attempts VALUES ('txn-1', 'finalized')")
+        conn.commit()
+        assert verify_correction_schema(conn)
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            conn.execute("UPDATE transactions SET public_id = 'changed' WHERE public_id = 'txn-1'")
+        conn.rollback()
+
+        trigger = "trg_correction_transactions_no_update"
+        original_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger,),
+        ).fetchone()[0]
+        assert original_sql.count("a.stage = 'finalized'") == 1
+        conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute(original_sql.replace("a.stage = 'finalized'", f"a.stage = {altered_literal}"))
+
+        with pytest.raises(CorrectionSchemaError, match=trigger):
+            verify_correction_schema(conn)
+        conn.execute("UPDATE transactions SET public_id = 'changed' WHERE public_id = 'txn-1'")
+        assert conn.execute("SELECT public_id FROM transactions").fetchone()[0] == "changed"
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     "column,value",
     (
@@ -86,9 +114,7 @@ def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:
         ("checksum_sha256", "0" * 64),
     ),
 )
-def test_schema_refuses_tampered_051_ledger_identity(
-    column: str, value: str | int
-) -> None:
+def test_schema_refuses_tampered_051_ledger_identity(column: str, value: str | int) -> None:
     conn = _db()
     try:
         conn.execute(f"UPDATE schema_migrations SET {column} = ?", (value,))
