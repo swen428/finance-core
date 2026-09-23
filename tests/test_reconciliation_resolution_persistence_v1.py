@@ -408,7 +408,8 @@ def test_successful_resolution_replay_refuses_corrected_target_under_lock(
         qid = _persist_matched_item(rqp)
         item = _row_to_queue_item(rqp, qid)
         decision = ResolutionDecision(
-            decision_id="dec-corrected-target", queue_item_id=qid,
+            decision_id="dec-corrected-target",
+            queue_item_id=qid,
             action=ResolutionAction.CONFIRM_MATCH,
         )
         rp.apply_resolution(item, decision)
@@ -442,7 +443,8 @@ def test_resolution_caller_transaction_is_not_committed() -> None:
         conn.execute("BEGIN")
         conn.execute("INSERT INTO caller_marker VALUES ('pending')")
         decision = ResolutionDecision(
-            decision_id="dec-caller-owned", queue_item_id=qid,
+            decision_id="dec-caller-owned",
+            queue_item_id=qid,
             action=ResolutionAction.CONFIRM_MATCH,
         )
         with pytest.raises(RuntimeError, match="caller-owned"):

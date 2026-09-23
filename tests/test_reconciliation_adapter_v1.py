@@ -92,10 +92,16 @@ def test_effective_fields_are_verified_before_filter_order_and_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = migrated_temp_db_connection
-    _seed_transaction(conn, "txn-corrected", merchant="Old", amount=Decimal("5.00"),
-                      transaction_date="2024-01-01")
-    _seed_transaction(conn, "txn-original", merchant="Other", amount=Decimal("7.00"),
-                      transaction_date="2024-06-01")
+    _seed_transaction(
+        conn, "txn-corrected", merchant="Old", amount=Decimal("5.00"), transaction_date="2024-01-01"
+    )
+    _seed_transaction(
+        conn,
+        "txn-original",
+        merchant="Other",
+        amount=Decimal("7.00"),
+        transaction_date="2024-06-01",
+    )
     monkeypatch.setattr(
         "finance_core.reconciliation.adapter.has_committed_correction",
         lambda _conn, target: target == "txn-corrected",
@@ -107,15 +113,14 @@ def test_effective_fields_are_verified_before_filter_order_and_count(
         ),
     )
     adapter = InternalCandidateAdapter(conn, effective_reader=lambda _conn, _id: effective)
-    filters = CandidateFilter(
-        merchant_like="new%", date_from="2024-11-01", currency="USD"
-    )
+    filters = CandidateFilter(merchant_like="new%", date_from="2024-11-01", currency="USD")
     candidates = adapter.fetch_candidates(filters)
     assert [candidate.internal_id for candidate in candidates] == ["txn-corrected"]
     assert candidates[0].amount == Decimal("12.34")
     assert adapter.candidate_count(filters) == 1
     assert [candidate.internal_id for candidate in adapter.fetch_candidates()] == [
-        "txn-original", "txn-corrected"
+        "txn-original",
+        "txn-corrected",
     ]
     with pytest.raises(ValueError, match="trusted_effective_reader"):
         InternalCandidateAdapter(conn).fetch_candidates(CandidateFilter(merchant_like="no-match"))

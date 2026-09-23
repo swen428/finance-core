@@ -432,9 +432,10 @@ def _legacy_mutation_block_reason(
     conn: sqlite3.Connection, inp: FinalMutationWorkflowInput
 ) -> str | None:
     proposal = inp.proposal
-    refs = {ref for ref in (
-        proposal.target_transaction_id, proposal.source_app_transaction_ref
-    ) if ref}
+    reason_type = FinalMutationWorkflowBlockReason
+    refs = {
+        ref for ref in (proposal.target_transaction_id, proposal.source_app_transaction_ref) if ref
+    }
     # A completed CREATE replay can also expose its old result ID even when
     # the incoming proposal only carries source references.
     prior = conn.execute(
@@ -445,42 +446,45 @@ def _legacy_mutation_block_reason(
     if prior is not None and prior[0]:
         refs.add(str(prior[0]))
     if any(has_committed_correction(conn, ref) for ref in sorted(refs)):
-        return (
-            FinalMutationWorkflowBlockReason
-            .CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION.value
-        )
+        return reason_type.CORRECTED_TRANSACTION_REQUIRES_VERSIONED_RECONCILIATION.value
     if proposal.action == FinalMutationAction.ADJUST_FINAL_TRANSACTION:
         target = proposal.target_transaction_id
         if target and _is_d2_finalized_original(conn, target):
-            return (
-                FinalMutationWorkflowBlockReason
-                .D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION.value
-            )
+            return reason_type.D2_FINALIZED_TRANSACTION_REQUIRES_CONTROLLED_CORRECTION.value
     return None
 
 
 def _is_d2_finalized_original(conn: sqlite3.Connection, target_id: str) -> bool:
     if _table_exists(conn, "d2_posting_attempts"):
-        if conn.execute(
-            "SELECT 1 FROM d2_posting_attempts "
-            "WHERE transaction_public_id = ? AND stage = 'finalized' LIMIT 1",
-            (target_id,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM d2_posting_attempts "
+                "WHERE transaction_public_id = ? AND stage = 'finalized' LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
             return True
     if _table_exists(conn, "parser_proposal_conversion_audit"):
-        if conn.execute(
-            "SELECT 1 FROM parser_proposal_conversion_audit AS conversion "
-            "JOIN transactions AS txn ON txn.id = conversion.transaction_id "
-            "WHERE txn.public_id = ? LIMIT 1",
-            (target_id,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM parser_proposal_conversion_audit AS conversion "
+                "JOIN transactions AS txn ON txn.id = conversion.transaction_id "
+                "WHERE txn.public_id = ? LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
             return True
     if _table_exists(conn, "receipt_finalization_audit"):
-        if conn.execute(
-            "SELECT 1 FROM receipt_finalization_audit "
-            "WHERE transaction_public_id = ? AND status = 'finalized' LIMIT 1",
-            (target_id,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM receipt_finalization_audit "
+                "WHERE transaction_public_id = ? AND status = 'finalized' LIMIT 1",
+                (target_id,),
+            ).fetchone()
+            is not None
+        ):
             return True
     return False
 

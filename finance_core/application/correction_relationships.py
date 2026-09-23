@@ -190,16 +190,27 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
     )
     for row in results:
         action = row["decision_action"]
-        if action not in {"confirm_match", "mark_duplicate"}:
-            continue
         label = f"resolution:{row['result_id']}"
         evidence = _object(row["audit_evidence_json"], label)
         queue_ref = row["app_transaction_ref"]
         evidence_ref = evidence.get("app_txn_id")
         canonical_ref = evidence.get("canonical_app_transaction_ref")
         payload_target = evidence.get("payload_target_app_txn_id")
-        ids = {value for value in (queue_ref, evidence_ref) if type(value) is str and value}
-        if action == "mark_duplicate":
+        evidence_action = evidence.get("resolution_action")
+        ids = {
+            value
+            for value in (queue_ref, evidence_ref, canonical_ref, payload_target)
+            if type(value) is str and value
+        }
+        duplicate_claim = (
+            action == "mark_duplicate"
+            or evidence_action == "mark_duplicate"
+            or any(
+                key in evidence
+                for key in ("duplicate_app_txn_ids", "kept_app_txn_id", "audit_only")
+            )
+        )
+        if duplicate_claim:
             duplicates = evidence.get("duplicate_app_txn_ids")
             kept = evidence.get("kept_app_txn_id")
             complete = (
@@ -223,7 +234,38 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         if target_id not in ids:
             continue
         if (
-            row["decision_queue_id"] != row["review_queue_public_id"]
+            action
+            in {
+                "adjust_app_transaction",
+                "create_missing_app_transaction",
+                "mark_statement_only",
+                "ignore",
+                "needs_more_info",
+            }
+            and evidence_action == action
+            and row["decision_queue_id"] == row["review_queue_public_id"]
+            and row["queue_status"]
+            == (
+                "ignored"
+                if action == "ignore"
+                else "needs_more_info"
+                if action == "needs_more_info"
+                else "resolved"
+            )
+            and type(queue_ref) is str
+            and queue_ref == evidence_ref
+            and canonical_ref is None
+            and payload_target is None
+            and not duplicate_claim
+        ):
+            # A coherent non-classification success can mention the target
+            # without creating a finalized relationship.
+            continue
+        if (
+            action not in {"confirm_match", "mark_duplicate"}
+            or (evidence_action is not None and evidence_action != action)
+            or duplicate_claim != (action == "mark_duplicate")
+            or row["decision_queue_id"] != row["review_queue_public_id"]
             or row["queue_status"] != "resolved"
             or type(queue_ref) is not str
             or type(evidence_ref) is not str
@@ -238,42 +280,105 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
 def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
     results = _rows(
         conn,
-        """SELECT apply_id, action, payload_json, app_transaction_reference_json
-        FROM reconciliation_apply_results WHERE success = 1
-        AND action IN ('confirm_match', 'mark_duplicate') ORDER BY apply_id""",
+        """SELECT apply_id, action, payload_json, audit_evidence_json,
+        app_transaction_reference_json
+        FROM reconciliation_apply_results WHERE success = 1 ORDER BY apply_id""",
         (),
     )
     for row in results:
         label = f"reconciliation-apply:{row['apply_id']}"
         payload = _object(row["payload_json"], label)
+        evidence = _object(row["audit_evidence_json"], label)
         app_ref = _optional_ref(row["app_transaction_reference_json"], label)
         action = row["action"]
-        if action == "confirm_match":
+        payload_action = payload.get("action_type")
+        evidence_action = evidence.get("resolution_action")
+        evidence_ref = evidence.get("app_txn_id")
+        duplicate_claim = (
+            action == "mark_duplicate"
+            or payload_action == "mark_duplicate"
+            or evidence_action == "mark_duplicate"
+            or any(
+                key in payload for key in ("duplicate_app_txn_ids", "kept_app_txn_id", "audit_only")
+            )
+        )
+        if duplicate_claim:
+            duplicates = payload.get("duplicate_app_txn_ids")
+            kept = payload.get("kept_app_txn_id")
+            if (
+                type(duplicates) is not list
+                or len(duplicates) < 2
+                or not all(type(value) is str and value for value in duplicates)
+                or len(set(duplicates)) != len(duplicates)
+                or type(kept) is not str
+                or kept not in duplicates
+                or payload.get("audit_only") is not True
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            ids = set(cast(list[str], duplicates))
+            ids.update(
+                value
+                for value in (kept, app_ref, payload.get("app_txn_id"), evidence_ref)
+                if type(value) is str and value
+            )
+            if target_id not in ids:
+                continue
+            if (
+                action != "mark_duplicate"
+                or payload_action != "mark_duplicate"
+                or (evidence_action is not None and evidence_action != action)
+                or (app_ref is not None and app_ref not in cast(list[str], duplicates))
+                or "app_txn_id" in payload
+                or (evidence_ref is not None and evidence_ref not in cast(list[str], duplicates))
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            _refuse("ACTIVE_RELATIONSHIP", label)
+        if (
+            action == "confirm_match"
+            or payload_action == "confirm_match"
+            or evidence_action == "confirm_match"
+        ):
             canonical_id = payload.get("app_txn_id")
             if type(canonical_id) is not str or not canonical_id:
                 _refuse("UNKNOWN_INTEGRITY", label)
-            if target_id not in {canonical_id, app_ref}:
+            if target_id not in (canonical_id, app_ref, evidence_ref):
                 continue
-            if app_ref != canonical_id or payload.get("action_type") != action:
+            if (
+                app_ref != canonical_id
+                or payload_action != action
+                or (evidence_action is not None and evidence_action != action)
+                or (evidence_ref is not None and evidence_ref != canonical_id)
+            ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             _refuse("ACTIVE_RELATIONSHIP", label)
-        duplicates = payload.get("duplicate_app_txn_ids")
-        kept = payload.get("kept_app_txn_id")
-        if (
-            type(duplicates) is not list
-            or len(duplicates) < 2
-            or not all(type(value) is str and value for value in duplicates)
-            or len(set(duplicates)) != len(duplicates)
-            or type(kept) is not str
-            or kept not in duplicates
-            or payload.get("audit_only") is not True
-        ):
-            _refuse("UNKNOWN_INTEGRITY", label)
-        if target_id not in set(cast(list[str], duplicates)) | {kept, app_ref}:
-            continue
-        if app_ref is not None and app_ref not in cast(list[str], duplicates):
-            _refuse("UNKNOWN_INTEGRITY", label)
-        _refuse("ACTIVE_RELATIONSHIP", label)
+        payload_ref = payload.get("app_txn_id")
+        if target_id in (app_ref, evidence_ref, payload_ref):
+            if type(action) is not str:
+                _refuse("UNKNOWN_INTEGRITY", label)
+            expected_payload_action = {
+                "adjust_app_transaction": "proposal",
+                "create_missing_app_transaction": "proposal",
+                "mark_statement_only": "mark_statement_only",
+                "ignore": "ignore",
+                "needs_more_info": "needs_more_info",
+            }.get(action)
+            if (
+                expected_payload_action is None
+                or payload_action != expected_payload_action
+                or evidence_action != action
+                or app_ref != evidence_ref
+                or (action == "adjust_app_transaction" and payload_ref != app_ref)
+                or (action != "adjust_app_transaction" and payload_ref is not None)
+                or (
+                    action in {"adjust_app_transaction", "create_missing_app_transaction"}
+                    and payload.get("proposal_type") != action
+                )
+                or (action == "ignore" and payload.get("skipped") is not True)
+                or (
+                    action == "needs_more_info" and payload.get("status") != "pending_investigation"
+                )
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
 
 
 def _guarded_apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
@@ -319,9 +424,8 @@ def _guarded_apply_relationships(conn: sqlite3.Connection, target_id: str) -> No
             or execution["operations_executed"] != executed
             or execution["operations_blocked"] != blocked
             or execution["operations_skipped"] != skipped
-            or execution["execution_status"] not in {
-                "executed", "blocked", "partially_blocked", "unsupported", "conflict"
-            }
+            or execution["execution_status"]
+            not in {"executed", "blocked", "partially_blocked", "unsupported", "conflict"}
         ):
             _refuse("UNKNOWN_INTEGRITY", label)
         if execution["execution_status"] == "executed" and executed != len(siblings):

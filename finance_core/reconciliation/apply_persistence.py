@@ -57,7 +57,8 @@ def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyRes
     if result.action.value == "confirm_match":
         target = payload.get("app_txn_id")
         if (
-            not isinstance(target, str) or not target
+            not isinstance(target, str)
+            or not target
             or payload.get("action_type") != "confirm_match"
             or result.app_transaction_reference != target
         ):
@@ -75,8 +76,10 @@ def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyRes
             or kept not in duplicates
             or payload.get("action_type") != "mark_duplicate"
             or payload.get("audit_only") is not True
-            or (result.app_transaction_reference is not None
-                and result.app_transaction_reference not in duplicates)
+            or (
+                result.app_transaction_reference is not None
+                and result.app_transaction_reference not in duplicates
+            )
         ):
             raise ValueError("successful duplicate classification has incomplete app targets")
         targets.update(duplicates)

@@ -294,7 +294,8 @@ def _conn() -> sqlite3.Connection:
         );
         CREATE TABLE reconciliation_apply_results (
             apply_id TEXT, action TEXT, payload_json TEXT,
-            app_transaction_reference_json TEXT, success INTEGER
+            app_transaction_reference_json TEXT, success INTEGER,
+            audit_evidence_json TEXT NOT NULL DEFAULT '{}'
         );
         CREATE TABLE reconciliation_final_mutation_audit (
             final_mutation_id TEXT, action TEXT, status TEXT,
@@ -326,23 +327,35 @@ def _source(route: str = "text") -> SimpleNamespace:
 
 
 def _guarded_claim(
-    conn: sqlite3.Connection, *, claim_id: str, target_id: str,
-    dry_run: int = 1, execution_status: str = "executed",
-    operation_status: str = "executed", payload: str | None = None,
+    conn: sqlite3.Connection,
+    *,
+    claim_id: str,
+    target_id: str,
+    dry_run: int = 1,
+    execution_status: str = "executed",
+    operation_status: str = "executed",
+    payload: str | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO reconciliation_guarded_apply_executions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            claim_id, execution_status, 1,
+            claim_id,
+            execution_status,
+            1,
             1 if execution_status == "executed" else 0,
             1 if execution_status == "blocked" else 0,
-            0, dry_run, json.dumps({"is_dry_run": bool(dry_run)}),
+            0,
+            dry_run,
+            json.dumps({"is_dry_run": bool(dry_run)}),
         ),
     )
     conn.execute(
         "INSERT INTO reconciliation_guarded_apply_operation_results VALUES (?, ?, ?, ?, ?, ?)",
         (
-            f"op-{claim_id}", claim_id, operation_status, 1,
+            f"op-{claim_id}",
+            claim_id,
+            operation_status,
+            1,
             "confirm_match",
             payload if payload is not None else json.dumps({"app_transaction_ref": target_id}),
         ),
@@ -369,13 +382,20 @@ def test_valid_guarded_dry_run_and_unrelated_claim_leave_target_clear() -> None:
     ],
 )
 def test_related_guarded_claim_with_impossible_or_malformed_state_is_unknown(
-    dry_run: int, execution_status: str, operation_status: str, payload: str | None,
+    dry_run: int,
+    execution_status: str,
+    operation_status: str,
+    payload: str | None,
 ) -> None:
     conn = _conn()
     try:
         _guarded_claim(
-            conn, claim_id="bad-target", target_id="txn-1", dry_run=dry_run,
-            execution_status=execution_status, operation_status=operation_status,
+            conn,
+            claim_id="bad-target",
+            target_id="txn-1",
+            dry_run=dry_run,
+            execution_status=execution_status,
+            operation_status=operation_status,
             payload=payload,
         )
         with pytest.raises(CorrectionRelationshipError) as blocked:
@@ -390,7 +410,9 @@ def test_clear_target_ignores_proposals_failed_results_and_blocked_attempts() ->
     conn = _conn()
     try:
         conn.execute(
-            "INSERT INTO reconciliation_apply_results VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+            "VALUES (?, ?, ?, ?, ?)",
             ("failed-1", "mark_duplicate", "{}", None, 0),
         )
         conn.execute(
@@ -429,7 +451,9 @@ def test_duplicate_secondary_reference_is_active_and_missing_list_is_unknown() -
             "audit_only": True,
         }
         conn.execute(
-            "INSERT INTO reconciliation_apply_results VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+            "VALUES (?, ?, ?, ?, ?)",
             ("apply-1", "mark_duplicate", json.dumps(payload), json.dumps("kept-1"), 1),
         )
         with pytest.raises(CorrectionRelationshipError) as active:
@@ -438,7 +462,9 @@ def test_duplicate_secondary_reference_is_active_and_missing_list_is_unknown() -
         assert active.value.evidence_ids == ("reconciliation-apply:apply-1",)
         conn.execute("DELETE FROM reconciliation_apply_results")
         conn.execute(
-            "INSERT INTO reconciliation_apply_results VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+            "VALUES (?, ?, ?, ?, ?)",
             ("apply-bad", "mark_duplicate", "{}", None, 1),
         )
         with pytest.raises(CorrectionRelationshipError) as unknown:
@@ -508,5 +534,295 @@ def test_successful_resolution_requires_complete_matching_target_claim() -> None
         with pytest.raises(CorrectionRelationshipError) as unknown:
             assert_correction_eligible(conn, _source())
         assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("action", ["confirm_match", "mark_duplicate"])
+def test_successful_resolution_action_change_cannot_hide_target(action: str) -> None:
+    conn = _conn()
+    try:
+        kept = "txn-1" if action == "confirm_match" else "kept-1"
+        conn.execute(
+            "INSERT INTO reconciliation_review_queue VALUES ('queue-1', ?, 'resolved')",
+            (kept,),
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_decisions VALUES ('decision-1', 'queue-1', ?)",
+            (action,),
+        )
+        evidence = {
+            "resolution_action": action,
+            "app_txn_id": kept,
+            "canonical_app_transaction_ref": kept,
+            "payload_target_app_txn_id": kept,
+        }
+        if action == "mark_duplicate":
+            evidence.update(
+                duplicate_app_txn_ids=[kept, "txn-1"],
+                kept_app_txn_id=kept,
+                audit_only=True,
+            )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+            ("result-1", json.dumps(evidence), "decision-1", "queue-1"),
+        )
+        with pytest.raises(CorrectionRelationshipError) as active:
+            assert_correction_eligible(conn, _source())
+        assert active.value.classification == "ACTIVE_RELATIONSHIP"
+
+        conn.execute(
+            "UPDATE reconciliation_resolution_decisions SET decision_action = 'ignore' "
+            "WHERE public_id = 'decision-1'"
+        )
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == ("resolution:result-1",)
+    finally:
+        conn.close()
+
+
+def test_resolution_separate_decision_and_result_disagreement_refuses() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO reconciliation_review_queue VALUES ('queue-1', 'txn-1', 'resolved')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_decisions VALUES "
+            "('decision-1', 'queue-1', 'ignore')"
+        )
+        evidence = {
+            "resolution_action": "confirm_match",
+            "app_txn_id": "txn-1",
+            "canonical_app_transaction_ref": "txn-1",
+            "payload_target_app_txn_id": "txn-1",
+        }
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+            ("result-1", json.dumps(evidence), "decision-1", "queue-1"),
+        )
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == ("resolution:result-1",)
+    finally:
+        conn.close()
+
+
+def test_resolution_changed_action_with_legacy_missing_claim_fields_refuses() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO reconciliation_review_queue VALUES ('queue-1', 'txn-1', 'resolved')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_decisions VALUES "
+            "('decision-1', 'queue-1', 'ignore')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+            ("result-1", json.dumps({"app_txn_id": "txn-1"}), "decision-1", "queue-1"),
+        )
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == ("resolution:result-1",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("action", ["confirm_match", "mark_duplicate"])
+def test_successful_apply_action_change_cannot_hide_target(action: str) -> None:
+    conn = _conn()
+    try:
+        if action == "confirm_match":
+            payload = {"action_type": action, "app_txn_id": "txn-1"}
+            app_ref = "txn-1"
+        else:
+            payload = {
+                "action_type": action,
+                "duplicate_app_txn_ids": ["kept-1", "txn-1"],
+                "kept_app_txn_id": "kept-1",
+                "audit_only": True,
+            }
+            app_ref = "kept-1"
+        conn.execute(
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("apply-1", action, json.dumps(payload), json.dumps(app_ref)),
+        )
+        with pytest.raises(CorrectionRelationshipError) as active:
+            assert_correction_eligible(conn, _source())
+        assert active.value.classification == "ACTIVE_RELATIONSHIP"
+
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET action = 'ignore' WHERE apply_id = 'apply-1'"
+        )
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == ("reconciliation-apply:apply-1",)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("audit_action", ["confirm_match", None])
+def test_apply_changed_action_with_erased_payload_claim_refuses(audit_action: str | None) -> None:
+    conn = _conn()
+    try:
+        evidence = {"app_txn_id": "txn-1"}
+        if audit_action is not None:
+            evidence["resolution_action"] = audit_action
+        conn.execute(
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, "
+            "success, audit_evidence_json) VALUES (?, ?, ?, ?, 1, ?)",
+            (
+                "apply-1",
+                "ignore",
+                json.dumps({"action_type": "ignore", "skipped": True}),
+                json.dumps("txn-1"),
+                json.dumps(evidence),
+            ),
+        )
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == ("reconciliation-apply:apply-1",)
+    finally:
+        conn.close()
+
+
+def test_unrelated_and_clean_non_classification_successes_leave_target_clear() -> None:
+    conn = _conn()
+    try:
+        conn.execute(
+            "INSERT INTO reconciliation_review_queue VALUES ('queue-1', 'txn-1', 'ignored')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_decisions VALUES "
+            "('decision-1', 'queue-1', 'ignore')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+            (
+                "result-ignore",
+                json.dumps({"resolution_action": "ignore", "app_txn_id": "txn-1"}),
+                "decision-1",
+                "queue-1",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_review_queue VALUES "
+            "('queue-other', 'txn-other', 'resolved')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_decisions VALUES "
+            "('decision-other', 'queue-other', 'confirm_match')"
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+            (
+                "result-other",
+                json.dumps(
+                    {
+                        "resolution_action": "confirm_match",
+                        "app_txn_id": "txn-other",
+                        "canonical_app_transaction_ref": "txn-other",
+                        "payload_target_app_txn_id": "txn-other",
+                    }
+                ),
+                "decision-other",
+                "queue-other",
+            ),
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, "
+            "success, audit_evidence_json) VALUES (?, ?, ?, ?, 1, ?)",
+            (
+                "apply-ignore",
+                "ignore",
+                json.dumps({"action_type": "ignore", "skipped": True}),
+                json.dumps("txn-1"),
+                json.dumps({"resolution_action": "ignore", "app_txn_id": "txn-1"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, "
+            "success, audit_evidence_json) VALUES (?, ?, ?, ?, 1, ?)",
+            (
+                "apply-proposal",
+                "adjust_app_transaction",
+                json.dumps(
+                    {
+                        "action_type": "proposal",
+                        "proposal_type": "adjust_app_transaction",
+                        "app_txn_id": "txn-1",
+                    }
+                ),
+                json.dumps("txn-1"),
+                json.dumps({"resolution_action": "adjust_app_transaction", "app_txn_id": "txn-1"}),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO reconciliation_apply_results "
+            "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (
+                "apply-other",
+                "confirm_match",
+                json.dumps({"action_type": "confirm_match", "app_txn_id": "txn-other"}),
+                json.dumps("txn-other"),
+            ),
+        )
+        assert_correction_eligible(conn, _source())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("source", ["resolution", "apply"])
+def test_changed_duplicate_action_with_missing_secondary_list_is_unknown(source: str) -> None:
+    conn = _conn()
+    try:
+        if source == "resolution":
+            conn.execute(
+                "INSERT INTO reconciliation_review_queue VALUES ('queue-1', 'kept-1', 'resolved')"
+            )
+            conn.execute(
+                "INSERT INTO reconciliation_resolution_decisions VALUES "
+                "('decision-1', 'queue-1', 'ignore')"
+            )
+            conn.execute(
+                "INSERT INTO reconciliation_resolution_results VALUES (?, ?, ?, ?, 1)",
+                (
+                    "result-1",
+                    json.dumps({"resolution_action": "mark_duplicate", "app_txn_id": "kept-1"}),
+                    "decision-1",
+                    "queue-1",
+                ),
+            )
+            expected_id = "resolution:result-1"
+        else:
+            conn.execute(
+                "INSERT INTO reconciliation_apply_results "
+                "(apply_id, action, payload_json, app_transaction_reference_json, success) "
+                "VALUES (?, ?, ?, ?, 1)",
+                (
+                    "apply-1",
+                    "ignore",
+                    json.dumps({"action_type": "mark_duplicate", "kept_app_txn_id": "kept-1"}),
+                    json.dumps("kept-1"),
+                ),
+            )
+            expected_id = "reconciliation-apply:apply-1"
+        with pytest.raises(CorrectionRelationshipError) as unknown:
+            assert_correction_eligible(conn, _source())
+        assert unknown.value.classification == "UNKNOWN_INTEGRITY"
+        assert unknown.value.evidence_ids == (expected_id,)
     finally:
         conn.close()

@@ -55,7 +55,8 @@ def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
 
 def _guard_successful_resolution(conn: sqlite3.Connection, result: ResolutionResult) -> None:
     if not result.success or result.decision.action not in {
-        ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE
+        ResolutionAction.CONFIRM_MATCH,
+        ResolutionAction.MARK_DUPLICATE,
     }:
         return
     candidate = result.queue_item.candidate
@@ -84,7 +85,8 @@ def _complete_success_evidence(
     conn: sqlite3.Connection, result: ResolutionResult
 ) -> ResolutionResult:
     if not result.success or result.decision.action not in {
-        ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE
+        ResolutionAction.CONFIRM_MATCH,
+        ResolutionAction.MARK_DUPLICATE,
     }:
         return result
     candidate = result.queue_item.candidate

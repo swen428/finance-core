@@ -392,7 +392,8 @@ def test_audit_only_actions_no_mutation(migrated_temp_db_connection):
 
 
 def test_successful_apply_replay_checks_corrected_secondary_duplicate(
-    migrated_temp_db_connection, monkeypatch: pytest.MonkeyPatch,
+    migrated_temp_db_connection,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = migrated_temp_db_connection
     stmt = _stmt(merchant_raw="Grab", statement_row_reference="guarded-dup")
@@ -400,7 +401,8 @@ def test_successful_apply_replay_checks_corrected_secondary_duplicate(
     items, _ = generate_review_queue(match_batch([stmt], apps))
     item = next(item for item in items if item.issue_type == IssueType.POSSIBLE_DUPLICATE)
     decision = ResolutionDecision(
-        decision_id="dec-guarded-duplicate", queue_item_id=item.queue_item_id,
+        decision_id="dec-guarded-duplicate",
+        queue_item_id=item.queue_item_id,
         action=ResolutionAction.MARK_DUPLICATE,
     )
     result = ResolutionApplyRuntime().apply(item, decision)

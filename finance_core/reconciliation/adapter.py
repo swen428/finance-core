@@ -246,9 +246,7 @@ class InternalCandidateAdapter:
             amount=Decimal(str(amount_raw)),
             currency=str(row["currency"] or ""),
             source_type=None if row["intent"] is None else str(row["intent"]),
-            source_channel=(
-                None if row["source_channel"] is None else str(row["source_channel"])
-            ),
+            source_channel=(None if row["source_channel"] is None else str(row["source_channel"])),
             evidence_reference=str(row["id"]),
         )
 

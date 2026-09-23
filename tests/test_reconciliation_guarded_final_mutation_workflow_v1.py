@@ -244,9 +244,7 @@ def test_source_bound_create_refuses_corrected_source_under_lock(
     )
     result = execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
     assert result.status == FinalMutationWorkflowStatus.BLOCKED
-    assert result.blocked_reasons == (
-        "corrected_transaction_requires_versioned_reconciliation",
-    )
+    assert result.blocked_reasons == ("corrected_transaction_requires_versioned_reconciliation",)
     assert conn.in_transaction is False
     assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
@@ -263,9 +261,7 @@ def test_successful_create_replay_refuses_corrected_result(
     )
     replay = execute_guarded_final_mutation_workflow(conn, inp, clock=_fixed_clock)
     assert replay.status == FinalMutationWorkflowStatus.BLOCKED
-    assert replay.blocked_reasons == (
-        "corrected_transaction_requires_versioned_reconciliation",
-    )
+    assert replay.blocked_reasons == ("corrected_transaction_requires_versioned_reconciliation",)
     assert replay.transaction_public_id is None
 
 
