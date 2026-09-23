@@ -15,11 +15,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
 import pytest
 
+from finance_core.application.correction_relationships import (
+    CorrectionRelationshipError,
+    _resolution_relationships,
+)
 from finance_core.reconciliation.matching import match_batch
 from finance_core.reconciliation.models import (
     AppTransaction,
@@ -89,6 +94,22 @@ def _persist_matched_item(rqp: ReviewQueuePersistence) -> str:
     items, _ = generate_review_queue(candidates)
     rqp.persist_review_queue(items)
     return items[0].queue_item_id
+
+
+def _bound_three_app_resolution(conn: sqlite3.Connection):
+    stmt = _make_stmt(
+        merchant_raw="Grab", amount=Decimal("8.50"), statement_row_reference="three-res"
+    )
+    apps = [_make_app(f"app-res-{part}", merchant="Grab", amount=Decimal("8.50")) for part in "abc"]
+    items, _ = generate_review_queue(match_batch([stmt], apps))
+    item = next(item for item in items if item.issue_type == IssueType.POSSIBLE_DUPLICATE)
+    ReviewQueuePersistence(conn).persist_review_queue([item])
+    decision = ResolutionDecision(
+        decision_id="dec-three-res",
+        queue_item_id=item.queue_item_id,
+        action=ResolutionAction.MARK_DUPLICATE,
+    )
+    return item, decision, ResolutionPersistence(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +421,76 @@ def test_successful_duplicate_persists_every_app_target() -> None:
         conn.close()
 
 
+def test_bound_three_app_resolution_rejects_short_caller_and_result(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    short_item = replace(
+        item,
+        candidate=replace(
+            item.candidate,
+            all_app_transactions=item.candidate.all_app_transactions[:2],
+        ),
+    )
+    with pytest.raises(ValueError, match="bound queue source"):
+        rp.apply_resolution(short_item, decision)
+    short_result = ResolutionRuntime().resolve(short_item, decision)
+    with pytest.raises(ValueError, match="bound queue source"):
+        rp.persist_result(short_result)
+    assert rp.list_decisions_for_queue_item(item.queue_item_id) == []
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    assert ReviewQueuePersistence(conn).get_by_public_id(item.queue_item_id)["status"] == "pending"
+    assert not conn.in_transaction
+
+
+def test_bound_three_app_resolution_checks_corrected_third_target(
+    migrated_temp_db_connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    checked: list[str] = []
+
+    def corrected(_conn: sqlite3.Connection, target: str) -> bool:
+        checked.append(target)
+        return target == "app-res-c"
+
+    monkeypatch.setattr(
+        "finance_core.reconciliation.resolution_persistence.has_committed_correction",
+        corrected,
+    )
+    with pytest.raises(ValueError, match="corrected_transaction_requires_versioned_reconciliation"):
+        rp.apply_resolution(item, decision)
+    assert checked == ["app-res-a", "app-res-b", "app-res-c"]
+    assert rp.list_decisions_for_queue_item(item.queue_item_id) == []
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+
+
+def test_bound_three_app_result_missing_third_is_unknown_and_replay_refused(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    assert rp.apply_resolution(item, decision).success
+    row = rp.list_results_for_queue_item(item.queue_item_id)[0]
+    evidence = json.loads(row["audit_evidence_json"])
+    assert evidence["duplicate_app_txn_ids"] == ["app-res-a", "app-res-b", "app-res-c"]
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _resolution_relationships(conn, "app-res-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
+    evidence["duplicate_app_txn_ids"] = evidence["duplicate_app_txn_ids"][:2]
+    conn.execute(
+        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
+        (json.dumps(evidence), row["public_id"]),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _resolution_relationships(conn, "app-res-c")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(ValueError, match="frozen queue source"):
+        rp.persist_decision(decision)
+
+
 def test_successful_resolution_replay_refuses_corrected_target_under_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -499,6 +590,9 @@ def test_resolution_audit_foreign_keys_reject_orphans():
                 ) VALUES ('orphan-decision', 'missing-review-item', 'ignore', 'human')
                 """
             )
+        # The failed direct SQL write opens a caller-owned SQLite transaction.
+        # The persistence adapter must never commit that transaction for us.
+        conn.rollback()
 
         qid = _persist_matched_item(_rqp)
         decision = ResolutionDecision(

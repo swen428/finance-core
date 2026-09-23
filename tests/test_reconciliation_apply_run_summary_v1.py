@@ -28,6 +28,7 @@ from finance_core.reconciliation.models import (
     StatementTransaction,
     SuggestedAction,
 )
+from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
 from finance_core.reconciliation.review_queue import generate_review_queue
 from finance_core.reconciliation.run_summary import (
     RunSummary,
@@ -135,6 +136,7 @@ def test_summary_distinguishes_proposal_vs_audit(migrated_temp_db_connection):
         suggested_action=SuggestedAction.MARK_DUPLICATE,
         priority=2,
     )
+    ReviewQueuePersistence(conn).persist_review_queue([dup_item])
 
     # -- Proposal: create_missing_app (manually constructed MISSING_IN_APP) --
     stmt_m = _stmt(merchant_raw="Giant", amount=Decimal("45.50"), statement_row_reference="prp-s1")
@@ -226,6 +228,7 @@ def test_summary_unresolved_queue_items(migrated_temp_db_connection):
     """When known queue items are supplied, unresolved ones are reported."""
     conn = migrated_temp_db_connection
     item, decision = _make_matched_item_and_decision()
+    ReviewQueuePersistence(conn).persist_review_queue([item])
     runtime = ResolutionApplyRuntime()
     result = runtime.apply(item, decision)
 
@@ -247,6 +250,7 @@ def test_summary_reviewer_counts(migrated_temp_db_connection):
     """Multiple reviewers should be counted separately."""
     conn = migrated_temp_db_connection
     item, decision = _make_matched_item_and_decision()
+    ReviewQueuePersistence(conn).persist_review_queue([item])
     # Modify reviewer
     custom_decision = ResolutionDecision(
         decision_id=decision.decision_id,

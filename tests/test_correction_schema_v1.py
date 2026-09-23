@@ -13,6 +13,7 @@ from finance_core.application.correction_schema import (
     has_committed_correction,
     verify_correction_schema,
 )
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 
 MIGRATION = Path(__file__).resolve().parents[1] / (
     "finance_core/resources/migrations/051_controlled_corrections.sql"
@@ -30,6 +31,15 @@ def _db() -> sqlite3.Connection:
         CREATE TABLE d2_posting_attempts(transaction_public_id TEXT,stage TEXT);
         CREATE TABLE parser_proposal_conversion_audit(transaction_id INTEGER);
         CREATE TABLE receipt_finalization_audit(transaction_public_id TEXT,status TEXT);
+        CREATE TABLE reconciliation_review_queue(
+            id INTEGER PRIMARY KEY, public_id TEXT NOT NULL UNIQUE,
+            run_public_id TEXT, candidate_id TEXT NOT NULL, issue_type TEXT NOT NULL,
+            suggested_action TEXT NOT NULL, priority INTEGER NOT NULL,
+            statement_transaction_ref TEXT, app_transaction_ref TEXT,
+            confidence_score TEXT NOT NULL, reason_codes_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE schema_migrations(
             migration_id TEXT, migration_filename TEXT,
             migration_sequence INTEGER, checksum_sha256 TEXT);
@@ -67,6 +77,42 @@ def _anchor(conn: sqlite3.Connection) -> None:
     )
 
 
+def _queue_row(conn: sqlite3.Connection) -> tuple[object, ...]:
+    conn.execute(
+        """INSERT INTO reconciliation_review_queue (
+            id, public_id, run_public_id, candidate_id, issue_type,
+            suggested_action, priority, statement_transaction_ref,
+            app_transaction_ref, confidence_score, reason_codes_json,
+            evidence_json, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            1,
+            "queue-1",
+            None,
+            "candidate-1",
+            "unmatched",
+            "review",
+            2,
+            None,
+            None,
+            "0.75",
+            '["reason"]',
+            '{"source":"original"}',
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:00:00",
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM reconciliation_review_queue WHERE id = 1").fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+def _assert_queue_row(conn: sqlite3.Connection, expected: tuple[object, ...]) -> None:
+    rows = conn.execute("SELECT * FROM reconciliation_review_queue ORDER BY id").fetchall()
+    assert [tuple(row) for row in rows] == [expected]
+
+
 def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:
     conn = _db()
     try:
@@ -77,6 +123,131 @@ def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:
             verify_correction_schema(conn)
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    (
+        "trg_correction_review_queue_source_no_update",
+        "trg_correction_review_queue_no_delete",
+        "trg_correction_review_queue_no_insert_collision",
+    ),
+)
+def test_schema_requires_review_queue_guards(trigger: str) -> None:
+    conn = _db()
+    try:
+        assert verify_correction_schema(conn)
+        conn.execute(f"DROP TRIGGER {trigger}")
+        with pytest.raises(CorrectionSchemaError, match="inventory"):
+            verify_correction_schema(conn)
+    finally:
+        conn.close()
+
+
+def test_schema_refuses_weakened_review_queue_guard() -> None:
+    conn = _db()
+    try:
+        trigger = "trg_correction_review_queue_source_no_update"
+        original_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger,),
+        ).fetchone()[0]
+        assert "OLD.evidence_json IS NOT NEW.evidence_json" in original_sql
+        conn.execute(f"DROP TRIGGER {trigger}")
+        conn.execute(
+            original_sql.replace(
+                "OLD.evidence_json IS NOT NEW.evidence_json",
+                "OLD.evidence_json IS NOT OLD.evidence_json",
+            )
+        )
+        with pytest.raises(CorrectionSchemaError, match=trigger):
+            verify_correction_schema(conn)
+    finally:
+        conn.close()
+
+
+def test_review_queue_source_fields_frozen_on_fresh_temp_db(
+    migrated_temp_db_connection: sqlite3.Connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    assert verify_correction_schema(conn)
+    original = _queue_row(conn)
+    changes: tuple[tuple[str, object], ...] = (
+        ("id", 2),
+        ("public_id", "queue-2"),
+        ("run_public_id", "run-1"),
+        ("candidate_id", "candidate-2"),
+        ("issue_type", "ambiguous"),
+        ("suggested_action", "ignore"),
+        ("priority", 3),
+        ("statement_transaction_ref", "statement-1"),
+        ("app_transaction_ref", "txn-1"),
+        ("confidence_score", "0.90"),
+        ("reason_codes_json", '["changed"]'),
+        ("evidence_json", '{"source":"changed"}'),
+        ("created_at", "2026-01-02 00:00:00"),
+    )
+    for column, changed in changes:
+        with pytest.raises(sqlite3.IntegrityError, match="source fields are immutable"):
+            conn.execute(
+                f"UPDATE reconciliation_review_queue SET {column} = ? WHERE id = 1",
+                (changed,),
+            )
+        _assert_queue_row(conn, original)
+
+    conn.execute(
+        """UPDATE reconciliation_review_queue
+           SET status = 'resolved', updated_at = '2026-01-02 00:00:00'
+           WHERE id = 1"""
+    )
+    assert tuple(
+        conn.execute(
+            "SELECT status, updated_at FROM reconciliation_review_queue WHERE id = 1"
+        ).fetchone()
+    ) == ("resolved", "2026-01-02 00:00:00")
+
+
+def test_review_queue_guards_existing_row_on_050_to_051_upgrade(
+    temp_db_connection: sqlite3.Connection,
+) -> None:
+    conn = temp_db_connection
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:50])
+    original = _queue_row(conn)
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    assert verify_correction_schema(conn)
+    _assert_queue_row(conn, original)
+
+    with pytest.raises(sqlite3.IntegrityError, match="source rows are immutable"):
+        conn.execute("DELETE FROM reconciliation_review_queue WHERE id = 1")
+    _assert_queue_row(conn, original)
+
+    for conflict_mode in ("REPLACE", "IGNORE"):
+        for row_id, public_id in ((1, "other-queue"), (2, "queue-1")):
+            with pytest.raises(sqlite3.IntegrityError, match="identity collision"):
+                conn.execute(
+                    f"""INSERT OR {conflict_mode} INTO reconciliation_review_queue (
+                        id, public_id, candidate_id, issue_type, suggested_action,
+                        priority, confidence_score, reason_codes_json, evidence_json
+                    ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (
+                        row_id,
+                        public_id,
+                        "candidate-2",
+                        "unmatched",
+                        "review",
+                        2,
+                        "0.50",
+                        "[]",
+                        "{}",
+                    ),
+                )
+            _assert_queue_row(conn, original)
+
+    conn.execute("UPDATE reconciliation_review_queue SET status = 'ignored' WHERE id = 1")
+    assert (
+        conn.execute("SELECT status FROM reconciliation_review_queue WHERE id = 1").fetchone()[0]
+        == "ignored"
+    )
 
 
 @pytest.mark.parametrize("altered_literal", ("'FINALIZED'", "'finalized '"))

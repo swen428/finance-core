@@ -23,6 +23,7 @@ import pytest
 
 from finance_core.reconciliation.demo_cli import _row_to_review_queue_item
 from finance_core.reconciliation.matching import match_batch
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from finance_core.reconciliation.models import (
     AppTransaction,
     IssueType,
@@ -38,6 +39,11 @@ from finance_core.reconciliation.persistence import apply_reconciliation_review_
 from finance_core.reconciliation.resolution_persistence import ResolutionPersistence
 from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
 from finance_core.reconciliation.review_queue import generate_review_queue
+from finance_core.reconciliation.source_binding import (
+    assert_candidate_matches_bound,
+    build_source_binding,
+    load_bound_queue,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -130,6 +136,143 @@ def _temp_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys = ON")
     apply_reconciliation_review_schema(conn)
     return conn
+
+
+def _bound_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    return conn
+
+
+def test_051_binds_complete_three_app_snapshot_and_reuses_identical_source():
+    conn = _bound_conn()
+    try:
+        item = _make_items()[0]
+        apps = (
+            _make_app(
+                "a",
+                source_channel="telegram",
+                normalized_merchant="apple",
+                posted_date=date(2024, 12, 2),
+                transaction_type="expense",
+            ),
+            _make_app(
+                "b",
+                merchant="Apple B",
+                amount=Decimal("28.90"),
+                source_type="receipt",
+                source_channel="pdf",
+            ),
+            _make_app(
+                "c",
+                merchant="Apple C",
+                amount=Decimal("30.90"),
+                source_type="manual",
+                transaction_type="transfer",
+            ),
+        )
+        item = replace(
+            item,
+            candidate=replace(
+                item.candidate, best_app_transaction=apps[0], all_app_transactions=apps
+            ),
+        )
+        rqp = ReviewQueuePersistence(conn)
+        assert rqp.persist_review_queue([item]) == 1
+        bound = load_bound_queue(conn, item.queue_item_id)
+        assert bound is not None
+        assert bound.app_transactions == apps
+        assert len(bound.sha256) == 64
+        assert_candidate_matches_bound(bound, item)
+        assert rqp.persist_review_queue([item]) == 0
+        assert rqp.count_all() == 1
+
+        changed = replace(
+            item,
+            candidate=replace(
+                item.candidate,
+                all_app_transactions=(apps[0], apps[1], replace(apps[2], source_channel="other")),
+            ),
+        )
+        with pytest.raises(ValueError, match="conflicts"):
+            rqp.persist_review_queue([changed])
+        changed_statement = replace(
+            item,
+            candidate=replace(
+                item.candidate,
+                statement=replace(item.candidate.statement, amount=Decimal("31.90")),
+            ),
+        )
+        with pytest.raises(ValueError, match="conflicts"):
+            rqp.persist_review_queue([changed_statement])
+        assert rqp.count_all() == 1
+    finally:
+        conn.close()
+
+
+def test_051_refuses_old_unbound_queue_and_does_not_commit_caller_transaction():
+    conn = _bound_conn()
+    try:
+        item = _make_items()[0]
+        conn.execute("BEGIN")
+        assert ReviewQueuePersistence(conn).persist_review_queue([item]) == 1
+        assert conn.in_transaction
+        conn.rollback()
+        assert ReviewQueuePersistence(conn).count_all() == 0
+
+        # A row created before 051 can still exist after the upgrade, but it
+        # cannot be given a binding after the fact to authorize classification.
+        conn.execute(
+            """INSERT INTO reconciliation_review_queue
+            (public_id, candidate_id, issue_type, suggested_action, priority,
+             confidence_score, reason_codes_json, evidence_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("old-q", "old-c", "matched", "confirm_match", 1, "1", "[]", "{}"),
+        )
+        with pytest.raises(ValueError, match="binding"):
+            load_bound_queue(conn, "old-q")
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("tamper", ["count", "duplicate", "field", "identity", "digest"])
+def test_051_refuses_malformed_preexisting_source_binding(tamper: str):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:50])
+        item = _make_duplicate_item()
+        rqp = ReviewQueuePersistence(conn)
+        assert rqp.persist_review_queue([item]) == 1
+        assert load_bound_queue(conn, item.queue_item_id) is None
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        evidence = json.loads(row["evidence_json"])
+        binding = build_source_binding(item)
+        evidence["source_binding"] = binding
+        if tamper == "count":
+            binding["app_transaction_count"] = 1
+        elif tamper == "duplicate":
+            binding["app_transactions"][1]["app_txn_id"] = "app-a"
+        elif tamper == "field":
+            del binding["app_transactions"][1]["source_type"]
+        elif tamper == "identity":
+            binding["candidate_id"] = "another-candidate"
+        else:
+            binding["sha256"] = "0" * 64
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), item.queue_item_id),
+        )
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        with pytest.raises(ValueError, match="bound queue"):
+            load_bound_queue(conn, item.queue_item_id)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

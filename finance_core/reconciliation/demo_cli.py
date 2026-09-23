@@ -468,6 +468,7 @@ def _run_apply_resolve_command(args: argparse.Namespace) -> int:
         _structured_rows_to_statements,
     )
     from finance_core.reconciliation.matching import match_batch
+    from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
     from finance_core.reconciliation.review_queue import generate_review_queue
     from finance_core.reconciliation.run_summary import (
         format_run_summary,
@@ -516,6 +517,10 @@ def _run_apply_resolve_command(args: argparse.Namespace) -> int:
 
             # -- Generate review queue --
             queue_items, _summary = generate_review_queue(candidates)
+
+            # Register the exact matcher output before a successful apply can
+            # refer to it. Replaying the same source reuses its bound queue.
+            ReviewQueuePersistence(conn).persist_review_queue(queue_items)
 
             # -- Load decisions fixture --
             decisions = _load_decisions_from_json(decisions_path)

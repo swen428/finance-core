@@ -30,6 +30,7 @@ from typing import Any, Sequence
 
 from finance_core.application.correction_schema import has_committed_correction
 from finance_core.reconciliation.models import ResolutionApplyResult
+from finance_core.reconciliation.source_binding import load_bound_queue
 
 
 class ApplyPersistenceConflictError(Exception):
@@ -52,6 +53,7 @@ def _owned_write(conn: sqlite3.Connection) -> Iterator[None]:
 def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyResult) -> None:
     if not result.success or result.action.value not in {"confirm_match", "mark_duplicate"}:
         return
+    bound = load_bound_queue(conn, result.queue_item_id)
     payload = result.payload
     targets: set[str] = set()
     if result.action.value == "confirm_match":
@@ -84,6 +86,30 @@ def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyRes
             raise ValueError("successful duplicate classification has incomplete app targets")
         targets.update(duplicates)
         targets.add(kept)
+    if bound is not None:
+        if (
+            result.candidate_id != bound.candidate_id
+            or result.statement_reference != bound.statement_transaction_ref
+            or result.app_transaction_reference != bound.app_transaction_ref
+            or result.audit_evidence.get("queue_item_id") != bound.queue_item_id
+            or result.audit_evidence.get("candidate_id") != bound.candidate_id
+            or result.audit_evidence.get("resolution_action") != result.action.value
+        ):
+            raise ValueError("successful reconciliation apply source identity changed")
+        if result.action.value == "mark_duplicate":
+            if (
+                payload.get("duplicate_app_txn_ids")
+                != [app.app_txn_id for app in bound.app_transactions]
+                or payload.get("kept_app_txn_id") != bound.app_transaction_ref
+            ):
+                raise ValueError(
+                    "successful duplicate apply targets differ from frozen queue source"
+                )
+        elif payload.get("app_txn_id") != bound.app_transaction_ref:
+            raise ValueError(
+                "successful reconciliation apply target differs from frozen queue source"
+            )
+        targets.update(app.app_txn_id for app in bound.app_transactions)
     if result.app_transaction_reference is not None:
         targets.add(result.app_transaction_reference)
     if any(has_committed_correction(conn, target) for target in sorted(targets)):

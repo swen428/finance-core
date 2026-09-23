@@ -11,8 +11,13 @@ import json
 import sqlite3
 from typing import NoReturn, Protocol, cast
 
+from finance_core.application.correction_schema import (
+    CorrectionSchemaError,
+    verify_correction_schema,
+)
 from finance_core.calculation.authoritative_snapshot import canonical_json_value
 from finance_core.financial_audit import verify_financial_audit_chain
+from finance_core.reconciliation.source_binding import load_bound_queue
 
 
 class RelationshipSource(Protocol):
@@ -236,6 +241,17 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 # Old success rows may omit secondary duplicate IDs. Their
                 # relationship to any target cannot be disproved safely.
                 _refuse("UNKNOWN_INTEGRITY", label)
+            try:
+                bound = load_bound_queue(conn, row["review_queue_public_id"])
+            except (ValueError, CorrectionSchemaError):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            if bound is not None and (
+                duplicates != [app.app_txn_id for app in bound.app_transactions]
+                or kept != bound.app_transaction_ref
+                or evidence.get("queue_item_id") != bound.queue_item_id
+                or evidence.get("candidate_id") != bound.candidate_id
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
             if target_id in cast(list[str], duplicates):
                 _refuse("ACTIVE_RELATIONSHIP", label)
             continue
@@ -247,6 +263,16 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or type(queue_ref) is not str
                 or canonical_ref != queue_ref
                 or payload_target != queue_ref
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            try:
+                bound = load_bound_queue(conn, row["review_queue_public_id"])
+            except (ValueError, CorrectionSchemaError):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            if bound is not None and (
+                queue_ref != bound.app_transaction_ref
+                or evidence.get("queue_item_id") != bound.queue_item_id
+                or evidence.get("candidate_id") != bound.candidate_id
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if target_id == queue_ref:
@@ -271,11 +297,14 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
 
 
 def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
+    try:
+        bound_required = verify_correction_schema(conn)
+    except CorrectionSchemaError:
+        _refuse("UNKNOWN_INTEGRITY", "reconciliation-apply:schema")
     results = _rows(
         conn,
-        """SELECT apply_id, action, payload_json, audit_evidence_json,
-        app_transaction_reference_json
-        FROM reconciliation_apply_results WHERE success = 1 ORDER BY apply_id""",
+        """SELECT * FROM reconciliation_apply_results
+        WHERE success = 1 ORDER BY apply_id""",
         (),
     )
     for row in results:
@@ -283,6 +312,7 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         payload = _object(row["payload_json"], label)
         evidence = _object(row["audit_evidence_json"], label)
         app_ref = _optional_ref(row["app_transaction_reference_json"], label)
+        statement_ref = _optional_ref(row.get("statement_reference_json"), label)
         action = row["action"]
         payload_action = payload.get("action_type")
         evidence_action = evidence.get("resolution_action")
@@ -306,6 +336,26 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 or type(kept) is not str
                 or kept not in duplicates
                 or payload.get("audit_only") is not True
+            ):
+                _refuse("UNKNOWN_INTEGRITY", label)
+            bound = None
+            if bound_required:
+                queue_id = row.get("queue_item_id")
+                if type(queue_id) is not str or not queue_id:
+                    _refuse("UNKNOWN_INTEGRITY", label)
+                try:
+                    bound = load_bound_queue(conn, queue_id)
+                except (ValueError, CorrectionSchemaError):
+                    _refuse("UNKNOWN_INTEGRITY", label)
+            if bound is not None and (
+                row["candidate_id"] != bound.candidate_id
+                or statement_ref != bound.statement_transaction_ref
+                or app_ref != bound.app_transaction_ref
+                or duplicates != [app.app_txn_id for app in bound.app_transactions]
+                or kept != bound.app_transaction_ref
+                or evidence.get("queue_item_id") != bound.queue_item_id
+                or evidence.get("candidate_id") != bound.candidate_id
+                or evidence_action != action
             ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             ids = set(cast(list[str], duplicates))
@@ -333,6 +383,25 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         ):
             canonical_id = payload.get("app_txn_id")
             if type(canonical_id) is not str or not canonical_id:
+                _refuse("UNKNOWN_INTEGRITY", label)
+            bound = None
+            if bound_required:
+                queue_id = row.get("queue_item_id")
+                if type(queue_id) is not str or not queue_id:
+                    _refuse("UNKNOWN_INTEGRITY", label)
+                try:
+                    bound = load_bound_queue(conn, queue_id)
+                except (ValueError, CorrectionSchemaError):
+                    _refuse("UNKNOWN_INTEGRITY", label)
+            if bound is not None and (
+                row["candidate_id"] != bound.candidate_id
+                or statement_ref != bound.statement_transaction_ref
+                or app_ref != bound.app_transaction_ref
+                or canonical_id != bound.app_transaction_ref
+                or evidence.get("queue_item_id") != bound.queue_item_id
+                or evidence.get("candidate_id") != bound.candidate_id
+                or evidence_action != action
+            ):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if target_id not in (canonical_id, app_ref, evidence_ref):
                 continue

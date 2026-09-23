@@ -16,8 +16,20 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import finance_core.reconciliation.resolution_persistence as resolution_persistence
 from finance_core.reconciliation.demo_cli import main
+from finance_core.reconciliation.demo_fixture import (
+    _load_app_transactions_from_json,
+    _structured_rows_to_statements,
+)
+from finance_core.reconciliation.matching import match_batch
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
+from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
+from finance_core.reconciliation.review_queue import generate_review_queue
+from finance_core.reconciliation.source_binding import load_bound_queue
+from finance_core.reconciliation.statement_csv import StatementCsvAdapter
 
 # Fixture paths relative to project root
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +65,46 @@ def _run_persist_review() -> str:
     ]
     exit_code = main(argv)
     assert exit_code == 0
+    return db_path
+
+
+def _run_legacy_review_without_app_list(queue_item_id: str) -> str:
+    """Create a real pre-051 queue row, then upgrade without retrosealing it."""
+    fd, db_path = tempfile.mkstemp(suffix=".sqlite", prefix="test_legacy_resolve_")
+    import os
+
+    os.close(fd)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:50])
+        parsed = StatementCsvAdapter().parse_file_hardened(_STATEMENT_CSV)
+        assert parsed.success
+        candidates = match_batch(
+            _structured_rows_to_statements(parsed.rows),
+            _load_app_transactions_from_json(_APP_TXN_JSON),
+        )
+        items, _ = generate_review_queue(candidates, run_label="resolve-test")
+        item = next(item for item in items if item.queue_item_id == queue_item_id)
+        ReviewQueuePersistence(conn).persist_review_queue([item], run_public_id="resolve-test")
+        evidence = json.loads(
+            conn.execute(
+                "SELECT evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
+                (queue_item_id,),
+            ).fetchone()[0]
+        )
+        evidence.pop("all_app_transactions")
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), queue_item_id),
+        )
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        with pytest.raises(ValueError, match="binding"):
+            load_bound_queue(conn, queue_item_id)
+    finally:
+        conn.close()
     return db_path
 
 
@@ -200,57 +252,78 @@ def test_corrected_second_duplicate_target_refuses_without_writes(tmp_path, monk
 
 
 def test_old_duplicate_without_app_list_refuses_before_any_writes(tmp_path):
-    db_path = _run_persist_review()
+    db_path = _run_legacy_review_without_app_list("resolve-test-q-004")
     try:
         decision = json.loads(_DECISIONS_JSON.read_text())["decisions"][4]
         decision_path = tmp_path / "duplicate-decision.json"
         decision_path.write_text(json.dumps({"decisions": [decision]}))
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                "SELECT evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
-                ("resolve-test-q-004",),
-            ).fetchone()
-            evidence = json.loads(row[0])
-            evidence.pop("all_app_transactions")
-            conn.execute(
-                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
-                (json.dumps(evidence), "resolve-test-q-004"),
-            )
         assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) != 0
         _assert_duplicate_still_pending_without_resolution(db_path)
     finally:
         Path(db_path).unlink(missing_ok=True)
 
 
-def test_old_single_target_without_app_list_still_confirms(tmp_path):
-    db_path = _run_persist_review()
+def test_old_single_target_without_binding_cannot_confirm(tmp_path):
+    db_path = _run_legacy_review_without_app_list("resolve-test-q-000")
     try:
         decision = json.loads(_DECISIONS_JSON.read_text())["decisions"][0]
         decision_path = tmp_path / "single-decision.json"
         decision_path.write_text(json.dumps({"decisions": [decision]}))
+        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) != 0
         with sqlite3.connect(db_path) as conn:
             row = conn.execute(
-                "SELECT evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
+                "SELECT status FROM reconciliation_review_queue WHERE public_id = ?",
                 ("resolve-test-q-000",),
             ).fetchone()
-            evidence = json.loads(row[0])
-            evidence.pop("all_app_transactions")
-            conn.execute(
-                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
-                (json.dumps(evidence), "resolve-test-q-000"),
-            )
-        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) == 0
-        with sqlite3.connect(db_path) as conn:
-            row = conn.execute(
-                """SELECT q.status, r.success FROM reconciliation_review_queue AS q
-                JOIN reconciliation_resolution_results AS r
-                  ON r.review_queue_public_id = q.public_id
-                WHERE q.public_id = ?""",
-                ("resolve-test-q-000",),
-            ).fetchone()
-            assert row == ("resolved", 1)
+            assert row == ("pending",)
     finally:
         Path(db_path).unlink(missing_ok=True)
+
+
+def test_old_unbound_queue_can_still_be_ignored(tmp_path):
+    db_path = _run_legacy_review_without_app_list("resolve-test-q-000")
+    try:
+        original = json.loads(_DECISIONS_JSON.read_text())["decisions"][0]
+        original["action"] = "ignore"
+        decision_path = tmp_path / "ignore.json"
+        decision_path.write_text(json.dumps({"decisions": [original]}))
+        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) == 0
+        with sqlite3.connect(db_path) as conn:
+            status = conn.execute(
+                "SELECT status FROM reconciliation_review_queue WHERE public_id = ?",
+                ("resolve-test-q-000",),
+            ).fetchone()[0]
+            assert status == "ignored"
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_apply_resolve_registers_bound_queue_and_replays(tmp_path):
+    db_path = tmp_path / "apply.sqlite"
+    args = [
+        "apply-resolve",
+        "--statement",
+        str(_STATEMENT_CSV),
+        "--app-transactions",
+        str(_APP_TXN_JSON),
+        "--decisions",
+        str(_DECISIONS_JSON),
+        "--db",
+        str(db_path),
+    ]
+    assert main(args) == 0
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        count = conn.execute("SELECT COUNT(*) FROM reconciliation_review_queue").fetchone()[0]
+        assert count == 6
+        assert load_bound_queue(conn, "q-004") is not None
+    assert main(args) == 0
+    with sqlite3.connect(db_path) as conn:
+        replay_count = conn.execute("SELECT COUNT(*) FROM reconciliation_review_queue").fetchone()[
+            0
+        ]
+        assert replay_count == count
 
 
 # ---------------------------------------------------------------------------

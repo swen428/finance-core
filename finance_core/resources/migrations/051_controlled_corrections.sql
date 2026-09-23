@@ -201,6 +201,33 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'finalized D2 transaction identity collision'); END;
 
+-- Review resolution may advance status, but must not rewrite the candidate or
+-- evidence that the human decision was based on. Explicit collision checks run
+-- before SQLite can turn OR REPLACE into a DELETE or OR IGNORE into a no-op.
+CREATE TRIGGER trg_correction_review_queue_source_no_update BEFORE UPDATE ON reconciliation_review_queue
+WHEN OLD.id IS NOT NEW.id
+  OR OLD.public_id IS NOT NEW.public_id
+  OR OLD.run_public_id IS NOT NEW.run_public_id
+  OR OLD.candidate_id IS NOT NEW.candidate_id
+  OR OLD.issue_type IS NOT NEW.issue_type
+  OR OLD.suggested_action IS NOT NEW.suggested_action
+  OR OLD.priority IS NOT NEW.priority
+  OR OLD.statement_transaction_ref IS NOT NEW.statement_transaction_ref
+  OR OLD.app_transaction_ref IS NOT NEW.app_transaction_ref
+  OR OLD.confidence_score IS NOT NEW.confidence_score
+  OR OLD.reason_codes_json IS NOT NEW.reason_codes_json
+  OR OLD.evidence_json IS NOT NEW.evidence_json
+  OR OLD.created_at IS NOT NEW.created_at
+BEGIN SELECT RAISE(ABORT, 'review queue source fields are immutable'); END;
+CREATE TRIGGER trg_correction_review_queue_no_delete BEFORE DELETE ON reconciliation_review_queue
+BEGIN SELECT RAISE(ABORT, 'review queue source rows are immutable'); END;
+CREATE TRIGGER trg_correction_review_queue_no_insert_collision BEFORE INSERT ON reconciliation_review_queue
+WHEN EXISTS (
+    SELECT 1 FROM reconciliation_review_queue q
+    WHERE q.id = NEW.id OR q.public_id = NEW.public_id
+)
+BEGIN SELECT RAISE(ABORT, 'review queue identity collision'); END;
+
 CREATE TRIGGER trg_correction_targets_no_update BEFORE UPDATE ON correction_targets BEGIN SELECT RAISE(ABORT, 'correction targets are append-only'); END;
 CREATE TRIGGER trg_correction_targets_no_delete BEFORE DELETE ON correction_targets BEGIN SELECT RAISE(ABORT, 'correction targets are append-only'); END;
 CREATE TRIGGER trg_correction_targets_no_insert_collision BEFORE INSERT ON correction_targets WHEN EXISTS (SELECT 1 FROM correction_targets WHERE target_id = NEW.target_id) BEGIN SELECT RAISE(ABORT, 'correction target identity collision'); END;
