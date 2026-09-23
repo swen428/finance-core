@@ -15,16 +15,27 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
+from finance_core.reconciliation.demo_cli import _row_to_review_queue_item
 from finance_core.reconciliation.matching import match_batch
 from finance_core.reconciliation.models import (
     AppTransaction,
+    IssueType,
+    MatchStatus,
+    ReconciliationTransactionType,
+    ResolutionAction,
+    ResolutionDecision,
     StatementAmountDirection,
     StatementTransaction,
+    SuggestedAction,
 )
 from finance_core.reconciliation.persistence import apply_reconciliation_review_schema
+from finance_core.reconciliation.resolution_persistence import ResolutionPersistence
 from finance_core.reconciliation.review_persistence import ReviewQueuePersistence
 from finance_core.reconciliation.review_queue import generate_review_queue
 
@@ -66,6 +77,49 @@ def _make_items():
     app = _make_app("app-1")
     candidates = match_batch([stmt], [app])
     items, _ = generate_review_queue(candidates)
+    return items
+
+
+def _make_duplicate_item():
+    item = _make_items()[0]
+    apps = (
+        _make_app(
+            "app-a",
+            source_channel="telegram",
+            normalized_merchant="apple",
+            posted_date=date(2024, 12, 2),
+            transaction_type=ReconciliationTransactionType.EXPENSE,
+        ),
+        _make_app("app-b", source_channel="manual", transaction_type="expense"),
+    )
+    candidate = replace(
+        item.candidate,
+        best_app_transaction=apps[0],
+        all_app_transactions=apps,
+        issue_type=IssueType.POSSIBLE_DUPLICATE,
+        match_status=MatchStatus.POSSIBLE_DUPLICATE,
+    )
+    return replace(
+        item,
+        candidate=candidate,
+        issue_type=IssueType.POSSIBLE_DUPLICATE,
+        suggested_action=SuggestedAction.MARK_DUPLICATE,
+    )
+
+
+def _make_shared_app_duplicate_items():
+    statements = [
+        _make_stmt(statement_row_reference="shared-stmt-1"),
+        _make_stmt(statement_row_reference="shared-stmt-2"),
+    ]
+    candidates = match_batch(statements, [_make_app("app-shared")])
+    items, _ = generate_review_queue(candidates)
+    assert len(items) == 2
+    assert all(item.issue_type == IssueType.POSSIBLE_DUPLICATE for item in items)
+    assert all(
+        [app.app_txn_id for app in item.candidate.all_app_transactions] == ["app-shared"]
+        for item in items
+    )
     return items
 
 
@@ -267,6 +321,245 @@ def test_json_serialization_is_stable():
         assert "candidate_id" in evidence
         assert "match_status" in evidence
         assert "issue_type" in evidence
+    finally:
+        conn.close()
+
+
+def test_duplicate_app_snapshots_round_trip_all_fields_in_original_order():
+    conn = _temp_conn()
+    try:
+        item = _make_duplicate_item()
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        snapshots = json.loads(row["evidence_json"])["all_app_transactions"]
+        assert [snapshot["app_txn_id"] for snapshot in snapshots] == ["app-a", "app-b"]
+        assert snapshots[0] == {
+            "app_txn_id": "app-a",
+            "transaction_date": "2024-12-01",
+            "merchant": "Apple",
+            "amount": "29.90",
+            "currency": "SGD",
+            "source_type": "expense",
+            "source_channel": "telegram",
+            "normalized_merchant": "apple",
+            "posted_date": "2024-12-02",
+            "transaction_type": "expense",
+        }
+        restored = _row_to_review_queue_item(row)
+        assert restored.candidate.all_app_transactions == item.candidate.all_app_transactions
+        assert restored.candidate.best_app_transaction == item.candidate.best_app_transaction
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda evidence: evidence.update(all_app_transactions=[]),
+        lambda evidence: evidence["all_app_transactions"][1].update(app_txn_id="app-a"),
+        lambda evidence: evidence.update(app_txn_id="another-best"),
+        lambda evidence: evidence["all_app_transactions"][1].update(amount=8.5),
+        lambda evidence: evidence["all_app_transactions"][1].update(transaction_date="bad-date"),
+    ],
+)
+def test_malformed_duplicate_snapshots_refuse_reconstruction(change):
+    conn = _temp_conn()
+    try:
+        item = _make_duplicate_item()
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        evidence = json.loads(row["evidence_json"])
+        change(evidence)
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), item.queue_item_id),
+        )
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        with pytest.raises(ValueError, match="review queue"):
+            _row_to_review_queue_item(row)
+    finally:
+        conn.close()
+
+
+def test_shared_app_duplicate_subtype_round_trips_one_original_app():
+    conn = _temp_conn()
+    try:
+        items = _make_shared_app_duplicate_items()
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue(items)
+        for item in items:
+            row = rqp.get_by_public_id(item.queue_item_id)
+            assert row is not None
+            snapshots = json.loads(row["evidence_json"])["all_app_transactions"]
+            assert [snapshot["app_txn_id"] for snapshot in snapshots] == ["app-shared"]
+            restored = _row_to_review_queue_item(row)
+            assert restored.issue_type == IssueType.POSSIBLE_DUPLICATE
+            assert restored.candidate.all_app_transactions == item.candidate.all_app_transactions
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("legacy_without_list", [False, True])
+@pytest.mark.parametrize(
+    ("action", "expected_status"),
+    [
+        (ResolutionAction.IGNORE, "ignored"),
+        (ResolutionAction.NEEDS_MORE_INFO, "needs_more_info"),
+    ],
+)
+def test_shared_app_duplicate_neutral_action_succeeds(legacy_without_list, action, expected_status):
+    conn = _temp_conn()
+    try:
+        item = _make_shared_app_duplicate_items()[0]
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        if legacy_without_list:
+            row = rqp.get_by_public_id(item.queue_item_id)
+            assert row is not None
+            evidence = json.loads(row["evidence_json"])
+            evidence.pop("all_app_transactions")
+            conn.execute(
+                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+                (json.dumps(evidence), item.queue_item_id),
+            )
+            conn.commit()
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        restored = _row_to_review_queue_item(row)
+        assert len(restored.candidate.all_app_transactions) == (0 if legacy_without_list else 1)
+        decision = ResolutionDecision(
+            decision_id=f"dec-{action.value}-{legacy_without_list}",
+            queue_item_id=item.queue_item_id,
+            action=action,
+        )
+        assert ResolutionPersistence(conn).apply_resolution(restored, decision).success
+        assert rqp.get_by_public_id(item.queue_item_id)["status"] == expected_status
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("legacy_without_list", [False, True])
+def test_shared_app_duplicate_mark_duplicate_rolls_back(legacy_without_list):
+    conn = _temp_conn()
+    try:
+        item = _make_shared_app_duplicate_items()[0]
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        if legacy_without_list:
+            row = rqp.get_by_public_id(item.queue_item_id)
+            assert row is not None
+            evidence = json.loads(row["evidence_json"])
+            evidence.pop("all_app_transactions")
+            conn.execute(
+                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+                (json.dumps(evidence), item.queue_item_id),
+            )
+            conn.commit()
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        restored = _row_to_review_queue_item(row)
+        decision = ResolutionDecision(
+            decision_id=f"dec-mark-duplicate-{legacy_without_list}",
+            queue_item_id=item.queue_item_id,
+            action=ResolutionAction.MARK_DUPLICATE,
+        )
+        with pytest.raises(ValueError, match="incomplete app targets"):
+            ResolutionPersistence(conn).apply_resolution(restored, decision)
+        assert (
+            conn.execute("SELECT COUNT(*) FROM reconciliation_resolution_decisions").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM reconciliation_resolution_results").fetchone()[0]
+            == 0
+        )
+        assert rqp.get_by_public_id(item.queue_item_id)["status"] == "pending"
+    finally:
+        conn.close()
+
+
+def test_truncated_duplicate_candidate_list_refuses_mark_duplicate_without_writes():
+    conn = _temp_conn()
+    try:
+        item = _make_duplicate_item()
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        evidence = json.loads(row["evidence_json"])
+        evidence["all_app_transactions"] = evidence["all_app_transactions"][:1]
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), item.queue_item_id),
+        )
+        conn.commit()
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        restored = _row_to_review_queue_item(row)
+        assert len(restored.candidate.all_app_transactions) == 1
+        decision = ResolutionDecision(
+            decision_id="dec-truncated-duplicate",
+            queue_item_id=item.queue_item_id,
+            action=ResolutionAction.MARK_DUPLICATE,
+        )
+        with pytest.raises(ValueError, match="incomplete app targets"):
+            ResolutionPersistence(conn).apply_resolution(restored, decision)
+        assert (
+            conn.execute("SELECT COUNT(*) FROM reconciliation_resolution_decisions").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM reconciliation_resolution_results").fetchone()[0]
+            == 0
+        )
+        assert rqp.get_by_public_id(item.queue_item_id)["status"] == "pending"
+    finally:
+        conn.close()
+
+
+def test_legacy_single_target_without_candidate_list_still_reconstructs():
+    conn = _temp_conn()
+    try:
+        item = _make_items()[0]
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        evidence = json.loads(row["evidence_json"])
+        evidence.pop("all_app_transactions")
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), item.queue_item_id),
+        )
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        restored = _row_to_review_queue_item(row)
+        assert restored.candidate.best_app_transaction is not None
+        assert restored.candidate.best_app_transaction.app_txn_id == "app-1"
+        assert restored.candidate.all_app_transactions == ()
+    finally:
+        conn.close()
+
+
+def test_duplicate_snapshot_refuses_changed_canonical_reference():
+    conn = _temp_conn()
+    try:
+        item = _make_duplicate_item()
+        rqp = ReviewQueuePersistence(conn)
+        rqp.persist_review_queue([item])
+        conn.execute(
+            "UPDATE reconciliation_review_queue SET app_transaction_ref = ? WHERE public_id = ?",
+            ("app-b", item.queue_item_id),
+        )
+        row = rqp.get_by_public_id(item.queue_item_id)
+        assert row is not None
+        with pytest.raises(ValueError, match="canonical reference disagree"):
+            _row_to_review_queue_item(row)
     finally:
         conn.close()
 

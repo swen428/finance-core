@@ -491,14 +491,29 @@ def test_replay_refuses_drifted_canonical_transaction(
     conn = migrated_temp_db_connection
     prepared, authorization, output = _finalized_pipeline(conn, tmp_path, "replaytxn")
 
-    # FORGED-DRIFT FIXTURE: corrupt the canonical monetary fact.
+    # Migration 051 prevents new drift of a finalized canonical transaction.
+    with pytest.raises(sqlite3.IntegrityError, match="finalized D2 transaction is immutable"):
+        conn.execute(
+            "UPDATE transactions SET amount = '999.99' WHERE public_id = ?",
+            (output.transaction_public_id,),
+        )
+
+    # FORGED-CORRUPTION FIXTURE: model a transaction already corrupted before
+    # migration 051 installed its guard, then exercise replay's independent check.
+    conn.execute("DROP TRIGGER trg_correction_transactions_no_update")
     conn.execute(
         "UPDATE transactions SET amount = '999.99' WHERE public_id = ?",
         (output.transaction_public_id,),
     )
     conn.commit()
+    assert (
+        conn.execute(
+            "SELECT amount FROM transactions WHERE public_id = ?", (output.transaction_public_id,)
+        ).fetchone()["amount"]
+        == 999.99
+    )
 
-    with pytest.raises(FAIL_CLOSED_ERRORS):
+    with pytest.raises(FAIL_CLOSED_ERRORS, match="Replay canonical transaction drifted"):
         finalize_prepared_receipt(conn, authorization)
     assert not conn.in_transaction
 

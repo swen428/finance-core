@@ -11,10 +11,12 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
 
+import finance_core.reconciliation.resolution_persistence as resolution_persistence
 from finance_core.reconciliation.demo_cli import main
 
 # Fixture paths relative to project root
@@ -64,6 +66,22 @@ def _run_resolve_review(db_path: str) -> int:
         str(_DECISIONS_JSON),
     ]
     return main(argv)
+
+
+def _assert_duplicate_still_pending_without_resolution(db_path: str) -> None:
+    with sqlite3.connect(db_path) as conn:
+        for table in (
+            "reconciliation_resolution_decisions",
+            "reconciliation_resolution_results",
+        ):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT status FROM reconciliation_review_queue WHERE public_id = ?",
+                ("resolve-test-q-004",),
+            ).fetchone()[0]
+            == "pending"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +151,104 @@ def test_resolution_results_rows_written():
             assert result_count > 0
         finally:
             conn.close()
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_duplicate_result_records_both_original_targets_and_resolves_queue():
+    db_path = _run_persist_review()
+    try:
+        assert _run_resolve_review(db_path) == 0
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT q.status, r.success, r.audit_evidence_json
+                FROM reconciliation_review_queue AS q
+                JOIN reconciliation_resolution_results AS r
+                  ON r.review_queue_public_id = q.public_id
+                WHERE q.public_id = 'resolve-test-q-004'"""
+            ).fetchone()
+            assert row is not None
+            evidence = json.loads(row["audit_evidence_json"])
+            assert row["status"] == "resolved"
+            assert row["success"] == 1
+            assert evidence["duplicate_app_txn_ids"] == ["app-004a", "app-004b"]
+            assert evidence["kept_app_txn_id"] == "app-004a"
+            assert evidence["audit_only"] is True
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_corrected_second_duplicate_target_refuses_without_writes(tmp_path, monkeypatch):
+    db_path = _run_persist_review()
+    try:
+        decision = json.loads(_DECISIONS_JSON.read_text())["decisions"][4]
+        decision_path = tmp_path / "duplicate-decision.json"
+        decision_path.write_text(json.dumps({"decisions": [decision]}))
+        checked: list[str] = []
+
+        def is_corrected(_conn, target_id: str) -> bool:
+            checked.append(target_id)
+            return target_id == "app-004b"
+
+        monkeypatch.setattr(resolution_persistence, "has_committed_correction", is_corrected)
+        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) != 0
+        assert checked == ["app-004a", "app-004b"]
+        _assert_duplicate_still_pending_without_resolution(db_path)
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_old_duplicate_without_app_list_refuses_before_any_writes(tmp_path):
+    db_path = _run_persist_review()
+    try:
+        decision = json.loads(_DECISIONS_JSON.read_text())["decisions"][4]
+        decision_path = tmp_path / "duplicate-decision.json"
+        decision_path.write_text(json.dumps({"decisions": [decision]}))
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
+                ("resolve-test-q-004",),
+            ).fetchone()
+            evidence = json.loads(row[0])
+            evidence.pop("all_app_transactions")
+            conn.execute(
+                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+                (json.dumps(evidence), "resolve-test-q-004"),
+            )
+        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) != 0
+        _assert_duplicate_still_pending_without_resolution(db_path)
+    finally:
+        Path(db_path).unlink(missing_ok=True)
+
+
+def test_old_single_target_without_app_list_still_confirms(tmp_path):
+    db_path = _run_persist_review()
+    try:
+        decision = json.loads(_DECISIONS_JSON.read_text())["decisions"][0]
+        decision_path = tmp_path / "single-decision.json"
+        decision_path.write_text(json.dumps({"decisions": [decision]}))
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
+                ("resolve-test-q-000",),
+            ).fetchone()
+            evidence = json.loads(row[0])
+            evidence.pop("all_app_transactions")
+            conn.execute(
+                "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
+                (json.dumps(evidence), "resolve-test-q-000"),
+            )
+        assert main(["resolve-review", "--db", db_path, "--decisions", str(decision_path)]) == 0
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                """SELECT q.status, r.success FROM reconciliation_review_queue AS q
+                JOIN reconciliation_resolution_results AS r
+                  ON r.review_queue_public_id = q.public_id
+                WHERE q.public_id = ?""",
+                ("resolve-test-q-000",),
+            ).fetchone()
+            assert row == ("resolved", 1)
     finally:
         Path(db_path).unlink(missing_ok=True)
 

@@ -209,6 +209,21 @@ def _serialize_evidence(item: ReviewQueueItem) -> str:
         evidence["app_amount"] = str(app.amount)
         evidence["app_currency"] = app.currency
         evidence["app_txn_date"] = app.transaction_date.isoformat()
+    evidence["all_app_transactions"] = [
+        {
+            "app_txn_id": app.app_txn_id,
+            "transaction_date": app.transaction_date.isoformat(),
+            "merchant": app.merchant,
+            "amount": str(app.amount),
+            "currency": app.currency,
+            "source_type": app.source_type,
+            "source_channel": app.source_channel,
+            "normalized_merchant": app.normalized_merchant,
+            "posted_date": app.posted_date.isoformat() if app.posted_date else None,
+            "transaction_type": app.transaction_type,
+        }
+        for app in cand.all_app_transactions
+    ]
     return json.dumps(evidence, sort_keys=True, separators=(",", ":"))
 
 
