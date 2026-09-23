@@ -1016,6 +1016,10 @@ def _row_to_review_queue_item(row: sqlite3.Row) -> ReviewQueueItem:
     evidence = _json.loads(row["evidence_json"] or "{}")
     if not isinstance(evidence, dict):
         raise ValueError("review queue evidence must be an object")
+    if "source_binding" in evidence:
+        from finance_core.reconciliation.source_binding import restore_bound_review_queue_item
+
+        return restore_bound_review_queue_item(row)
     reason_codes_raw = _json.loads(row["reason_codes_json"] or "[]")
     reason_codes = tuple(
         ReasonCode(r) if r in {rc.value for rc in ReasonCode} else ReasonCode.NEEDS_REVIEW

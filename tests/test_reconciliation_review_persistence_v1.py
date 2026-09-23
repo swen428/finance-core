@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date
 from decimal import Decimal
 
@@ -27,13 +27,16 @@ from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, appl
 from finance_core.reconciliation.models import (
     AppTransaction,
     IssueType,
+    MatchEvidence,
     MatchStatus,
+    ReconciliationCandidate,
+    ReconciliationReviewEvidence,
     ReconciliationTransactionType,
     ResolutionAction,
     ResolutionDecision,
+    ReviewQueueItem,
     StatementAmountDirection,
     StatementTransaction,
-    SuggestedAction,
 )
 from finance_core.reconciliation.persistence import apply_reconciliation_review_schema
 from finance_core.reconciliation.resolution_persistence import ResolutionPersistence
@@ -41,6 +44,7 @@ from finance_core.reconciliation.review_persistence import ReviewQueuePersistenc
 from finance_core.reconciliation.review_queue import generate_review_queue
 from finance_core.reconciliation.source_binding import (
     assert_candidate_matches_bound,
+    bound_source_audit_projection,
     build_source_binding,
     load_bound_queue,
 )
@@ -105,12 +109,7 @@ def _make_duplicate_item():
         issue_type=IssueType.POSSIBLE_DUPLICATE,
         match_status=MatchStatus.POSSIBLE_DUPLICATE,
     )
-    return replace(
-        item,
-        candidate=candidate,
-        issue_type=IssueType.POSSIBLE_DUPLICATE,
-        suggested_action=SuggestedAction.MARK_DUPLICATE,
-    )
+    return generate_review_queue([candidate])[0][0]
 
 
 def _make_shared_app_duplicate_items():
@@ -173,12 +172,9 @@ def test_051_binds_complete_three_app_snapshot_and_reuses_identical_source():
                 transaction_type="transfer",
             ),
         )
-        item = replace(
-            item,
-            candidate=replace(
-                item.candidate, best_app_transaction=apps[0], all_app_transactions=apps
-            ),
-        )
+        item = generate_review_queue(
+            [replace(item.candidate, best_app_transaction=apps[0], all_app_transactions=apps)]
+        )[0][0]
         rqp = ReviewQueuePersistence(conn)
         assert rqp.persist_review_queue([item]) == 1
         bound = load_bound_queue(conn, item.queue_item_id)
@@ -212,6 +208,94 @@ def test_051_binds_complete_three_app_snapshot_and_reuses_identical_source():
         conn.close()
 
 
+def test_051_restores_complete_source_for_cli_and_rejects_changed_decision_fields():
+    conn = _bound_conn()
+    try:
+        item = _make_duplicate_item()
+        assert ReviewQueuePersistence(conn).persist_review_queue([item]) == 1
+        row = ReviewQueuePersistence(conn).get_by_public_id(item.queue_item_id)
+        assert row is not None
+        restored = _row_to_review_queue_item(row)
+        assert restored == item
+        bound = load_bound_queue(conn, item.queue_item_id)
+        assert bound is not None and bound.item == item
+        projection = bound_source_audit_projection(bound)
+        assert projection["statement_amount"] == "29.90"
+        assert projection["reason_codes"] == [code.value for code in item.reason_codes]
+        assert projection["app_txn_id"] == item.candidate.best_app_transaction.app_txn_id
+
+        mutations = (
+            replace(item, issue_type=IssueType.NEEDS_REVIEW),
+            replace(item, reason_codes=()),
+            replace(item, evidence_summary="different summary"),
+            replace(
+                item,
+                candidate=replace(
+                    item.candidate,
+                    statement=replace(item.candidate.statement, amount=Decimal("999.00")),
+                ),
+            ),
+            replace(
+                item,
+                candidate=replace(item.candidate, confidence_score=Decimal("0.01")),
+            ),
+        )
+        for changed in mutations:
+            with pytest.raises(ValueError):
+                assert_candidate_matches_bound(bound, changed)
+    finally:
+        conn.close()
+
+
+def test_051_registration_rejects_inconsistent_and_untyped_source():
+    conn = _bound_conn()
+    try:
+        item = _make_duplicate_item()
+        invalid = (
+            replace(item, issue_type=IssueType.NEEDS_REVIEW),
+            replace(item, reason_codes=()),
+            replace(item, suggested_action="confirm_match"),
+            replace(item, priority=99),
+            replace(item, evidence_summary="forged"),
+            replace(item, structured_evidence=None),
+            replace(item, candidate=replace(item.candidate, confidence_score=Decimal("1.01"))),
+            replace(item, candidate=replace(item.candidate, match_status="matched")),
+            replace(item, candidate=replace(item.candidate, is_review_required=False)),
+            replace(item, candidate=replace(item.candidate, review_priority="low")),
+            replace(
+                item,
+                candidate=replace(
+                    item.candidate,
+                    evidence=replace(item.candidate.evidence, statement_amount=Decimal("0.01")),
+                ),
+            ),
+            replace(item, candidate=replace(item.candidate, best_app_transaction=None)),
+        )
+        persistence = ReviewQueuePersistence(conn)
+        for changed in invalid:
+            with pytest.raises(ValueError):
+                persistence.persist_review_queue([changed])
+        assert persistence.count_all() == 0
+    finally:
+        conn.close()
+
+
+def test_051_binding_covers_every_typed_source_field():
+    item = _make_duplicate_item()
+    source = build_source_binding(item)["decision_source"]
+    candidate = source["candidate"]
+    assert set(source) == {field.name for field in fields(ReviewQueueItem)}
+    assert set(candidate) == {field.name for field in fields(ReconciliationCandidate)}
+    assert set(candidate["statement"]) == {field.name for field in fields(StatementTransaction)}
+    assert set(candidate["all_app_transactions"][0]) == {
+        field.name for field in fields(AppTransaction)
+    }
+    assert set(candidate["evidence"]) == {field.name for field in fields(MatchEvidence)}
+    assert set(source["structured_evidence"]) == {
+        field.name for field in fields(ReconciliationReviewEvidence)
+    }
+
+
 def test_051_refuses_old_unbound_queue_and_does_not_commit_caller_transaction():
     conn = _bound_conn()
     try:
@@ -237,7 +321,9 @@ def test_051_refuses_old_unbound_queue_and_does_not_commit_caller_transaction():
         conn.close()
 
 
-@pytest.mark.parametrize("tamper", ["count", "duplicate", "field", "identity", "digest"])
+@pytest.mark.parametrize(
+    "tamper", ["count", "duplicate", "field", "identity", "digest", "v1", "duplicate_json"]
+)
 def test_051_refuses_malformed_preexisting_source_binding(tamper: str):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -261,11 +347,19 @@ def test_051_refuses_malformed_preexisting_source_binding(tamper: str):
             del binding["app_transactions"][1]["source_type"]
         elif tamper == "identity":
             binding["candidate_id"] = "another-candidate"
+        elif tamper == "v1":
+            binding["version"] = 1
+            del binding["decision_source"]
+        elif tamper == "duplicate_json":
+            pass
         else:
             binding["sha256"] = "0" * 64
+        evidence_json = json.dumps(evidence)
+        if tamper == "duplicate_json":
+            evidence_json = evidence_json[:-1] + ',"source_binding":{} }'
         conn.execute(
             "UPDATE reconciliation_review_queue SET evidence_json = ? WHERE public_id = ?",
-            (json.dumps(evidence), item.queue_item_id),
+            (evidence_json, item.queue_item_id),
         )
         conn.commit()
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)

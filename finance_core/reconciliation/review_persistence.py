@@ -66,6 +66,7 @@ class ReviewQueuePersistence:
         ids = [item.queue_item_id for item in items]
         if len(ids) != len(set(ids)):
             raise ValueError("review queue IDs must be unique")
+        bindings = [build_source_binding(item) if bound_schema else None for item in items]
         rows = [
             (
                 item.queue_item_id,
@@ -78,9 +79,9 @@ class ReviewQueuePersistence:
                 _app_ref(item),
                 str(item.candidate.confidence_score),
                 _serialize_reason_codes(item),
-                _serialize_evidence(item, bound_schema=bound_schema),
+                _serialize_evidence(item, source_binding=binding),
             )
-            for item in items
+            for item, binding in zip(items, bindings, strict=True)
         ]
 
         self._conn.execute("SAVEPOINT review_queue_registration")
@@ -219,7 +220,9 @@ def _serialize_reason_codes(item: ReviewQueueItem) -> str:
     return json.dumps(codes, sort_keys=True, separators=(",", ":"))
 
 
-def _serialize_evidence(item: ReviewQueueItem, *, bound_schema: bool = False) -> str:
+def _serialize_evidence(
+    item: ReviewQueueItem, *, source_binding: dict[str, Any] | None = None
+) -> str:
     cand = item.candidate
     evidence: dict[str, Any] = {
         "candidate_id": cand.candidate_id,
@@ -258,9 +261,9 @@ def _serialize_evidence(item: ReviewQueueItem, *, bound_schema: bool = False) ->
         }
         for app in cand.all_app_transactions
     ]
-    if bound_schema:
-        evidence["source_binding"] = build_source_binding(item)
-    return json.dumps(evidence, sort_keys=True, separators=(",", ":"))
+    if source_binding is not None:
+        evidence["source_binding"] = source_binding
+    return json.dumps(evidence, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
 def _statement_ref(item: ReviewQueueItem) -> str | None:
