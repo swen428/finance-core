@@ -37,15 +37,20 @@ identity files with:
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.4 \
+  --core-version 0.1.5 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
-  61e7dfaa6b1d8e4ffaccb04c52fb9335d709bf82a9c8c48965138fe859b6e6f3
+  40e3f64b1582d0a97ef669c18ab61b6594ea14b7c5d32eea95b4d221c674088a
 ```
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
+
+Version 0.1.5 adds the D2b controlled correction source for finalized D2
+transactions. It preserves the original transaction and evidence, records an
+append-only correction history, and requires a fresh human confirmation before
+applying a correction. It does not activate or upgrade a runtime.
 
 Version 0.1.4 adds D2 one-confirmation guarded posting for complete text and
 personal-total receipt cards. The Bridge renders Python-owned projections,
