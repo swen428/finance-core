@@ -335,26 +335,26 @@ class ResolutionPersistence:
             return self._insert_decision(decision)
 
     def _insert_decision(self, decision: ResolutionDecision) -> bool:
-        try:
-            self._conn.execute(
-                """
-                INSERT INTO reconciliation_resolution_decisions (
-                    public_id, review_queue_public_id, decision_action,
-                    decision_note, reviewer, resolved_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                _decision_values(decision),
-            )
-            return True
-        except sqlite3.IntegrityError as exc:
-            if not _is_unique_public_id_error(exc):
-                raise
-            existing = self._get_decision_by_public_id(decision.decision_id)
-            if existing is not None and _decision_row_matches(existing, decision):
+        # 051 rejects duplicate INSERT before SQLite's UNIQUE handler runs.
+        # The caller owns BEGIN IMMEDIATE, so this prequery is serialized with
+        # the eventual write and preserves the established replay contract.
+        existing = self._get_decision_by_public_id(decision.decision_id)
+        if existing is not None:
+            if _decision_row_matches(existing, decision):
                 return False
             raise DuplicateResolutionPersistenceError(
                 f"Conflicting resolution decision public_id: {decision.decision_id}"
-            ) from exc
+            )
+        self._conn.execute(
+            """
+            INSERT INTO reconciliation_resolution_decisions (
+                public_id, review_queue_public_id, decision_action,
+                decision_note, reviewer, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            _decision_values(decision),
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Write results
@@ -380,26 +380,23 @@ class ResolutionPersistence:
             return self._insert_result(_complete_success_evidence(self._conn, result))
 
     def _insert_result(self, result: ResolutionResult) -> bool:
-        try:
-            self._conn.execute(
-                """
-                INSERT INTO reconciliation_resolution_results (
-                    public_id, review_queue_public_id, decision_public_id,
-                    success, error_message, audit_evidence_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                _result_values(result),
-            )
-            return True
-        except sqlite3.IntegrityError as exc:
-            if not _is_unique_public_id_error(exc):
-                raise
-            existing = self._get_result_by_public_id(result.result_id)
-            if existing is not None and _result_row_matches(existing, result):
+        existing = self._get_result_by_public_id(result.result_id)
+        if existing is not None:
+            if _result_row_matches(existing, result):
                 return False
             raise DuplicateResolutionPersistenceError(
                 f"Conflicting resolution result public_id: {result.result_id}"
-            ) from exc
+            )
+        self._conn.execute(
+            """
+            INSERT INTO reconciliation_resolution_results (
+                public_id, review_queue_public_id, decision_public_id,
+                success, error_message, audit_evidence_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            _result_values(result),
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Apply resolution
@@ -530,11 +527,6 @@ def _result_values(result: ResolutionResult) -> tuple[str, str, str, int, str | 
         result.error_message or None,
         audit_json,
     )
-
-
-def _is_unique_public_id_error(exc: sqlite3.IntegrityError) -> bool:
-    message = str(exc).lower()
-    return "unique" in message and "public_id" in message
 
 
 def _decision_row_matches(row: sqlite3.Row, decision: ResolutionDecision) -> bool:

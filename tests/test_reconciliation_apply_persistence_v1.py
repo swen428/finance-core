@@ -504,7 +504,7 @@ def test_bound_apply_rejects_malformed_success_envelope(
         ("note", "forged decision note"),
     ],
 )
-def test_bound_duplicate_apply_rejects_forged_payload_and_history(
+def test_bound_duplicate_apply_rejects_forged_payload_and_update(
     migrated_temp_db_connection, payload_key, forged_value
 ) -> None:
     conn = migrated_temp_db_connection
@@ -514,14 +514,15 @@ def test_bound_duplicate_apply_rejects_forged_payload_and_history(
     with pytest.raises(ValueError, match="frozen queue source"):
         ApplyPersistence(conn).save_apply_result(forged)
     assert ApplyPersistence(conn).save_apply_result(result)
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET payload_json = ? WHERE apply_id = ?",
-        (json.dumps(payload), result.apply_id),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
-        _apply_relationships(conn, "unrelated-app")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET payload_json = ? WHERE apply_id = ?",
+            (json.dumps(payload), result.apply_id),
+        )
+    _apply_relationships(conn, "unrelated-app")
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _apply_relationships(conn, "app-three-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
 @pytest.mark.parametrize(
@@ -546,14 +547,15 @@ def test_bound_apply_source_audit_is_checked_before_target_filter(
         ap.save_apply_result(replace(result, audit_evidence=audit))
     assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
     assert ap.save_apply_result(result)
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
-        (json.dumps(audit), result.apply_id),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
-        _apply_relationships(conn, "unrelated-app")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+            (json.dumps(audit), result.apply_id),
+        )
+    _apply_relationships(conn, "unrelated-app")
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _apply_relationships(conn, "app-three-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
 @pytest.mark.parametrize(
@@ -577,14 +579,15 @@ def test_051_apply_rejects_extra_or_wrong_producer_audit_fields(
         ap.save_apply_result(replace(result, audit_evidence=audit))
     assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
     assert ap.save_apply_result(result)
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
-        (json.dumps(audit), result.apply_id),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
-        _apply_relationships(conn, "unrelated-app")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+            (json.dumps(audit), result.apply_id),
+        )
+    _apply_relationships(conn, "unrelated-app")
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _apply_relationships(conn, "app-three-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
 @pytest.mark.parametrize("refs", [None, 1, {}, [""], ["valid", 1], ["  "]])
@@ -599,14 +602,15 @@ def test_051_apply_rejects_malformed_caller_evidence_refs(
         ap.save_apply_result(replace(result, audit_evidence=audit))
     assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
     assert ap.save_apply_result(result)
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
-        (json.dumps(audit), result.apply_id),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
-        _apply_relationships(conn, "unrelated-app")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+            (json.dumps(audit), result.apply_id),
+        )
+    _apply_relationships(conn, "unrelated-app")
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _apply_relationships(conn, "app-three-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
 def test_051_nonempty_caller_refs_are_trace_only_and_replay_is_exact(
@@ -767,7 +771,7 @@ def test_bound_three_app_apply_checks_third_corrected_target(
     assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
 
 
-def test_bound_apply_rejects_incompatible_success_and_reader_detects_it(
+def test_bound_apply_rejects_incompatible_success_and_update(
     migrated_temp_db_connection,
 ) -> None:
     conn = migrated_temp_db_connection
@@ -784,24 +788,24 @@ def test_bound_apply_rejects_incompatible_success_and_reader_detects_it(
     assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
 
     assert ApplyPersistence(conn).save_apply_result(result)
-    conn.execute(
-        """UPDATE reconciliation_apply_results
-        SET action = ?, payload_json = ?, audit_evidence_json = ?
-        WHERE apply_id = ?""",
-        (
-            "confirm_match",
-            json.dumps(forged.payload),
-            json.dumps(forged.audit_evidence),
-            result.apply_id,
-        ),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            """UPDATE reconciliation_apply_results
+            SET action = ?, payload_json = ?, audit_evidence_json = ?
+            WHERE apply_id = ?""",
+            (
+                "confirm_match",
+                json.dumps(forged.payload),
+                json.dumps(forged.audit_evidence),
+                result.apply_id,
+            ),
+        )
+    with pytest.raises(CorrectionRelationshipError) as active:
         _apply_relationships(conn, "app-three-c")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
-def test_bound_apply_rejects_conflicting_audit_identity_and_reader_detects_it(
+def test_bound_apply_rejects_conflicting_audit_identity_and_update(
     migrated_temp_db_connection,
 ) -> None:
     conn = migrated_temp_db_connection
@@ -820,17 +824,17 @@ def test_bound_apply_rejects_conflicting_audit_identity_and_reader_detects_it(
     assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
 
     assert ap.save_apply_result(result)
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
-        (json.dumps(forged_evidence), result.apply_id),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+            (json.dumps(forged_evidence), result.apply_id),
+        )
+    with pytest.raises(CorrectionRelationshipError) as active:
         _apply_relationships(conn, "app-three-c")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
-def test_bound_apply_result_missing_third_target_is_unknown_integrity(
+def test_bound_apply_rejects_removing_third_target_from_saved_result(
     migrated_temp_db_connection,
 ) -> None:
     conn = migrated_temp_db_connection
@@ -839,22 +843,22 @@ def test_bound_apply_result_missing_third_target_is_unknown_integrity(
     with pytest.raises(CorrectionRelationshipError) as active:
         _apply_relationships(conn, "app-three-c")
     assert active.value.classification == "ACTIVE_RELATIONSHIP"
-    conn.execute(
-        "UPDATE reconciliation_apply_results SET payload_json = ? WHERE apply_id = ?",
-        (
-            json.dumps(
-                {
-                    **result.payload,
-                    "duplicate_app_txn_ids": result.payload["duplicate_app_txn_ids"][:2],
-                }
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_apply_results SET payload_json = ? WHERE apply_id = ?",
+            (
+                json.dumps(
+                    {
+                        **result.payload,
+                        "duplicate_app_txn_ids": result.payload["duplicate_app_txn_ids"][:2],
+                    }
+                ),
+                result.apply_id,
             ),
-            result.apply_id,
-        ),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
+        )
+    with pytest.raises(CorrectionRelationshipError) as active:
         _apply_relationships(conn, "app-three-c")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
 
 
 def test_bound_apply_batch_rolls_back_prior_good_result_on_short_duplicate(

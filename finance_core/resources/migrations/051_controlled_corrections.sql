@@ -228,6 +228,24 @@ WHEN EXISTS (
 )
 BEGIN SELECT RAISE(ABORT, 'review queue identity collision'); END;
 
+-- Resolution and final-mutation success are part of the same frozen
+-- relationship evidence as the queue source. Protect every stored outcome,
+-- including failures: changing success 1 -> 0 or deleting a row must never
+-- make a previously committed relationship disappear from history. Explicit
+-- collisions also precede SQLite's OR REPLACE / OR IGNORE handling.
+CREATE TRIGGER trg_correction_resolution_decisions_no_update BEFORE UPDATE ON reconciliation_resolution_decisions BEGIN SELECT RAISE(ABORT, 'resolution decisions are append-only'); END;
+CREATE TRIGGER trg_correction_resolution_decisions_no_delete BEFORE DELETE ON reconciliation_resolution_decisions BEGIN SELECT RAISE(ABORT, 'resolution decisions are append-only'); END;
+CREATE TRIGGER trg_correction_resolution_decisions_no_insert_collision BEFORE INSERT ON reconciliation_resolution_decisions WHEN EXISTS (SELECT 1 FROM reconciliation_resolution_decisions WHERE id = NEW.id OR public_id = NEW.public_id) BEGIN SELECT RAISE(ABORT, 'resolution decision identity collision'); END;
+CREATE TRIGGER trg_correction_resolution_results_no_update BEFORE UPDATE ON reconciliation_resolution_results BEGIN SELECT RAISE(ABORT, 'resolution results are append-only'); END;
+CREATE TRIGGER trg_correction_resolution_results_no_delete BEFORE DELETE ON reconciliation_resolution_results BEGIN SELECT RAISE(ABORT, 'resolution results are append-only'); END;
+CREATE TRIGGER trg_correction_resolution_results_no_insert_collision BEFORE INSERT ON reconciliation_resolution_results WHEN EXISTS (SELECT 1 FROM reconciliation_resolution_results WHERE id = NEW.id OR public_id = NEW.public_id) BEGIN SELECT RAISE(ABORT, 'resolution result identity collision'); END;
+CREATE TRIGGER trg_correction_apply_results_no_update BEFORE UPDATE ON reconciliation_apply_results BEGIN SELECT RAISE(ABORT, 'apply results are append-only'); END;
+CREATE TRIGGER trg_correction_apply_results_no_delete BEFORE DELETE ON reconciliation_apply_results BEGIN SELECT RAISE(ABORT, 'apply results are append-only'); END;
+CREATE TRIGGER trg_correction_apply_results_no_insert_collision BEFORE INSERT ON reconciliation_apply_results WHEN EXISTS (SELECT 1 FROM reconciliation_apply_results WHERE id = NEW.id OR apply_id = NEW.apply_id OR decision_id = NEW.decision_id) BEGIN SELECT RAISE(ABORT, 'apply result identity collision'); END;
+CREATE TRIGGER trg_correction_final_mutation_audit_no_update BEFORE UPDATE ON reconciliation_final_mutation_audit BEGIN SELECT RAISE(ABORT, 'final mutation audit is append-only'); END;
+CREATE TRIGGER trg_correction_final_mutation_audit_no_delete BEFORE DELETE ON reconciliation_final_mutation_audit BEGIN SELECT RAISE(ABORT, 'final mutation audit is append-only'); END;
+CREATE TRIGGER trg_correction_final_mutation_audit_no_insert_collision BEFORE INSERT ON reconciliation_final_mutation_audit WHEN EXISTS (SELECT 1 FROM reconciliation_final_mutation_audit WHERE rowid = NEW.rowid OR final_mutation_id = NEW.final_mutation_id OR idempotency_key = NEW.idempotency_key) BEGIN SELECT RAISE(ABORT, 'final mutation audit identity collision'); END;
+
 CREATE TRIGGER trg_correction_targets_no_update BEFORE UPDATE ON correction_targets BEGIN SELECT RAISE(ABORT, 'correction targets are append-only'); END;
 CREATE TRIGGER trg_correction_targets_no_delete BEFORE DELETE ON correction_targets BEGIN SELECT RAISE(ABORT, 'correction targets are append-only'); END;
 CREATE TRIGGER trg_correction_targets_no_insert_collision BEFORE INSERT ON correction_targets WHEN EXISTS (SELECT 1 FROM correction_targets WHERE target_id = NEW.target_id) BEGIN SELECT RAISE(ABORT, 'correction target identity collision'); END;

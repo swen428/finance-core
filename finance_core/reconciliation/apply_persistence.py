@@ -244,57 +244,24 @@ class ApplyPersistence:
             result.applied_at,
         )
 
-        try:
-            self._conn.execute(
-                """
-                INSERT INTO reconciliation_apply_results (
-                    apply_id, decision_id, queue_item_id, candidate_id,
-                    action, success, idempotent,
-                    payload_json, audit_evidence_json,
-                    statement_reference_json, app_transaction_reference_json,
-                    reviewer, note, fingerprint, applied_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                values,
-            )
-            return True
-        except sqlite3.IntegrityError as exc:
-            if not (_is_unique_apply_id_error(exc) or _is_unique_decision_id_error(exc)):
-                raise
-
-            # Check apply_id first (primary uniqueness contract), then decision_id
-            existing = self._get_by_apply_id(result.apply_id)
-            if existing is None:
-                existing = self._get_by_decision_id(result.decision_id)
-                if existing is None:
-                    raise ApplyPersistenceConflictError(
-                        f"Unexpected: unique constraint violated for apply_id "
-                        f"'{result.apply_id}' / decision_id '{result.decision_id}' "
-                        f"but row not found on read-back."
-                    ) from exc
-                conflict_id = f"decision_id '{result.decision_id}'"
-            else:
-                conflict_id = f"apply_id '{result.apply_id}'"
-
-            # The historical fingerprint intentionally omits source refs,
-            # timestamps and audit JSON.  A replay is safe only when every
-            # persisted claim matches; the runtime's replay flag may differ.
+        # 051's collision guard fires before SQLite reports a UNIQUE error.
+        # BEGIN IMMEDIATE makes this lookup and insert one owned transaction.
+        existing = self._get_by_apply_id(result.apply_id)
+        if existing is None:
+            existing = self._get_by_decision_id(result.decision_id)
+            conflict_id = f"decision_id '{result.decision_id}'"
+        else:
+            conflict_id = f"apply_id '{result.apply_id}'"
+        if existing is not None:
+            # The historical fingerprint omits source refs, timestamps and
+            # audit JSON.  Replay requires the complete stored claim; only
+            # the runtime's replay flag may differ.
             columns = (
-                "apply_id",
-                "decision_id",
-                "queue_item_id",
-                "candidate_id",
-                "action",
-                "success",
-                "idempotent",
-                "payload_json",
-                "audit_evidence_json",
-                "statement_reference_json",
-                "app_transaction_reference_json",
-                "reviewer",
-                "note",
-                "fingerprint",
-                "applied_at",
+                "apply_id", "decision_id", "queue_item_id", "candidate_id",
+                "action", "success", "idempotent", "payload_json",
+                "audit_evidence_json", "statement_reference_json",
+                "app_transaction_reference_json", "reviewer", "note",
+                "fingerprint", "applied_at",
             )
             same_claim = all(
                 existing[column] == value
@@ -303,12 +270,24 @@ class ApplyPersistence:
             )
             if existing["fingerprint"] == fingerprint and same_claim:
                 return False
-
             raise ApplyPersistenceConflictError(
                 f"Conflicting {conflict_id}: "
                 f"existing fingerprint '{existing['fingerprint'][:16]}...' "
                 f"does not match new fingerprint '{fingerprint[:16]}...'"
-            ) from exc
+            )
+        self._conn.execute(
+            """
+            INSERT INTO reconciliation_apply_results (
+                apply_id, decision_id, queue_item_id, candidate_id,
+                action, success, idempotent,
+                payload_json, audit_evidence_json,
+                statement_reference_json, app_transaction_reference_json,
+                reviewer, note, fingerprint, applied_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Read
@@ -427,16 +406,6 @@ def _build_fingerprint(result: ResolutionApplyResult) -> str:
     }
     raw = json.dumps(canonical, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def _is_unique_apply_id_error(exc: sqlite3.IntegrityError) -> bool:
-    message = str(exc).lower()
-    return "unique" in message and "apply_id" in message
-
-
-def _is_unique_decision_id_error(exc: sqlite3.IntegrityError) -> bool:
-    message = str(exc).lower()
-    return "unique" in message and "decision_id" in message
 
 
 __all__ = [

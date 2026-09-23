@@ -18,6 +18,7 @@ from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, appl
 MIGRATION = Path(__file__).resolve().parents[1] / (
     "finance_core/resources/migrations/051_controlled_corrections.sql"
 )
+MIGRATIONS = MIGRATION.parent
 
 
 def _db() -> sqlite3.Connection:
@@ -47,6 +48,14 @@ def _db() -> sqlite3.Connection:
             aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
         INSERT INTO transactions VALUES (1,'txn-1',10);"""
     )
+    # The 051 triggers protect the real prerequisite audit tables from
+    # migrations 007, 008 and 019, even in this reduced schema fixture.
+    for name in (
+        "007_reconciliation_review_resolution_persistence.sql",
+        "008_reconciliation_apply_results.sql",
+        "019_reconciliation_final_mutation_audit.sql",
+    ):
+        conn.executescript((MIGRATIONS / name).read_text("utf-8"))
     conn.execute(
         "INSERT INTO schema_migrations VALUES (?,?,?,?)",
         ("051", MIGRATION.name, 51, hashlib.sha256(MIGRATION.read_bytes()).hexdigest()),
@@ -111,6 +120,145 @@ def _queue_row(conn: sqlite3.Connection) -> tuple[object, ...]:
 def _assert_queue_row(conn: sqlite3.Connection, expected: tuple[object, ...]) -> None:
     rows = conn.execute("SELECT * FROM reconciliation_review_queue ORDER BY id").fetchall()
     assert [tuple(row) for row in rows] == [expected]
+
+
+_AUDIT_INSERTS: dict[str, str] = {
+    "reconciliation_resolution_decisions": (
+        "INSERT INTO reconciliation_resolution_decisions "
+        "(id, public_id, review_queue_public_id, decision_action, reviewer) "
+        "VALUES (1, 'decision-1', 'queue-1', 'ignore', 'human')"
+    ),
+    "reconciliation_resolution_results": (
+        "INSERT INTO reconciliation_resolution_results "
+        "(id, public_id, review_queue_public_id, decision_public_id, success, audit_evidence_json) "
+        "VALUES (1, 'result-1', 'queue-1', 'decision-1', 1, '{}')"
+    ),
+    "reconciliation_apply_results": (
+        "INSERT INTO reconciliation_apply_results "
+        "(id, apply_id, decision_id, queue_item_id, action, success, payload_json, "
+        "audit_evidence_json, fingerprint, applied_at) "
+        "VALUES (1, 'apply-1', 'apply-decision-1', 'queue-1', 'ignore', 1, "
+        "'{}', '{}', 'fp', '2026-01-01')"
+    ),
+    "reconciliation_final_mutation_audit": (
+        "INSERT INTO reconciliation_final_mutation_audit "
+        "(rowid, final_mutation_id, idempotency_key, idempotency_fingerprint, operation_id, "
+        "plan_id, proposal_id, guard_decision_proposal_id, guarded_execution_id, "
+        "guarded_execution_idempotency_key, human_confirmation_id, actor_type, action, "
+        "status, created_at) VALUES (1, 'final-1', 'final-key-1', 'fp', 'op-1', 'plan-1', "
+        "'proposal-1', 'guard-1', 'execution-1', 'exec-key-1', 'confirm-1', 'human', "
+        "'apply', 'applied', '2026-01-01')"
+    ),
+}
+
+
+def _audit_rows(conn: sqlite3.Connection) -> None:
+    _queue_row(conn)
+    for statement in _AUDIT_INSERTS.values():
+        conn.execute(statement)
+    conn.commit()
+
+
+@pytest.mark.parametrize("table", tuple(_AUDIT_INSERTS))
+def test_051_reconciliation_audit_rows_are_append_only_and_ignore_replace_safe(
+    table: str,
+) -> None:
+    conn = _db()
+    try:
+        _audit_rows(conn)
+        original = conn.execute(f"SELECT rowid, * FROM {table}").fetchall()
+        for statement in (
+            f"UPDATE {table} SET rowid = rowid WHERE rowid = 1",
+            f"DELETE FROM {table} WHERE rowid = 1",
+            _AUDIT_INSERTS[table].replace("INSERT INTO", "INSERT OR REPLACE INTO", 1),
+            _AUDIT_INSERTS[table].replace("INSERT INTO", "INSERT OR IGNORE INTO", 1),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="append-only|identity collision"):
+                conn.execute(statement)
+            assert conn.execute(f"SELECT rowid, * FROM {table}").fetchall() == original
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "replacement"),
+    [
+        ("reconciliation_resolution_decisions", "'decision-1'"),
+        ("reconciliation_resolution_results", "'result-1'"),
+        ("reconciliation_apply_results", "'apply-1'"),
+        ("reconciliation_final_mutation_audit", "'final-1'"),
+    ],
+)
+def test_051_reconciliation_audit_unique_identity_collision_before_replace(
+    table: str, replacement: str
+) -> None:
+    conn = _db()
+    try:
+        _audit_rows(conn)
+        before = conn.execute(f"SELECT rowid, * FROM {table}").fetchall()
+        # A second logical row with the same public identity cannot use OR
+        # REPLACE to delete the original even when its rowid is different.
+        statement = _AUDIT_INSERTS[table].replace("INSERT INTO", "INSERT OR REPLACE INTO", 1)
+        statement = statement.replace("VALUES (1,", "VALUES (2,", 1)
+        assert replacement in statement
+        with pytest.raises(sqlite3.IntegrityError, match="identity collision"):
+            conn.execute(statement)
+        assert conn.execute(f"SELECT rowid, * FROM {table}").fetchall() == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("table", "substitutions"),
+    [
+        ("reconciliation_resolution_decisions", (("decision-1", "decision-2"),)),
+        ("reconciliation_resolution_results", (("result-1", "result-2"),)),
+        (
+            "reconciliation_apply_results",
+            (("apply-1", "apply-2"), ("apply-decision-1", "apply-decision-2")),
+        ),
+        (
+            "reconciliation_final_mutation_audit",
+            (("final-1", "final-2"), ("final-key-1", "final-key-2")),
+        ),
+    ],
+)
+def test_051_reconciliation_audit_explicit_rowid_collision_is_rejected(
+    table: str, substitutions: tuple[tuple[str, str], ...]
+) -> None:
+    conn = _db()
+    try:
+        _audit_rows(conn)
+        before = conn.execute(f"SELECT rowid, * FROM {table}").fetchall()
+        for mode in ("REPLACE", "IGNORE"):
+            statement = _AUDIT_INSERTS[table].replace("INSERT INTO", f"INSERT OR {mode} INTO", 1)
+            for original, changed in substitutions:
+                statement = statement.replace(original, changed)
+            with pytest.raises(sqlite3.IntegrityError, match="identity collision"):
+                conn.execute(statement)
+            assert conn.execute(f"SELECT rowid, * FROM {table}").fetchall() == before
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        f"trg_correction_{name}_{operation}"
+        for name in (
+            "resolution_decisions", "resolution_results", "apply_results", "final_mutation_audit"
+        )
+        for operation in ("no_update", "no_delete", "no_insert_collision")
+    ],
+)
+def test_051_schema_inventory_requires_each_reconciliation_audit_guard(trigger: str) -> None:
+    conn = _db()
+    try:
+        conn.execute(f"DROP TRIGGER {trigger}")
+        with pytest.raises(CorrectionSchemaError, match="inventory"):
+            verify_correction_schema(conn)
+    finally:
+        conn.close()
 
 
 def test_schema_requires_all_recorded_objects_and_foreign_keys() -> None:

@@ -555,14 +555,16 @@ def test_051_resolution_rejects_extra_audit_fields_before_and_after_persistence(
     row = rp.list_results_for_queue_item(item.queue_item_id)[0]
     stored_audit = json.loads(row["audit_evidence_json"])
     stored_audit[extra_key] = value
-    conn.execute(
-        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
-        (json.dumps(stored_audit), row["public_id"]),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
-        _resolution_relationships(conn, "unrelated-app")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_resolution_results "
+            "SET audit_evidence_json = ? WHERE public_id = ?",
+            (json.dumps(stored_audit), row["public_id"]),
+        )
+    assert rp.list_results_for_queue_item(item.queue_item_id)[0]["audit_evidence_json"] == row[
+        "audit_evidence_json"
+    ]
+    _resolution_relationships(conn, "unrelated-app")
 
 
 def test_bound_resolution_rejects_provided_result_with_different_decision(
@@ -668,19 +670,20 @@ def test_direct_success_result_and_reader_verify_human_attribution(
     row = rp.list_results_for_queue_item(item.queue_item_id)[0]
     evidence = json.loads(row["audit_evidence_json"])
     evidence["reviewer"] = "Alice"
-    conn.execute(
-        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
-        (json.dumps(evidence), row["public_id"]),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_resolution_results "
+            "SET audit_evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), row["public_id"]),
+        )
+    conn.rollback()
+    with pytest.raises(CorrectionRelationshipError) as active:
         _resolution_relationships(conn, "app-res-c")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
-    with pytest.raises(ValueError, match="decision evidence changed"):
-        rp.persist_decision(bob)
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
+    assert rp.persist_decision(bob) is False
 
 
-def test_bound_three_app_result_missing_third_is_unknown_and_replay_refused(
+def test_bound_three_app_result_rejects_removing_third_and_replays(
     migrated_temp_db_connection,
 ) -> None:
     conn = migrated_temp_db_connection
@@ -693,16 +696,17 @@ def test_bound_three_app_result_missing_third_is_unknown_and_replay_refused(
         _resolution_relationships(conn, "app-res-c")
     assert active.value.classification == "ACTIVE_RELATIONSHIP"
     evidence["duplicate_app_txn_ids"] = evidence["duplicate_app_txn_ids"][:2]
-    conn.execute(
-        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
-        (json.dumps(evidence), row["public_id"]),
-    )
-    conn.commit()
-    with pytest.raises(CorrectionRelationshipError) as error:
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        conn.execute(
+            "UPDATE reconciliation_resolution_results "
+            "SET audit_evidence_json = ? WHERE public_id = ?",
+            (json.dumps(evidence), row["public_id"]),
+        )
+    conn.rollback()
+    with pytest.raises(CorrectionRelationshipError) as active:
         _resolution_relationships(conn, "app-res-c")
-    assert error.value.classification == "UNKNOWN_INTEGRITY"
-    with pytest.raises(ValueError, match="frozen queue source"):
-        rp.persist_decision(decision)
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
+    assert rp.persist_decision(decision) is False
 
 
 def test_successful_resolution_replay_refuses_corrected_target_under_lock(
