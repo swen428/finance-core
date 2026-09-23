@@ -155,17 +155,14 @@ def _migration_contract(contract_payload: bytes) -> tuple[str, tuple[str, ...]]:
     ):
         raise ValueError("wheel migration filename declaration is invalid")
     filenames = tuple(filename for filename in filenames_value if isinstance(filename, str))
-    if (
-        len(filenames) != len(set(filenames))
-        or any(
-            len(filename) < 9
-            or not filename[:3].isdigit()
-            or filename[3] != "_"
-            or not filename.endswith(".sql")
-            or "/" in filename
-            or "\\" in filename
-            for filename in filenames
-        )
+    if len(filenames) != len(set(filenames)) or any(
+        len(filename) < 9
+        or not filename[:3].isdigit()
+        or filename[3] != "_"
+        or not filename.endswith(".sql")
+        or "/" in filename
+        or "\\" in filename
+        for filename in filenames
     ):
         raise ValueError("wheel migration filename declaration is invalid")
     return digest_value, filenames
@@ -347,9 +344,7 @@ def _inspect_wheel(
     package_init = package_files.get("finance_core/__init__.py")
     if package_init is None:
         raise ValueError("wheel is missing finance_core/__init__.py")
-    migration_contract = package_files.get(
-        "finance_core/resources/migration-contract-v1.json"
-    )
+    migration_contract = package_files.get("finance_core/resources/migration-contract-v1.json")
     if migration_contract is None:
         raise ValueError("wheel is missing the migration contract resource")
     observed_ledger = _migration_ledger_digest(package_files)
@@ -358,8 +353,7 @@ def _inspect_wheel(
         sorted(
             PurePosixPath(name).name
             for name in package_files
-            if name.startswith("finance_core/resources/migrations/")
-            and name.endswith(".sql")
+            if name.startswith("finance_core/resources/migrations/") and name.endswith(".sql")
         )
     )
     if declared_ledger != observed_ledger or declared_filenames != observed_filenames:

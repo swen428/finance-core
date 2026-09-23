@@ -16,7 +16,7 @@ from enum import Enum
 from typing import Any
 
 from finance_core.application.correction_schema import verify_correction_schema
-from finance_core.reconciliation.models import AppTransaction, ReviewQueueItem
+from finance_core.reconciliation.models import AppTransaction, IssueType, ReviewQueueItem
 
 _APP_KEYS = frozenset(
     {
@@ -37,6 +37,7 @@ _BINDING_KEYS = frozenset(
         "version",
         "queue_item_id",
         "candidate_id",
+        "issue_type",
         "statement_transaction_ref",
         "app_transaction_ref",
         "app_transaction_count",
@@ -50,6 +51,7 @@ _BINDING_KEYS = frozenset(
 class BoundQueue:
     queue_item_id: str
     candidate_id: str
+    issue_type: IssueType
     statement_transaction_ref: str | None
     app_transaction_ref: str | None
     app_transactions: tuple[AppTransaction, ...]
@@ -149,6 +151,7 @@ def _source_material(item: ReviewQueueItem) -> dict[str, Any]:
         "version": 1,
         "queue_item_id": item.queue_item_id,
         "candidate_id": candidate.candidate_id,
+        "issue_type": item.issue_type.value,
         "statement_transaction_ref": statement_ref,
         "app_transaction_ref": app_ref,
         "app_transaction_count": len(snapshots),
@@ -167,14 +170,15 @@ def load_bound_queue(conn: sqlite3.Connection, queue_id: str) -> BoundQueue | No
     if not verify_correction_schema(conn):
         return None
     row = conn.execute(
-        "SELECT public_id, candidate_id, statement_transaction_ref, app_transaction_ref, "
+        "SELECT public_id, candidate_id, issue_type, statement_transaction_ref, "
+        "app_transaction_ref, "
         "evidence_json FROM reconciliation_review_queue WHERE public_id = ?",
         (queue_id,),
     ).fetchone()
     if row is None:
         raise ValueError("bound queue row is missing")
     try:
-        evidence = json.loads(row[4])
+        evidence = json.loads(row[5])
     except (TypeError, ValueError) as exc:
         raise ValueError("bound queue evidence is invalid") from exc
     if not isinstance(evidence, dict):
@@ -190,8 +194,9 @@ def load_bound_queue(conn: sqlite3.Connection, queue_id: str) -> BoundQueue | No
     for key, row_index in (
         ("queue_item_id", 0),
         ("candidate_id", 1),
-        ("statement_transaction_ref", 2),
-        ("app_transaction_ref", 3),
+        ("issue_type", 2),
+        ("statement_transaction_ref", 3),
+        ("app_transaction_ref", 4),
     ):
         if raw[key] != row[row_index]:
             raise ValueError(f"bound queue {key} conflicts with canonical row")
@@ -199,6 +204,10 @@ def load_bound_queue(conn: sqlite3.Connection, queue_id: str) -> BoundQueue | No
         raise ValueError("bound queue identity is invalid")
     if not isinstance(raw["candidate_id"], str) or not raw["candidate_id"].strip():
         raise ValueError("bound queue candidate identity is invalid")
+    try:
+        issue_type = IssueType(raw["issue_type"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("bound queue issue type is invalid") from exc
     for key in ("statement_transaction_ref", "app_transaction_ref"):
         if raw[key] is not None and (not isinstance(raw[key], str) or not raw[key].strip()):
             raise ValueError(f"bound queue {key} is invalid")
@@ -240,6 +249,7 @@ def load_bound_queue(conn: sqlite3.Connection, queue_id: str) -> BoundQueue | No
     return BoundQueue(
         queue_item_id=raw["queue_item_id"],
         candidate_id=raw["candidate_id"],
+        issue_type=issue_type,
         statement_transaction_ref=raw["statement_transaction_ref"],
         app_transaction_ref=raw["app_transaction_ref"],
         app_transactions=apps,

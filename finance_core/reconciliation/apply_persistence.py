@@ -29,7 +29,10 @@ from contextlib import contextmanager
 from typing import Any, Sequence
 
 from finance_core.application.correction_schema import has_committed_correction
-from finance_core.reconciliation.models import ResolutionApplyResult
+from finance_core.reconciliation.models import (
+    ResolutionApplyResult,
+    validate_resolution_decision,
+)
 from finance_core.reconciliation.source_binding import load_bound_queue
 
 
@@ -87,6 +90,11 @@ def _guard_successful_apply(conn: sqlite3.Connection, result: ResolutionApplyRes
         targets.update(duplicates)
         targets.add(kept)
     if bound is not None:
+        compatible, _ = validate_resolution_decision(result.action, bound.issue_type)
+        if not compatible:
+            raise ValueError(
+                "successful reconciliation apply action conflicts with frozen queue issue"
+            )
         if (
             result.candidate_id != bound.candidate_id
             or result.statement_reference != bound.statement_transaction_ref

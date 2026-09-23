@@ -17,6 +17,7 @@ from finance_core.application.correction_schema import (
 )
 from finance_core.calculation.authoritative_snapshot import canonical_json_value
 from finance_core.financial_audit import verify_financial_audit_chain
+from finance_core.reconciliation.models import ResolutionAction, validate_resolution_decision
 from finance_core.reconciliation.source_binding import load_bound_queue
 
 
@@ -246,7 +247,10 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
             except (ValueError, CorrectionSchemaError):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if bound is not None and (
-                duplicates != [app.app_txn_id for app in bound.app_transactions]
+                not validate_resolution_decision(ResolutionAction.MARK_DUPLICATE, bound.issue_type)[
+                    0
+                ]
+                or duplicates != [app.app_txn_id for app in bound.app_transactions]
                 or kept != bound.app_transaction_ref
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
@@ -270,7 +274,10 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
             except (ValueError, CorrectionSchemaError):
                 _refuse("UNKNOWN_INTEGRITY", label)
             if bound is not None and (
-                queue_ref != bound.app_transaction_ref
+                not validate_resolution_decision(ResolutionAction.CONFIRM_MATCH, bound.issue_type)[
+                    0
+                ]
+                or queue_ref != bound.app_transaction_ref
                 or evidence.get("queue_item_id") != bound.queue_item_id
                 or evidence.get("candidate_id") != bound.candidate_id
             ):
@@ -348,7 +355,11 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 except (ValueError, CorrectionSchemaError):
                     _refuse("UNKNOWN_INTEGRITY", label)
             if bound is not None and (
-                row["candidate_id"] != bound.candidate_id
+                action != ResolutionAction.MARK_DUPLICATE.value
+                or not validate_resolution_decision(
+                    ResolutionAction.MARK_DUPLICATE, bound.issue_type
+                )[0]
+                or row["candidate_id"] != bound.candidate_id
                 or statement_ref != bound.statement_transaction_ref
                 or app_ref != bound.app_transaction_ref
                 or duplicates != [app.app_txn_id for app in bound.app_transactions]
@@ -394,7 +405,11 @@ def _apply_relationships(conn: sqlite3.Connection, target_id: str) -> None:
                 except (ValueError, CorrectionSchemaError):
                     _refuse("UNKNOWN_INTEGRITY", label)
             if bound is not None and (
-                row["candidate_id"] != bound.candidate_id
+                action != ResolutionAction.CONFIRM_MATCH.value
+                or not validate_resolution_decision(
+                    ResolutionAction.CONFIRM_MATCH, bound.issue_type
+                )[0]
+                or row["candidate_id"] != bound.candidate_id
                 or statement_ref != bound.statement_transaction_ref
                 or app_ref != bound.app_transaction_ref
                 or canonical_id != bound.app_transaction_ref

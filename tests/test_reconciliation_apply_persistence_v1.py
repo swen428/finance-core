@@ -486,6 +486,40 @@ def test_bound_three_app_apply_checks_third_corrected_target(
     assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
 
 
+def test_bound_apply_rejects_incompatible_success_and_reader_detects_it(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    canonical = item.candidate.best_app_transaction.app_txn_id
+    forged = replace(
+        result,
+        action=ResolutionAction.CONFIRM_MATCH,
+        payload={"action_type": "confirm_match", "app_txn_id": canonical},
+        audit_evidence={**result.audit_evidence, "resolution_action": "confirm_match"},
+    )
+    with pytest.raises(ValueError, match="conflicts with frozen queue issue"):
+        ApplyPersistence(conn).save_apply_result(forged)
+    assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
+
+    assert ApplyPersistence(conn).save_apply_result(result)
+    conn.execute(
+        """UPDATE reconciliation_apply_results
+        SET action = ?, payload_json = ?, audit_evidence_json = ?
+        WHERE apply_id = ?""",
+        (
+            "confirm_match",
+            json.dumps(forged.payload),
+            json.dumps(forged.audit_evidence),
+            result.apply_id,
+        ),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "app-three-c")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
 def test_bound_apply_result_missing_third_target_is_unknown_integrity(
     migrated_temp_db_connection,
 ) -> None:

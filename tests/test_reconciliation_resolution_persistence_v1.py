@@ -466,6 +466,76 @@ def test_bound_three_app_resolution_checks_corrected_third_target(
     assert rp.list_results_for_queue_item(item.queue_item_id) == []
 
 
+def test_bound_resolution_rejects_provided_result_with_different_decision(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, mark_decision, rp = _bound_three_app_resolution(conn)
+    mark_result = ResolutionRuntime().resolve(item, mark_decision)
+    assert mark_result.success
+    ignore_decision = replace(mark_decision, action=ResolutionAction.IGNORE)
+    with pytest.raises(ValueError, match="caller and result disagree"):
+        rp.apply_resolution(item, ignore_decision, mark_result)
+    assert rp.list_decisions_for_queue_item(item.queue_item_id) == []
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+
+
+def test_bound_resolution_rejects_forged_success_for_incompatible_issue(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, mark_decision, rp = _bound_three_app_resolution(conn)
+    confirm = replace(
+        mark_decision, decision_id="dec-three-forged-confirm", action=ResolutionAction.CONFIRM_MATCH
+    )
+    failed = ResolutionRuntime().resolve(item, confirm)
+    assert not failed.success
+    forged = replace(
+        failed,
+        success=True,
+        audit_evidence={
+            "resolution_action": "confirm_match",
+            "queue_item_id": item.queue_item_id,
+            "candidate_id": item.candidate.candidate_id,
+            "app_txn_id": item.candidate.best_app_transaction.app_txn_id,
+        },
+    )
+    with pytest.raises(ValueError, match="incompatible with issue type"):
+        rp.apply_resolution(item, confirm, forged)
+    assert rp.list_decisions_for_queue_item(item.queue_item_id) == []
+    rp.persist_decision(confirm)
+    with pytest.raises(ValueError, match="incompatible with issue type"):
+        rp.persist_result(forged)
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+
+    canonical = item.candidate.best_app_transaction.app_txn_id
+    conn.execute(
+        """INSERT INTO reconciliation_resolution_results (
+            public_id, review_queue_public_id, decision_public_id,
+            success, audit_evidence_json
+        ) VALUES (?, ?, ?, 1, ?)""",
+        (
+            "res-forged-confirm",
+            item.queue_item_id,
+            confirm.decision_id,
+            json.dumps(
+                {
+                    "resolution_action": "confirm_match",
+                    "queue_item_id": item.queue_item_id,
+                    "candidate_id": item.candidate.candidate_id,
+                    "app_txn_id": canonical,
+                    "canonical_app_transaction_ref": canonical,
+                    "payload_target_app_txn_id": canonical,
+                }
+            ),
+        ),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _resolution_relationships(conn, "app-res-c")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
 def test_bound_three_app_result_missing_third_is_unknown_and_replay_refused(
     migrated_temp_db_connection,
 ) -> None:

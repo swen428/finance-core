@@ -32,6 +32,7 @@ from finance_core.reconciliation.models import (
     ResolutionDecision,
     ResolutionResult,
     ReviewQueueItem,
+    validate_resolution_decision,
 )
 from finance_core.reconciliation.resolution import ResolutionRuntime
 from finance_core.reconciliation.source_binding import (
@@ -101,8 +102,16 @@ def _bound_successful_classification(
     }:
         return None
     bound = load_bound_queue(conn, result.queue_item.queue_item_id)
+    compatible, _ = validate_resolution_decision(
+        result.decision.action, result.queue_item.issue_type
+    )
+    if not compatible:
+        raise ValueError("successful reconciliation action is incompatible with issue type")
     if bound is not None:
         assert_candidate_matches_bound(bound, result.queue_item)
+        compatible, _ = validate_resolution_decision(result.decision.action, bound.issue_type)
+        if not compatible or result.queue_item.issue_type != bound.issue_type:
+            raise ValueError("successful reconciliation action conflicts with frozen queue issue")
         if result.decision.queue_item_id != bound.queue_item_id:
             raise ValueError("successful reconciliation decision queue identity changed")
         evidence = result.audit_evidence
@@ -352,18 +361,15 @@ class ResolutionPersistence:
             result = self._runtime.resolve(item, decision)
 
         with _owned_write(self._conn):
-            if result.success and decision.action in {
+            if result.decision != decision or result.queue_item != item:
+                raise ValueError("reconciliation caller and result disagree")
+            if result.success and result.decision.action in {
                 ResolutionAction.CONFIRM_MATCH,
                 ResolutionAction.MARK_DUPLICATE,
             }:
                 bound = load_bound_queue(self._conn, item.queue_item_id)
                 if bound is not None:
                     assert_candidate_matches_bound(bound, item)
-                    if (
-                        result.decision != decision
-                        or result.queue_item.queue_item_id != item.queue_item_id
-                    ):
-                        raise ValueError("successful reconciliation caller and result disagree")
             _guard_successful_resolution(self._conn, result)
             self._insert_decision(decision)
             self._insert_result(_complete_success_evidence(self._conn, result))
