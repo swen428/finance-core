@@ -40,6 +40,23 @@ _SOURCE_AUDIT_KEYS = frozenset(
     }
 )
 _CLASSIFICATION = frozenset({ResolutionAction.CONFIRM_MATCH, ResolutionAction.MARK_DUPLICATE})
+_RESOLUTION_ENVELOPE_KEYS = frozenset({"resolution_action", "resolved_at", "reviewer", "note"})
+_RESOLUTION_PERSISTED_KEYS = frozenset(
+    {"canonical_app_transaction_ref", "payload_target_app_txn_id"}
+)
+_RESOLUTION_DUPLICATE_KEYS = frozenset({"duplicate_app_txn_ids", "kept_app_txn_id", "audit_only"})
+_APPLY_ENVELOPE_KEYS = frozenset(
+    {
+        "apply_runtime_version",
+        "instruction_id",
+        "resolution_action",
+        "reviewer",
+        "note",
+        "applied_timestamp",
+        "decision_id",
+        "evidence_refs",
+    }
+)
 
 
 def require_nonempty(value: object, label: str) -> str:
@@ -74,6 +91,59 @@ def assert_source_audit(evidence: Mapping[str, Any], bound: BoundQueue) -> None:
         raise ValueError("successful reconciliation audit differs from bound queue source")
 
 
+def assert_resolution_audit_schema(
+    evidence: Mapping[str, Any], bound: BoundQueue, action: ResolutionAction, *, persisted: bool
+) -> None:
+    """Verify exact action/stage keys; provenance cannot be added by a caller."""
+    from finance_core.reconciliation.source_binding import bound_source_audit_projection
+
+    expected = set(bound_source_audit_projection(bound)) | _RESOLUTION_ENVELOPE_KEYS
+    if persisted:
+        expected.update(_RESOLUTION_PERSISTED_KEYS)
+        if action == ResolutionAction.MARK_DUPLICATE:
+            expected.update(_RESOLUTION_DUPLICATE_KEYS)
+    if set(evidence) != expected:
+        raise ValueError("successful reconciliation audit has unexpected or missing fields")
+    assert_source_audit(evidence, bound)
+    if persisted:
+        canonical = bound.app_transaction_ref
+        if (
+            evidence.get("canonical_app_transaction_ref") != canonical
+            or evidence.get("payload_target_app_txn_id") != canonical
+        ):
+            raise ValueError("successful reconciliation stored target differs from frozen queue")
+        if action == ResolutionAction.MARK_DUPLICATE:
+            if (
+                evidence.get("duplicate_app_txn_ids")
+                != [app.app_txn_id for app in bound.app_transactions]
+                or evidence.get("kept_app_txn_id") != canonical
+                or evidence.get("audit_only") is not True
+            ):
+                raise ValueError("successful duplicate audit differs from frozen queue")
+
+
+def assert_apply_audit_schema(
+    evidence: Mapping[str, Any], bound: BoundQueue, decision_id: str
+) -> None:
+    """Verify the complete apply audit shape and derived producer metadata."""
+    from finance_core.reconciliation.source_binding import bound_source_audit_projection
+
+    expected = set(bound_source_audit_projection(bound)) | _APPLY_ENVELOPE_KEYS
+    if set(evidence) != expected:
+        raise ValueError("successful reconciliation apply audit has unexpected or missing fields")
+    assert_source_audit(evidence, bound)
+    # These refs are caller-supplied auxiliary traceability only.  They are
+    # not bound source members, verified targets, or authorization evidence.
+    refs = evidence.get("evidence_refs")
+    if (
+        evidence.get("apply_runtime_version") != "v1"
+        or evidence.get("instruction_id") != f"instr-{decision_id}"
+        or type(refs) is not list
+        or any(type(ref) is not str or not ref.strip() for ref in refs)
+    ):
+        raise ValueError("successful reconciliation apply audit producer metadata is invalid")
+
+
 def assert_resolution_envelope(result: ResolutionResult, bound: BoundQueue) -> None:
     decision = result.decision
     evidence = result.audit_evidence
@@ -97,7 +167,7 @@ def assert_resolution_envelope(result: ResolutionResult, bound: BoundQueue) -> N
         )
     ):
         raise ValueError("successful reconciliation evidence source identity changed")
-    assert_source_audit(evidence, bound)
+    assert_resolution_audit_schema(evidence, bound, decision.action, persisted=False)
 
 
 def assert_apply_envelope(result: ResolutionApplyResult, bound: BoundQueue) -> None:
@@ -126,7 +196,7 @@ def assert_apply_envelope(result: ResolutionApplyResult, bound: BoundQueue) -> N
         raise ValueError(
             "successful reconciliation apply evidence differs from frozen queue source"
         )
-    assert_source_audit(evidence, bound)
+    assert_apply_audit_schema(evidence, bound, result.decision_id)
     assert_apply_payload(result.payload, result.action, bound)
 
 
@@ -168,7 +238,7 @@ def assert_resolution_row(
         or not validate_resolution_decision(action, bound.issue_type)[0]
     ):
         raise ValueError("successful reconciliation stored action conflicts with queue")
-    assert_source_audit(evidence, bound)
+    assert_resolution_audit_schema(evidence, bound, action, persisted=True)
 
 
 def assert_resolution_basic(result: ResolutionResult) -> None:
@@ -295,7 +365,7 @@ def assert_apply_row(
         or not validate_resolution_decision(action, bound.issue_type)[0]
     ):
         raise ValueError("successful reconciliation stored apply action conflicts with queue")
-    assert_source_audit(evidence, bound)
+    assert_apply_audit_schema(evidence, bound, row["decision_id"])
     assert_apply_payload(payload, action, bound)
 
 

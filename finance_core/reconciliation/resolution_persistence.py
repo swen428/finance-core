@@ -253,7 +253,9 @@ def _guard_successful_decision_replay(
                 bound,
             )
         except ValueError as exc:
-            raise ValueError("successful reconciliation replay decision evidence changed") from exc
+            raise ValueError(
+                "successful reconciliation replay differs from frozen queue source"
+            ) from exc
     canonical = prior[1]
     target = evidence.get("app_txn_id")
     if not isinstance(canonical, str) or not canonical or target != canonical:

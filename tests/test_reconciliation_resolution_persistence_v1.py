@@ -532,6 +532,39 @@ def test_051_neutral_resolution_keeps_nonclassification_contract(
     _resolution_relationships(conn, "unrelated-app")
 
 
+@pytest.mark.parametrize(
+    ("extra_key", "value"),
+    [
+        ("statement_direction", "credit"),
+        ("duplicate_app_txn_ids", ["app-res-a", "ghost"]),
+        ("canonical_app_transaction_ref", "ghost"),
+        ("forged_provenance", "trusted"),
+    ],
+)
+def test_051_resolution_rejects_extra_audit_fields_before_and_after_persistence(
+    migrated_temp_db_connection, extra_key, value
+) -> None:
+    conn = migrated_temp_db_connection
+    item, decision, rp = _bound_three_app_resolution(conn)
+    result = ResolutionRuntime().resolve(item, decision)
+    forged_audit = {**result.audit_evidence, extra_key: value}
+    with pytest.raises(ValueError):
+        rp.apply_resolution(item, decision, replace(result, audit_evidence=forged_audit))
+    assert rp.list_results_for_queue_item(item.queue_item_id) == []
+    rp.apply_resolution(item, decision, result)
+    row = rp.list_results_for_queue_item(item.queue_item_id)[0]
+    stored_audit = json.loads(row["audit_evidence_json"])
+    stored_audit[extra_key] = value
+    conn.execute(
+        "UPDATE reconciliation_resolution_results SET audit_evidence_json = ? WHERE public_id = ?",
+        (json.dumps(stored_audit), row["public_id"]),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _resolution_relationships(conn, "unrelated-app")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
 def test_bound_resolution_rejects_provided_result_with_different_decision(
     migrated_temp_db_connection,
 ) -> None:

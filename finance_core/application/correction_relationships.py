@@ -209,14 +209,24 @@ def _resolution_relationships(conn: sqlite3.Connection, target_id: str) -> None:
         bound_required = verify_correction_schema(conn)
     except CorrectionSchemaError:
         _refuse("UNKNOWN_INTEGRITY", "reconciliation-resolution:schema")
+    # Pre-051 historical fixtures carry only the columns that the original
+    # relationship reader used.  Additional 051 audit fields are selected only
+    # when that schema (and its stricter evidence contract) is present.
+    bound_columns = (
+        "results.success, results.error_message, "
+        "decisions.public_id AS stored_decision_id, "
+        "decisions.reviewer AS stored_reviewer, "
+        "decisions.decision_note AS stored_note, "
+        "decisions.resolved_at AS stored_resolved_at, "
+        if bound_required
+        else ""
+    )
     results = _rows(
         conn,
-        """SELECT results.public_id AS result_id, results.audit_evidence_json,
-        results.success, results.error_message,
+        f"""SELECT results.public_id AS result_id, results.audit_evidence_json,
+        {bound_columns}
         results.decision_public_id, results.review_queue_public_id,
         decisions.decision_action, decisions.review_queue_public_id AS decision_queue_id,
-        decisions.public_id AS stored_decision_id, decisions.reviewer AS stored_reviewer,
-        decisions.decision_note AS stored_note, decisions.resolved_at AS stored_resolved_at,
         queues.public_id AS queue_id, queues.app_transaction_ref
         FROM reconciliation_resolution_results AS results
         LEFT JOIN reconciliation_resolution_decisions AS decisions

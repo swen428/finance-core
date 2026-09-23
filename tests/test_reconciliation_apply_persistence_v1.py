@@ -556,6 +556,139 @@ def test_bound_apply_source_audit_is_checked_before_target_filter(
     assert error.value.classification == "UNKNOWN_INTEGRITY"
 
 
+@pytest.mark.parametrize(
+    ("extra_key", "value"),
+    [
+        ("duplicate_app_txn_ids", ["app-three-a", "ghost"]),
+        ("statement_direction", "credit"),
+        ("instruction_id", "instr-other-decision"),
+        ("apply_runtime_version", "v999"),
+        ("forged_provenance", "trusted"),
+    ],
+)
+def test_051_apply_rejects_extra_or_wrong_producer_audit_fields(
+    migrated_temp_db_connection, extra_key, value
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    audit = {**result.audit_evidence, extra_key: value}
+    ap = ApplyPersistence(conn)
+    with pytest.raises(ValueError):
+        ap.save_apply_result(replace(result, audit_evidence=audit))
+    assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert ap.save_apply_result(result)
+    conn.execute(
+        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+        (json.dumps(audit), result.apply_id),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "unrelated-app")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
+@pytest.mark.parametrize("refs", [None, 1, {}, [""], ["valid", 1], ["  "]])
+def test_051_apply_rejects_malformed_caller_evidence_refs(
+    migrated_temp_db_connection, refs
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    audit = {**result.audit_evidence, "evidence_refs": refs}
+    ap = ApplyPersistence(conn)
+    with pytest.raises(ValueError):
+        ap.save_apply_result(replace(result, audit_evidence=audit))
+    assert ap.list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert ap.save_apply_result(result)
+    conn.execute(
+        "UPDATE reconciliation_apply_results SET audit_evidence_json = ? WHERE apply_id = ?",
+        (json.dumps(audit), result.apply_id),
+    )
+    conn.commit()
+    with pytest.raises(CorrectionRelationshipError) as error:
+        _apply_relationships(conn, "unrelated-app")
+    assert error.value.classification == "UNKNOWN_INTEGRITY"
+
+
+def test_051_nonempty_caller_refs_are_trace_only_and_replay_is_exact(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, original = _bound_three_app_duplicate(conn)
+    decision = ResolutionDecision(
+        decision_id=original.decision_id,
+        queue_item_id=item.queue_item_id,
+        action=ResolutionAction.MARK_DUPLICATE,
+    )
+    result = ResolutionApplyRuntime().apply(item, decision, evidence_refs=("ghost-app", "ev-2"))
+    assert result.audit_evidence["evidence_refs"] == ["ghost-app", "ev-2"]
+    ap = ApplyPersistence(conn)
+    assert ap.save_apply_result(result)
+    _apply_relationships(conn, "ghost-app")
+    with pytest.raises(CorrectionRelationshipError) as active:
+        _apply_relationships(conn, "app-three-c")
+    assert active.value.classification == "ACTIVE_RELATIONSHIP"
+    changed = replace(
+        result,
+        audit_evidence={**result.audit_evidence, "evidence_refs": ["ev-other"]},
+    )
+    with pytest.raises(ApplyPersistenceConflictError):
+        ap.save_apply_result(changed)
+
+
+def test_051_caller_refs_cannot_replace_bound_target_or_skip_correction_guard(
+    migrated_temp_db_connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = migrated_temp_db_connection
+    item, original = _bound_three_app_duplicate(conn)
+    decision = ResolutionDecision(
+        decision_id=original.decision_id,
+        queue_item_id=item.queue_item_id,
+        action=ResolutionAction.MARK_DUPLICATE,
+    )
+    result = ResolutionApplyRuntime().apply(item, decision, evidence_refs=("ghost-app",))
+    payload = {
+        **result.payload,
+        "duplicate_app_txn_ids": ["app-three-a", "app-three-b", "ghost-app"],
+    }
+    with pytest.raises(ValueError, match="frozen queue source"):
+        ApplyPersistence(conn).save_apply_result(replace(result, payload=payload))
+    checked: list[str] = []
+
+    def corrected(_conn: sqlite3.Connection, target: str) -> bool:
+        checked.append(target)
+        return target == "app-three-c"
+
+    monkeypatch.setattr(
+        "finance_core.reconciliation.apply_persistence.has_committed_correction", corrected
+    )
+    with pytest.raises(ValueError, match="corrected_transaction_requires_versioned_reconciliation"):
+        ApplyPersistence(conn).save_apply_result(result)
+    assert checked == ["app-three-a", "app-three-b", "app-three-c"]
+    assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
+
+
+def test_051_invalid_refs_in_second_batch_result_rolls_back_first(
+    migrated_temp_db_connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    item, result = _bound_three_app_duplicate(conn)
+    bad = replace(
+        result,
+        apply_id="apply-bad-refs",
+        decision_id="dec-bad-refs",
+        audit_evidence={
+            **result.audit_evidence,
+            "decision_id": "dec-bad-refs",
+            "instruction_id": "instr-dec-bad-refs",
+            "evidence_refs": [""],
+        },
+    )
+    with pytest.raises(ValueError):
+        ApplyPersistence(conn).persist_apply_results([result, bad])
+    assert ApplyPersistence(conn).list_apply_results_for_queue_item(item.queue_item_id) == []
+    assert not conn.in_transaction
+
+
 def test_bound_apply_batch_rolls_back_prior_success_on_bad_second_envelope(
     migrated_temp_db_connection,
 ) -> None:
