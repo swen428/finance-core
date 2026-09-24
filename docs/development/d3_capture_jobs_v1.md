@@ -13,7 +13,9 @@ original image, or ingress identity fails with an idempotency conflict. The
 receipt caption is part of raw content; replay compares its canonical value
 (`caption` or `[telegram receipt image]`) even if the handoff file is gone.
 Migration 052 seals a job's source identity and its linked raw intake source,
-while processing status and lease fields remain updatable.
+while processing status and lease fields remain updatable. A receipt job insert
+requires a non-null original hash and a source row matching its intake,
+canonical attachment, and content hash.
 
 The `get_status` command accepts either the existing `intake_public_id` or a new
 `job_public_id` and includes the durable `capture_job` in its response.

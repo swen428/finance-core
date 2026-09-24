@@ -28,6 +28,7 @@ CREATE TABLE finance_capture_jobs (
     CHECK ((capture_kind = 'text' AND attachment_evidence_id IS NULL
             AND attachment_content_hash IS NULL)
         OR (capture_kind = 'receipt_image' AND attachment_evidence_id IS NOT NULL
+            AND attachment_content_hash IS NOT NULL
             AND length(attachment_content_hash) = 64)),
     CHECK ((lease_owner IS NULL AND lease_expires_at IS NULL)
         OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
@@ -35,6 +36,26 @@ CREATE TABLE finance_capture_jobs (
 
 CREATE INDEX finance_capture_jobs_status_idx
     ON finance_capture_jobs(status, id);
+
+-- SQLite CHECK treats NULL as passing. The explicit non-NULL check above and
+-- this join require a receipt job to name the source for its own intake,
+-- canonical attachment, and original content hash at insert time.
+CREATE TRIGGER trg_finance_capture_jobs_require_receipt_source
+BEFORE INSERT ON finance_capture_jobs
+FOR EACH ROW
+WHEN NEW.capture_kind = 'receipt_image'
+AND NOT EXISTS (
+    SELECT 1 FROM telegram_attachment_source AS source
+    JOIN raw_intake_records AS intake ON intake.id = NEW.raw_intake_record_id
+    WHERE source.id = NEW.attachment_evidence_id
+      AND source.raw_intake_record_id = intake.id
+      AND source.attachment_id = intake.attachment_id
+      AND source.content_hash = NEW.attachment_content_hash
+      AND intake.attachment_hash = source.content_hash
+)
+BEGIN
+    SELECT RAISE(ABORT, 'receipt capture job source linkage mismatch');
+END;
 
 -- A capture job may advance its status and lease, but its adopted source
 -- identity must remain the one that was committed with the original intake.

@@ -509,3 +509,57 @@ def test_migration_052_seals_receipt_caption_before_proposal(
                 "FROM raw_intake_records WHERE public_id = ?",
                 (intake_id,),
             )
+
+
+@pytest.mark.parametrize("case", ["null_hash", "wrong_intake"])
+def test_migration_052_rejects_receipt_job_without_matching_source(
+    workspace: support.BridgeWorkspace, case: str
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    assert support.run_cli(_receipt_request(workspace)).exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        source_id, source_hash, attachment_id = conn.execute(
+            "SELECT id, content_hash, attachment_id FROM telegram_attachment_source"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO raw_intake_records "
+            "(public_id, source_type, source_channel, raw_input, received_at, "
+            "content_fingerprint, attachment_id, attachment_hash) "
+            "VALUES ('other_intake', 'telegram_image', 'telegram', 'image', "
+            "'2026-01-01', ?, ?, ?)",
+            ("a" * 64, attachment_id, source_hash),
+        )
+        other_intake_id = conn.execute(
+            "SELECT id FROM raw_intake_records WHERE public_id = 'other_intake'"
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO telegram_attachment_source "
+            "(public_id, attachment_id, raw_intake_record_id, "
+            "original_attachment_path, observed_file_size, content_hash, "
+            "source_evidence_payload) "
+            "SELECT 'other_source', attachment_id, ?, original_attachment_path, "
+            "observed_file_size, content_hash, source_evidence_payload "
+            "FROM telegram_attachment_source WHERE id = ?",
+            (other_intake_id, source_id),
+        )
+        own_source_id = conn.execute(
+            "SELECT id FROM telegram_attachment_source WHERE public_id = 'other_source'"
+        ).fetchone()[0]
+        submitted_hash = None if case == "null_hash" else source_hash
+        submitted_source_id = own_source_id if case == "null_hash" else source_id
+        if case == "null_hash":
+            # Isolate the table CHECK; SQLite runs BEFORE INSERT triggers first.
+            conn.execute("DROP TRIGGER trg_finance_capture_jobs_require_receipt_source")
+        with pytest.raises(sqlite3.IntegrityError) as rejected:
+            conn.execute(
+                "INSERT INTO finance_capture_jobs "
+                "(public_id, raw_intake_record_id, capture_kind, intake_fingerprint, "
+                "attachment_evidence_id, attachment_content_hash) "
+                "VALUES (?, ?, 'receipt_image', ?, ?, ?)",
+                (case, other_intake_id, "a" * 64, submitted_source_id, submitted_hash),
+            )
+        if case == "null_hash":
+            assert "CHECK constraint failed" in str(rejected.value)
+        else:
+            assert "receipt capture job source linkage mismatch" in str(rejected.value)
+        assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
