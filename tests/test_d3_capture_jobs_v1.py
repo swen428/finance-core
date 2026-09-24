@@ -121,9 +121,7 @@ def test_text_adapter_replay_after_job_preserves_typed_idempotency(
     with support.open_database(workspace) as conn:
         same = process_telegram_text_update(conn, support.telegram_text_update("lunch 12.50"))
         assert same["intake"]["public_id"] == first.response["result"]["intake_public_id"]
-        assert same["parser_output"]["public_id"] == first.response["result"][
-            "proposal_public_id"
-        ]
+        assert same["parser_output"]["public_id"] == first.response["result"]["proposal_public_id"]
         with pytest.raises(RawIntakeIdempotencyConflictError):
             process_telegram_text_update(conn, support.telegram_text_update("lunch 13.50"))
         assert conn.execute("SELECT count(*) FROM raw_intake_records").fetchone()[0] == 1
@@ -183,11 +181,14 @@ def test_receipt_job_and_attachment_source_commit_together_and_replay(
 
 
 @pytest.mark.parametrize("handoff_missing", [False, True])
-@pytest.mark.parametrize("first_caption,replay_caption", [
-    ("meal receipt", "changed receipt"),
-    ("meal receipt", None),
-    (None, "meal receipt"),
-])
+@pytest.mark.parametrize(
+    "first_caption,replay_caption",
+    [
+        ("meal receipt", "changed receipt"),
+        ("meal receipt", None),
+        (None, "meal receipt"),
+    ],
+)
 def test_receipt_replay_rejects_changed_caption_even_without_handoff(
     workspace: support.BridgeWorkspace,
     handoff_missing: bool,
@@ -289,15 +290,14 @@ def test_receipt_status_does_not_claim_missing_original(
 
 
 def test_receipt_status_rejects_source_linked_to_another_intake(
-    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch,
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
     first = support.run_cli(_receipt_request(workspace))
     second_request = support.make_request(
         "capture",
-        support.capture_receipt_arguments(
-            workspace, handoff_filename="d3.jpg", message_id=21
-        ),
+        support.capture_receipt_arguments(workspace, handoff_filename="d3.jpg", message_id=21),
         idempotency_key=support.canonical_capture_key(message_id=21),
     )
     second = support.run_cli(second_request)
@@ -478,10 +478,12 @@ def test_migration_052_freezes_job_identity_but_allows_processing_state(
             "updated_at = 'later' WHERE public_id = ?",
             (job_id,),
         )
-        assert tuple(conn.execute(
-            "SELECT status, lease_epoch FROM finance_capture_jobs WHERE public_id = ?",
-            (job_id,),
-        ).fetchone()) == ("processing", 1)
+        assert tuple(
+            conn.execute(
+                "SELECT status, lease_epoch FROM finance_capture_jobs WHERE public_id = ?",
+                (job_id,),
+            ).fetchone()
+        ) == ("processing", 1)
 
 
 def test_migration_052_prevents_job_and_intake_delete_or_replace(
@@ -544,10 +546,13 @@ def test_migration_052_seals_receipt_caption_before_proposal(
     assert capture.exit_code == errors.EXIT_OK
     with support.open_database(workspace) as conn:
         intake_id = capture.response["result"]["intake_public_id"]
-        assert conn.execute(
-            "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?",
-            (intake_id,),
-        ).fetchone()[0] is None
+        assert (
+            conn.execute(
+                "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?",
+                (intake_id,),
+            ).fetchone()[0]
+            is None
+        )
         with pytest.raises(sqlite3.IntegrityError, match="capture raw intake source"):
             conn.execute(
                 "UPDATE raw_intake_records SET raw_input = 'changed caption' WHERE public_id = ?",
