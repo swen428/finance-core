@@ -932,6 +932,7 @@ def extract_and_persist_receipt_ocr_evidence(
     attachment_id: int,
     engine: ReceiptOcrEngine,
     limits: ReceiptOcrLimits = ReceiptOcrLimits(),
+    before_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> ReceiptOcrExtractionResult:
     """Extract and append one canonical bounded OCR evidence result."""
     _validate_public_arguments(public_id, attachment_id, engine, limits)
@@ -1000,6 +1001,7 @@ def extract_and_persist_receipt_ocr_evidence(
             fingerprint=fingerprint,
             normalized=normalized,
             limits=limits,
+            before_commit=before_commit,
         )
     finally:
         opened.close()
@@ -1588,6 +1590,7 @@ def _persist_normalized_result(
     fingerprint: str,
     normalized: _NormalizedOutcome,
     limits: ReceiptOcrLimits,
+    before_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> ReceiptOcrExtractionResult:
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1609,6 +1612,8 @@ def _persist_normalized_result(
                 expected_result_hash=normalized.result_hash,
                 idempotent=True,
             )
+            if before_commit is not None:
+                before_commit(conn)
             conn.commit()
             return result
 
@@ -1698,6 +1703,8 @@ def _persist_normalized_result(
             idempotent=False,
         )
         _inject_failure("before_commit")
+        if before_commit is not None:
+            before_commit(conn)
         conn.commit()
         return result
     except (OcrIdempotencyConflictError, OcrPersistenceConflictError):

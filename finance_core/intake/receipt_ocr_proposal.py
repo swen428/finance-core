@@ -177,6 +177,7 @@ def ingest_receipt_ocr_evidence_as_total_expense_proposal(
     proposal_public_id: str,
     link_public_id: str,
     parser_contract_version: str = PARSER_CONTRACT_VERSION_DEFAULT,
+    before_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> ReceiptTotalProposalIngestionResult:
     """Ingest one verified OCR extraction into a total-level expense proposal.
 
@@ -223,6 +224,7 @@ def ingest_receipt_ocr_evidence_as_total_expense_proposal(
         payload_json=payload_json,
         proposal_input_hash=proposal_input_hash,
         proposal_result_hash=proposal_result_hash,
+        before_commit=before_commit,
     )
 
 
@@ -568,6 +570,7 @@ def _persist(
     payload_json: str,
     proposal_input_hash: str,
     proposal_result_hash: str,
+    before_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> ReceiptTotalProposalIngestionResult:
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -583,6 +586,8 @@ def _persist(
                 proposal_result_hash=proposal_result_hash,
                 parse=parse,
             )
+            if before_commit is not None:
+                before_commit(conn)
             conn.commit()
             return result
 
@@ -630,6 +635,8 @@ def _persist(
         )
 
         _inject_failure("before_commit")
+        if before_commit is not None:
+            before_commit(conn)
         conn.commit()
         return _result(
             command=command,
