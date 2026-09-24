@@ -50,6 +50,7 @@ from finance_core.intake.raw_text_repository import (
 from finance_core.intake.receipt_ocr_evidence import (
     ReceiptOcrError,
     extract_and_persist_receipt_ocr_evidence,
+    verify_telegram_original_attachment,
 )
 from finance_core.intake.receipt_ocr_proposal import (
     ReceiptOcrProposalError,
@@ -558,6 +559,29 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
     return workspace, conn
 
 
+def _require_durable_capture_connection(conn: sqlite3.Connection) -> None:
+    """Keep a Core capture committed after the host discards its spool copy."""
+    try:
+        journal = conn.execute("PRAGMA journal_mode").fetchone()
+        if journal is None or str(journal[0]).lower() not in {
+            "wal",
+            "delete",
+            "truncate",
+            "persist",
+        }:
+            raise ValueError("Core capture journal does not support durable commits")
+        conn.execute("PRAGMA synchronous = FULL")
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()
+        if synchronous is None or int(synchronous[0]) != 2:
+            raise ValueError("Core capture connection did not retain FULL synchronization")
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        raise errors.bridge_error(
+            errors.INTERNAL_ERROR,
+            "Core capture could not prove a durable SQLite commit setting.",
+            errors.EXIT_INTERNAL,
+        ) from exc
+
+
 def _map_review_error(exc: application_review.ReviewError) -> errors.BridgeError:
     if isinstance(exc, application_review.ReviewNotFoundError):
         return errors.bridge_error(
@@ -1027,6 +1051,22 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             if proposal_row is not None:
                 proposal_public_id_value = str(proposal_row["public_id"])
                 parse_status = str(proposal_row["parse_status"])
+        capture_job = get_capture_job(conn, intake_public_id=public_id)
+        capture_attachment_integrity: str | None = None
+        if capture_job is not None and capture_job["capture_kind"] == "receipt_image":
+            source_id = capture_job["attachment_evidence_id"]
+            expected_hash = capture_job["attachment_content_hash"]
+            try:
+                if not isinstance(source_id, int) or not isinstance(expected_hash, str):
+                    raise ValueError("Receipt capture job has incomplete original evidence")
+                verify_telegram_original_attachment(
+                    conn, source_id=source_id, expected_hash=expected_hash
+                )
+            except (ReceiptOcrError, ValueError):
+                capture_attachment_integrity = "missing"
+            else:
+                capture_attachment_integrity = "verified"
+            deadline.check("receipt original status verification")
         return {
             "identity_kind": "intake",
             "intake_public_id": intake["public_id"],
@@ -1035,7 +1075,8 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "proposal_public_id": proposal_public_id_value,
             "parse_status": parse_status,
             "final_transaction_created": False,
-            "capture_job": get_capture_job(conn, intake_public_id=public_id),
+            "capture_job": capture_job,
+            "capture_attachment_integrity": capture_attachment_integrity,
         }, False
     finally:
         conn.close()
@@ -1359,6 +1400,7 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
 
     workspace, conn = _open_context(request.arguments, deadline)
     try:
+        _require_durable_capture_connection(conn)
         deadline.check("capture replay inspection")
         idempotency_key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
         existing = get_raw_intake_record_by_idempotency_key(conn, idempotency_key)
@@ -1651,6 +1693,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
 
     workspace, conn = _open_context(arguments, deadline)
     try:
+        _require_durable_capture_connection(conn)
         deadline.check("receipt capture replay inspection")
         existing = get_raw_intake_record_by_idempotency_key(conn, derived_intake_key)
         if existing is not None and existing["public_id"] != identities["raw_intake_public_id"]:

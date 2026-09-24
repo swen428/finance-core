@@ -54,6 +54,16 @@ def _ingress(*, message_id: int, attachment_hash: str | None = None) -> dict:
     return identity
 
 
+def test_capture_refuses_non_durable_sqlite_journal(tmp_path: Path) -> None:
+    conn = sqlite3.connect(tmp_path / "unsafe.db")
+    try:
+        assert conn.execute("PRAGMA journal_mode = OFF").fetchone()[0] == "off"
+        with pytest.raises(errors.BridgeError):
+            commands._require_durable_capture_connection(conn)
+    finally:
+        conn.close()
+
+
 def _with_authenticated_ingress(request: dict, ingress: dict) -> dict:
     request["arguments"].update(
         {
@@ -155,6 +165,7 @@ def test_receipt_lost_capture_reply_recovers_by_stable_intake_without_handoff(
     )
     assert status.exit_code == errors.EXIT_OK
     job = status.response["result"]["capture_job"]
+    assert status.response["result"]["capture_attachment_integrity"] == "verified"
     assert (
         job["ingress_identity_digest"]
         == capture.response["result"]["capture_job"]["ingress_identity_digest"]
@@ -162,6 +173,40 @@ def test_receipt_lost_capture_reply_recovers_by_stable_intake_without_handoff(
     assert job["attachment_content_hash"] == support.sha256_hex(support.JPEG_BYTES)
     with support.open_database(workspace) as conn:
         assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt"])
+def test_receipt_status_does_not_claim_missing_original(
+    workspace: support.BridgeWorkspace, damage: str
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    capture = support.run_cli(_receipt_request(workspace))
+    assert capture.exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        original = Path(
+            conn.execute("SELECT attachment_path FROM raw_intake_records").fetchone()[0]
+        )
+    if damage == "missing":
+        original.unlink()
+    else:
+        original.chmod(0o600)
+        original.write_bytes(b"changed original")
+        original.chmod(0o400)
+    status = support.run_cli(
+        support.make_request(
+            "get_status",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "job_public_id": capture.response["result"]["capture_job"]["public_id"],
+            },
+        )
+    )
+    assert status.exit_code == errors.EXIT_OK
+    assert status.response["result"]["capture_attachment_integrity"] == "missing"
+    assert (
+        status.response["result"]["capture_job"]["public_id"]
+        == (capture.response["result"]["capture_job"]["public_id"])
+    )
 
 
 def test_receipt_job_write_failure_keeps_original_without_false_adoption(

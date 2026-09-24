@@ -1214,6 +1214,32 @@ def _open_and_verify_attachment(record: _AttachmentRecord) -> _OpenedAttachment:
         raise
 
 
+def verify_telegram_original_attachment(
+    conn: sqlite3.Connection, *, source_id: int, expected_hash: str
+) -> None:
+    """Verify current original bytes against the immutable Telegram source row.
+
+    A capture job's database row alone cannot prove that the original remains
+    recoverable after a lost ingress response. This uses the same bounded,
+    no-symlink descriptor verification as receipt OCR, without running OCR.
+    """
+    require_staging_database(conn)
+    source = conn.execute(
+        "SELECT attachment_id, content_hash FROM telegram_attachment_source WHERE id = ?",
+        (source_id,),
+    ).fetchone()
+    if source is None:
+        raise OcrAttachmentNotFoundError("Telegram original source evidence is missing.")
+    if source["content_hash"] != expected_hash:
+        raise OcrAttachmentIntegrityConflictError("Telegram original source hash has changed.")
+    record = _load_attachment_record(conn, int(source["attachment_id"]))
+    if record.content_hash != expected_hash:
+        raise OcrAttachmentIntegrityConflictError("Telegram original attachment hash has changed.")
+    _reject_attachment_above_absolute_ceiling(record)
+    opened = _open_and_verify_attachment(record)
+    opened.close()
+
+
 def _verify_attachment_fd(opened: _OpenedAttachment) -> tuple[int, int, int, int, int, int]:
     record = opened.record
     try:

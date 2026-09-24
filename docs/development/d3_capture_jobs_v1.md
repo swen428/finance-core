@@ -12,6 +12,11 @@ same chat/message and identical content returns that job. Changed raw content,
 original image, or ingress identity fails with an idempotency conflict. The
 `get_status` command accepts either the existing `intake_public_id` or a new
 `job_public_id` and includes the durable `capture_job` in its response.
+For a receipt job, `get_status` also returns `capture_attachment_integrity`:
+`verified` only after reopening the current original and matching its immutable
+size, signature and SHA-256; `missing` when that proof fails. Other jobs return
+`null`. A lost-response recovery must require `verified` before reporting
+original-image custody to the host. The job row alone is not that proof.
 
 New capture clients may supply `finance_ingress` with exactly these fields:
 `channel: "telegram"`, `accountId`, integer `updateId`, integer `chatId`,
@@ -37,6 +42,9 @@ orphan content-addressed file, but returns no successful capture; a replay
 verifies and reuses the original. Only a successful result with a non-null
 matching ingress digest and, for an image, a linked original image, may be
 considered for host adoption.
+Capture checks an on-disk SQLite journal and sets this connection to
+`synchronous=FULL` before any capture write; if the setting cannot be verified,
+the command fails without an adoption receipt.
 
 The job starts as `captured`, `ai_status=not_started`, `reply_status=pending`.
 Processing leases, AI outcome transitions, reply delivery and canonical
