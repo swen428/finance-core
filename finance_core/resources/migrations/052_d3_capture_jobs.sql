@@ -148,5 +148,18 @@ WHEN EXISTS (
            AND existing.idempotency_key = NEW.idempotency_key)
 )
 BEGIN
-    SELECT RAISE(ABORT, 'capture raw intake identity collision cannot replace evidence');
+    SELECT CASE
+        WHEN NEW.idempotency_key IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM raw_intake_records AS existing
+              WHERE existing.id = NEW.id OR existing.public_id = NEW.public_id
+          )
+          AND EXISTS (
+              SELECT 1 FROM raw_intake_records AS existing
+              JOIN finance_capture_jobs AS job ON job.raw_intake_record_id = existing.id
+              WHERE existing.idempotency_key = NEW.idempotency_key
+          )
+        THEN RAISE(ABORT, 'capture raw intake idempotency_key collision cannot replace evidence')
+        ELSE RAISE(ABORT, 'capture raw intake identity collision cannot replace evidence')
+    END;
 END;

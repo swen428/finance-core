@@ -11,6 +11,10 @@ import openclaw_staging_bridge_support_v1 as support
 import pytest
 
 from finance_core.intake.capture_jobs import ensure_capture_job, get_capture_job
+from finance_core.intake.raw_text_repository import (
+    RawIntakeIdempotencyConflictError,
+    create_raw_intake_record,
+)
 from finance_core.intake.telegram_text_adapter import process_telegram_text_update
 from finance_core.openclaw_staging_bridge import commands, errors, identity
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
@@ -107,6 +111,39 @@ def test_text_job_commits_with_raw_intake_and_replays_same_identity(
     )
     with support.open_database(workspace) as conn:
         assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
+
+
+def test_text_adapter_replay_after_job_preserves_typed_idempotency(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    first = support.run_cli(_text_request(workspace))
+    assert first.exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        same = process_telegram_text_update(conn, support.telegram_text_update("lunch 12.50"))
+        assert same["intake"]["public_id"] == first.response["result"]["intake_public_id"]
+        assert same["parser_output"]["public_id"] == first.response["result"][
+            "proposal_public_id"
+        ]
+        with pytest.raises(RawIntakeIdempotencyConflictError):
+            process_telegram_text_update(conn, support.telegram_text_update("lunch 13.50"))
+        assert conn.execute("SELECT count(*) FROM raw_intake_records").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
+
+
+def test_text_job_collision_does_not_relabel_public_id_conflict_as_idempotency(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    first = support.run_cli(_text_request(workspace))
+    assert first.exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="identity collision"):
+            create_raw_intake_record(
+                conn,
+                "different message",
+                source_channel="telegram",
+                source_metadata={"chat_id": "111", "message_id": "999"},
+                public_id=first.response["result"]["intake_public_id"],
+            )
 
 
 def test_text_job_write_failure_rolls_back_raw_intake(
@@ -473,6 +510,19 @@ def test_migration_052_prevents_job_and_intake_delete_or_replace(
         ]:
             with pytest.raises(sqlite3.IntegrityError, match=message):
                 conn.execute(sql, (key,))
+        key = conn.execute(
+            "SELECT idempotency_key FROM raw_intake_records WHERE public_id = ?",
+            (intake_id,),
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="idempotency_key collision"):
+            conn.execute(
+                "INSERT OR REPLACE INTO raw_intake_records "
+                "(public_id, source_type, source_channel, raw_input, received_at, "
+                "idempotency_key) "
+                "VALUES ('replace_attempt', 'telegram_text', 'telegram', "
+                "'changed', '2026-01-01', ?)",
+                (key,),
+            )
         with pytest.raises(sqlite3.IntegrityError, match="capture raw intake source"):
             conn.execute(
                 "UPDATE raw_intake_records SET raw_input = 'changed caption' WHERE public_id = ?",
