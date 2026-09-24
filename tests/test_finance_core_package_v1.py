@@ -332,7 +332,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.5"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 51
+        assert payload["migration_count"] == 52
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
