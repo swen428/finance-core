@@ -28,7 +28,7 @@ import sqlite3
 import stat
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from finance_core.staging_guard import require_staging_database
@@ -124,6 +124,7 @@ def persist_attachment_evidence(
     declared_mime_type: str | None = None,
     expected_file_size: int | None = None,
     expected_content_hash: str | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Persist attachment evidence for an already-acquired local file.
 
@@ -172,6 +173,8 @@ def persist_attachment_evidence(
             original_filename=original_filename,
             declared_mime_type=declared_mime_type,
         )
+        if persistence_effect is not None:
+            persistence_effect(conn, result)
         _check_injected_commit_failure()
         conn.commit()
         return result

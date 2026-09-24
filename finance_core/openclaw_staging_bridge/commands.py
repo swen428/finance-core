@@ -35,6 +35,11 @@ from finance_core.intake.attachment_evidence import (
     get_telegram_source_evidence_for_raw_intake,
     validate_attachment_identity_metadata,
 )
+from finance_core.intake.capture_jobs import (
+    CaptureJobConflictError,
+    ensure_capture_job,
+    get_capture_job,
+)
 from finance_core.intake.raw_text_repository import (
     TELEGRAM_TEXT,
     RawIntakeIdempotencyConflictError,
@@ -893,6 +898,7 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         optional=frozenset(
             {
                 "intake_public_id",
+                "job_public_id",
                 "proposal_public_id",
                 "posting_review_public_id",
                 "short_reference",
@@ -904,6 +910,7 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         ),
     )
     intake_public_id = request.arguments.get("intake_public_id")
+    job_public_id = request.arguments.get("job_public_id")
     proposal_public_id = request.arguments.get("proposal_public_id")
     posting_review_public_id = request.arguments.get("posting_review_public_id")
     short_reference = request.arguments.get("short_reference")
@@ -911,6 +918,7 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         value
         for value in (
             intake_public_id,
+            job_public_id,
             proposal_public_id,
             posting_review_public_id,
             short_reference,
@@ -992,6 +1000,18 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             result.update(_finalization_view(conn, proposal, content_hash))
             return result, False
 
+        if job_public_id is not None:
+            job = get_capture_job(
+                conn,
+                public_id=_require_string(job_public_id, "job_public_id", max_length=200),
+            )
+            if job is None:
+                raise errors.bridge_error(
+                    errors.INTAKE_NOT_FOUND,
+                    "Capture job was not found in the staging database.",
+                    errors.EXIT_VALIDATION_REFUSED,
+                )
+            intake_public_id = job["intake_public_id"]
         public_id = _require_string(intake_public_id, "intake_public_id", max_length=200)
         intake = get_raw_intake_record_by_public_id(conn, public_id)
         if intake is None:
@@ -1015,6 +1035,7 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "proposal_public_id": proposal_public_id_value,
             "parse_status": parse_status,
             "final_transaction_created": False,
+            "capture_job": get_capture_job(conn, intake_public_id=public_id),
         }, False
     finally:
         conn.close()
@@ -1108,6 +1129,131 @@ def _capture_context_effect(
     return persist
 
 
+def _capture_text_effect(
+    source_context: TelegramSourceContext | None,
+    ingress_identity_digest: str | None,
+) -> Callable[[sqlite3.Connection, dict[str, Any]], None]:
+    context_effect = _capture_context_effect(source_context)
+
+    def persist(conn: sqlite3.Connection, intake: dict[str, Any]) -> None:
+        if context_effect is not None:
+            context_effect(conn, intake)
+        ensure_capture_job(
+            conn,
+            intake_id=int(intake["id"]),
+            capture_kind="text",
+            ingress_identity_digest=ingress_identity_digest,
+        )
+
+    return persist
+
+
+def _ensure_replayed_capture_job(
+    conn: sqlite3.Connection, *, intake_id: int, ingress_identity_digest: str | None
+) -> dict[str, Any]:
+    # A pre-D3 capture may exist without a job. Enlist it before reporting
+    # successful D3 capture, including when replay wins a concurrent insert.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = ensure_capture_job(
+            conn,
+            intake_id=intake_id,
+            capture_kind="text",
+            ingress_identity_digest=ingress_identity_digest,
+        )
+        conn.commit()
+        return job
+    except CaptureJobConflictError as exc:
+        conn.rollback()
+        raise _capture_job_conflict(exc) from exc
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _capture_job_conflict(exc: CaptureJobConflictError) -> errors.BridgeError:
+    return errors.bridge_error(
+        errors.IDEMPOTENCY_CONFLICT,
+        "Capture job conflicts with persisted source evidence.",
+        errors.EXIT_AUTHORITY_REFUSED,
+    )
+
+
+def _validated_finance_ingress(
+    arguments: dict[str, Any],
+    *,
+    capture_kind: str,
+    chat_id: int,
+    message_id: int,
+    sender_id: int | None,
+    source_context: TelegramSourceContext | None,
+    update_id: int | None,
+) -> tuple[str | None, str | None]:
+    ingress = arguments.get("finance_ingress")
+    if ingress is None:
+        return None, None
+    required = {
+        "channel",
+        "accountId",
+        "updateId",
+        "chatId",
+        "messageId",
+        "senderId",
+        "payloadSha256",
+        "bindingId",
+    }
+    expected = required | ({"attachmentSha256"} if capture_kind == "receipt_image" else set())
+    if not isinstance(ingress, dict) or set(ingress) != expected:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Finance ingress identity has unexpected fields.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    if ingress["channel"] != "telegram" or source_context is None:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Finance ingress requires authenticated Telegram source context.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    update = _require_non_negative_int(ingress["updateId"], "finance_ingress.updateId")
+    mapped = (
+        (_require_non_negative_int(ingress["chatId"], "finance_ingress.chatId"), chat_id),
+        (_require_positive_int(ingress["messageId"], "finance_ingress.messageId"), message_id),
+        (_require_non_negative_int(ingress["senderId"], "finance_ingress.senderId"), sender_id),
+    )
+    if any(given != expected_value for given, expected_value in mapped) or (
+        update_id is not None and update != update_id
+    ):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Finance ingress Telegram identity does not match capture source.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    account = _require_string(ingress["accountId"], "finance_ingress.accountId", max_length=200)
+    binding = _require_string(ingress["bindingId"], "finance_ingress.bindingId", max_length=500)
+    if account != source_context.account_id or binding != source_context.binding_id:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Finance ingress account or binding conflicts with authenticated source.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    hashes = (
+        ("payloadSha256", "attachmentSha256")
+        if capture_kind == "receipt_image"
+        else ("payloadSha256",)
+    )
+    for name in hashes:
+        digest = _require_string(ingress[name], f"finance_ingress.{name}", max_length=64)
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "Finance ingress SHA-256 value is invalid.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+    material = json.dumps(ingress, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest(), ingress.get("attachmentSha256")
+
+
 def _require_replay_source_context(
     conn: sqlite3.Connection,
     intake: dict[str, Any],
@@ -1169,7 +1315,7 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(
         request.arguments,
         required=frozenset({"workspace_path", "kind", payload_field}),
-        optional=_D2_CAPTURE_CONTEXT_FIELDS,
+        optional=_D2_CAPTURE_CONTEXT_FIELDS | frozenset({"finance_ingress"}),
     )
     payload = request.arguments[payload_field]
     policy_payload = payload if has_update else {"message": payload}
@@ -1195,6 +1341,15 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         message_id=validated.message_id,
         sender_id=validated.sender_id,
     )
+    ingress_digest, _unused_attachment_hash = _validated_finance_ingress(
+        request.arguments,
+        capture_kind="text",
+        chat_id=validated.chat_id,
+        message_id=validated.message_id,
+        sender_id=validated.sender_id,
+        source_context=source_context,
+        update_id=validated.update_id,
+    )
 
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
@@ -1216,11 +1371,14 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
             _require_replay_source_context(conn, existing, source_context)
+            _ensure_replayed_capture_job(
+                conn, intake_id=int(existing["id"]), ingress_identity_digest=ingress_digest
+            )
             return _text_capture_result(conn, existing), True
 
         deadline.check("capture persistence")
         try:
-            persistence_effect = _capture_context_effect(source_context)
+            persistence_effect = _capture_text_effect(source_context, ingress_digest)
             if has_update:
                 result = process_telegram_text_update(
                     conn, payload, persistence_effect=persistence_effect
@@ -1249,7 +1407,12 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                     errors.EXIT_AUTHORITY_REFUSED,
                 ) from exc
             _require_replay_source_context(conn, winner, source_context)
+            _ensure_replayed_capture_job(
+                conn, intake_id=int(winner["id"]), ingress_identity_digest=ingress_digest
+            )
             return _text_capture_result(conn, winner), True
+        except CaptureJobConflictError as exc:
+            raise _capture_job_conflict(exc) from exc
         return _text_capture_result(conn, result["intake"]), False
     finally:
         conn.close()
@@ -1270,6 +1433,7 @@ def _text_capture_result(conn: sqlite3.Connection, intake: dict[str, Any]) -> di
         "proposal_public_id": proposal_public_id,
         "parse_status": parse_status,
         "final_transaction_created": False,
+        "capture_job": get_capture_job(conn, intake_public_id=str(intake["public_id"])),
     }
 
 
@@ -1358,6 +1522,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 "original_filename",
                 "declared_mime_type",
                 "caption",
+                "finance_ingress",
             }
         )
         | _D2_CAPTURE_CONTEXT_FIELDS,
@@ -1408,6 +1573,15 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
         chat_id=chat_id,
         message_id=message_id,
         sender_id=sender_id,
+    )
+    ingress_digest, expected_attachment_hash = _validated_finance_ingress(
+        arguments,
+        capture_kind="receipt_image",
+        chat_id=chat_id,
+        message_id=message_id,
+        sender_id=sender_id,
+        source_context=source_context,
+        update_id=update_id,
     )
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
@@ -1570,16 +1744,35 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
 
         assert existing is not None
         deadline.check("receipt handoff publication")
-        handoff = publish_receipt_handoff(
-            conn,
-            workspace=workspace,
-            handoff_path=handoff_path,
-            attachment_evidence_public_id=identities["attachment_evidence_public_id"],
-            raw_intake_id=int(existing["id"]),
-            original_filename=original_filename,
-            declared_mime_type=declared_mime_type,
-            preloaded_content=preloaded_content,
-        )
+
+        def persist_job(transaction: sqlite3.Connection, evidence: dict[str, Any]) -> None:
+            if (
+                expected_attachment_hash is not None
+                and evidence["content_hash"] != expected_attachment_hash
+            ):
+                raise CaptureJobConflictError("Finance ingress image hash differs from original")
+            ensure_capture_job(
+                transaction,
+                intake_id=int(existing["id"]),
+                capture_kind="receipt_image",
+                attachment_evidence_id=int(evidence["id"]),
+                ingress_identity_digest=ingress_digest,
+            )
+
+        try:
+            handoff = publish_receipt_handoff(
+                conn,
+                workspace=workspace,
+                handoff_path=handoff_path,
+                attachment_evidence_public_id=identities["attachment_evidence_public_id"],
+                raw_intake_id=int(existing["id"]),
+                original_filename=original_filename,
+                declared_mime_type=declared_mime_type,
+                preloaded_content=preloaded_content,
+                persistence_effect=persist_job,
+            )
+        except CaptureJobConflictError as exc:
+            raise _capture_job_conflict(exc) from exc
         return {
             "capture_kind": "receipt_image",
             "intake_public_id": existing["public_id"],
@@ -1590,6 +1783,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
             "durable_file_reused": handoff.durable_file_reused,
             "persistence_idempotent": handoff.persistence_idempotent,
             "final_transaction_created": False,
+            "capture_job": get_capture_job(conn, intake_public_id=str(existing["public_id"])),
         }, is_replay or handoff.persistence_idempotent
     finally:
         conn.close()

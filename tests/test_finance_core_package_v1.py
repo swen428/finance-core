@@ -48,7 +48,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "40e3f64b1582d0a97ef669c18ab61b6594ea14b7c5d32eea95b4d221c674088a"
+EXPECTED_LEDGER_DIGEST = "35b6fafdd2634b9dd273779ee1eeec7f2cd1e031a20896641c9c05f651992613"
 
 
 def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
@@ -77,8 +77,8 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 51
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 52))
+    assert len(paths) == 52
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 53))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
@@ -93,7 +93,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 51
+    assert len(paths) == 52
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 

@@ -20,7 +20,7 @@ import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from finance_core.intake import attachment_publication as publication
 from finance_core.intake.attachment_evidence import (
@@ -211,6 +211,7 @@ def publish_receipt_handoff(
     original_filename: str | None,
     declared_mime_type: str | None,
     preloaded_content: bytes | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
 ) -> HandoffResult:
     """Validate, durably publish, and persist one receipt handoff file.
 
@@ -253,6 +254,7 @@ def publish_receipt_handoff(
                 raw_intake_id=raw_intake_id,
                 original_filename=original_filename,
                 declared_mime_type=declared_mime_type,
+                persistence_effect=persistence_effect,
             )
 
         if preloaded_content is not None:
@@ -322,6 +324,7 @@ def publish_receipt_handoff(
             declared_mime_type=declared_mime_type,
             expected_file_size=observed_size,
             expected_content_hash=content_hash,
+            persistence_effect=persistence_effect,
         )
     except AttachmentEvidenceConflictError as exc:
         raise errors.bridge_error(
@@ -357,6 +360,7 @@ def _replay_persisted_handoff(
     raw_intake_id: int,
     original_filename: str | None,
     declared_mime_type: str | None,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None,
 ) -> HandoffResult:
     """Replay through the persisted-row seam: verify durable bytes, re-persist."""
     expected_fields = {
@@ -401,6 +405,7 @@ def _replay_persisted_handoff(
             declared_mime_type=declared_mime_type,
             expected_file_size=observed_size,
             expected_content_hash=content_hash,
+            persistence_effect=persistence_effect,
         )
     except AttachmentEvidenceConflictError as exc:
         raise errors.bridge_error(
