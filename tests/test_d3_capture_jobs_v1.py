@@ -145,6 +145,48 @@ def test_receipt_job_and_attachment_source_commit_together_and_replay(
         assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("handoff_missing", [False, True])
+@pytest.mark.parametrize("first_caption,replay_caption", [
+    ("meal receipt", "changed receipt"),
+    ("meal receipt", None),
+    (None, "meal receipt"),
+])
+def test_receipt_replay_rejects_changed_caption_even_without_handoff(
+    workspace: support.BridgeWorkspace,
+    handoff_missing: bool,
+    first_caption: str | None,
+    replay_caption: str | None,
+) -> None:
+    handoff = support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    first = _receipt_request(workspace)
+    if first_caption is not None:
+        first["arguments"]["caption"] = first_caption
+    assert support.run_cli(first).exit_code == errors.EXIT_OK
+    if handoff_missing:
+        handoff.unlink()
+    replay = _receipt_request(workspace)
+    if replay_caption is not None:
+        replay["arguments"]["caption"] = replay_caption
+    refusal = support.run_cli(replay)
+    assert refusal.exit_code == errors.EXIT_AUTHORITY_REFUSED
+    assert refusal.response["error"]["code"] == errors.IDEMPOTENCY_CONFLICT
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
+        expected = first_caption or "[telegram receipt image]"
+        assert conn.execute("SELECT raw_input FROM raw_intake_records").fetchone()[0] == expected
+
+
+def test_receipt_replay_same_canonical_caption_succeeds_without_handoff(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    handoff = support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    assert support.run_cli(_receipt_request(workspace)).exit_code == errors.EXIT_OK
+    handoff.unlink()
+    replay = _receipt_request(workspace)
+    replay["arguments"]["caption"] = "[telegram receipt image]"
+    assert support.run_cli(replay).exit_code == errors.EXIT_OK
+
+
 def test_receipt_lost_capture_reply_recovers_by_stable_intake_without_handoff(
     workspace: support.BridgeWorkspace,
 ) -> None:
@@ -207,6 +249,44 @@ def test_receipt_status_does_not_claim_missing_original(
         status.response["result"]["capture_job"]["public_id"]
         == (capture.response["result"]["capture_job"]["public_id"])
     )
+
+
+def test_receipt_status_rejects_source_linked_to_another_intake(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    first = support.run_cli(_receipt_request(workspace))
+    second_request = support.make_request(
+        "capture",
+        support.capture_receipt_arguments(
+            workspace, handoff_filename="d3.jpg", message_id=21
+        ),
+        idempotency_key=support.canonical_capture_key(message_id=21),
+    )
+    second = support.run_cli(second_request)
+    assert first.exit_code == second.exit_code == errors.EXIT_OK
+    first_job = first.response["result"]["capture_job"]
+    second_source_id = second.response["result"]["capture_job"]["attachment_evidence_id"]
+    original_get_job = commands.get_capture_job
+
+    def corrupted_job(*args: object, **kwargs: object) -> dict | None:
+        job = original_get_job(*args, **kwargs)
+        if job is not None and job["public_id"] == first_job["public_id"]:
+            return {**job, "attachment_evidence_id": second_source_id}
+        return job
+
+    monkeypatch.setattr(commands, "get_capture_job", corrupted_job)
+    status = support.run_cli(
+        support.make_request(
+            "get_status",
+            {
+                "workspace_path": str(workspace.workspace_path),
+                "job_public_id": first_job["public_id"],
+            },
+        )
+    )
+    assert status.exit_code == errors.EXIT_OK
+    assert status.response["result"]["capture_attachment_integrity"] == "missing"
 
 
 def test_receipt_job_write_failure_keeps_original_without_false_adoption(
@@ -327,3 +407,105 @@ def test_migration_052_adds_jobs_without_changing_prior_raw_intake(tmp_path: Pat
         )
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("id", 999999),
+        ("public_id", "fcj_changed"),
+        ("raw_intake_record_id", 999999),
+        ("capture_kind", "receipt_image"),
+        ("intake_fingerprint", "a" * 64),
+        ("attachment_evidence_id", 999999),
+        ("attachment_content_hash", "b" * 64),
+        ("ingress_identity_digest", "c" * 64),
+        ("created_at", "1900-01-01"),
+    ],
+)
+def test_migration_052_freezes_job_identity_but_allows_processing_state(
+    workspace: support.BridgeWorkspace, column: str, value: object
+) -> None:
+    capture = support.run_cli(_text_request(workspace))
+    assert capture.exit_code == errors.EXIT_OK
+    job_id = capture.response["result"]["capture_job"]["public_id"]
+    with support.open_database(workspace) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="capture job source identity"):
+            conn.execute(
+                f"UPDATE finance_capture_jobs SET {column} = ? WHERE public_id = ?",
+                (value, job_id),
+            )
+        conn.execute(
+            "UPDATE finance_capture_jobs SET status = 'processing', "
+            "lease_epoch = 1, lease_owner = 'worker', lease_expires_at = 123, "
+            "updated_at = 'later' WHERE public_id = ?",
+            (job_id,),
+        )
+        assert tuple(conn.execute(
+            "SELECT status, lease_epoch FROM finance_capture_jobs WHERE public_id = ?",
+            (job_id,),
+        ).fetchone()) == ("processing", 1)
+
+
+def test_migration_052_prevents_job_and_intake_delete_or_replace(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    capture = support.run_cli(_text_request(workspace))
+    assert capture.exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        job_id = capture.response["result"]["capture_job"]["public_id"]
+        intake_id = capture.response["result"]["intake_public_id"]
+        for sql, key, message in [
+            ("DELETE FROM finance_capture_jobs WHERE public_id = ?", job_id, "capture job cannot"),
+            ("DELETE FROM raw_intake_records WHERE public_id = ?", intake_id, "raw intake cannot"),
+            (
+                "INSERT OR REPLACE INTO finance_capture_jobs SELECT * "
+                "FROM finance_capture_jobs WHERE public_id = ?",
+                job_id,
+                "capture job identity collision",
+            ),
+            (
+                "INSERT OR REPLACE INTO raw_intake_records SELECT * "
+                "FROM raw_intake_records WHERE public_id = ?",
+                intake_id,
+                "capture raw intake identity collision",
+            ),
+        ]:
+            with pytest.raises(sqlite3.IntegrityError, match=message):
+                conn.execute(sql, (key,))
+        with pytest.raises(sqlite3.IntegrityError, match="capture raw intake source"):
+            conn.execute(
+                "UPDATE raw_intake_records SET raw_input = 'changed caption' WHERE public_id = ?",
+                (intake_id,),
+            )
+        conn.execute(
+            "UPDATE raw_intake_records SET status = 'parsed_pending_confirmation' "
+            "WHERE public_id = ?",
+            (intake_id,),
+        )
+        assert conn.execute("SELECT COUNT(*) FROM finance_capture_jobs").fetchone()[0] == 1
+
+
+def test_migration_052_seals_receipt_caption_before_proposal(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    capture = support.run_cli(_receipt_request(workspace))
+    assert capture.exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        intake_id = capture.response["result"]["intake_public_id"]
+        assert conn.execute(
+            "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?",
+            (intake_id,),
+        ).fetchone()[0] is None
+        with pytest.raises(sqlite3.IntegrityError, match="capture raw intake source"):
+            conn.execute(
+                "UPDATE raw_intake_records SET raw_input = 'changed caption' WHERE public_id = ?",
+                (intake_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="capture raw intake identity collision"):
+            conn.execute(
+                "INSERT OR REPLACE INTO raw_intake_records SELECT * "
+                "FROM raw_intake_records WHERE public_id = ?",
+                (intake_id,),
+            )

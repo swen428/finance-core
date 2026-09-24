@@ -1215,7 +1215,12 @@ def _open_and_verify_attachment(record: _AttachmentRecord) -> _OpenedAttachment:
 
 
 def verify_telegram_original_attachment(
-    conn: sqlite3.Connection, *, source_id: int, expected_hash: str
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    expected_hash: str,
+    expected_intake_id: int,
+    expected_attachment_id: int,
 ) -> None:
     """Verify current original bytes against the immutable Telegram source row.
 
@@ -1225,11 +1230,19 @@ def verify_telegram_original_attachment(
     """
     require_staging_database(conn)
     source = conn.execute(
-        "SELECT attachment_id, content_hash FROM telegram_attachment_source WHERE id = ?",
+        "SELECT attachment_id, raw_intake_record_id, content_hash "
+        "FROM telegram_attachment_source WHERE id = ?",
         (source_id,),
     ).fetchone()
     if source is None:
         raise OcrAttachmentNotFoundError("Telegram original source evidence is missing.")
+    if (
+        source["raw_intake_record_id"] != expected_intake_id
+        or source["attachment_id"] != expected_attachment_id
+    ):
+        raise OcrAttachmentIntegrityConflictError(
+            "Telegram original source is not linked to the capture intake."
+        )
     if source["content_hash"] != expected_hash:
         raise OcrAttachmentIntegrityConflictError("Telegram original source hash has changed.")
     record = _load_attachment_record(conn, int(source["attachment_id"]))

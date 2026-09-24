@@ -1048,11 +1048,20 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         if capture_job is not None and capture_job["capture_kind"] == "receipt_image":
             source_id = capture_job["attachment_evidence_id"]
             expected_hash = capture_job["attachment_content_hash"]
+            intake_attachment_id = intake["attachment_id"]
             try:
-                if not isinstance(source_id, int) or not isinstance(expected_hash, str):
+                if (
+                    not isinstance(source_id, int)
+                    or not isinstance(expected_hash, str)
+                    or not isinstance(intake_attachment_id, int)
+                ):
                     raise ValueError("Receipt capture job has incomplete original evidence")
                 verify_telegram_original_attachment(
-                    conn, source_id=source_id, expected_hash=expected_hash
+                    conn,
+                    source_id=source_id,
+                    expected_hash=expected_hash,
+                    expected_intake_id=int(capture_job["raw_intake_record_id"]),
+                    expected_attachment_id=intake_attachment_id,
                 )
             except (ReceiptOcrError, ValueError):
                 capture_attachment_integrity = "missing"
@@ -1524,6 +1533,15 @@ def _require_replay_content_matches(
     return content
 
 
+def _require_replay_caption_matches(intake: dict[str, Any], caption: str) -> None:
+    if intake["raw_input"] != (caption or "[telegram receipt image]"):
+        raise errors.bridge_error(
+            errors.IDEMPOTENCY_CONFLICT,
+            "Capture idempotency key is already bound to a different receipt caption.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+
+
 def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(
         request.arguments,
@@ -1686,6 +1704,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
             )
         is_replay = existing is not None
         if existing is not None:
+            _require_replay_caption_matches(existing, caption)
             _require_replay_source_context(conn, existing, source_context)
 
         deadline.check("receipt handoff publication")
@@ -1756,6 +1775,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                         "Capture idempotency key is already bound to a different intake identity.",
                         errors.EXIT_AUTHORITY_REFUSED,
                     ) from exc
+                _require_replay_caption_matches(winner, caption)
                 preloaded_content = _require_replay_content_matches(
                     conn, winner, handoff_path, descriptor_content
                 )

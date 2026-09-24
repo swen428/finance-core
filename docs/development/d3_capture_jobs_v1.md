@@ -10,13 +10,20 @@ The `capture` command now returns `capture_job` with a stable `public_id`
 `finance-capture-job-v1\0` followed by the intake public ID). A replay of the
 same chat/message and identical content returns that job. Changed raw content,
 original image, or ingress identity fails with an idempotency conflict. The
-`get_status` command accepts either the existing `intake_public_id` or a new
+receipt caption is part of raw content; replay compares its canonical value
+(`caption` or `[telegram receipt image]`) even if the handoff file is gone.
+Migration 052 seals a job's source identity and its linked raw intake source,
+while processing status and lease fields remain updatable.
+
+The `get_status` command accepts either the existing `intake_public_id` or a new
 `job_public_id` and includes the durable `capture_job` in its response.
 For a receipt job, `get_status` also returns `capture_attachment_integrity`:
 `verified` only after reopening the current original and matching its immutable
 size, signature and SHA-256; `missing` when that proof fails. Other jobs return
 `null`. A lost-response recovery must require `verified` before reporting
-original-image custody to the host. The job row alone is not that proof.
+original-image custody to the host. Verification also checks that the source
+row links to this job's intake and attachment. The job row alone is not that
+proof.
 
 New capture clients may supply `finance_ingress` with exactly these fields:
 `channel: "telegram"`, `accountId`, integer `updateId`, integer `chatId`,
