@@ -37,8 +37,11 @@ from finance_core.intake.attachment_evidence import (
 )
 from finance_core.intake.capture_jobs import (
     CaptureJobConflictError,
+    DurableCaptureConnectionError,
     ensure_capture_job,
+    ensure_replayed_text_capture_job,
     get_capture_job,
+    require_durable_capture_connection,
 )
 from finance_core.intake.raw_text_repository import (
     TELEGRAM_TEXT,
@@ -562,19 +565,8 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
 def _require_durable_capture_connection(conn: sqlite3.Connection) -> None:
     """Keep a Core capture committed after the host discards its spool copy."""
     try:
-        journal = conn.execute("PRAGMA journal_mode").fetchone()
-        if journal is None or str(journal[0]).lower() not in {
-            "wal",
-            "delete",
-            "truncate",
-            "persist",
-        }:
-            raise ValueError("Core capture journal does not support durable commits")
-        conn.execute("PRAGMA synchronous = FULL")
-        synchronous = conn.execute("PRAGMA synchronous").fetchone()
-        if synchronous is None or int(synchronous[0]) != 2:
-            raise ValueError("Core capture connection did not retain FULL synchronization")
-    except (sqlite3.Error, ValueError, TypeError) as exc:
+        require_durable_capture_connection(conn)
+    except DurableCaptureConnectionError as exc:
         raise errors.bridge_error(
             errors.INTERNAL_ERROR,
             "Core capture could not prove a durable SQLite commit setting.",
@@ -1194,22 +1186,12 @@ def _ensure_replayed_capture_job(
 ) -> dict[str, Any]:
     # A pre-D3 capture may exist without a job. Enlist it before reporting
     # successful D3 capture, including when replay wins a concurrent insert.
-    conn.execute("BEGIN IMMEDIATE")
     try:
-        job = ensure_capture_job(
-            conn,
-            intake_id=intake_id,
-            capture_kind="text",
-            ingress_identity_digest=ingress_identity_digest,
+        return ensure_replayed_text_capture_job(
+            conn, intake_id=intake_id, ingress_identity_digest=ingress_identity_digest
         )
-        conn.commit()
-        return job
     except CaptureJobConflictError as exc:
-        conn.rollback()
         raise _capture_job_conflict(exc) from exc
-    except BaseException:
-        conn.rollback()
-        raise
 
 
 def _capture_job_conflict(exc: CaptureJobConflictError) -> errors.BridgeError:

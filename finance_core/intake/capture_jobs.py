@@ -21,6 +21,35 @@ class CaptureJobConflictError(ValueError):
     """An intake/job identity is already bound to different source evidence."""
 
 
+class DurableCaptureConnectionError(ValueError):
+    """The SQLite connection cannot prove a durable capture commit."""
+
+
+def require_durable_capture_connection(conn: sqlite3.Connection) -> None:
+    """Require a disk-backed FULL-synchronous journal before capture writes."""
+    try:
+        journal = conn.execute("PRAGMA journal_mode").fetchone()
+        if journal is None or str(journal[0]).lower() not in {
+            "wal",
+            "delete",
+            "truncate",
+            "persist",
+        }:
+            raise DurableCaptureConnectionError(
+                "Core capture journal does not support durable commits"
+            )
+        conn.execute("PRAGMA synchronous = FULL")
+        synchronous = conn.execute("PRAGMA synchronous").fetchone()
+        if synchronous is None or int(synchronous[0]) != 2:
+            raise DurableCaptureConnectionError(
+                "Core capture connection did not retain FULL synchronization"
+            )
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        raise DurableCaptureConnectionError(
+            "Core capture could not prove a durable SQLite commit setting"
+        ) from exc
+
+
 def capture_job_public_id(intake_public_id: str) -> str:
     if not intake_public_id or len(intake_public_id) > 200:
         raise ValueError("Invalid intake public ID")
@@ -139,3 +168,23 @@ def ensure_capture_job(
     created = get_capture_job(conn, public_id=job_id)
     assert created is not None
     return created
+
+
+def ensure_replayed_text_capture_job(
+    conn: sqlite3.Connection, *, intake_id: int, ingress_identity_digest: str | None
+) -> dict[str, Any]:
+    """Atomically attach a D3 job to a pre-D3 text capture during replay."""
+    require_staging_database(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        job = ensure_capture_job(
+            conn,
+            intake_id=intake_id,
+            capture_kind="text",
+            ingress_identity_digest=ingress_identity_digest,
+        )
+        conn.commit()
+        return job
+    except BaseException:
+        conn.rollback()
+        raise
