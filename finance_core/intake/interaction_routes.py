@@ -43,6 +43,50 @@ class InteractionRouteConflictError(ValueError):
     """A replay disagrees with frozen source, identity or route evidence."""
 
 
+def begin_interaction_capture(conn: sqlite3.Connection) -> None:
+    """Reserve the route decision and its source/job writes in one write unit."""
+    require_staging_database(conn)
+    conn.execute("BEGIN IMMEDIATE")
+
+
+def mark_control_refusal(
+    conn: sqlite3.Connection, *, job_public_id: str, refusal_code: str
+) -> None:
+    require_staging_database(conn)
+    if not conn.in_transaction:
+        raise RuntimeError("Control refusal requires the capture transaction")
+    conn.execute(
+        "UPDATE finance_capture_jobs SET status = 'needs_attention', last_error = ? "
+        "WHERE public_id = ?",
+        (refusal_code, job_public_id),
+    )
+
+
+def find_interaction_route_job(
+    conn: sqlite3.Connection,
+    *,
+    context: InteractionContext,
+    message_id: int | None = None,
+    operation_key: str | None = None,
+) -> str | None:
+    """Find one immutable route by authenticated source and one selector."""
+    require_staging_database(conn)
+    if (message_id is None) == (operation_key is None):
+        raise ValueError("Provide exactly one route selector")
+    predicate = "r.telegram_message_id = ?" if message_id is not None else "r.operation_key = ?"
+    key = message_id if message_id is not None else operation_key
+    rows = conn.execute(
+        "SELECT r.job_public_id FROM finance_capture_interaction_routes r "
+        "WHERE r.authenticated_actor_id = ? AND r.telegram_account_id = ? "
+        "AND r.telegram_conversation_id = ? AND r.conversation_binding_id = ? "
+        f"AND {predicate}",
+        (context.actor_id, context.account_id, context.conversation_id, context.binding_id, key),
+    ).fetchall()
+    if len(rows) > 1:
+        raise InteractionRouteConflictError("Original interaction is ambiguous")
+    return None if not rows else str(rows[0][0])
+
+
 class InteractionContext(Protocol):
     """The authenticated source fields needed for routing, without a platform import."""
 

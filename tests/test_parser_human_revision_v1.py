@@ -61,7 +61,8 @@ def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
         assert "parser_human_draft_publications" in new_sql
         assert "operation.result_completeness = 'complete'" in new_sql
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
-        assert migration_ledger_rows(conn)[-1]["migration_id"] == "054"
+        latest_migration_id = TEMP_DB_MIGRATION_PATHS[-1].name[:3]
+        assert migration_ledger_rows(conn)[-1]["migration_id"] == latest_migration_id
         rows = [tuple(row) for row in migration_ledger_rows(conn)]
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         assert [tuple(row) for row in migration_ledger_rows(conn)] == rows

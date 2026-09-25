@@ -52,8 +52,11 @@ from finance_core.intake.capture_jobs import (
 )
 from finance_core.intake.interaction_routes import (
     InteractionRouteConflictError,
+    begin_interaction_capture,
+    find_interaction_route_job,
     freeze_interaction_route,
     get_interaction_route,
+    mark_control_refusal,
     require_replayed_interaction_route,
 )
 from finance_core.intake.raw_text_repository import (
@@ -1579,7 +1582,7 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
     try:
         _require_durable_capture_connection(conn)
         deadline.check("interaction capture")
-        conn.execute("BEGIN IMMEDIATE")
+        begin_interaction_capture(conn)
         try:
             key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
             intake = get_raw_intake_record_by_idempotency_key(conn, key)
@@ -1608,10 +1611,10 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
                     message_id=validated.message_id,
                 )
                 if route["route_kind"] == "control_refused":
-                    conn.execute(
-                        "UPDATE finance_capture_jobs SET status = 'needs_attention', "
-                        "last_error = ? WHERE public_id = ?",
-                        (str(route["refusal_code"]), job["public_id"]),
+                    mark_control_refusal(
+                        conn,
+                        job_public_id=str(job["public_id"]),
+                        refusal_code=str(route["refusal_code"]),
                     )
                 replay = False
             else:
@@ -1686,46 +1689,42 @@ def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> 
             errors.EXIT_VALIDATION_REFUSED,
         )
     context = _require_telegram_human_context(request.arguments)
-    predicate = "r.telegram_message_id = ?" if by_message else "r.operation_key = ?"
-    key = (
+    message_id = (
         _require_positive_int(
             request.arguments["telegram_message_id"],
             "telegram_message_id",
             maximum=2**63 - 1,
         )
         if by_message
-        else _require_string(
+        else None
+    )
+    operation_key = (
+        _require_string(
             request.arguments["operation_key"],
             "operation_key",
             max_length=200,
         )
+        if by_operation
+        else None
     )
     _workspace, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("frozen interaction route lookup")
-        cursor = conn.execute(
-            "SELECT r.job_public_id FROM finance_capture_interaction_routes r "
-            "WHERE r.authenticated_actor_id = ? AND r.telegram_account_id = ? "
-            "AND r.telegram_conversation_id = ? AND r.conversation_binding_id = ? "
-            f"AND {predicate}",
-            (
-                context.actor_id,
-                context.account_id,
-                context.conversation_id,
-                context.binding_id,
-                key,
-            ),
-        )
-        rows = cursor.fetchall()
-        if len(rows) > 1:
+        try:
+            job_id = find_interaction_route_job(
+                conn,
+                context=context,
+                message_id=message_id,
+                operation_key=operation_key,
+            )
+        except InteractionRouteConflictError as exc:
             raise errors.bridge_error(
                 errors.LIFECYCLE_CONFLICT,
                 "Original interaction is ambiguous.",
                 errors.EXIT_AUTHORITY_REFUSED,
-            )
-        if not rows:
+            ) from exc
+        if job_id is None:
             return {"found": False, "final_transaction_created": False}, False
-        job_id = str(rows[0][0])
         route = get_interaction_route(conn, job_id)
         job = get_capture_job(conn, public_id=job_id)
         if route is None or job is None:
