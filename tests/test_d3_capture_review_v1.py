@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import openclaw_staging_bridge_support_v1 as support
 import pytest
 from test_receipt_ocr_evidence import FakeEngine
 
+from finance_core import posting_authority as posting_authority_module
 from finance_core.application import capture_processing, capture_review
+from finance_core.application.capture_results import recover_capture_result
 from finance_core.intake.capture_jobs import claim_capture_job, get_capture_job
+from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
+from finance_core.posting_authority import (
+    PreparedPostingReview,
+    begin_posting_review_delivery,
+    confirm_and_post,
+)
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    require_telegram_source_context,
+)
+from tests.test_d2_initial_card_delivery_authority_v1 import _record_delivery
 
 
 @pytest.fixture()
@@ -68,6 +84,40 @@ def _capture_processed_text(
             )
             conn.commit()
     return job_public_id
+
+
+def _activate_review(
+    conn: sqlite3.Connection, *, job: dict[str, object], review: PreparedPostingReview
+) -> tuple[HumanActionContext, bytes, str]:
+    context = HumanActionContext("111", "synthetic-account", "111", "synthetic-binding")
+    source_identity = require_telegram_source_context(
+        conn,
+        raw_intake_record_id=int(job["raw_intake_record_id"]),
+        context=TelegramSourceContext(
+            authenticated_actor_id="111",
+            account_id="synthetic-account",
+            conversation_id="111",
+            binding_id="synthetic-binding",
+            message_id="10",
+        ),
+    )
+    key = b"synthetic-d3-expiry-review-key"
+    manifest = begin_posting_review_delivery(
+        conn,
+        review_public_id=review.review_public_id,
+        key=key,
+        context=context,
+    )
+    _record_delivery(
+        conn,
+        manifest=manifest,
+        context=context,
+        provider_message_id=54321,
+        source_identity_sha256=source_identity,
+        now=int(capture_review.time.time()),
+    )
+    confirm = next(control for control in manifest.controls if control.action == "confirm")
+    return context, key, confirm.callback_value.removeprefix("post:")
 
 
 def test_review_card_is_durable_before_awaiting_user_and_replays_same_card(
@@ -132,6 +182,161 @@ def test_crash_after_d2_card_commit_recovers_same_review(
         assert review.review_public_id == original["review_public_id"]
         assert review.initial_card_public_id == original["initial_card_public_id"]
         assert conn.execute("SELECT count(*) FROM d2_posting_reviews").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("created_status", ["processing", "awaiting_user"])
+def test_review_expiry_is_a_durable_queryable_stop_without_new_card(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    created_status: str,
+) -> None:
+    job_public_id = _capture_processed_text(workspace, eligible_proposal=True)
+    with support.open_database(workspace) as conn:
+        job, review, _ = capture_review.ensure_capture_review(conn, job_public_id=job_public_id)
+        assert job["status"] == "awaiting_user" and review is not None
+        if created_status == "processing":
+            conn.execute(
+                "UPDATE finance_capture_jobs SET status = 'processing' WHERE public_id = ?",
+                (job_public_id,),
+            )
+            conn.commit()
+        expiry = review.expires_at
+        monkeypatch.setattr(capture_review.time, "time", lambda: expiry - 61)
+        still_live, same_review, replay = capture_review.ensure_capture_review(
+            conn, job_public_id=job_public_id
+        )
+        assert replay and same_review is not None
+        assert still_live["status"] == "awaiting_user"
+        monkeypatch.setattr(capture_review.time, "time", lambda: expiry - 60)
+        stopped, card, replay = capture_review.ensure_capture_review(
+            conn, job_public_id=job_public_id
+        )
+        assert replay and card is None
+        assert stopped["status"] == "needs_attention"
+        assert stopped["last_error"] == "review_expired"
+        monkeypatch.setattr(capture_review.time, "time", lambda: expiry + 1)
+        again, card, replay = capture_review.ensure_capture_review(
+            conn, job_public_id=job_public_id
+        )
+        assert replay and card is None
+        assert again == stopped
+        assert get_capture_job(conn, public_id=job_public_id) == stopped
+        assert conn.execute("SELECT count(*) FROM d2_posting_reviews").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM d2_initial_proposal_cards").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+def test_expired_review_after_d2_commit_preserves_canonical_result(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_public_id = _capture_processed_text(workspace, eligible_proposal=True)
+    with support.open_database(workspace) as conn:
+        job, review, _ = capture_review.ensure_capture_review(conn, job_public_id=job_public_id)
+        assert job["status"] == "awaiting_user" and review is not None
+        context, key, reference = _activate_review(conn, job=job, review=review)
+        posted = confirm_and_post(
+            conn,
+            key=key,
+            reference=reference,
+            context=context,
+            callback_id="d3-review-expiry-confirm",
+            callback_message_id=54321,
+        )
+        assert posted.state == "finalized"
+        before = conn.execute("SELECT count(*) FROM transactions").fetchone()[0]
+        monkeypatch.setattr(capture_review.time, "time", lambda: review.expires_at + 1)
+        recovered_job, card, replay = capture_review.ensure_capture_review(
+            conn, job_public_id=job_public_id
+        )
+        assert replay and card is None
+        assert recovered_job["status"] == "awaiting_user"
+        assert recovered_job["last_error"] is None
+        result = recover_capture_result(
+            conn,
+            job_public_id=job_public_id,
+            review_public_id=review.review_public_id,
+            context=context,
+        )
+        assert result["result_public_id"] == posted.transaction_public_id
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == before
+
+
+def test_expired_review_after_accepted_confirm_waits_for_existing_posting(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_public_id = _capture_processed_text(workspace, eligible_proposal=True)
+    with support.open_database(workspace) as conn:
+        job, review, _ = capture_review.ensure_capture_review(conn, job_public_id=job_public_id)
+        assert review is not None
+        context, key, reference = _activate_review(conn, job=job, review=review)
+
+        def crash_after_accept(stage: str) -> None:
+            if stage == "after_confirmation_commit":
+                raise RuntimeError("synthetic crash after accepted decision")
+
+        monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", crash_after_accept)
+        with pytest.raises(RuntimeError, match="synthetic crash"):
+            confirm_and_post(
+                conn,
+                key=key,
+                reference=reference,
+                context=context,
+                callback_id="d3-review-accepted-confirm",
+                callback_message_id=54321,
+            )
+        monkeypatch.setattr(posting_authority_module, "_failure_injection_hook", None)
+        assert conn.execute("SELECT count(*) FROM d2_posting_decisions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+        monkeypatch.setattr(capture_review.time, "time", lambda: review.expires_at + 1)
+        recovered_job, card, replay = capture_review.ensure_capture_review(
+            conn, job_public_id=job_public_id
+        )
+        assert replay and card is None
+        assert recovered_job["status"] == "awaiting_user"
+        assert recovered_job["last_error"] is None
+        posted = confirm_and_post(
+            conn,
+            key=key,
+            reference=reference,
+            context=context,
+            callback_id="d3-review-accepted-confirm",
+            callback_message_id=54321,
+        )
+        assert posted.state == "finalized"
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+
+
+def test_concurrent_expired_review_replays_one_stop(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_public_id = _capture_processed_text(workspace, eligible_proposal=True)
+    with support.open_database(workspace) as conn:
+        _, review, _ = capture_review.ensure_capture_review(conn, job_public_id=job_public_id)
+        assert review is not None
+    monkeypatch.setattr(capture_review.time, "time", lambda: review.expires_at + 1)
+    barrier = Barrier(2)
+
+    def replay() -> dict[str, object]:
+        with support.open_database(workspace) as conn:
+            barrier.wait(timeout=5)
+            job, card, reused = capture_review.ensure_capture_review(
+                conn, job_public_id=job_public_id
+            )
+            assert card is None and reused
+            return job
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(replay)
+        second_future = pool.submit(replay)
+        first = first_future.result(timeout=10)
+        second = second_future.result(timeout=10)
+    assert first == second
+    assert first["status"] == "needs_attention"
+    assert first["last_error"] == "review_expired"
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT count(*) FROM d2_posting_reviews").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM d2_initial_proposal_cards").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
 
 
