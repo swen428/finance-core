@@ -78,6 +78,7 @@ CREATE TRIGGER trg_finance_capture_interaction_routes_no_replace
 BEFORE INSERT ON finance_capture_interaction_routes
 WHEN EXISTS (SELECT 1 FROM finance_capture_interaction_routes AS prior
     WHERE prior.job_public_id = NEW.job_public_id
+       OR prior.rowid = NEW.rowid
        OR (NEW.operation_key IS NOT NULL
            AND prior.operation_key = NEW.operation_key)
        OR (prior.telegram_account_id = NEW.telegram_account_id

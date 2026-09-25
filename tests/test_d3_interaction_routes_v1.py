@@ -299,6 +299,44 @@ def test_duplicate_operation_cannot_replace_a_different_frozen_route(
         assert saved[0]["operation_key"] == original["operation_key"]
 
 
+@pytest.mark.parametrize("rowid_alias", ["rowid", "oid", "_rowid_"])
+def test_hidden_rowid_cannot_replace_a_frozen_route(
+    workspace: support.BridgeWorkspace,
+    rowid_alias: str,
+) -> None:
+    first = support.run_cli(_request(workspace, "完成"))
+    assert first.exit_code == errors.EXIT_OK, first.response
+    original = first.response["result"]["interaction_route"]
+    second = _request(workspace, "lunch 13", message_id=22)
+    second["command"] = "capture"
+    second["arguments"]["kind"] = "text"
+    legacy = support.run_cli(second)
+    assert legacy.exit_code == errors.EXIT_OK, legacy.response
+    other_job = legacy.response["result"]["capture_job"]["public_id"]
+    with support.open_database(workspace) as conn:
+        assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
+        original_rowid = conn.execute(
+            "SELECT rowid FROM finance_capture_interaction_routes WHERE job_public_id = ?",
+            (original["job_public_id"],),
+        ).fetchone()[0]
+        with pytest.raises(sqlite3.IntegrityError, match="cannot replace evidence"):
+            conn.execute(
+                "INSERT OR REPLACE INTO finance_capture_interaction_routes "
+                f"({rowid_alias}, job_public_id, route_kind, raw_text_sha256, "
+                "authenticated_actor_id, "
+                "telegram_account_id, telegram_conversation_id, conversation_binding_id, "
+                "telegram_message_id) "
+                "VALUES (?, ?, 'initial_intake', ?, '111', 'finance', '111', 'bind-1', 22)",
+                (original_rowid, other_job, hashlib.sha256(b"lunch 13").hexdigest()),
+            )
+        saved = conn.execute(
+            "SELECT job_public_id, route_kind FROM finance_capture_interaction_routes"
+        ).fetchall()
+        assert len(saved) == 1
+        assert saved[0]["job_public_id"] == original["job_public_id"]
+        assert saved[0]["route_kind"] == "control_refused"
+
+
 def test_guided_route_is_frozen_and_found_by_original_operation(
     workspace: support.BridgeWorkspace,
 ) -> None:
