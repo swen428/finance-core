@@ -13,9 +13,10 @@ import pytest
 from test_receipt_ocr_evidence import FakeEngine
 
 from finance_core import posting_authority as posting_authority_module
-from finance_core.application import capture_processing, capture_review
-from finance_core.application.capture_results import recover_capture_result
+from finance_core.application import capture_processing
 from finance_core.intake.capture_jobs import claim_capture_job, get_capture_job
+from finance_core.openclaw_staging_bridge import capture_review
+from finance_core.openclaw_staging_bridge.capture_results import recover_capture_result
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.posting_authority import (
     PreparedPostingReview,

@@ -7,18 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from finance_core.application.capture_reply_outbox import (
-    ReplyOutboxConflict,
-    begin_reply_attempt,
-    ensure_result_reply,
-    get_reply,
-    reconcile_capture_result_replies,
-    record_reply_sent,
-)
-from finance_core.application.capture_results import (
-    CaptureResultUnavailable,
-    recover_capture_result,
-)
 from finance_core.application.corrections import CorrectionService
 from finance_core.correction_adapters import local_authority
 from finance_core.correction_adapters.d2_source import D2OriginalSourceVerifier
@@ -27,6 +15,18 @@ from finance_core.correction_adapters.policy import open_local_authority_connect
 from finance_core.intake.capture_jobs import (
     DurableCaptureConnectionError,
     capture_job_public_id,
+)
+from finance_core.openclaw_staging_bridge.capture_reply_outbox import (
+    ReplyOutboxConflict,
+    begin_reply_attempt,
+    ensure_result_reply,
+    get_reply,
+    reconcile_capture_result_replies,
+    record_reply_sent,
+)
+from finance_core.openclaw_staging_bridge.capture_results import (
+    CaptureResultUnavailable,
+    recover_capture_result,
 )
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.posting_authority import (

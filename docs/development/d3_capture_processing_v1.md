@@ -6,6 +6,12 @@ extraction ID, parser proposal ID, and OCR-to-proposal link ID before OCR starts
 A text job reuses the proposal created by the capture transaction. The job
 never grants confirmation, conversion, or finalization authority.
 
+The local OCR/proposal processor remains in `finance_core.application.capture_processing`.
+The D3 review, committed-result recovery, and reply-outbox services live in
+`finance_core.openclaw_staging_bridge` because they depend on authenticated
+Telegram context and D2/D2b platform authority. The former `application`
+module paths are not public compatibility aliases.
+
 `process_capture_job` accepts an existing job public ID and uses the local OCR
 engine configured for the staging workspace. A worker first claims the job
 with `BEGIN IMMEDIATE`, a bounded lease, and a new monotonically increasing

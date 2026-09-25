@@ -2020,10 +2020,7 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
             and job["lease_owner"] is None
             and job["lease_expires_at"] is None
             and job["last_error"] != "ocr_timeout_retry_pending"
-            and conn.execute(
-                "SELECT 1 FROM parser_outputs WHERE public_id = ?",
-                (job["proposal_public_id"],),
-            ).fetchone()
+            and ParserProposalRepository(conn).get_by_public_id(str(job["proposal_public_id"]))
             is not None
         ):
             # Local processing committed its proposal but a durable review

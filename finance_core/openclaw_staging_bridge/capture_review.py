@@ -13,8 +13,8 @@ import sqlite3
 import time
 from typing import Any
 
-from finance_core.application.capture_results import recover_capture_result
 from finance_core.intake.capture_jobs import get_capture_job
+from finance_core.openclaw_staging_bridge.capture_results import recover_capture_result
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.posting_authority import (
