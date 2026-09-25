@@ -50,6 +50,8 @@ def require_durable_capture_connection(conn: sqlite3.Connection) -> None:
         raise DurableCaptureConnectionError(
             "Core capture could not prove a durable SQLite commit setting"
         ) from exc
+
+
 class CaptureLeaseLostError(RuntimeError):
     """The worker's epoch, owner, or unexpired lease no longer matches."""
 
