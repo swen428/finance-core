@@ -18,6 +18,8 @@ from finance_core.intake.capture_jobs import (
     assert_capture_lease,
     get_capture_job,
 )
+from finance_core.intake.interaction_routes import get_interaction_route
+from finance_core.intake.raw_text_repository import get_raw_intake_record, save_parser_proposal
 from finance_core.intake.receipt_ocr_evidence import (
     OcrDeadlineExceededError,
     ReceiptOcrEngine,
@@ -28,6 +30,7 @@ from finance_core.intake.receipt_ocr_proposal import (
     ReceiptOcrProposalError,
     ingest_receipt_ocr_evidence_as_total_expense_proposal,
 )
+from finance_core.parsers.text_expense_parser import parse_text_expense
 from finance_core.staging_guard import require_staging_database
 
 
@@ -184,7 +187,21 @@ def process_claimed_capture_job(
     require_staging_database(conn)
     job = _begin_checked(conn, lease)
     try:
+        route = get_interaction_route(conn, lease.public_id)
+        if route is not None and route["route_kind"] != "initial_intake":
+            raise CaptureProcessingConflictError("Non-intake interaction cannot enter parser")
         if job["capture_kind"] == "text":
+            if route is not None:
+                intake = get_raw_intake_record(conn, int(job["raw_intake_record_id"]))
+                if intake is None:
+                    raise CaptureProcessingConflictError("Captured text source is missing")
+                if intake["parser_output_id"] is None:
+                    proposal = parse_text_expense(
+                        str(intake["raw_input"]),
+                        raw_input_reference=str(intake["public_id"]),
+                        source_type=str(intake["source_type"]),
+                    )
+                    save_parser_proposal(conn, int(intake["id"]), proposal)
             row = conn.execute(
                 "SELECT p.public_id FROM raw_intake_records r "
                 "JOIN parser_outputs p ON p.id = r.parser_output_id "

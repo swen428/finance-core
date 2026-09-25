@@ -50,6 +50,12 @@ from finance_core.intake.capture_jobs import (
     get_capture_job,
     require_durable_capture_connection,
 )
+from finance_core.intake.interaction_routes import (
+    InteractionRouteConflictError,
+    freeze_interaction_route,
+    get_interaction_route,
+    require_replayed_interaction_route,
+)
 from finance_core.intake.raw_text_repository import (
     TELEGRAM_TEXT,
     RawIntakeIdempotencyConflictError,
@@ -1085,6 +1091,10 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "parse_status": parse_status,
             "final_transaction_created": False,
             "capture_job": capture_job,
+            "interaction_route": (
+                None if capture_job is None
+                else get_interaction_route(conn, str(capture_job["public_id"]))
+            ),
             "capture_attachment_integrity": capture_attachment_integrity,
         }, False
     finally:
@@ -1476,6 +1486,185 @@ def _text_capture_result(conn: sqlite3.Connection, intake: dict[str, Any]) -> di
         "final_transaction_created": False,
         "capture_job": get_capture_job(conn, intake_public_id=str(intake["public_id"])),
     }
+
+
+def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Adopt ordinary private Telegram text and freeze its work route.
+
+    This command performs no parser, AI, edit, confirmation or finalization.
+    A non-null authenticated ingress identity is required for host adoption.
+    """
+    has_update = "telegram_update" in request.arguments
+    has_message = "telegram_message" in request.arguments
+    if has_update == has_message:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED, "Exactly one Telegram text payload is required.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    payload_field = "telegram_update" if has_update else "telegram_message"
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset({"workspace_path", payload_field, "finance_ingress"})
+        | _D2_CAPTURE_CONTEXT_FIELDS,
+    )
+    payload = request.arguments[payload_field]
+    telegram_boundary.validate_private_direct_message(
+        payload if has_update else {"message": payload}
+    )
+    try:
+        validated = (
+            validate_telegram_text_update(payload) if has_update
+            else validate_openclaw_telegram_text_message(payload)
+        )
+    except TelegramTextUpdateValidationError as exc:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED, str(exc), errors.EXIT_VALIDATION_REFUSED
+        ) from exc
+    source_context = _validated_capture_source_context(
+        request.arguments, chat_id=validated.chat_id,
+        message_id=validated.message_id, sender_id=validated.sender_id,
+    )
+    assert source_context is not None
+    ingress_digest, _ = _validated_finance_ingress(
+        request.arguments, capture_kind="text", chat_id=validated.chat_id,
+        message_id=validated.message_id, sender_id=validated.sender_id,
+        source_context=source_context, update_id=validated.update_id,
+    )
+    assert ingress_digest is not None
+    _require_canonical_idempotency_key(
+        request, canonical_capture_key(chat_id=validated.chat_id, message_id=validated.message_id)
+    )
+    context = human_actions.HumanActionContext(
+        actor_id=source_context.authenticated_actor_id,
+        account_id=source_context.account_id,
+        conversation_id=source_context.conversation_id,
+        binding_id=source_context.binding_id,
+    )
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        _require_durable_capture_connection(conn)
+        deadline.check("interaction capture")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
+            intake = get_raw_intake_record_by_idempotency_key(conn, key)
+            if intake is None:
+                intake = create_raw_intake_record(
+                    conn, validated.text, source_type=TELEGRAM_TEXT,
+                    source_channel="telegram", source_metadata=validated.source_metadata,
+                )
+                effect = _capture_context_effect(source_context)
+                assert effect is not None
+                effect(conn, intake)
+                job = ensure_capture_job(
+                    conn, intake_id=int(intake["id"]), capture_kind="text",
+                    ingress_identity_digest=ingress_digest,
+                )
+                route = freeze_interaction_route(
+                    conn, job_public_id=str(job["public_id"]), text=validated.text,
+                    context=context, message_id=validated.message_id,
+                )
+                if route["route_kind"] == "control_refused":
+                    conn.execute(
+                        "UPDATE finance_capture_jobs SET status = 'needs_attention', "
+                        "last_error = ? WHERE public_id = ?",
+                        (str(route["refusal_code"]), job["public_id"]),
+                    )
+                replay = False
+            else:
+                if intake.get("content_fingerprint") != _expected_text_fingerprint(validated):
+                    raise InteractionRouteConflictError(
+                        "Telegram text conflicts with captured source"
+                    )
+                _require_replay_source_context(conn, intake, source_context)
+                existing_job = get_capture_job(conn, intake_public_id=str(intake["public_id"]))
+                if (
+                    existing_job is None
+                    or existing_job["ingress_identity_digest"] != ingress_digest
+                ):
+                    raise InteractionRouteConflictError(
+                        "Telegram ingress conflicts with captured job"
+                    )
+                route = require_replayed_interaction_route(
+                    conn, job_public_id=str(existing_job["public_id"]), text=validated.text,
+                    context=context, message_id=validated.message_id,
+                )
+                replay = True
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return {
+            "capture_kind": "text", "intake_public_id": intake["public_id"],
+            "capture_job": get_capture_job(conn, intake_public_id=str(intake["public_id"])),
+            "interaction_route": route, "final_transaction_created": False,
+        }, replay
+    except (InteractionRouteConflictError, CaptureJobConflictError,
+            RawIntakeIdempotencyConflictError, sqlite3.IntegrityError) as exc:
+        raise errors.bridge_error(
+            errors.IDEMPOTENCY_CONFLICT, "Interaction capture conflicts with frozen evidence.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
+    finally:
+        conn.close()
+
+
+def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Read the original route by message or operation after a session ends."""
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset({"workspace_path", "operator_actor_id", "telegram_account_id",
+                            "telegram_conversation_id", "conversation_binding_id"}),
+        optional=frozenset({"telegram_message_id", "operation_key"}),
+    )
+    by_message = "telegram_message_id" in request.arguments
+    by_operation = "operation_key" in request.arguments
+    if by_message == by_operation:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED, "Provide one message ID or operation key.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    context = _require_telegram_human_context(request.arguments)
+    predicate = "r.telegram_message_id = ?" if by_message else "r.operation_key = ?"
+    key = (
+        _require_positive_int(
+            request.arguments["telegram_message_id"], "telegram_message_id",
+            maximum=2**63 - 1,
+        ) if by_message else _require_string(
+            request.arguments["operation_key"], "operation_key", max_length=200,
+        )
+    )
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("frozen interaction route lookup")
+        cursor = conn.execute(
+            "SELECT r.job_public_id FROM finance_capture_interaction_routes r "
+            "WHERE r.authenticated_actor_id = ? AND r.telegram_account_id = ? "
+            "AND r.telegram_conversation_id = ? AND r.conversation_binding_id = ? "
+            f"AND {predicate}",
+            (context.actor_id, context.account_id, context.conversation_id,
+             context.binding_id, key),
+        )
+        rows = cursor.fetchall()
+        if len(rows) > 1:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT, "Original interaction is ambiguous.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        if not rows:
+            return {"found": False, "final_transaction_created": False}, False
+        job_id = str(rows[0][0])
+        route = get_interaction_route(conn, job_id)
+        job = get_capture_job(conn, public_id=job_id)
+        if route is None or job is None:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT, "Original interaction evidence is incomplete.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        return {"found": True, "interaction_route": route,
+                "capture_job": job, "final_transaction_created": False}, False
+    finally:
+        conn.close()
 
 
 def _require_replay_content_matches(
@@ -2006,6 +2195,13 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
                 errors.INTAKE_NOT_FOUND,
                 "Capture job was not found.",
                 errors.EXIT_VALIDATION_REFUSED,
+            )
+        route = get_interaction_route(conn, job_public_id)
+        if route is not None and route["route_kind"] != "initial_intake":
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Interaction job is reserved for its frozen edit or refusal route.",
+                errors.EXIT_AUTHORITY_REFUSED,
             )
         if job["status"] in {"awaiting_user", "needs_attention", "result_ready"}:
             return {"capture_job": job, "final_transaction_created": False}, True
@@ -6225,6 +6421,8 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         envelope.COMMAND_HEALTH: handle_health,
         envelope.COMMAND_GET_STATUS: handle_get_status,
         envelope.COMMAND_CAPTURE: handle_capture,
+        envelope.COMMAND_CAPTURE_INTERACTION: handle_capture_interaction,
+        envelope.COMMAND_GET_INTERACTION_ROUTE: handle_get_interaction_route,
         envelope.COMMAND_PROCESS_CAPTURE_JOB: handle_process_capture_job,
         envelope.COMMAND_PROPOSE: handle_propose,
         envelope.COMMAND_GET_REVIEW: handle_get_review,
