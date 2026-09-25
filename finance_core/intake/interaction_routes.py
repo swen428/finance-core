@@ -10,9 +10,9 @@ import hashlib
 import json
 import re
 import sqlite3
-from typing import Any
+from datetime import UTC, datetime
+from typing import Any, Protocol
 
-from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.staging_guard import require_staging_database
 
 _CARD = re.compile(r"^d1card_[0-9a-f]{32}$")
@@ -23,15 +23,44 @@ _CARD_LIKE = re.compile(
     re.I | re.M,
 )
 _FIELD_ALIASES = {
-    "amount": "amount", "金额": "amount", "currency": "currency", "币种": "currency",
-    "transaction_date": "transaction_date", "date": "transaction_date", "日期": "transaction_date",
-    "merchant": "merchant", "商户": "merchant", "description": "description", "描述": "description",
-    "category": "category", "分类": "category",
+    "amount": "amount",
+    "金额": "amount",
+    "currency": "currency",
+    "币种": "currency",
+    "transaction_date": "transaction_date",
+    "date": "transaction_date",
+    "日期": "transaction_date",
+    "merchant": "merchant",
+    "商户": "merchant",
+    "description": "description",
+    "描述": "description",
+    "category": "category",
+    "分类": "category",
 }
 
 
 class InteractionRouteConflictError(ValueError):
     """A replay disagrees with frozen source, identity or route evidence."""
+
+
+class InteractionContext(Protocol):
+    """The authenticated source fields needed for routing, without a platform import."""
+
+    @property
+    def actor_id(self) -> str: ...
+
+    @property
+    def account_id(self) -> str: ...
+
+    @property
+    def conversation_id(self) -> str: ...
+
+    @property
+    def binding_id(self) -> str: ...
+
+
+def _now_epoch() -> int:
+    return int(datetime.now(UTC).timestamp())
 
 
 def _framed_digest(domain: str, *fields: str) -> str:
@@ -53,7 +82,7 @@ def get_interaction_route(conn: sqlite3.Connection, job_public_id: str) -> dict[
 
 
 def _historical_guided_session(
-    conn: sqlite3.Connection, context: HumanActionContext, message_id: int
+    conn: sqlite3.Connection, context: InteractionContext, message_id: int
 ) -> str | None:
     rows = conn.execute(
         "SELECT DISTINCT s.session_public_id FROM openclaw_guided_edit_sessions s "
@@ -61,8 +90,14 @@ def _historical_guided_session(
         "WHERE s.authenticated_actor_id = ? AND s.channel_account_id = ? "
         "AND s.channel_conversation_id = ? AND s.conversation_binding_id = ? "
         "AND (s.completed_message_id = ? OR e.telegram_message_id = ?) LIMIT 2",
-        (context.actor_id, context.account_id, context.conversation_id,
-         context.binding_id, message_id, message_id),
+        (
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+            message_id,
+            message_id,
+        ),
     ).fetchall()
     if len(rows) > 1:
         raise InteractionRouteConflictError("Historical guided message has ambiguous sessions")
@@ -70,7 +105,7 @@ def _historical_guided_session(
 
 
 def classify_interaction(
-    conn: sqlite3.Connection, *, text: str, context: HumanActionContext, message_id: int
+    conn: sqlite3.Connection, *, text: str, context: InteractionContext, message_id: int
 ) -> dict[str, Any]:
     """Core-owned precedence: whole card, historical guided, active guided, intake."""
     # A visible D1 card label always blocks ordinary expense parsing, even
@@ -80,48 +115,79 @@ def classify_interaction(
         if len(card_lines) != 1 or _CARD.fullmatch(card_lines[0]) is None:
             return {"route_kind": "control_refused", "refusal_code": "invalid_whole_card"}
         card = card_lines[0]
-        operation = "d1op_" + _framed_digest(
-            "d1-plugin-card-operation-v1", context.account_id,
-            context.conversation_id, context.binding_id, str(message_id), card,
-        )[:32]
-        return {"route_kind": "whole_card", "card_generation_public_id": card,
-                "operation_key": operation}
+        operation = (
+            "d1op_"
+            + _framed_digest(
+                "d1-plugin-card-operation-v1",
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
+                str(message_id),
+                card,
+            )[:32]
+        )
+        return {
+            "route_kind": "whole_card",
+            "card_generation_public_id": card,
+            "operation_key": operation,
+        }
 
     historical = _historical_guided_session(conn, context, message_id)
     session = conn.execute(
         "SELECT session_public_id FROM openclaw_guided_edit_sessions "
         "WHERE authenticated_actor_id = ? AND channel_account_id = ? "
         "AND channel_conversation_id = ? AND conversation_binding_id = ? "
-        "AND status = 'active'",
-        (context.actor_id, context.account_id, context.conversation_id, context.binding_id),
+        "AND status = 'active' AND expires_at > ?",
+        (
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+            _now_epoch(),
+        ),
     ).fetchone()
     session_id = historical or (None if session is None else str(session[0]))
     value = text.strip()
     if session_id is not None:
         if value == "完成":
-            return {"route_kind": "guided_complete", "guided_session_public_id": session_id,
-                    "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}"}
+            return {
+                "route_kind": "guided_complete",
+                "guided_session_public_id": session_id,
+                "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}",
+            }
         if value.count("=") == 1:
             alias, field_value = (part.strip() for part in value.split("=", 1))
             field = _FIELD_ALIASES.get(alias.lower())
             if field is not None and field_value and len(field_value.encode("utf-8")) <= 1024:
                 if not any(ord(char) < 32 or ord(char) == 127 for char in field_value):
                     return {
-                        "route_kind": "guided_update", "guided_session_public_id": session_id,
+                        "route_kind": "guided_update",
+                        "guided_session_public_id": session_id,
                         "operation_key": f"bridge-guided-edit-update:{session_id}:{message_id}",
                         "field_name": field,
                         "field_value_json": json.dumps(field_value, ensure_ascii=False),
                     }
-        return {"route_kind": "control_refused", "refusal_code": "invalid_guided_control",
-                "guided_session_public_id": session_id}
-    if value == "完成" or value.count("=") == 1:
+        return {
+            "route_kind": "control_refused",
+            "refusal_code": "invalid_guided_control",
+            "guided_session_public_id": session_id,
+        }
+    # A malformed field command remains a control attempt. In particular,
+    # multiple or full-width separators must not turn it into a new expense.
+    separator = re.search(r"[=＝]", value)
+    control_alias = value[: separator.start()].strip().lower() if separator is not None else ""
+    if value == "完成" or control_alias in _FIELD_ALIASES:
         return {"route_kind": "control_refused", "refusal_code": "no_guided_session"}
     return {"route_kind": "initial_intake"}
 
 
 def freeze_interaction_route(
-    conn: sqlite3.Connection, *, job_public_id: str, text: str,
-    context: HumanActionContext, message_id: int,
+    conn: sqlite3.Connection,
+    *,
+    job_public_id: str,
+    text: str,
+    context: InteractionContext,
+    message_id: int,
 ) -> dict[str, Any]:
     require_staging_database(conn)
     if not conn.in_transaction:
@@ -136,11 +202,22 @@ def freeze_interaction_route(
         "telegram_message_id, card_generation_public_id, guided_session_public_id, "
         "operation_key, field_name, field_value_json, refusal_code) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (job_public_id, route["route_kind"], hashlib.sha256(text.encode()).hexdigest(),
-         context.actor_id, context.account_id, context.conversation_id, context.binding_id,
-         message_id, route.get("card_generation_public_id"), route.get("guided_session_public_id"),
-         route.get("operation_key"), route.get("field_name"), route.get("field_value_json"),
-         route.get("refusal_code")),
+        (
+            job_public_id,
+            route["route_kind"],
+            hashlib.sha256(text.encode()).hexdigest(),
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+            message_id,
+            route.get("card_generation_public_id"),
+            route.get("guided_session_public_id"),
+            route.get("operation_key"),
+            route.get("field_name"),
+            route.get("field_value_json"),
+            route.get("refusal_code"),
+        ),
     )
     saved = get_interaction_route(conn, job_public_id)
     assert saved is not None
@@ -148,17 +225,23 @@ def freeze_interaction_route(
 
 
 def require_replayed_interaction_route(
-    conn: sqlite3.Connection, *, job_public_id: str, text: str,
-    context: HumanActionContext, message_id: int,
+    conn: sqlite3.Connection,
+    *,
+    job_public_id: str,
+    text: str,
+    context: InteractionContext,
+    message_id: int,
 ) -> dict[str, Any]:
     route = get_interaction_route(conn, job_public_id)
-    if route is None or any((
-        route["raw_text_sha256"] != hashlib.sha256(text.encode()).hexdigest(),
-        route["authenticated_actor_id"] != context.actor_id,
-        route["telegram_account_id"] != context.account_id,
-        route["telegram_conversation_id"] != context.conversation_id,
-        route["conversation_binding_id"] != context.binding_id,
-        route["telegram_message_id"] != message_id,
-    )):
+    if route is None or any(
+        (
+            route["raw_text_sha256"] != hashlib.sha256(text.encode()).hexdigest(),
+            route["authenticated_actor_id"] != context.actor_id,
+            route["telegram_account_id"] != context.account_id,
+            route["telegram_conversation_id"] != context.conversation_id,
+            route["conversation_binding_id"] != context.binding_id,
+            route["telegram_message_id"] != message_id,
+        )
+    ):
         raise InteractionRouteConflictError("Replay differs from the frozen interaction route")
     return route

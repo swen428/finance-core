@@ -23,7 +23,7 @@ and saved route. It never reclassifies from the current session. An old
 capture with no route cannot be treated as a successful interaction adoption.
 
 Core owns route precedence: D1 whole-card shaped text first, historical
-guided message identity, current guided session, then initial intake. A
+guided message identity, unexpired current guided session, then initial intake. A
 malformed card or guided control is `control_refused` with a queryable reason;
 it is never sent to the ordinary parser. The immutable route stores original
 text SHA-256, message/context identity, and applicable card, session,
@@ -31,6 +31,10 @@ operation, field and field-value material. `get_interaction_route` retrieves
 it read-only under the same authenticated context by original message ID or
 operation key, including after a guided session ends. `get_status` also
 returns the route for a known intake/job.
+
+Text adoption rejects payloads that also contain Telegram media fields before
+any persistence; those attachments require the separate receipt capture path.
+An expired guided session cannot claim a newly arriving ordinary expense.
 
 A worker may run `process_capture_job` only for `initial_intake`; for text it
 creates the deterministic parser proposal after adoption. For `whole_card`,
