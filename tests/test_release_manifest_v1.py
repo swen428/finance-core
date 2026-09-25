@@ -481,8 +481,8 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
         lambda payload: payload.replace(
-            b'    "052_d3_capture_jobs.sql",\n    "053_d3_capture_processing.sql"\n',
-            b'    "052_d3_capture_jobs.sql"\n',
+            b'    "053_d3_capture_processing.sql",\n    "054_d3_result_reply_outbox.sql"\n',
+            b'    "053_d3_capture_processing.sql"\n',
         ),
     ],
 )
