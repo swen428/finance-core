@@ -1523,9 +1523,12 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
             else validate_openclaw_telegram_text_message(payload)
         )
     except TelegramTextUpdateValidationError as exc:
-        raise errors.bridge_error(
-            errors.ARGUMENTS_REFUSED, str(exc), errors.EXIT_VALIDATION_REFUSED
-        ) from exc
+        code = (
+            errors.UNSUPPORTED_UPDATE_TYPE
+            if exc.reason_code == "UNSUPPORTED_UPDATE_TYPE"
+            else errors.ARGUMENTS_REFUSED
+        )
+        raise errors.bridge_error(code, str(exc), errors.EXIT_VALIDATION_REFUSED) from exc
     message = payload["message"] if has_update else payload
     if any(
         field in message
