@@ -18,6 +18,10 @@ from finance_core.intake.capture_jobs import (
     get_capture_job,
     renew_capture_job_lease,
 )
+from finance_core.intake.receipt_ocr_evidence import (
+    OcrAttachmentIntegrityConflictError,
+    OcrDeadlineExceededError,
+)
 from finance_core.openclaw_staging_bridge import commands, identity
 
 
@@ -298,3 +302,214 @@ def test_worker_adopts_prior_bridge_propose_without_duplicate_evidence(
         assert engine.calls == 1
         assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM receipt_ocr_proposal_links").fetchone()[0] == 1
+
+
+def test_ocr_timeout_defers_then_reuses_same_job_and_stage_ids(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    public_id = _capture_receipt(workspace)
+
+    def timeout(_source: object) -> None:
+        raise OcrDeadlineExceededError("synthetic local OCR timeout")
+
+    with support.open_database(workspace) as conn:
+        first = claim_capture_job(conn, public_id=public_id, owner="worker-timeout")
+        deferred = capture_processing.process_claimed_capture_job(
+            conn, lease=first, engine=FakeEngine(callback=timeout)
+        )
+        assert deferred["status"] == "processing"
+        assert deferred["last_error"] == "ocr_timeout_retry_pending"
+        assert deferred["ocr_retry_count"] == 1
+        assert deferred["ocr_retry_not_before_ms"] > 0
+        assert deferred["lease_owner"] is None
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
+        with pytest.raises(CaptureJobNotRunnableError, match="deferred"):
+            claim_capture_job(
+                conn,
+                public_id=public_id,
+                owner="worker-too-soon",
+                now_ms=int(deferred["ocr_retry_not_before_ms"]) - 1,
+            )
+        second = claim_capture_job(
+            conn,
+            public_id=public_id,
+            owner="worker-after-delay",
+            now_ms=int(deferred["ocr_retry_not_before_ms"]),
+        )
+        assert second.epoch == first.epoch + 1
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            with pytest.raises(CaptureLeaseLostError):
+                assert_capture_lease(conn, first)
+        finally:
+            conn.rollback()
+        result = capture_processing.process_claimed_capture_job(
+            conn, lease=second, engine=FakeEngine()
+        )
+        assert result["status"] == "processing"
+        assert result["last_error"] is None
+        assert result["ocr_retry_count"] == 1
+        assert result["ocr_retry_not_before_ms"] == 0
+        assert result["ocr_extraction_public_id"] == deferred["ocr_extraction_public_id"]
+        assert result["proposal_public_id"] == deferred["proposal_public_id"]
+        assert result["proposal_link_public_id"] == deferred["proposal_link_public_id"]
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_proposal_links").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+def test_three_ocr_timeouts_stop_without_spin_or_new_economic_event(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    public_id = _capture_receipt(workspace)
+
+    def timeout(_source: object) -> None:
+        raise OcrDeadlineExceededError("synthetic local OCR timeout")
+
+    with support.open_database(workspace) as conn:
+        next_claim_ms = None
+        for attempt in range(1, 4):
+            lease = claim_capture_job(
+                conn,
+                public_id=public_id,
+                owner=f"worker-timeout-{attempt}",
+                now_ms=next_claim_ms,
+            )
+            job = capture_processing.process_claimed_capture_job(
+                conn, lease=lease, engine=FakeEngine(callback=timeout)
+            )
+            assert job["ocr_retry_count"] == attempt
+            if attempt < 3:
+                assert job["status"] == "processing"
+                assert job["last_error"] == "ocr_timeout_retry_pending"
+                next_claim_ms = int(job["ocr_retry_not_before_ms"])
+            else:
+                assert job["status"] == "needs_attention"
+                assert job["last_error"] == "ocr_timeout_exhausted"
+                assert job["ocr_retry_not_before_ms"] == 0
+        with pytest.raises(CaptureJobNotRunnableError):
+            claim_capture_job(conn, public_id=public_id, owner="worker-fourth")
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+def test_stale_ocr_timeout_cannot_release_successor_claim(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    public_id = _capture_receipt(workspace)
+    with support.open_database(workspace) as conn:
+        first = claim_capture_job(conn, public_id=public_id, owner="worker-old")
+
+        def late_timeout(_source: object) -> None:
+            with support.open_database(workspace) as other:
+                second = claim_capture_job(
+                    other,
+                    public_id=public_id,
+                    owner="worker-new",
+                    now_ms=first.expires_at_ms,
+                )
+                assert second.epoch == first.epoch + 1
+            raise OcrDeadlineExceededError("old OCR finished after lease loss")
+
+        with pytest.raises(CaptureLeaseLostError):
+            capture_processing.process_claimed_capture_job(
+                conn, lease=first, engine=FakeEngine(callback=late_timeout)
+            )
+        job = get_capture_job(conn, public_id=public_id)
+        assert job is not None
+        assert job["lease_owner"] == "worker-new"
+        assert job["ocr_retry_count"] == 0
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
+
+
+def test_permanent_ocr_integrity_error_remains_attention(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    public_id = _capture_receipt(workspace)
+
+    def invalid_original(_source: object) -> None:
+        raise OcrAttachmentIntegrityConflictError("synthetic original mismatch")
+
+    with support.open_database(workspace) as conn:
+        lease = claim_capture_job(conn, public_id=public_id, owner="worker-integrity")
+        job = capture_processing.process_claimed_capture_job(
+            conn, lease=lease, engine=FakeEngine(callback=invalid_original)
+        )
+        assert job["status"] == "needs_attention"
+        assert job["last_error"] == "ocr_failed"
+        assert job["ocr_retry_count"] == 0
+        with pytest.raises(CaptureJobNotRunnableError):
+            claim_capture_job(conn, public_id=public_id, owner="worker-unsafe")
+
+
+def test_process_command_waits_for_retry_time_then_runs_same_receipt_job(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_id = _capture_receipt(workspace)
+    request = support.make_request(
+        "process_capture_job",
+        {"workspace_path": str(workspace.workspace_path), "job_public_id": public_id},
+        idempotency_key="fcp_"
+        + identity.canonical_digest("finance-process-capture-job-v1", public_id),
+    )
+
+    def timeout(_source: object) -> None:
+        raise OcrDeadlineExceededError("synthetic local OCR timeout")
+
+    monkeypatch.setattr(
+        commands, "build_ocr_engine", lambda _workspace: FakeEngine(callback=timeout)
+    )
+    first = support.run_cli(request)
+    assert first.exit_code == 0, first.stderr
+    deferred = first.response["result"]["capture_job"]
+    assert deferred["last_error"] == "ocr_timeout_retry_pending"
+    monkeypatch.setattr(commands, "build_ocr_engine", lambda _workspace: FakeEngine())
+    immediate = support.run_cli(request)
+    assert immediate.exit_code == 0, immediate.stderr
+    assert immediate.response["idempotent_replay"] is True
+    assert immediate.response["result"]["capture_job"]["ocr_retry_count"] == 1
+    monkeypatch.setattr(
+        commands.time,
+        "time_ns",
+        lambda: (int(deferred["ocr_retry_not_before_ms"]) + 1) * 1_000_000,
+    )
+    resumed = support.run_cli(request)
+    assert resumed.exit_code == 0, resumed.stderr
+    result = resumed.response["result"]["capture_job"]
+    assert result["last_error"] is None
+    assert result["ocr_retry_count"] == 1
+    assert result["proposal_public_id"] == deferred["proposal_public_id"]
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("failure", "retryable"),
+    [
+        (CaptureLeaseLostError("synthetic lease loss"), True),
+        (capture_processing.CaptureProcessingConflictError("synthetic source conflict"), False),
+    ],
+)
+def test_process_command_distinguishes_lease_loss_from_source_conflict(
+    workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+    retryable: bool,
+) -> None:
+    public_id = _capture_receipt(workspace)
+    monkeypatch.setattr(commands, "build_ocr_engine", lambda _workspace: FakeEngine())
+
+    def fail_processor(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(commands, "process_claimed_capture_job", fail_processor)
+    request = support.make_request(
+        "process_capture_job",
+        {"workspace_path": str(workspace.workspace_path), "job_public_id": public_id},
+        idempotency_key="fcp_"
+        + identity.canonical_digest("finance-process-capture-job-v1", public_id),
+    )
+    refused = support.run_cli(request)
+    assert refused.exit_code != 0
+    assert refused.response["error"]["retryable"] is retryable

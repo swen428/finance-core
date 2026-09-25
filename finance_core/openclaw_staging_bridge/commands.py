@@ -242,6 +242,7 @@ from finance_core.telegram_source_context import (
 )
 
 DEFAULT_DEADLINE_SECONDS = 30.0
+PROCESS_CAPTURE_LEASE_MS = 90_000
 
 BRIDGE_CONFIRMATION_CHANNEL = "openclaw_staging_bridge"
 
@@ -2009,10 +2010,21 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
         if job["status"] in {"awaiting_user", "needs_attention", "result_ready"}:
             return {"capture_job": job, "final_transaction_created": False}, True
         if (
+            job["last_error"] == "ocr_timeout_retry_pending"
+            and int(job["ocr_retry_not_before_ms"]) > time.time_ns() // 1_000_000
+        ):
+            return {"capture_job": job, "final_transaction_created": False}, True
+        if (
             job["status"] == "processing"
             and job["proposal_public_id"] is not None
             and job["lease_owner"] is None
             and job["lease_expires_at"] is None
+            and job["last_error"] != "ocr_timeout_retry_pending"
+            and conn.execute(
+                "SELECT 1 FROM parser_outputs WHERE public_id = ?",
+                (job["proposal_public_id"],),
+            ).fetchone()
+            is not None
         ):
             # Local processing committed its proposal but a durable review
             # card has not yet been established. The next stage may resume
@@ -2026,6 +2038,7 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
                 public_id=job_public_id,
                 owner="fcp_"
                 + identity.canonical_digest("finance-capture-worker-v1", request.request_id)[:40],
+                duration_ms=PROCESS_CAPTURE_LEASE_MS,
             )
             result = process_claimed_capture_job(conn, lease=lease, engine=engine)
         except CaptureJobNotRunnableError as exc:
@@ -2035,7 +2048,14 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
                 errors.EXIT_AUTHORITY_REFUSED,
                 retryable=True,
             ) from exc
-        except (CaptureLeaseLostError, CaptureProcessingConflictError) as exc:
+        except CaptureLeaseLostError as exc:
+            raise errors.bridge_error(
+                errors.PROPOSAL_UNAVAILABLE,
+                "Capture lease changed; query the job before retrying.",
+                errors.EXIT_AUTHORITY_REFUSED,
+                retryable=True,
+            ) from exc
+        except CaptureProcessingConflictError as exc:
             raise errors.bridge_error(
                 errors.PROPOSAL_UNAVAILABLE,
                 str(exc),

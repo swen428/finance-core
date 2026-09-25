@@ -9,6 +9,7 @@ work. A crashed worker can resume by the stable job and stage identities.
 from __future__ import annotations
 
 import sqlite3
+import time
 from typing import Any
 
 from finance_core.intake.capture_jobs import (
@@ -18,6 +19,7 @@ from finance_core.intake.capture_jobs import (
     get_capture_job,
 )
 from finance_core.intake.receipt_ocr_evidence import (
+    OcrDeadlineExceededError,
     ReceiptOcrEngine,
     ReceiptOcrError,
     extract_and_persist_receipt_ocr_evidence,
@@ -31,6 +33,10 @@ from finance_core.staging_guard import require_staging_database
 
 class CaptureProcessingConflictError(RuntimeError):
     """The durable stage bindings do not match the captured source."""
+
+
+OCR_TIMEOUT_MAX_ATTEMPTS = 3
+OCR_TIMEOUT_BACKOFF_MS = (10_000, 30_000)
 
 
 def _stage_ids(job: dict[str, Any]) -> tuple[str, str, str]:
@@ -133,6 +139,32 @@ def _mark_attention(
     return result
 
 
+def _defer_ocr_timeout(conn: sqlite3.Connection, lease: CaptureLease) -> dict[str, Any]:
+    """Release only this live claim after a bounded local OCR deadline."""
+    job = _begin_checked(conn, lease)
+    try:
+        count = int(job["ocr_retry_count"]) + 1
+        if count >= OCR_TIMEOUT_MAX_ATTEMPTS:
+            _finish(conn, lease, status="needs_attention", last_error="ocr_timeout_exhausted")
+            not_before_ms = 0
+        else:
+            _finish(conn, lease, status="processing", last_error="ocr_timeout_retry_pending")
+            not_before_ms = time.time_ns() // 1_000_000 + OCR_TIMEOUT_BACKOFF_MS[count - 1]
+        conn.execute(
+            "UPDATE finance_capture_jobs SET ocr_retry_count = ?, "
+            "ocr_retry_not_before_ms = ? WHERE public_id = ?",
+            (count, not_before_ms, lease.public_id),
+        )
+        conn.commit()
+    except BaseException:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    result = get_capture_job(conn, public_id=lease.public_id)
+    assert result is not None
+    return result
+
+
 def _fence_cause(exc: BaseException) -> CaptureLeaseLostError | None:
     current: BaseException | None = exc
     while current is not None:
@@ -221,6 +253,8 @@ def process_claimed_capture_job(
         fence = _fence_cause(exc)
         if fence is not None:
             raise fence from exc
+        if isinstance(exc, OcrDeadlineExceededError):
+            return _defer_ocr_timeout(conn, lease)
         return _mark_attention(conn, lease, reason="ocr_failed")
 
     # The OCR service can return previously persisted evidence before opening

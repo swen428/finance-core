@@ -12,7 +12,10 @@ from finance_core.application.capture_results import (
     recover_capture_result,
 )
 from finance_core.application.corrections import CorrectionService
-from finance_core.intake.capture_jobs import get_capture_job
+from finance_core.intake.capture_jobs import (
+    get_capture_job,
+    require_durable_capture_connection,
+)
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.staging_guard import require_staging_database
 
@@ -132,6 +135,10 @@ def begin_reply_attempt(
     require_staging_database(conn)
     if conn.in_transaction:
         raise RuntimeError("Reply claim requires a fresh transaction")
+    # The next commit is the last local barrier before an external send. In
+    # WAL/NORMAL, a returned commit is not sufficient evidence after power
+    # loss. Do not hand a send nonce to the caller until FULL is verified.
+    require_durable_capture_connection(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _row(conn, public_id)

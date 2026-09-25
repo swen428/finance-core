@@ -5,6 +5,12 @@ ALTER TABLE finance_capture_jobs ADD COLUMN ocr_extraction_public_id TEXT;
 ALTER TABLE finance_capture_jobs ADD COLUMN proposal_public_id TEXT;
 ALTER TABLE finance_capture_jobs ADD COLUMN proposal_link_public_id TEXT;
 ALTER TABLE finance_capture_jobs ADD COLUMN ai_attempt_public_id TEXT;
+-- Only a bounded local OCR deadline may defer retry. A claim clears the
+-- not-before time; the monotonically increasing count remains as evidence.
+ALTER TABLE finance_capture_jobs ADD COLUMN ocr_retry_count INTEGER NOT NULL DEFAULT 0
+    CHECK (ocr_retry_count BETWEEN 0 AND 3);
+ALTER TABLE finance_capture_jobs ADD COLUMN ocr_retry_not_before_ms INTEGER NOT NULL DEFAULT 0
+    CHECK (ocr_retry_not_before_ms >= 0);
 
 CREATE UNIQUE INDEX finance_capture_jobs_ocr_identity_idx
     ON finance_capture_jobs(ocr_extraction_public_id)

@@ -24,7 +24,10 @@ from finance_core.correction_adapters import local_authority
 from finance_core.correction_adapters.d2_source import D2OriginalSourceVerifier
 from finance_core.correction_adapters.local_authority import LocalApprovalAuthority
 from finance_core.correction_adapters.policy import open_local_authority_connection, provision
-from finance_core.intake.capture_jobs import capture_job_public_id
+from finance_core.intake.capture_jobs import (
+    DurableCaptureConnectionError,
+    capture_job_public_id,
+)
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.posting_authority import (
     begin_posting_review_delivery,
@@ -163,6 +166,45 @@ def test_committed_result_reply_loss_and_duplicate_replay(
         assert conn.execute("SELECT count(*) FROM finance_capture_reply_outbox").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == before
         assert get_reply(conn, public_id=first["public_id"])["status"] == "pending"
+    finally:
+        conn.close()
+
+
+def test_send_attempt_upgrades_wal_normal_to_full_before_nonce_is_exposed(
+    tmp_path: Path,
+) -> None:
+    conn, job_id, review_id, context, _ = _committed_initial(tmp_path)
+    try:
+        row, _ = ensure_result_reply(
+            conn, job_public_id=job_id, review_public_id=review_id, context=context
+        )
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        conn.execute("PRAGMA synchronous=NORMAL")
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        attempted, _ = begin_reply_attempt(
+            conn, public_id=row["public_id"], review_public_id=review_id, context=context
+        )
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        assert attempted["status"] == "outcome_unknown"
+        assert attempted["send_attempt_nonce"]
+    finally:
+        conn.close()
+
+
+def test_send_attempt_refuses_unsafe_journal_before_issuing_nonce(tmp_path: Path) -> None:
+    conn, job_id, review_id, context, _ = _committed_initial(tmp_path)
+    try:
+        row, _ = ensure_result_reply(
+            conn, job_public_id=job_id, review_public_id=review_id, context=context
+        )
+        assert conn.execute("PRAGMA journal_mode=OFF").fetchone()[0] == "off"
+        with pytest.raises(DurableCaptureConnectionError):
+            begin_reply_attempt(
+                conn, public_id=row["public_id"], review_public_id=review_id, context=context
+            )
+        untouched = get_reply(conn, public_id=row["public_id"])
+        assert untouched["status"] == "pending"
+        assert untouched["send_attempt_nonce"] is None
     finally:
         conn.close()
 

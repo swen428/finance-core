@@ -95,7 +95,8 @@ def get_capture_job(
         "j.ai_status, j.reply_status, j.lease_epoch, j.lease_owner, "
         "j.lease_expires_at, j.last_error, j.created_at, j.updated_at, "
         "j.ocr_extraction_public_id, j.proposal_public_id, "
-        "j.proposal_link_public_id, j.ai_attempt_public_id "
+        "j.proposal_link_public_id, j.ai_attempt_public_id, "
+        "j.ocr_retry_count, j.ocr_retry_not_before_ms "
         "FROM finance_capture_jobs j JOIN raw_intake_records r "
         f"ON r.id = j.raw_intake_record_id WHERE {predicate}",
         (key,),
@@ -269,6 +270,8 @@ def claim_capture_job(
         job = get_capture_job(conn, public_id=public_id)
         if job is None or job["status"] not in {"captured", "processing"}:
             raise CaptureJobNotRunnableError("Capture job is not runnable")
+        if int(job["ocr_retry_not_before_ms"]) > now:
+            raise CaptureJobNotRunnableError("Capture OCR retry is deferred")
         expiry = job["lease_expires_at"]
         if expiry is not None and int(expiry) > now:
             raise CaptureJobNotRunnableError("Capture job has an active lease")
@@ -277,6 +280,7 @@ def claim_capture_job(
         cursor = conn.execute(
             "UPDATE finance_capture_jobs SET status = 'processing', "
             "lease_epoch = ?, lease_owner = ?, lease_expires_at = ?, "
+            "ocr_retry_not_before_ms = 0, "
             "updated_at = CURRENT_TIMESTAMP WHERE public_id = ? AND lease_epoch = ?",
             (epoch, owner, expires_at, public_id, epoch - 1),
         )
