@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from finance_core.application import review as application_review
+from finance_core.application.capture_processing import (
+    CaptureProcessingConflictError,
+    process_claimed_capture_job,
+)
 from finance_core.calculators.receipt_calculator_readiness import (
     ReceiptFactsIntegrityError,
     ReceiptNotFoundError,
@@ -37,7 +41,10 @@ from finance_core.intake.attachment_evidence import (
 )
 from finance_core.intake.capture_jobs import (
     CaptureJobConflictError,
+    CaptureJobNotRunnableError,
+    CaptureLeaseLostError,
     DurableCaptureConnectionError,
+    claim_capture_job,
     ensure_capture_job,
     ensure_replayed_text_capture_job,
     get_capture_job,
@@ -235,6 +242,7 @@ from finance_core.telegram_source_context import (
 )
 
 DEFAULT_DEADLINE_SECONDS = 30.0
+PROCESS_CAPTURE_LEASE_MS = 90_000
 
 BRIDGE_CONFIRMATION_CHANNEL = "openclaw_staging_bridge"
 
@@ -1975,6 +1983,85 @@ def _propose_receipt(
         "proposal_idempotent": ingestion.idempotent,
         "final_transaction_created": False,
     }, ingestion.idempotent and extraction.persistence_idempotent
+
+
+def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Thin local processor adapter; model calls and reply delivery are absent."""
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset({"workspace_path", "job_public_id"}),
+    )
+    job_public_id = _require_string(
+        request.arguments["job_public_id"], "job_public_id", max_length=200
+    )
+    canonical_key = "fcp_" + identity.canonical_digest(
+        "finance-process-capture-job-v1", job_public_id
+    )
+    _require_canonical_idempotency_key(request, canonical_key)
+    workspace, conn = _open_context(request.arguments, deadline)
+    try:
+        job = get_capture_job(conn, public_id=job_public_id)
+        if job is None:
+            raise errors.bridge_error(
+                errors.INTAKE_NOT_FOUND,
+                "Capture job was not found.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+        if job["status"] in {"awaiting_user", "needs_attention", "result_ready"}:
+            return {"capture_job": job, "final_transaction_created": False}, True
+        if (
+            job["last_error"] == "ocr_timeout_retry_pending"
+            and int(job["ocr_retry_not_before_ms"]) > time.time_ns() // 1_000_000
+        ):
+            return {"capture_job": job, "final_transaction_created": False}, True
+        if (
+            job["status"] == "processing"
+            and job["proposal_public_id"] is not None
+            and job["lease_owner"] is None
+            and job["lease_expires_at"] is None
+            and job["last_error"] != "ocr_timeout_retry_pending"
+            and ParserProposalRepository(conn).get_by_public_id(str(job["proposal_public_id"]))
+            is not None
+        ):
+            # Local processing committed its proposal but a durable review
+            # card has not yet been established. The next stage may resume
+            # from this exact job without repeating OCR or proposal work.
+            return {"capture_job": job, "final_transaction_created": False}, True
+        engine = build_ocr_engine(workspace) if job["capture_kind"] == "receipt_image" else None
+        deadline.check("capture processing claim")
+        try:
+            lease = claim_capture_job(
+                conn,
+                public_id=job_public_id,
+                owner="fcp_"
+                + identity.canonical_digest("finance-capture-worker-v1", request.request_id)[:40],
+                duration_ms=PROCESS_CAPTURE_LEASE_MS,
+            )
+            result = process_claimed_capture_job(conn, lease=lease, engine=engine)
+        except CaptureJobNotRunnableError as exc:
+            raise errors.bridge_error(
+                errors.PROPOSAL_UNAVAILABLE,
+                str(exc),
+                errors.EXIT_AUTHORITY_REFUSED,
+                retryable=True,
+            ) from exc
+        except CaptureLeaseLostError as exc:
+            raise errors.bridge_error(
+                errors.PROPOSAL_UNAVAILABLE,
+                "Capture lease changed; query the job before retrying.",
+                errors.EXIT_AUTHORITY_REFUSED,
+                retryable=True,
+            ) from exc
+        except CaptureProcessingConflictError as exc:
+            raise errors.bridge_error(
+                errors.PROPOSAL_UNAVAILABLE,
+                str(exc),
+                errors.EXIT_AUTHORITY_REFUSED,
+                retryable=False,
+            ) from exc
+        return {"capture_job": result, "final_transaction_created": False}, False
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -6138,6 +6225,7 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         envelope.COMMAND_HEALTH: handle_health,
         envelope.COMMAND_GET_STATUS: handle_get_status,
         envelope.COMMAND_CAPTURE: handle_capture,
+        envelope.COMMAND_PROCESS_CAPTURE_JOB: handle_process_capture_job,
         envelope.COMMAND_PROPOSE: handle_propose,
         envelope.COMMAND_GET_REVIEW: handle_get_review,
         envelope.COMMAND_CONFIRM: handle_confirm,

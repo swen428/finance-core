@@ -56,6 +56,9 @@ Capture checks an on-disk SQLite journal and sets this connection to
 the command fails without an adoption receipt.
 
 The job starts as `captured`, `ai_status=not_started`, `reply_status=pending`.
-Processing leases, AI outcome transitions, reply delivery and canonical
-result reconstruction are separate later changes. This boundary performs no
-AI call, OCR, confirmation, finalization, or Telegram send.
+Migration 052 itself performs no AI call, OCR, confirmation, finalization, or
+Telegram send. Migration 053 and the local processor add leased OCR/proposal
+work as described in [D3 local processing](d3_capture_processing_v1.md).
+Migration 054 adds a result reply outbox; it stores delivery state and result
+identity only. Canonical financial results are reverified from D2/D2b before
+any send attempt, and the outbox does not itself send a Telegram message.

@@ -1,6 +1,6 @@
 {
   "schema": "finance-core-migration-contract-v1",
-  "migration_ledger_digest": "075d84da070e477275c73f8093337e341802f7c076e66e070bfe534dbd51350c",
+  "migration_ledger_digest": "bb903f45f8c93cf5932ce664208b116ef7159938a876935ecbb8d2579f9940ea",
   "migration_filenames": [
     "001_create_core_schema.sql",
     "002_receipt_split_schema.sql",
@@ -53,6 +53,8 @@
     "049_d2_one_confirmation_posting.sql",
     "050_d2_initial_card_delivery_authority.sql",
     "051_controlled_corrections.sql",
-    "052_d3_capture_jobs.sql"
+    "052_d3_capture_jobs.sql",
+    "053_d3_capture_processing.sql",
+    "054_d3_result_reply_outbox.sql"
   ]
 }

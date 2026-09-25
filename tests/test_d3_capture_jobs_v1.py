@@ -419,7 +419,7 @@ def test_text_ingress_replay_requires_same_host_update_digest(
 
 def test_migration_052_adds_jobs_without_changing_prior_raw_intake(tmp_path: Path) -> None:
     conn = create_staging_database(
-        tmp_path / "prior.sqlite", migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
+        tmp_path / "prior.sqlite", migration_paths=TEMP_DB_MIGRATION_PATHS[:51]
     )
     try:
         result = process_telegram_text_update(conn, support.telegram_text_update("meal 7.00"))
