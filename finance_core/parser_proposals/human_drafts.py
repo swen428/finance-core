@@ -774,6 +774,15 @@ def _parse_card_fields(raw_card_text: str) -> tuple[str, dict[str, str]]:
     return reference, fields
 
 
+def parse_human_draft_card_structure_for_routing(raw_card_text: str) -> str | None:
+    """Use D1's syntax authority without applying a card or creating facts."""
+    try:
+        reference, _fields = _parse_card_fields(raw_card_text)
+    except _HumanDraftRefusal:
+        return None
+    return reference
+
+
 def _validate_human_draft_adapter(
     current_payload: dict[str, object],
     field_values: dict[str, str],

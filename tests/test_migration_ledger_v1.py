@@ -779,6 +779,19 @@ def test_schema_fingerprint_covers_columns_indexes_foreign_keys_and_partial_pred
         conn.close()
 
 
+def test_schema_fingerprint_supports_implicit_without_rowid_primary_index() -> None:
+    conn = _connection()
+    try:
+        conn.execute("CREATE TABLE route_probe (key TEXT PRIMARY KEY) STRICT, WITHOUT ROWID")
+        first = schema_fingerprint(conn)
+        assert first == schema_fingerprint(conn)
+        payload = canonical_schema_payload(conn)
+        route = next(table for table in payload["tables"] if table["name"] == "route_probe")
+        assert any(index["origin"] == "pk" and index["sql"] is None for index in route["indexes"])
+    finally:
+        conn.close()
+
+
 def test_schema_drift_after_success_fails_closed() -> None:
     conn = _connection()
     try:

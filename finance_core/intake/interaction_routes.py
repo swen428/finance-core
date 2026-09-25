@@ -10,17 +10,20 @@ import hashlib
 import json
 import re
 import sqlite3
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from finance_core.parser_proposals.human_drafts import (
+    parse_human_draft_card_structure_for_routing,
+)
 from finance_core.staging_guard import require_staging_database
 
-_CARD = re.compile(r"^d1card_[0-9a-f]{32}$")
-_CARD_LINE = re.compile(r"^[ \t]*(?:card[ \t]+ref|资料卡编号)[ \t]*[:：][ \t]*(\S+)", re.I | re.M)
-_CARD_LIKE = re.compile(
-    r"^[ \t]*(?:资料卡编号|金额|币种|日期|商户|描述|分类|card[ \t]+ref|"
-    r"amount|currency|date|merchant|description|category)[ \t]*[:：]",
-    re.I | re.M,
+_CARD_LABEL_START = re.compile(
+    r"^(?:资料卡编号|金额|币种|日期|商户|描述|分类|card\s*ref|"
+    r"amount|currency|transaction_date|date|merchant|description|category)"
+    r"(?=$|\s|[:：])",
+    re.I,
 )
 _FIELD_ALIASES = {
     "amount": "amount",
@@ -37,6 +40,66 @@ _FIELD_ALIASES = {
     "category": "category",
     "分类": "category",
 }
+
+
+def _normalized_control_text(text: str) -> str | None:
+    """Normalize only line endings for classification; retain original evidence."""
+    for char in text:
+        if char in "\r\n\t":
+            continue
+        category = unicodedata.category(char)
+        if category.startswith("C") or category in {"Zl", "Zp"}:
+            return None
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _guided_shape(normalized: str) -> tuple[str, str | None, str | None]:
+    if "\n" in normalized:
+        return "invalid", None, None
+    value = normalized.strip(" \t")
+    if value == "完成":
+        return "complete", None, None
+    if value.count("=") != 1 or "＝" in value:
+        return "invalid", None, None
+    alias, field_value = (part.strip(" \t") for part in value.split("=", 1))
+    field = _FIELD_ALIASES.get(alias.lower())
+    if field is None or not field_value or len(field_value.encode("utf-8")) > 1024:
+        return "invalid", None, None
+    if any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        or (unicodedata.category(char) == "Zs" and char != " ")
+        for char in field_value
+    ):
+        return "invalid", None, None
+    return "update", field, field_value
+
+
+def classify_control_text_shape(text: str) -> tuple[str, str | None]:
+    """Classify control candidates before they can acquire ordinary parser rights.
+
+    The shape decision is shared by text routing and receipt-caption admission.
+    D1 and guided handlers still decide whether a candidate is actionable.
+    """
+    normalized = _normalized_control_text(text)
+    if normalized is None:
+        return "invalid", None
+    lines = (line.strip(" \t") for line in normalized.split("\n"))
+    card_candidate = "d1card_" in normalized.casefold() or any(
+        _CARD_LABEL_START.match(line) is not None for line in lines
+    )
+    guided_candidate = (
+        "=" in normalized
+        or "＝" in normalized
+        or any(line.strip(" \t") == "完成" for line in normalized.split("\n"))
+    )
+    if card_candidate and guided_candidate:
+        return "ambiguous", normalized
+    if card_candidate:
+        return "card", normalized
+    if guided_candidate:
+        return "guided", normalized
+    return "ordinary", normalized
 
 
 class InteractionRouteConflictError(ValueError):
@@ -148,17 +211,76 @@ def _historical_guided_session(
     return None if not rows else str(rows[0][0])
 
 
+def _historical_guided_route(
+    conn: sqlite3.Connection, *, session_id: str, message_id: int, normalized: str
+) -> dict[str, Any]:
+    refusal = {
+        "route_kind": "control_refused",
+        "refusal_code": "historical_guided_mismatch",
+        "guided_session_public_id": session_id,
+    }
+    rows = conn.execute(
+        "SELECT e.event_type, e.operation_key, e.field_name, e.field_value_json, "
+        "s.completed_message_id FROM openclaw_guided_edit_events e "
+        "JOIN openclaw_guided_edit_sessions s ON s.id = e.session_id "
+        "WHERE s.session_public_id = ? AND e.telegram_message_id = ? "
+        "AND e.event_type IN ('update_requested', 'completed')",
+        (session_id, message_id),
+    ).fetchall()
+    if len(rows) != 1:
+        return refusal
+    event_type, original_key, original_field, original_value_json, completed_id = rows[0]
+    kind, field, value = _guided_shape(normalized)
+    if event_type == "completed":
+        if kind != "complete" or completed_id != message_id:
+            return refusal
+        return {
+            "route_kind": "guided_complete",
+            "guided_session_public_id": session_id,
+            "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}",
+        }
+    operation_key = f"bridge-guided-edit-update:{session_id}:{message_id}"
+    if kind != "update" or field != original_field or original_key != operation_key:
+        return refusal
+    try:
+        original_value = json.loads(str(original_value_json))
+    except (TypeError, ValueError):
+        return refusal
+    if value != original_value:
+        return refusal
+    return {
+        "route_kind": "guided_update",
+        "guided_session_public_id": session_id,
+        "operation_key": operation_key,
+        "field_name": field,
+        "field_value_json": json.dumps(value, ensure_ascii=False),
+    }
+
+
 def classify_interaction(
     conn: sqlite3.Connection, *, text: str, context: InteractionContext, message_id: int
 ) -> dict[str, Any]:
-    """Core-owned precedence: whole card, historical guided, active guided, intake."""
-    # A visible D1 card label always blocks ordinary expense parsing, even
-    # when malformed. Its guarded D1 handler decides material validity later.
-    card_lines = _CARD_LINE.findall(text)
-    if card_lines or _CARD_LIKE.search(text):
-        if len(card_lines) != 1 or _CARD.fullmatch(card_lines[0]) is None:
+    """Freeze one Core-owned interpretation under the source/job transaction."""
+    shape, normalized = classify_control_text_shape(text)
+    if shape == "invalid":
+        return {"route_kind": "control_refused", "refusal_code": "invalid_control_text"}
+    if shape == "ambiguous":
+        return {"route_kind": "control_refused", "refusal_code": "ambiguous_control"}
+    assert normalized is not None
+    try:
+        historical = _historical_guided_session(conn, context, message_id)
+    except InteractionRouteConflictError:
+        return {"route_kind": "control_refused", "refusal_code": "ambiguous_guided_history"}
+    if historical is not None:
+        if shape == "card":
+            return {"route_kind": "control_refused", "refusal_code": "ambiguous_control"}
+        return _historical_guided_route(
+            conn, session_id=historical, message_id=message_id, normalized=normalized
+        )
+    if shape == "card":
+        card = parse_human_draft_card_structure_for_routing(normalized)
+        if card is None:
             return {"route_kind": "control_refused", "refusal_code": "invalid_whole_card"}
-        card = card_lines[0]
         operation = (
             "d1op_"
             + _framed_digest(
@@ -176,7 +298,6 @@ def classify_interaction(
             "operation_key": operation,
         }
 
-    historical = _historical_guided_session(conn, context, message_id)
     session = conn.execute(
         "SELECT session_public_id FROM openclaw_guided_edit_sessions "
         "WHERE authenticated_actor_id = ? AND channel_account_id = ? "
@@ -190,37 +311,31 @@ def classify_interaction(
             _now_epoch(),
         ),
     ).fetchone()
-    session_id = historical or (None if session is None else str(session[0]))
-    value = text.strip()
+    session_id = None if session is None else str(session[0])
     if session_id is not None:
-        if value == "完成":
+        kind, field, field_value = _guided_shape(normalized)
+        if kind == "complete":
             return {
                 "route_kind": "guided_complete",
                 "guided_session_public_id": session_id,
                 "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}",
             }
-        if value.count("=") == 1:
-            alias, field_value = (part.strip() for part in value.split("=", 1))
-            field = _FIELD_ALIASES.get(alias.lower())
-            if field is not None and field_value and len(field_value.encode("utf-8")) <= 1024:
-                if not any(ord(char) < 32 or ord(char) == 127 for char in field_value):
-                    return {
-                        "route_kind": "guided_update",
-                        "guided_session_public_id": session_id,
-                        "operation_key": f"bridge-guided-edit-update:{session_id}:{message_id}",
-                        "field_name": field,
-                        "field_value_json": json.dumps(field_value, ensure_ascii=False),
-                    }
+        if kind == "update" and field is not None and field_value is not None:
+            return {
+                "route_kind": "guided_update",
+                "guided_session_public_id": session_id,
+                "operation_key": f"bridge-guided-edit-update:{session_id}:{message_id}",
+                "field_name": field,
+                "field_value_json": json.dumps(field_value, ensure_ascii=False),
+            }
         return {
             "route_kind": "control_refused",
             "refusal_code": "invalid_guided_control",
             "guided_session_public_id": session_id,
         }
-    # A malformed field command remains a control attempt. In particular,
-    # multiple or full-width separators must not turn it into a new expense.
-    separator = re.search(r"[=＝]", value)
-    control_alias = value[: separator.start()].strip().lower() if separator is not None else ""
-    if value == "完成" or control_alias in _FIELD_ALIASES:
+    # Every control-shaped input is refused without an active session, even
+    # when its field alias or syntax is malformed.
+    if shape == "guided":
         return {"route_kind": "control_refused", "refusal_code": "no_guided_session"}
     return {"route_kind": "initial_intake"}
 

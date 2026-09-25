@@ -101,11 +101,37 @@ def test_initial_text_is_adopted_without_parser_then_worker_parses(
     ("text", "route_kind", "refusal"),
     [
         ("完成", "control_refused", "no_guided_session"),
+        ("foo=12", "control_refused", "no_guided_session"),
+        ("foo=12=3", "control_refused", "no_guided_session"),
         ("Amount=12", "control_refused", "no_guided_session"),
         ("Amount=12=3", "control_refused", "no_guided_session"),
         ("金额=", "control_refused", "no_guided_session"),
         ("金额＝12", "control_refused", "no_guided_session"),
         ("Card Ref: bad\nAmount: 12", "control_refused", "invalid_whole_card"),
+        ("Amount: 12", "control_refused", "invalid_whole_card"),
+        ("金额 12", "control_refused", "invalid_whole_card"),
+        ("金额\u3000:12", "control_refused", "invalid_whole_card"),
+        ("Card\u00a0Ref: d1card_" + "a" * 32, "control_refused", "invalid_whole_card"),
+        ("Card Ref: d1card_" + "a" * 32, "control_refused", "invalid_whole_card"),
+        (
+            "Card Ref: d1card_" + "a" * 32 + "\nUnknown: 12",
+            "control_refused",
+            "invalid_whole_card",
+        ),
+        (
+            "Card Ref: d1card_" + "a" * 32 + "\nAmount: 12\nfoo=12",
+            "control_refused",
+            "ambiguous_control",
+        ),
+        ("Card Ref d1card_" + "a" * 32, "control_refused", "invalid_whole_card"),
+        (
+            "note\rCard Ref: d1card_" + "a" * 32 + "\rAmount: 12",
+            "control_refused",
+            "invalid_whole_card",
+        ),
+        ("\rCard Ref: d1card_" + "a" * 32 + "\rAmount: 12", "whole_card", None),
+        ("\u0085Card Ref: d1card_" + "a" * 32, "control_refused", "invalid_control_text"),
+        ("\u2028Card Ref: d1card_" + "a" * 32, "control_refused", "invalid_control_text"),
         ("Card Ref: d1card_" + "a" * 32 + "\nAmount: 12", "whole_card", None),
     ],
 )
@@ -144,9 +170,11 @@ def test_control_text_never_enters_parser(
             )
 
 
+@pytest.mark.parametrize("expiry_offset", [0, 1])
 def test_expired_guided_session_does_not_capture_new_expense_as_control(
     workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
+    expiry_offset: int,
 ) -> None:
     _proposal, session, _redemption = _begin(workspace)
     with support.open_database(workspace) as conn:
@@ -154,7 +182,7 @@ def test_expired_guided_session_does_not_capture_new_expense_as_control(
             "SELECT expires_at FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
             (session,),
         ).fetchone()[0]
-    monkeypatch.setattr(interaction_routes, "_now_epoch", lambda: expires_at + 1)
+    monkeypatch.setattr(interaction_routes, "_now_epoch", lambda: expires_at + expiry_offset)
     request = _request(
         workspace,
         "lunch 12.50",
@@ -169,6 +197,96 @@ def test_expired_guided_session_does_not_capture_new_expense_as_control(
         support.run_cli(request).response["result"]["interaction_route"]
         == (captured.response["result"]["interaction_route"])
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "refusal"),
+    [
+        ("foo=12", "invalid_guided_control"),
+        ("description=a\nb", "invalid_guided_control"),
+        ("description=a\tb", "invalid_guided_control"),
+        ("description=a\u00a0b", "invalid_guided_control"),
+        ("description=" + "a" * 1025, "invalid_guided_control"),
+        ("description=a\u200bb", "invalid_control_text"),
+        ("description=a\u2028b", "invalid_control_text"),
+    ],
+)
+def test_active_guided_session_refuses_malformed_or_ambiguous_text(
+    workspace: support.BridgeWorkspace, text: str, refusal: str
+) -> None:
+    _proposal, _session, _redemption = _begin(workspace)
+    captured = support.run_cli(
+        _request(workspace, text, message_id=21, account="finance-account", binding="binding-1")
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "control_refused"
+    assert route["refusal_code"] == refusal
+    job_id = captured.response["result"]["capture_job"]["public_id"]
+    blocked = support.run_cli(
+        support.make_request(
+            "process_capture_job",
+            {"workspace_path": str(workspace.workspace_path), "job_public_id": job_id},
+            idempotency_key="fcp_"
+            + identity.canonical_digest("finance-process-capture-job-v1", job_id),
+        )
+    )
+    assert blocked.exit_code == errors.EXIT_AUTHORITY_REFUSED
+    with support.open_database(workspace) as conn:
+        intake_id = captured.response["result"]["intake_public_id"]
+        count = conn.execute(
+            "SELECT COUNT(*) FROM parser_outputs WHERE source_public_id = ?", (intake_id,)
+        ).fetchone()[0]
+        assert count == 0
+
+
+def test_active_guided_value_accepts_exact_1024_byte_limit(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    captured = support.run_cli(
+        _request(
+            workspace,
+            "description=" + "a" * 1024,
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "guided_update"
+    assert route["guided_session_public_id"] == session
+
+
+def test_historical_guided_message_must_match_original_operation_content(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    assert _apply(workspace, session, 21, "amount", "13.00").exit_code == errors.EXIT_OK
+    request = _request(
+        workspace, "amount=99.00", message_id=21, account="finance-account", binding="binding-1"
+    )
+    captured = support.run_cli(request)
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "control_refused"
+    assert route["refusal_code"] == "historical_guided_mismatch"
+    assert support.run_cli(request).response["result"]["interaction_route"] == route
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        "\v", "\f", "\x1c", "\x1d", "\x1e", "\u0085", "\u2028", "\u2029",
+        "\u200b", "\u200d", "\ufeff",
+    ],
+)
+def test_control_shape_rejects_ambiguous_unicode_or_line_separator(separator: str) -> None:
+    shape, normalized = interaction_routes.classify_control_text_shape(
+        "Card Ref: d1card_" + "a" * 32 + separator + "Amount: 12"
+    )
+    assert (shape, normalized) == ("invalid", None)
 
 
 @pytest.mark.parametrize("media_field", ["photo", "document", "video_note"])
@@ -315,19 +433,19 @@ def test_hidden_rowid_cannot_replace_a_frozen_route(
     other_job = legacy.response["result"]["capture_job"]["public_id"]
     with support.open_database(workspace) as conn:
         assert conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 0
-        original_rowid = conn.execute(
-            "SELECT rowid FROM finance_capture_interaction_routes WHERE job_public_id = ?",
-            (original["job_public_id"],),
+        schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'finance_capture_interaction_routes'"
         ).fetchone()[0]
-        with pytest.raises(sqlite3.IntegrityError, match="cannot replace evidence"):
+        assert "WITHOUT ROWID" in schema
+        with pytest.raises(sqlite3.OperationalError, match="no column named"):
             conn.execute(
                 "INSERT OR REPLACE INTO finance_capture_interaction_routes "
                 f"({rowid_alias}, job_public_id, route_kind, raw_text_sha256, "
                 "authenticated_actor_id, "
                 "telegram_account_id, telegram_conversation_id, conversation_binding_id, "
                 "telegram_message_id) "
-                "VALUES (?, ?, 'initial_intake', ?, '111', 'finance', '111', 'bind-1', 22)",
-                (original_rowid, other_job, hashlib.sha256(b"lunch 13").hexdigest()),
+                "VALUES (1, ?, 'initial_intake', ?, '111', 'finance', '111', 'bind-1', 22)",
+                (other_job, hashlib.sha256(b"lunch 13").hexdigest()),
             )
         saved = conn.execute(
             "SELECT job_public_id, route_kind FROM finance_capture_interaction_routes"
@@ -335,6 +453,10 @@ def test_hidden_rowid_cannot_replace_a_frozen_route(
         assert len(saved) == 1
         assert saved[0]["job_public_id"] == original["job_public_id"]
         assert saved[0]["route_kind"] == "control_refused"
+
+    next_message = support.run_cli(_request(workspace, "lunch 14", message_id=23))
+    assert next_message.exit_code == errors.EXIT_OK, next_message.response
+    assert next_message.response["result"]["interaction_route"]["route_kind"] == "initial_intake"
 
 
 def test_guided_route_is_frozen_and_found_by_original_operation(

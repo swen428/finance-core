@@ -22,9 +22,31 @@ original content fingerprint, authenticated source context, ingress digest,
 and saved route. It never reclassifies from the current session. An old
 capture with no route cannot be treated as a successful interaction adoption.
 
-Core owns route precedence: D1 whole-card shaped text first, historical
-guided message identity, unexpired current guided session, then initial intake. A
-malformed card or guided control is `control_refused` with a queryable reason;
+Core owns route precedence under the same capture transaction. It preserves the
+original text and SHA-256 exactly; only a classification copy normalizes CRLF
+and CR to LF. Other control or format characters, including NEL, Unicode line
+separators and zero-width controls, become `control_refused`. A line beginning
+with a D1 field/reference label, or text containing a `d1card_` marker, is a
+card candidate. D1's structural parser must accept the whole candidate before
+it can become `whole_card`; malformed, mixed card/guided, extra-line, duplicate
+or unsupported content is refused. Any ASCII/full-width equals sign or
+standalone `完成` is a guided candidate, even with an unknown field or malformed
+value. A guided update is actionable only with one ASCII equals sign, a known
+field, one nonempty logical line and a safe value of at most 1024 UTF-8 bytes.
+
+A historical guided message is checked against its original append-only event;
+a different field, value, operation key or completion text is refused instead
+of being reinterpreted under the current session. An unexpired active guided
+session owns a new non-card message, accepting only valid guided syntax;
+malformed syntax is refused. At `expires_at <=` the capture-time clock, an
+expired session does not claim a genuinely new ordinary expense. With no active
+session, any guided candidate is refused. Only after all control candidates
+and ambiguous characters are excluded can text become `initial_intake`. This
+conservatively refuses some ordinary notes containing labels or equals signs.
+The pure control-shape classifier is also the receipt-caption admission input;
+OCR text is never interpreted as a user control command.
+
+A malformed card or guided control is `control_refused` with a queryable reason;
 it is never sent to the ordinary parser. The immutable route stores original
 text SHA-256, message/context identity, and applicable card, session,
 operation, field and field-value material. `get_interaction_route` retrieves
@@ -47,7 +69,9 @@ saved. It does not say an edit or economic event succeeded.
 
 Migration 055 rejects direct parser-output and AI-attempt inserts tied to a
 saved non-intake route, so an older worker cannot silently process that
-message as a new expense.
+message as a new expense. Its route table uses `WITHOUT ROWID` so hidden SQLite
+row identifiers cannot replace frozen evidence; primary, message, and operation
+key collisions are also refused before SQLite conflict replacement executes.
 
 The pre-existing `capture` command remains compatible for initial receipt
 images. Migration 055 does not rewrite attachment evidence or older jobs.

@@ -800,6 +800,14 @@ def _index_payload(conn: sqlite3.Connection, table_name: str) -> list[dict[str, 
     payload: list[dict[str, object]] = []
     for index in indexes:
         name = str(index["name"])
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (name,),
+        ).fetchone()
+        # WITHOUT ROWID primary keys have a PRAGMA index_list entry but no
+        # sqlite_master row. Its index_xinfo still fingerprints the key shape.
+        if sql_row is None and index.get("origin") != "pk":
+            raise MigrationSchemaDriftError(f"Index metadata is missing for {name}")
         payload.append(
             {
                 "name": name,
@@ -807,12 +815,7 @@ def _index_payload(conn: sqlite3.Connection, table_name: str) -> list[dict[str, 
                 "origin": index.get("origin"),
                 "partial": index.get("partial"),
                 "columns": _pragma_payload(conn, "index_xinfo", name),
-                "sql": _normalize_sql(
-                    conn.execute(
-                        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
-                        (name,),
-                    ).fetchone()[0]
-                ),
+                "sql": _normalize_sql(None if sql_row is None else sql_row[0]),
             }
         )
     return sorted(payload, key=lambda item: str(item["name"]))

@@ -1,6 +1,6 @@
 {
   "schema": "finance-core-migration-contract-v1",
-  "migration_ledger_digest": "afa69ec156703fd2ea184b23a942168c5595741ece0f4c8a148f5c7b8c766f80",
+  "migration_ledger_digest": "9bf4d410cdb6f72d9517ac1a9c012892a10b9bdddf4d4f90e91bb712d972ab29",
   "migration_filenames": [
     "001_create_core_schema.sql",
     "002_receipt_split_schema.sql",
