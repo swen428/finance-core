@@ -91,7 +91,7 @@ def test_text_processing_replays_existing_proposal_without_finalization(
     with support.open_database(workspace) as conn:
         lease = claim_capture_job(conn, public_id=public_id, owner="worker-text")
         job = capture_processing.process_claimed_capture_job(conn, lease=lease)
-        assert job["status"] == "awaiting_user"
+        assert job["status"] == "processing"
         assert job["proposal_public_id"]
         assert job["lease_owner"] is None
         assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
@@ -105,7 +105,7 @@ def test_receipt_processing_binds_stable_stages_and_no_duplicate_evidence(
     with support.open_database(workspace) as conn:
         lease = claim_capture_job(conn, public_id=public_id, owner="worker-receipt")
         job = capture_processing.process_claimed_capture_job(conn, lease=lease, engine=engine)
-        assert job["status"] == "awaiting_user"
+        assert job["status"] == "processing"
         assert job["ocr_extraction_public_id"].startswith("rocr_bridge_")
         assert job["proposal_public_id"].startswith("prop_bridge_")
         assert job["proposal_link_public_id"].startswith("ropl_bridge_")
@@ -172,7 +172,7 @@ def test_crash_after_ocr_replays_stage_identity(
             now_ms=first.expires_at_ms,
         )
         result = capture_processing.process_claimed_capture_job(conn, lease=second, engine=engine)
-        assert result["status"] == "awaiting_user"
+        assert result["status"] == "processing"
         assert engine.calls == 1
         assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 1
         assert conn.execute("SELECT count(*) FROM receipt_ocr_proposal_links").fetchone()[0] == 1
@@ -243,7 +243,7 @@ def test_bridge_process_command_replays_finished_local_job(
     first = support.run_cli(request)
     replay = support.run_cli(request)
     assert first.exit_code == replay.exit_code == 0
-    assert first.response["result"]["capture_job"]["status"] == "awaiting_user"
+    assert first.response["result"]["capture_job"]["status"] == "processing"
     assert replay.response["idempotent_replay"] is True
     assert replay.response["result"]["final_transaction_created"] is False
 
@@ -262,7 +262,10 @@ def test_bridge_receipt_command_uses_local_engine_only(
     )
     outcome = support.run_cli(request)
     assert outcome.exit_code == 0, outcome.stderr
-    assert outcome.response["result"]["capture_job"]["status"] == "awaiting_user"
+    assert outcome.response["result"]["capture_job"]["status"] == "processing"
+    assert engine.calls == 1
+    replay = support.run_cli(request)
+    assert replay.response["idempotent_replay"] is True
     assert engine.calls == 1
 
 
@@ -290,7 +293,7 @@ def test_worker_adopts_prior_bridge_propose_without_duplicate_evidence(
     with support.open_database(workspace) as conn:
         lease = claim_capture_job(conn, public_id=public_id, owner="worker-adopt")
         result = capture_processing.process_claimed_capture_job(conn, lease=lease, engine=engine)
-        assert result["status"] == "awaiting_user"
+        assert result["status"] == "processing"
         assert result["proposal_public_id"] == proposed.response["result"]["proposal_public_id"]
         assert engine.calls == 1
         assert conn.execute("SELECT count(*) FROM receipt_ocr_extractions").fetchone()[0] == 1

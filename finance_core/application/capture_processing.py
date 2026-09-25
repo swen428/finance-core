@@ -169,7 +169,9 @@ def process_claimed_capture_job(
                     "UPDATE finance_capture_jobs SET proposal_public_id = ? WHERE public_id = ?",
                     (proposal_id, lease.public_id),
                 )
-                _finish(conn, lease, status="awaiting_user")
+                # A proposal alone is not a review card. Keep the job
+                # runnable until the later delivery stage persists one.
+                _finish(conn, lease, status="processing")
             conn.commit()
             result = get_capture_job(conn, public_id=lease.public_id)
             assert result is not None
@@ -230,7 +232,7 @@ def process_claimed_capture_job(
             extraction_public_id=extraction.public_id,
             proposal_public_id=proposal_id,
             link_public_id=link_id,
-            before_commit=lambda tx: _finish(tx, lease, status="awaiting_user"),
+            before_commit=lambda tx: _finish(tx, lease, status="processing"),
         )
     except ReceiptOcrProposalError as exc:
         fence = _fence_cause(exc)

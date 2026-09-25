@@ -2008,6 +2008,16 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
             )
         if job["status"] in {"awaiting_user", "needs_attention", "result_ready"}:
             return {"capture_job": job, "final_transaction_created": False}, True
+        if (
+            job["status"] == "processing"
+            and job["proposal_public_id"] is not None
+            and job["lease_owner"] is None
+            and job["lease_expires_at"] is None
+        ):
+            # Local processing committed its proposal but a durable review
+            # card has not yet been established. The next stage may resume
+            # from this exact job without repeating OCR or proposal work.
+            return {"capture_job": job, "final_transaction_created": False}, True
         engine = build_ocr_engine(workspace) if job["capture_kind"] == "receipt_image" else None
         deadline.check("capture processing claim")
         try:
