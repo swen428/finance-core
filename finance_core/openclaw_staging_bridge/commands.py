@@ -2497,32 +2497,24 @@ def handle_list_capture_recovery_candidates(
                 "telegram_account_id",
                 "telegram_conversation_id",
                 "conversation_binding_id",
-                "after_job_id",
                 "limit",
             }
         ),
-        optional=frozenset({"through_job_id"}),
+        optional=frozenset({"after_job_public_id", "through_job_public_id"}),
     )
     context = _require_telegram_human_context(request.arguments)
-    after = _require_non_negative_int(
-        request.arguments["after_job_id"], "after_job_id", maximum=2**63 - 1
-    )
     limit = _require_positive_int(request.arguments["limit"], "limit", maximum=100)
-    through = request.arguments.get("through_job_id")
-    if through is None and after != 0:
+    after = request.arguments.get("after_job_public_id")
+    through = request.arguments.get("through_job_public_id")
+    if (after is None) != (through is None):
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
-            "through_job_id is required after the first discovery page.",
+            "Both capture discovery cursor IDs are required after the first page.",
             errors.EXIT_VALIDATION_REFUSED,
         )
-    if through is not None:
-        through = _require_non_negative_int(through, "through_job_id", maximum=2**63 - 1)
-        if through < after:
-            raise errors.bridge_error(
-                errors.ARGUMENTS_REFUSED,
-                "through_job_id must not precede after_job_id.",
-                errors.EXIT_VALIDATION_REFUSED,
-            )
+    if after is not None:
+        after = _require_string(after, "after_job_public_id", max_length=200)
+        through = _require_string(through, "through_job_public_id", max_length=200)
     _, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("capture discovery")
@@ -2531,8 +2523,8 @@ def handle_list_capture_recovery_candidates(
                 list_capture_recovery_candidates(
                     conn,
                     context=context,
-                    after_job_id=after,
-                    through_job_id=through,
+                    after_job_public_id=after,
+                    through_job_public_id=through,
                     limit=limit,
                 ),
                 False,

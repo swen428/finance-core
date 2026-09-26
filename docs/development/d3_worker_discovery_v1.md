@@ -3,18 +3,19 @@
 `list_capture_recovery_candidates` is a read-only Bridge command for a
 background worker that already has the current trusted Telegram actor,
 account, conversation and binding. It also requires the staging workspace,
-`after_job_id` (zero for a new sweep), and a `limit` from 1 to 100. The first
-response freezes `through_job_id` at the greatest saved integer job ID. Pass
-that value and the returned `after_job_id` into later pages of the same sweep.
-Each candidate contains only the job public ID, integer job ID, original
-Telegram message ID and saved D2 source identity hash. A candidate is a
-locator, not authority to process, post, enqueue or send.
+and a `limit` from 1 to 100. Omit both cursor fields for a new sweep. The
+first response freezes `through_job_public_id` at the newest job visible to
+that exact binding. Pass it and the returned `after_job_public_id` into later
+pages of the same sweep. A foreign or missing cursor is refused. Public
+responses contain no global integer job IDs. Each candidate contains only
+the job public ID, original Telegram message ID and saved D2 source identity
+hash. A candidate is a locator, not authority to process, post, enqueue or send.
 
 The query checks all four saved identity fields and rechecks the immutable
 Telegram source for each returned job. It deliberately includes old jobs in
 every new sweep, regardless of their current processing status. Later D2
 acceptance, a D2b correction, or a missing result outbox row can make an old
-job actionable. A worker must start periodic sweeps again at `after_job_id=0`;
+job actionable. A worker must start periodic sweeps with both cursors omitted;
 advancing a cursor forever would miss those changes. Each candidate still
 requires `get_capture_recovery` and, for a permitted local action, the
 token-bound `resume_capture_recovery` command. Those commands independently
