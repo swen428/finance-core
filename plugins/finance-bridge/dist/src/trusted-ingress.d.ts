@@ -38,5 +38,8 @@ export declare class TrustedIngressCapture {
     private inFlight;
     private readonly activeByMessage;
     constructor(workspaceRoot: string, runner: BridgeRunner, media: ReceiptMediaAdapter, handoff: HandoffPublisher);
+    private verifyCoreCustody;
+    /** Called at plugin readiness, including when the Host has already ACKed. */
+    resumePendingReclaims(maxDurationMs?: number): Promise<void>;
     handle(event: PluginHookInboundClaimEvent, context: PluginHookInboundClaimContext): Promise<TrustedClaimResult>;
 }

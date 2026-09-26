@@ -162,6 +162,7 @@ export function registerFinanceBridge(
       hostLlmRuntime(api, config),
     );
     trustedIngress = new TrustedIngressCapture(config.workspaceRoot, runner, media, handoff);
+    await trustedIngress.resumePendingReclaims();
     humanActionRuntime = { workspaceRoot: config.workspaceRoot, runner };
     healthy = true;
   }).catch(() => {

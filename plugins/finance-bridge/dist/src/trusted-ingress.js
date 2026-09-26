@@ -4,6 +4,7 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const INTAKE_ID = /^(?:raw_intake_bridge_[0-9a-f]{32}|raw_intake_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u;
 const JOB_ID = /^fcj_[0-9a-f]{40}$/u;
 const COMMAND_DEADLINE_MS = 30_000;
+const RECLAIM_PASS_DEADLINE_MS = 45_000;
 const MAX_IN_FLIGHT_CAPTURES = 8;
 function isRecord(value) {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -152,6 +153,49 @@ export class TrustedIngressCapture {
         this.media = media;
         this.handoff = handoff;
     }
+    async verifyCoreCustody(claim, deadlineAt) {
+        const remaining = deadlineAt === undefined ? COMMAND_DEADLINE_MS :
+            Math.min(COMMAND_DEADLINE_MS, Math.ceil(deadlineAt - performance.now()));
+        if (remaining <= 0)
+            throw new Error("Trusted handoff recovery deadline exceeded.");
+        const response = await this.runner.run(createBridgeRequest("get_status", {
+            workspace_path: this.workspaceRoot,
+            job_public_id: claim.jobPublicId,
+        }), remaining);
+        if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+            throw new Error("Trusted handoff recovery deadline exceeded.");
+        }
+        if (response.status !== "ok")
+            return false;
+        const result = response.result;
+        const job = result.capture_job;
+        return result.identity_kind === "intake" &&
+            result.intake_public_id === claim.rawIntakePublicId &&
+            result.capture_attachment_integrity === "verified" &&
+            result.final_transaction_created === false &&
+            isRecord(job) && job.public_id === claim.jobPublicId &&
+            job.intake_public_id === claim.rawIntakePublicId &&
+            job.capture_kind === "receipt_image" &&
+            job.ingress_identity_digest === claim.ingressIdentityDigest &&
+            job.attachment_content_hash === claim.attachmentContentHash;
+    }
+    /** Called at plugin readiness, including when the Host has already ACKed. */
+    async resumePendingReclaims(maxDurationMs = RECLAIM_PASS_DEADLINE_MS) {
+        if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs <= 0 ||
+            maxDurationMs > RECLAIM_PASS_DEADLINE_MS) {
+            throw new Error("Trusted handoff recovery budget is invalid.");
+        }
+        const deadline = performance.now() + maxDurationMs;
+        for (const claim of await this.handoff.pendingReclaims()) {
+            if (performance.now() >= deadline) {
+                throw new Error("Trusted handoff recovery deadline exceeded.");
+            }
+            await this.handoff.reclaimVerified(claim, async (candidate) => await this.verifyCoreCustody(candidate, deadline), deadline);
+            if (performance.now() >= deadline) {
+                throw new Error("Trusted handoff recovery deadline exceeded.");
+            }
+        }
+    }
     async handle(event, context) {
         const turn = validateTurn(event, context);
         if (turn === undefined)
@@ -169,6 +213,16 @@ export class TrustedIngressCapture {
         this.inFlight += 1;
         try {
             const key = canonicalCaptureKey(String(turn.chatId), String(turn.messageId));
+            const photoClaim = () => {
+                const intakeId = captureIdentities(key).rawIntakePublicId;
+                return {
+                    rawIntakePublicId: intakeId,
+                    jobPublicId: `fcj_${createHash("sha256").update(`finance-capture-job-v1\0${intakeId}`).digest("hex").slice(0, 40)}`,
+                    canonicalKeyHash: createHash("sha256").update(key).digest("hex"),
+                    ingressIdentityDigest: ingressDigest(coreIdentity(turn.ingress)),
+                    attachmentContentHash: turn.ingress.attachmentSha256,
+                };
+            };
             const status = async (jobId) => {
                 const response = await this.runner.run(createBridgeRequest("get_status", {
                     workspace_path: this.workspaceRoot,
@@ -207,11 +261,28 @@ export class TrustedIngressCapture {
                 }
                 return { found: true, jobId: candidate.job_public_id };
             };
+            // A prior turn may have ACKed immediately before a cleanup crash. Each
+            // restart rechecks Core custody before resuming any durable intent.
+            await this.resumePendingReclaims();
+            const adoptPhoto = async (adoption) => {
+                const claim = photoClaim();
+                if (adoption.jobId !== claim.jobPublicId || adoption.intakeId !== claim.rawIntakePublicId) {
+                    return { handled: false };
+                }
+                if (!await this.handoff.isReclaimed(claim)) {
+                    await this.handoff.prepareRetainedReclaim(key, claim);
+                    if (!await this.handoff.reclaimVerified(claim, async (candidate) => await this.verifyCoreCustody(candidate)))
+                        return { handled: false };
+                }
+                return { handled: true, adoption };
+            };
             const found = await discover();
             if (found.found && found.jobId !== undefined) {
                 const existing = await status(found.jobId);
                 if (existing.adoption !== undefined)
-                    return { handled: true, adoption: existing.adoption };
+                    return turn.photo
+                        ? await adoptPhoto(existing.adoption)
+                        : { handled: true, adoption: existing.adoption };
                 if (turn.ingress.attachmentUnavailable === true && existing.reupload === true) {
                     return { handled: false, financeIngressRefusal: {
                             ...turn.ingress, schema: "finance-ingress-refusal-v1", kind: "reupload_required",
@@ -246,7 +317,7 @@ export class TrustedIngressCapture {
                 const receiptCaption = caption(turn.text);
                 try {
                     capturedJobId = await this.handoff.withPublished(key, intakeId, media, async (published, payloadFd) => {
-                        const response = await this.runner.run(createBridgeRequest("capture", {
+                        const request = createBridgeRequest("capture", {
                             workspace_path: this.workspaceRoot,
                             kind: "receipt_image",
                             handoff_filename: published.handoffFilename,
@@ -264,15 +335,22 @@ export class TrustedIngressCapture {
                             ...(media.originalFilename === undefined ? {} : { original_filename: media.originalFilename }),
                             ...(receiptCaption === undefined ? {} : { caption: receiptCaption }),
                             finance_ingress: coreIdentity(turn.ingress),
-                        }, key), COMMAND_DEADLINE_MS, payloadFd);
+                        }, key);
+                        let response;
+                        try {
+                            response = await this.runner.run(request, COMMAND_DEADLINE_MS, payloadFd);
+                        }
+                        catch {
+                            return undefined;
+                        }
                         if (response.status !== "ok")
-                            throw new Error("Core receipt capture refused.");
+                            return undefined;
                         const job = response.result.capture_job;
                         if (!isRecord(job) || typeof job.public_id !== "string" || !JOB_ID.test(job.public_id)) {
-                            throw new Error("Core capture job ID is invalid.");
+                            return undefined;
                         }
                         return job.public_id;
-                    }, COMMAND_DEADLINE_MS);
+                    }, COMMAND_DEADLINE_MS, photoClaim());
                 }
                 catch {
                     // A lost response may follow a durable Core commit. Only a matching read can adopt it.
@@ -282,7 +360,16 @@ export class TrustedIngressCapture {
                     const recovered = await status(recoveredId.jobId);
                     return recovered.adoption === undefined
                         ? { handled: false }
-                        : { handled: true, adoption: recovered.adoption };
+                        : await adoptPhoto(recovered.adoption);
+                }
+                if (capturedJobId === undefined) {
+                    const recoveredId = await discover();
+                    if (recoveredId.jobId === undefined)
+                        return { handled: false };
+                    const recovered = await status(recoveredId.jobId);
+                    return recovered.adoption === undefined
+                        ? { handled: false }
+                        : await adoptPhoto(recovered.adoption);
                 }
             }
             else {
@@ -328,7 +415,8 @@ export class TrustedIngressCapture {
             const adopted = await status(capturedJobId);
             return adopted.adoption === undefined
                 ? { handled: false }
-                : { handled: true, adoption: adopted.adoption };
+                : turn.photo ? await adoptPhoto(adopted.adoption)
+                    : { handled: true, adoption: adopted.adoption };
         }
         catch {
             // A subprocess can die after Core commits; status is queried on replay.

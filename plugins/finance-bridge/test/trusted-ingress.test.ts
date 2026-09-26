@@ -169,10 +169,21 @@ function capture(core: FakeCore, options: {
       return media;
     },
   } as unknown as ReceiptMediaAdapter;
+  let retained = false;
   const handoff = {
+    pendingReclaims: async () => [],
+    isReclaimed: async () => !retained,
+    prepareRetainedReclaim: async () => retained,
+    reclaimVerified: async (_claim: unknown, prove: (claim: never) => Promise<boolean>) => {
+      if (!retained) return false;
+      if (!await prove(_claim as never)) return false;
+      retained = false;
+      return true;
+    },
     withPublished: async (_key: string, _intake: string, _media: ValidatedMedia,
       callback: (published: { handoffFilename: string }, fd: number) => Promise<unknown>) => {
       if (options.meter) options.meter.publish += 1;
+      retained = true;
       return await callback({ handoffFilename: "original.jpg" }, 3);
     },
   } as unknown as HandoffPublisher;
@@ -215,7 +226,7 @@ for (const image of [jpeg, png]) {
     assert.equal(result.adoption?.attachmentStatus, "stored");
     assert.equal(result.adoption?.attachmentSha256, ingress.attachmentSha256);
     assert.deepEqual(core.calls.map((call) => call.command), [
-      "get_capture_job_for_message", "capture", "get_status",
+      "get_capture_job_for_message", "capture", "get_status", "get_status",
     ]);
   });
 }
@@ -336,7 +347,7 @@ test("lost Core response is recovered by read only status after durable commit",
   const result = await capture(core, { image: jpeg }).handle(event, context);
   assert.equal(result.adoption?.attachmentStatus, "stored");
   assert.deepEqual(core.calls.map((call) => call.command), [
-    "get_capture_job_for_message", "capture", "get_capture_job_for_message", "get_status",
+    "get_capture_job_for_message", "capture", "get_capture_job_for_message", "get_status", "get_status",
   ]);
 });
 
@@ -357,4 +368,34 @@ test("queue pressure refuses the ninth in flight update before capture", async (
   release();
   const results = await Promise.all(pending);
   assert.ok(results.every((result) => result.adoption !== undefined));
+});
+
+test("startup reclaim caps multiple slow Core proofs and never claims adoption", async () => {
+  const deadlines: number[] = [];
+  const runner = { async run(request: BridgeRequest, deadlineMs: number) {
+    assert.equal(request.command, "get_status");
+    deadlines.push(deadlineMs);
+    await new Promise<void>((resolve) => setTimeout(resolve, deadlines.length === 1 ? 10 : 150));
+    return missing(request);
+  } } as BridgeRunner;
+  const claim = (messageId: string) => {
+    const key = canonicalCaptureKey("111", messageId);
+    const rawIntakePublicId = captureIdentities(key).rawIntakePublicId;
+    return {
+      rawIntakePublicId,
+      jobPublicId: `fcj_${sha256(`finance-capture-job-v1\0${rawIntakePublicId}`).slice(0, 40)}`,
+      canonicalKeyHash: sha256(key), ingressIdentityDigest: "a".repeat(64),
+      attachmentContentHash: sha256(jpeg),
+    };
+  };
+  const handoff = {
+    pendingReclaims: async () => [claim("901"), claim("902")],
+    reclaimVerified: async (candidate: ReturnType<typeof claim>,
+      proof: (value: ReturnType<typeof claim>) => Promise<boolean>) => await proof(candidate),
+  } as unknown as HandoffPublisher;
+  const ingress = new TrustedIngressCapture("/synthetic", runner,
+    {} as ReceiptMediaAdapter, handoff);
+  await assert.rejects(ingress.resumePendingReclaims(100), /deadline exceeded/u);
+  assert.equal(deadlines.length, 2);
+  assert.ok(deadlines[0]! <= 100 && deadlines[1]! < deadlines[0]!);
 });

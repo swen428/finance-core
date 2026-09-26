@@ -310,7 +310,11 @@ const dependencies: RegistrationDependencies = {
     return new ReceiptMediaAdapter(() => "/unreachable");
   },
   createHandoffPublisher(config) {
-    return new HandoffPublisher(config.workspaceRoot);
+    // Registration fixtures use an intentionally nonexistent /workspace;
+    // the real handoff startup inventory is exercised with temporary workspaces.
+    return new class extends HandoffPublisher {
+      override async pendingReclaims() { return []; }
+    }(config.workspaceRoot);
   },
 };
 
