@@ -2479,6 +2479,117 @@ def _raise_capture_recovery_error(exc: Exception) -> None:
     raise exc
 
 
+def handle_list_capture_recovery_candidates(
+    request: BridgeRequest, deadline: Deadline
+) -> HandlerResult:
+    """Enumerate authenticated job locators in a bounded, stable ID window."""
+    from finance_core.openclaw_staging_bridge.capture_discovery import (
+        CaptureDiscoveryConflict,
+        list_capture_recovery_candidates,
+    )
+
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+                "after_job_id",
+                "limit",
+            }
+        ),
+        optional=frozenset({"through_job_id"}),
+    )
+    context = _require_telegram_human_context(request.arguments)
+    after = _require_non_negative_int(
+        request.arguments["after_job_id"], "after_job_id", maximum=2**63 - 1
+    )
+    limit = _require_positive_int(request.arguments["limit"], "limit", maximum=100)
+    through = request.arguments.get("through_job_id")
+    if through is None and after != 0:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "through_job_id is required after the first discovery page.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    if through is not None:
+        through = _require_non_negative_int(through, "through_job_id", maximum=2**63 - 1)
+        if through < after:
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "through_job_id must not precede after_job_id.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+    _, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("capture discovery")
+        try:
+            return (
+                list_capture_recovery_candidates(
+                    conn,
+                    context=context,
+                    after_job_id=after,
+                    through_job_id=through,
+                    limit=limit,
+                ),
+                False,
+            )
+        except CaptureDiscoveryConflict as exc:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Capture discovery evidence needs local attention.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
+    finally:
+        conn.close()
+
+
+def handle_get_capture_job_for_message(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Locate the captured original message within one authenticated binding."""
+    from finance_core.openclaw_staging_bridge.capture_discovery import (
+        CaptureDiscoveryConflict,
+        get_capture_job_for_message,
+    )
+
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+                "telegram_message_id",
+            }
+        ),
+    )
+    context = _require_telegram_human_context(request.arguments)
+    message_id = _require_positive_int(
+        request.arguments["telegram_message_id"], "telegram_message_id", maximum=2**63 - 1
+    )
+    _, conn = _open_context(request.arguments, deadline)
+    try:
+        deadline.check("original message lookup")
+        try:
+            return {
+                "candidate": get_capture_job_for_message(
+                    conn, context=context, telegram_message_id=str(message_id)
+                )
+            }, False
+        except CaptureDiscoveryConflict as exc:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Original capture evidence needs local attention.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
+    finally:
+        conn.close()
+
+
 def handle_get_capture_recovery(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     """Read one authenticated, durable recovery state without processing it."""
     from finance_core.openclaw_staging_bridge.capture_recovery import get_capture_recovery
@@ -6946,6 +7057,8 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         envelope.COMMAND_PROCESS_CAPTURE_JOB: handle_process_capture_job,
         envelope.COMMAND_GET_CAPTURE_RECOVERY: handle_get_capture_recovery,
         envelope.COMMAND_RESUME_CAPTURE_RECOVERY: handle_resume_capture_recovery,
+        envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES: handle_list_capture_recovery_candidates,
+        envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE: handle_get_capture_job_for_message,
         envelope.COMMAND_PROPOSE: handle_propose,
         envelope.COMMAND_GET_REVIEW: handle_get_review,
         envelope.COMMAND_CONFIRM: handle_confirm,

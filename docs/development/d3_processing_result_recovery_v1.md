@@ -92,3 +92,5 @@ gaps remain visible above. D3-4 owns durable pending-job enumeration, worker
 scheduling, ordered transport sends and recording transport acknowledgements.
 D3-3 only prepares and recovers local outbox state; it does not send or
 acknowledge Telegram messages and does not activate a finance runtime.
+The bounded, authenticated D3-4 discovery locator is described in
+[`d3_worker_discovery_v1.md`](d3_worker_discovery_v1.md).
