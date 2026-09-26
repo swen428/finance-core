@@ -584,11 +584,11 @@ def _open_capture_recovery_context(
     workspace: Path, context: human_actions.HumanActionContext
 ) -> Iterator[tuple[sqlite3.Connection, Any]]:
     """Reopen a corrected ledger only through its bound local authority."""
+    from finance_core.openclaw_staging_bridge.capture_recovery import has_correction_history
+
     ordinary = workspace_access.open_workspace_database(workspace)
     try:
-        has_corrections = (
-            ordinary.execute("SELECT 1 FROM correction_versions LIMIT 1").fetchone() is not None
-        )
+        has_corrections = has_correction_history(ordinary)
         if not has_corrections:
             yield ordinary, None
             return
@@ -2510,29 +2510,12 @@ def _replay_frozen_capture_control(
     deadline: Deadline,
 ) -> tuple[str, bool]:
     """Re-enter the existing D1/guided command with frozen route material."""
+    from finance_core.openclaw_staging_bridge.capture_recovery import frozen_control_material
     from finance_core.parser_proposals.human_drafts import _parse_card_fields
 
     conn = workspace_access.open_workspace_database(workspace)
     try:
-        route = get_interaction_route(conn, job_id)
-        job = get_capture_job(conn, public_id=job_id)
-        if route is None or job is None:
-            raise errors.bridge_error(
-                errors.LIFECYCLE_CONFLICT,
-                "Frozen interaction route is unavailable.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            )
-        raw_row = conn.execute(
-            "SELECT raw_input FROM raw_intake_records WHERE id = ?",
-            (job["raw_intake_record_id"],),
-        ).fetchone()
-        raw_text = None if raw_row is None else raw_row[0]
-        if not isinstance(raw_text, str):
-            raise errors.bridge_error(
-                errors.LIFECYCLE_CONFLICT,
-                "Frozen interaction text is unavailable.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            )
+        route, raw_text = frozen_control_material(conn, job_public_id=job_id)
         message_id = int(route["telegram_message_id"])
         kind = str(route["route_kind"])
         arguments: dict[str, Any] = {

@@ -42,6 +42,29 @@ class CaptureRecoveryConflict(RuntimeError):
     """Durable recovery evidence is ambiguous or changed."""
 
 
+def has_correction_history(conn: sqlite3.Connection) -> bool:
+    """Keep the Bridge command layer free of direct repository queries."""
+    return conn.execute("SELECT 1 FROM correction_versions LIMIT 1").fetchone() is not None
+
+
+def frozen_control_material(
+    conn: sqlite3.Connection, *, job_public_id: str
+) -> tuple[dict[str, Any], str]:
+    """Read saved route and original text for one guarded control replay."""
+    route = get_interaction_route(conn, job_public_id)
+    job = get_capture_job(conn, public_id=job_public_id)
+    if route is None or job is None:
+        raise CaptureRecoveryConflict("Frozen interaction route is unavailable")
+    raw_row = conn.execute(
+        "SELECT raw_input FROM raw_intake_records WHERE id = ?",
+        (job["raw_intake_record_id"],),
+    ).fetchone()
+    raw_text = None if raw_row is None else raw_row[0]
+    if not isinstance(raw_text, str):
+        raise CaptureRecoveryConflict("Frozen interaction text is unavailable")
+    return route, raw_text
+
+
 @contextmanager
 def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
     owned = not conn.in_transaction
