@@ -19,10 +19,11 @@ import json
 import sqlite3
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterator, Mapping
 
 from finance_core.application import review as application_review
 from finance_core.application.capture_processing import (
@@ -576,6 +577,50 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
     deadline.check("database open")
     conn = workspace_access.open_workspace_database(workspace)
     return workspace, conn
+
+
+@contextmanager
+def _open_capture_recovery_context(
+    workspace: Path, context: human_actions.HumanActionContext
+) -> Iterator[tuple[sqlite3.Connection, Any]]:
+    """Reopen a corrected ledger only through its bound local authority."""
+    ordinary = workspace_access.open_workspace_database(workspace)
+    try:
+        has_corrections = (
+            ordinary.execute("SELECT 1 FROM correction_versions LIMIT 1").fetchone() is not None
+        )
+        if not has_corrections:
+            yield ordinary, None
+            return
+    finally:
+        ordinary.close()
+
+    from finance_core.application.corrections import CorrectionService
+    from finance_core.correction_adapters.d2_source import D2OriginalSourceVerifier
+    from finance_core.correction_adapters.local_authority import LocalApprovalAuthority
+    from finance_core.correction_adapters.policy import (
+        LocalPolicyError,
+        load_policy_for_connection,
+        open_local_authority_connection,
+    )
+
+    expected = workspace_access.database_path_for(workspace)
+    try:
+        if expected.is_symlink() or expected.resolve(strict=True) != expected:
+            raise LocalPolicyError("workspace database is not canonical")
+        with open_local_authority_connection() as trusted:
+            policy = load_policy_for_connection(trusted)
+            if policy.database_path != expected:
+                raise LocalPolicyError("correction policy belongs to another workspace")
+            authority = LocalApprovalAuthority()
+            authority.current_binding(trusted, context.actor_id)
+            yield trusted, CorrectionService(trusted, D2OriginalSourceVerifier(), authority)
+    except (LocalPolicyError, OSError) as exc:
+        raise errors.bridge_error(
+            errors.LIFECYCLE_CONFLICT,
+            "Corrected result needs the matching local authority and workspace.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
 
 
 def _require_durable_capture_connection(conn: sqlite3.Connection) -> None:
@@ -2355,6 +2400,258 @@ def handle_process_capture_job(request: BridgeRequest, deadline: Deadline) -> Ha
         return {"capture_job": result, "final_transaction_created": False}, False
     finally:
         conn.close()
+
+
+def _capture_recovery_key(job_public_id: str, step_token: str) -> str:
+    return "bridge-d3-recover:" + identity.canonical_digest(
+        "finance-capture-recovery-v1", job_public_id, step_token
+    )
+
+
+def _capture_recovery_step_token(view: dict[str, object]) -> str:
+    durable_view = {
+        key: value
+        for key, value in view.items()
+        if key not in {"performed_action", "stale_recovery_step", "recovery_step_token"}
+    }
+    material = json.dumps(durable_view, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return "d3step_" + identity.canonical_digest("finance-capture-recovery-step-v1", material)
+
+
+def _with_capture_recovery_step(view: dict[str, object]) -> dict[str, object]:
+    return {**view, "recovery_step_token": _capture_recovery_step_token(view)}
+
+
+def _capture_recovery_arguments(
+    request: BridgeRequest, *, resume: bool = False
+) -> tuple[str, human_actions.HumanActionContext, str | None]:
+    _require_exact_arguments(
+        request.arguments,
+        required=frozenset(
+            {
+                "workspace_path",
+                "job_public_id",
+                "operator_actor_id",
+                "telegram_account_id",
+                "telegram_conversation_id",
+                "conversation_binding_id",
+            }
+        )
+        | (frozenset({"recovery_step_token"}) if resume else frozenset()),
+    )
+    job_id = _require_string(request.arguments["job_public_id"], "job_public_id", max_length=200)
+    step_token = None
+    if resume:
+        step_token = _require_string(
+            request.arguments["recovery_step_token"], "recovery_step_token", max_length=71
+        )
+        if (
+            len(step_token) != 71
+            or not step_token.startswith("d3step_")
+            or any(char not in "0123456789abcdef" for char in step_token[7:])
+        ):
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "recovery_step_token is invalid.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
+    return job_id, _require_telegram_human_context(request.arguments), step_token
+
+
+def _raise_capture_recovery_error(exc: Exception) -> None:
+    from finance_core.openclaw_staging_bridge.capture_recovery import (
+        CaptureRecoveryConflict,
+        CaptureRecoveryUnavailable,
+    )
+
+    if isinstance(exc, CaptureRecoveryUnavailable):
+        raise errors.bridge_error(
+            errors.ACTOR_MISMATCH,
+            "Capture recovery source is unavailable for this conversation.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
+    if isinstance(exc, CaptureRecoveryConflict):
+        raise errors.bridge_error(
+            errors.LIFECYCLE_CONFLICT,
+            "Capture recovery evidence needs local attention.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
+    raise exc
+
+
+def handle_get_capture_recovery(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Read one authenticated, durable recovery state without processing it."""
+    from finance_core.openclaw_staging_bridge.capture_recovery import get_capture_recovery
+
+    job_id, context, _ = _capture_recovery_arguments(request)
+    workspace, conn = _open_context(request.arguments, deadline)
+    conn.close()
+    deadline.check("capture recovery read")
+    try:
+        with _open_capture_recovery_context(workspace, context) as (read_conn, verifier):
+            view = get_capture_recovery(
+                read_conn,
+                job_public_id=job_id,
+                context=context,
+                correction_service=verifier,
+            )
+            return _with_capture_recovery_step(view), False
+    except Exception as exc:
+        _raise_capture_recovery_error(exc)
+        raise AssertionError("unreachable")
+
+
+def _replay_frozen_capture_control(
+    request: BridgeRequest,
+    *,
+    job_id: str,
+    context: human_actions.HumanActionContext,
+    workspace: Path,
+    deadline: Deadline,
+) -> tuple[str, bool]:
+    """Re-enter the existing D1/guided command with frozen route material."""
+    from finance_core.parser_proposals.human_drafts import _parse_card_fields
+
+    conn = workspace_access.open_workspace_database(workspace)
+    try:
+        route = get_interaction_route(conn, job_id)
+        job = get_capture_job(conn, public_id=job_id)
+        if route is None or job is None:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Frozen interaction route is unavailable.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        raw_row = conn.execute(
+            "SELECT raw_input FROM raw_intake_records WHERE id = ?",
+            (job["raw_intake_record_id"],),
+        ).fetchone()
+        raw_text = None if raw_row is None else raw_row[0]
+        if not isinstance(raw_text, str):
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Frozen interaction text is unavailable.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        message_id = int(route["telegram_message_id"])
+        kind = str(route["route_kind"])
+        arguments: dict[str, Any] = {
+            "workspace_path": str(workspace),
+            "operator_actor_id": context.actor_id,
+            "telegram_account_id": context.account_id,
+            "telegram_conversation_id": context.conversation_id,
+            "conversation_binding_id": context.binding_id,
+            "telegram_message_id": message_id,
+        }
+        if kind == "whole_card":
+            card_id, fields = _parse_card_fields(raw_text)
+            operation_id = str(route["operation_key"])
+            if card_id != route["card_generation_public_id"]:
+                raise errors.bridge_error(
+                    errors.LIFECYCLE_CONFLICT,
+                    "Frozen card reference changed.",
+                    errors.EXIT_AUTHORITY_REFUSED,
+                )
+            arguments.update(
+                card_generation_public_id=card_id,
+                operation_public_id=operation_id,
+                raw_card_text=raw_text,
+                field_values=fields,
+            )
+            command = "apply_human_draft_card"
+            key = canonical_human_draft_apply_key(operation_id)
+            handler = handle_apply_human_draft_card
+        elif kind in {"guided_update", "guided_complete"}:
+            session_id = str(route["guided_session_public_id"])
+            arguments["session_public_id"] = session_id
+            if kind == "guided_update":
+                arguments["field_name"] = str(route["field_name"])
+                arguments["field_value"] = json.loads(str(route["field_value_json"]))
+                command = "apply_guided_edit_update"
+                key = canonical_guided_edit_update_key(session_id, message_id)
+                handler = handle_apply_guided_edit_update
+            else:
+                command = "complete_guided_edit"
+                key = canonical_guided_edit_complete_key(session_id, message_id)
+                handler = handle_complete_guided_edit
+        else:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Interaction route has no recoverable control command.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+    finally:
+        conn.close()
+    replay = BridgeRequest("v1", command, request.request_id, key, arguments)
+    _, already_done = handler(replay, deadline)
+    return command, already_done
+
+
+def handle_resume_capture_recovery(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    """Choose one persisted local step; original authorities recheck each write."""
+    from finance_core.openclaw_staging_bridge.capture_recovery import (
+        get_capture_recovery,
+        resume_capture_recovery,
+    )
+
+    job_id, context, step_token = _capture_recovery_arguments(request, resume=True)
+    assert step_token is not None
+    _require_canonical_idempotency_key(request, _capture_recovery_key(job_id, step_token))
+    workspace, conn = _open_context(request.arguments, deadline)
+    conn.close()
+    deadline.check("capture recovery selection")
+    try:
+        with _open_capture_recovery_context(workspace, context) as (read_conn, verifier):
+            before = get_capture_recovery(
+                read_conn,
+                job_public_id=job_id,
+                context=context,
+                correction_service=verifier,
+            )
+        if step_token != _capture_recovery_step_token(before):
+            stale = _with_capture_recovery_step(before)
+            stale["performed_action"] = "none"
+            stale["stale_recovery_step"] = True
+            return stale, True
+        action = str(before["next_action"])
+        if action == "capture_processing_required":
+            key = "fcp_" + identity.canonical_digest("finance-process-capture-job-v1", job_id)
+            step = BridgeRequest(
+                "v1",
+                "process_capture_job",
+                request.request_id,
+                key,
+                {"workspace_path": str(workspace), "job_public_id": job_id},
+            )
+            handle_process_capture_job(step, deadline)
+            performed = "process_capture_job"
+            replay = False
+        elif action in {"d1_command_required", "guided_command_required"}:
+            performed, replay = _replay_frozen_capture_control(
+                request, job_id=job_id, context=context, workspace=workspace, deadline=deadline
+            )
+        else:
+            with _open_capture_recovery_context(workspace, context) as (write_conn, verifier):
+                result = resume_capture_recovery(
+                    write_conn,
+                    job_public_id=job_id,
+                    context=context,
+                    correction_service=verifier,
+                    expected_view=before,
+                )
+            return _with_capture_recovery_step(result), result.get("performed_action") == "none"
+        with _open_capture_recovery_context(workspace, context) as (read_conn, verifier):
+            result = get_capture_recovery(
+                read_conn,
+                job_public_id=job_id,
+                context=context,
+                correction_service=verifier,
+            )
+        result["performed_action"] = performed
+        return _with_capture_recovery_step(result), replay
+    except Exception as exc:
+        _raise_capture_recovery_error(exc)
+        raise AssertionError("unreachable")
 
 
 # ---------------------------------------------------------------------------
@@ -6665,6 +6962,8 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         envelope.COMMAND_CAPTURE_INTERACTION: handle_capture_interaction,
         envelope.COMMAND_GET_INTERACTION_ROUTE: handle_get_interaction_route,
         envelope.COMMAND_PROCESS_CAPTURE_JOB: handle_process_capture_job,
+        envelope.COMMAND_GET_CAPTURE_RECOVERY: handle_get_capture_recovery,
+        envelope.COMMAND_RESUME_CAPTURE_RECOVERY: handle_resume_capture_recovery,
         envelope.COMMAND_PROPOSE: handle_propose,
         envelope.COMMAND_GET_REVIEW: handle_get_review,
         envelope.COMMAND_CONFIRM: handle_confirm,

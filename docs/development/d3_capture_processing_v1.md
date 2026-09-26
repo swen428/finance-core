@@ -11,6 +11,8 @@ The D3 review, committed-result recovery, and reply-outbox services live in
 `finance_core.openclaw_staging_bridge` because they depend on authenticated
 Telegram context and D2/D2b platform authority. The former `application`
 module paths are not public compatibility aliases.
+The known-job query and one-step continuation contract is in
+[D3-3 processing and result recovery](d3_processing_result_recovery_v1.md).
 
 `process_capture_job` accepts an existing job public ID and uses the local OCR
 engine configured for the staging workspace. A worker first claims the job
@@ -67,14 +69,28 @@ The processor reads existing AI attempt, invocation claim, and result records.
 A claim without a result projects `outcome_unknown`; it never starts or
 retries a provider call. Existing AI services remain the invocation and
 result authority. The processor does not send Telegram replies or create an
-outbox. Migration 054's separate outbox verifies a committed result and records
-`outcome_unknown` with a fresh nonce under `synchronous=FULL` before a caller
-may send. It does not create final financial facts, transactions, or edits. A
-job summary of `awaiting_user` after an accepted but unfinished D2 posting is
-insufficient on its own: the later Bridge worker must query the D2 posting
-status and result locator before telling the user to confirm again.
+outbox. Migration 054's separate outbox verifies a committed result and
+records `outcome_unknown` with a fresh nonce under `synchronous=FULL` before a
+future sender may cross the transport boundary. It does not create final
+financial facts, transactions, or edits. A job summary of `awaiting_user`
+after an accepted but unfinished D2 posting is insufficient on its own: the
+later Bridge recovery command must query the D2 posting status and result
+locator before telling the user to confirm again.
 
-Acceptance uses temporary staging databases and synthetic receipt bytes:
-lease contention and renewal, expired claim fencing at OCR and proposal save,
-crash after OCR commit, deferred local timeout and stable retry identity,
-existing AI claim with unknown result, and absence of final transactions.
+## D3-2 processing test boundaries
+
+These cases exercise the local processor in temporary staging databases. They
+are not evidence that the separate D3-3 recovery command paths pass.
+
+| Boundary | Checked-in tests |
+| --- | --- |
+| Claim renewal, expired-claim reclamation, and stale-worker fencing during OCR/proposal save | `tests/test_d3_capture_processing_v1.py::test_claim_renew_and_expired_reclaim_fence_old_worker`, `::test_worker_stolen_during_ocr_cannot_save_evidence`, `::test_stolen_after_ocr_cannot_save_proposal` |
+| Reuse stage identities after OCR commit and preserve existing proposals | `::test_crash_after_ocr_replays_stage_identity`, `::test_text_processing_replays_existing_proposal_without_finalization` |
+| Local OCR timeout schedule, stable retry IDs, exhaustion, and stale timeout fencing | `::test_ocr_timeout_defers_then_reuses_same_job_and_stage_ids`, `::test_three_ocr_timeouts_stop_without_spin_or_new_economic_event`, `::test_stale_ocr_timeout_cannot_release_successor_claim` |
+| Existing AI claim without result | `::test_existing_ai_claim_without_result_is_unknown_and_never_reclaimed` |
+| Bridge processor does not create a final transaction | `::test_bridge_process_command_replays_finished_local_job`, `::test_bridge_receipt_command_uses_local_engine_only` |
+
+The D3-3 recovery query and token-bound resume, frozen D1/guided replay, D1/AI
+child review, D2b policy binding and missing-outbox recovery boundaries are
+tracked separately in
+[`d3_processing_result_recovery_v1.md`](d3_processing_result_recovery_v1.md).
