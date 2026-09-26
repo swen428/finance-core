@@ -29,9 +29,7 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 def _text_request(workspace: support.BridgeWorkspace, text: str = "lunch 12.50") -> dict:
     return support.make_request(
         "capture",
-        support.authenticated_text_capture_arguments(
-            workspace, support.telegram_text_update(text)
-        ),
+        support.authenticated_text_capture_arguments(workspace, support.telegram_text_update(text)),
         idempotency_key=support.canonical_capture_key(message_id=10),
     )
 

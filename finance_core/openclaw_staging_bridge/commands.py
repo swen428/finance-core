@@ -1434,9 +1434,7 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                 )
                 if (
                     historical_job is not None
-                    and get_interaction_route(
-                        historical_conn, str(historical_job["public_id"])
-                    )
+                    and get_interaction_route(historical_conn, str(historical_job["public_id"]))
                     is None
                 ):
                     if (
@@ -5063,9 +5061,7 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
                     context=context,
                     message_id=message_id,
                     route_kind="guided_complete",
-                    operation_key=canonical_guided_edit_complete_key(
-                        session_public_id, message_id
-                    ),
+                    operation_key=canonical_guided_edit_complete_key(session_public_id, message_id),
                     session_id=session_public_id,
                 ),
             )
@@ -5244,6 +5240,7 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
     _workspace, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("human draft whole-card apply")
+
         def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
             _require_frozen_command_route(
                 locked,

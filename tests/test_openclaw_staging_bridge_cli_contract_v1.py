@@ -437,7 +437,8 @@ class TestCaptureText:
         conflicting_arguments = dict(arguments)
         conflicting_arguments["telegram_account_id"] = "other-bot"
         conflicting_arguments["finance_ingress"] = {
-            **arguments["finance_ingress"], "accountId": "other-bot"
+            **arguments["finance_ingress"],
+            "accountId": "other-bot",
         }
         conflict = support.run_cli(
             support.make_request(
@@ -609,13 +610,10 @@ class TestCaptureText:
         public_ids = {outcome.response["result"]["intake_public_id"] for outcome in outcomes}
         assert len(public_ids) == 1
         route_jobs = {
-            outcome.response["result"]["interaction_route"]["job_public_id"]
-            for outcome in outcomes
+            outcome.response["result"]["interaction_route"]["job_public_id"] for outcome in outcomes
         }
         assert len(route_jobs) == 1
-        assert all(
-            outcome.response["result"]["proposal_public_id"] is None for outcome in outcomes
-        )
+        assert all(outcome.response["result"]["proposal_public_id"] is None for outcome in outcomes)
         # At least one invocation performed the original insert; any other
         # invocation replayed through raw-intake key-level idempotency.
         replay_flags = [outcome.response["idempotent_replay"] for outcome in outcomes]

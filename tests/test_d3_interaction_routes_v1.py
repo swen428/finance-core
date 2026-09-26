@@ -73,9 +73,7 @@ def _full_card(reference: str) -> str:
     )
 
 
-def _stage_pre_route_guided_update(
-    workspace: support.BridgeWorkspace, session_id: str
-) -> None:
+def _stage_pre_route_guided_update(workspace: support.BridgeWorkspace, session_id: str) -> None:
     """Model an update accepted before D3 began freezing interaction routes."""
     context = human_actions.HumanActionContext(
         actor_id="111",
@@ -99,10 +97,13 @@ def _stage_pre_route_guided_update(
             field_value="13.00",
         )
         commands._pending_guided_update(conn, pending)
-        assert conn.execute(
-            "SELECT COUNT(*) FROM finance_capture_interaction_routes "
-            "WHERE telegram_message_id = 21"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM finance_capture_interaction_routes "
+                "WHERE telegram_message_id = 21"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_initial_text_is_adopted_without_parser_then_worker_parses(
@@ -353,8 +354,17 @@ def test_historical_guided_exact_applied_message_recovers_original_route(
 @pytest.mark.parametrize(
     "separator",
     [
-        "\v", "\f", "\x1c", "\x1d", "\x1e", "\u0085", "\u2028", "\u2029",
-        "\u200b", "\u200d", "\ufeff",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\u0085",
+        "\u2028",
+        "\u2029",
+        "\u200b",
+        "\u200d",
+        "\ufeff",
     ],
 )
 def test_control_shape_rejects_ambiguous_unicode_or_line_separator(separator: str) -> None:
@@ -440,9 +450,10 @@ def test_authenticated_job_without_route_cannot_enter_parser(
             capture_kind="text",
             ingress_identity_digest="a" * 64,
         )
-        assert conn.execute(
-            "SELECT COUNT(*) FROM finance_capture_interaction_routes"
-        ).fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM finance_capture_interaction_routes").fetchone()[0]
+            == 0
+        )
         with pytest.raises(sqlite3.IntegrityError, match="cannot enter parser"):
             conn.execute(
                 "INSERT INTO parser_outputs "

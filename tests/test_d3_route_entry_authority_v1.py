@@ -119,9 +119,7 @@ def _begin_guided(workspace: support.BridgeWorkspace) -> tuple[str, str]:
                 "callback_id": "guided-route-callback",
                 "callback_message_id": 20,
             },
-            idempotency_key=support.canonical_human_action_redemption_key(
-                "guided-route-callback"
-            ),
+            idempotency_key=support.canonical_human_action_redemption_key("guided-route-callback"),
         )
     )
     assert redeemed.exit_code == errors.EXIT_OK, redeemed.response
@@ -203,7 +201,9 @@ def test_exact_historical_no_route_capture_is_read_only_replay(
             captured_at=str(intake["received_at"]),
         )
         ensure_capture_job(
-            conn, intake_id=int(intake["id"]), capture_kind="text",
+            conn,
+            intake_id=int(intake["id"]),
+            capture_kind="text",
             ingress_identity_digest=digest,
         )
         conn.commit()
@@ -299,7 +299,8 @@ def test_capture_context_uses_direct_human_canonical_bounds(
     args[field] = value
     outcome = support.run_cli(
         support.make_request(
-            "capture_interaction", args,
+            "capture_interaction",
+            args,
             idempotency_key=support.canonical_capture_key(message_id=24),
         )
     )
@@ -395,18 +396,14 @@ def test_guided_update_and_completion_consume_their_frozen_routes(
     }
     update_key = f"bridge-guided-edit-update:{session}:21"
     missing = support.run_cli(
-        support.make_request(
-            "apply_guided_edit_update", update_args, idempotency_key=update_key
-        )
+        support.make_request("apply_guided_edit_update", update_args, idempotency_key=update_key)
     )
     assert missing.exit_code == errors.EXIT_AUTHORITY_REFUSED
     captured = _capture(workspace, "description=Dinner", message_id=21)
     assert captured.exit_code == errors.EXIT_OK, captured.response
     assert captured.response["result"]["interaction_route"]["route_kind"] == "guided_update"
     updated = support.run_cli(
-        support.make_request(
-            "apply_guided_edit_update", update_args, idempotency_key=update_key
-        )
+        support.make_request("apply_guided_edit_update", update_args, idempotency_key=update_key)
     )
     assert updated.exit_code == errors.EXIT_OK, updated.response
 
@@ -417,9 +414,7 @@ def test_guided_update_and_completion_consume_their_frozen_routes(
     }
     complete_key = f"bridge-guided-edit-complete:{session}:22"
     missing_complete = support.run_cli(
-        support.make_request(
-            "complete_guided_edit", completed_args, idempotency_key=complete_key
-        )
+        support.make_request("complete_guided_edit", completed_args, idempotency_key=complete_key)
     )
     assert missing_complete.exit_code == errors.EXIT_AUTHORITY_REFUSED
     frozen_complete = _capture(workspace, "完成", message_id=22)
@@ -428,8 +423,6 @@ def test_guided_update_and_completion_consume_their_frozen_routes(
         "guided_complete"
     )
     completed = support.run_cli(
-        support.make_request(
-            "complete_guided_edit", completed_args, idempotency_key=complete_key
-        )
+        support.make_request("complete_guided_edit", completed_args, idempotency_key=complete_key)
     )
     assert completed.exit_code == errors.EXIT_OK, completed.response
