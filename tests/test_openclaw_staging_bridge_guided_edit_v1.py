@@ -1649,6 +1649,7 @@ def test_core_replay_crossing_expiry_is_settled_as_applied(
         version=int(active["proposal_version"]),
         content_hash=str(active["effective_content_hash"]),
     )
+    _capture_routed_message(workspace, "merchant=Committed During Race", 30)
     conn = support.open_database(workspace)
     try:
         row = conn.execute(
@@ -1741,6 +1742,7 @@ def test_refusal_settlement_rechecks_core_result_under_write_lock(
         version=0,
         content_hash=str(active["effective_content_hash"]),
     )
+    _capture_routed_message(workspace, "category=Meals", 30)
     conn = support.open_database(workspace)
     try:
         session_row = dict(
@@ -1787,6 +1789,8 @@ def test_stale_refusal_settler_cannot_clear_a_later_pending_message(
         version=0,
         content_hash=str(active["effective_content_hash"]),
     )
+    _capture_routed_message(workspace, "category=Invalid First", 30)
+    _capture_routed_message(workspace, "merchant=Valid Second", 31)
     conn = support.open_database(workspace)
     try:
         session_row = dict(
@@ -1857,6 +1861,8 @@ def test_stale_applied_settler_cannot_clear_a_later_pending_message(
         version=0,
         content_hash=str(active["effective_content_hash"]),
     )
+    _capture_routed_message(workspace, "category=Meals", 30)
+    _capture_routed_message(workspace, "merchant=Valid Second", 31)
     conn = support.open_database(workspace)
     try:
         session_row = dict(
@@ -2071,6 +2077,7 @@ def test_expired_uncommitted_pending_is_audited_and_fresh_session_can_start(
     proposal, session, _redemption = _begin(workspace)
     active = _get(workspace).response["result"]
     expires_at = int(active["expires_at"])
+    _capture_routed_message(workspace, "merchant=Never Committed", 30)
     conn = support.open_database(workspace)
     try:
         row = conn.execute(

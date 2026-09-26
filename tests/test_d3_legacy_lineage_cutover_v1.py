@@ -106,3 +106,57 @@ def test_055_cutover_preserves_admitted_history_but_blocks_new_unrouted_text(
         conn.execute("DELETE FROM finance_legacy_text_lineage_admissions")
     assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_055_guards_every_new_telegram_text_binding_direction(
+    migrated_temp_db_connection: sqlite3.Connection,
+) -> None:
+    conn = migrated_temp_db_connection
+    conn.execute(
+        "INSERT INTO raw_intake_records "
+        "(public_id, source_type, source_channel, raw_input, received_at) "
+        "VALUES ('unrouted_flip', 'telegram_text', 'telegram', 'x', '2026-01-01')"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="source identity is immutable"):
+        conn.execute(
+            "UPDATE raw_intake_records SET source_channel = 'manual' "
+            "WHERE public_id = 'unrouted_flip'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="source identity is immutable"):
+        conn.execute(
+            "UPDATE raw_intake_records SET source_type = 'manual_entry' "
+            "WHERE public_id = 'unrouted_flip'"
+        )
+
+    conn.execute(
+        "INSERT INTO parser_outputs "
+        "(public_id, source_type, source_public_id, parse_status) "
+        "VALUES ('later_bound', 'telegram_text', NULL, 'parsed_pending_confirmation')"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="parser source identity is immutable"):
+        conn.execute(
+            "UPDATE parser_outputs SET source_public_id = 'unrouted_flip' "
+            "WHERE public_id = 'later_bound'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="route before parser binding"):
+        conn.execute(
+            "UPDATE raw_intake_records SET parser_output_id = "
+            "(SELECT id FROM parser_outputs WHERE public_id = 'later_bound') "
+            "WHERE public_id = 'unrouted_flip'"
+        )
+
+    conn.execute(
+        "INSERT INTO parser_outputs "
+        "(public_id, source_type, source_public_id, parse_status) "
+        "VALUES ('future_proposal', 'telegram_text', 'future_raw', "
+        "'parsed_pending_confirmation')"
+    )
+    for pointer in ("NULL", "(SELECT id FROM parser_outputs WHERE public_id = 'future_proposal')"):
+        with pytest.raises(sqlite3.IntegrityError, match="prebound parser"):
+            conn.execute(
+                "INSERT INTO raw_intake_records "
+                "(public_id, source_type, source_channel, raw_input, received_at, "
+                "parser_output_id) VALUES "
+                f"('future_raw', 'telegram_text', 'telegram', 'x', '2026-01-01', {pointer})"
+            )
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

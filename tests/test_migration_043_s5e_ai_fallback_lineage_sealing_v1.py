@@ -387,7 +387,7 @@ def test_raw_intake_pointer_collision_is_refused_after_fallback_sealing() -> Non
         )
         conn.commit()
 
-        with pytest.raises(sqlite3.IntegrityError, match="raw-intake binding"):
+        with pytest.raises(sqlite3.IntegrityError, match="raw-intake binding|prebound parser"):
             conn.execute(
                 """
                 INSERT INTO raw_intake_records (
@@ -413,7 +413,9 @@ def test_raw_intake_pointer_collision_is_refused_after_fallback_sealing() -> Non
             )
             """
         )
-        with pytest.raises(sqlite3.IntegrityError, match="raw-intake binding"):
+        with pytest.raises(
+            sqlite3.IntegrityError, match="raw-intake binding|route before parser binding"
+        ):
             conn.execute(
                 """
                 UPDATE raw_intake_records
@@ -475,6 +477,9 @@ def test_raw_intake_lineage_escape_is_blocked_and_only_trigger_bypass_allows_it(
             (child_id, intake_id),
         )
         conn.commit()
+        # Keep this 043-specific trigger test focused after proving 055's
+        # admitted child transition; 055 also blocks later repoint attempts.
+        conn.execute("DROP TRIGGER trg_finance_telegram_text_parser_pointer")
         conn.execute("DROP TRIGGER trg_raw_intake_records_pointer_lineage_control")
         with pytest.raises(sqlite3.IntegrityError, match="lineage cannot be escaped"):
             conn.execute(
@@ -504,8 +509,10 @@ def test_raw_intake_lineage_escape_is_blocked_and_only_trigger_bypass_allows_it(
 def test_ocr_link_insert_or_replace_cannot_replace_an_append_only_row() -> None:
     conn = _connection()
     try:
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        apply_migration_paths(conn, PATHS_BEFORE_D3_ROUTE)
         parent_id, _intake_id = seed_parent(conn, "insert_collision_043")
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         conn.execute(
             """
             INSERT INTO attachments (

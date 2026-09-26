@@ -12,6 +12,7 @@ import pytest
 from finance_core.intake import interaction_routes
 from finance_core.intake.capture_jobs import ensure_capture_job
 from finance_core.intake.raw_text_repository import create_raw_intake_record
+from finance_core.intake.raw_text_service import process_raw_text_input
 from finance_core.intake.telegram_text_adapter import validate_telegram_text_update
 from finance_core.openclaw_staging_bridge import (
     commands,
@@ -20,6 +21,8 @@ from finance_core.openclaw_staging_bridge import (
     human_actions,
     identity,
 )
+from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from tests.test_openclaw_staging_bridge_guided_edit_v1 import _apply, _begin, _complete
 
 
@@ -73,37 +76,71 @@ def _full_card(reference: str) -> str:
     )
 
 
-def _stage_pre_route_guided_update(workspace: support.BridgeWorkspace, session_id: str) -> None:
-    """Model an update accepted before D3 began freezing interaction routes."""
-    context = human_actions.HumanActionContext(
-        actor_id="111",
-        account_id="finance-account",
-        conversation_id="111",
-        binding_id="binding-1",
+def _pre_055_pending_workspace(tmp_path: Path) -> tuple[support.BridgeWorkspace, str]:
+    """Create an actual pre-cutover pending claim, then migrate that same DB."""
+    workspace = support.create_bridge_workspace(
+        tmp_path, migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
     )
+    session_id = "gedit_" + "a" * 32
     with support.open_database(workspace) as conn:
-        session = guided_edit.get_session_by_public_id(conn, session_id, context)
-        assert session is not None
-        pending = guided_edit.request_update(
+        result = process_raw_text_input(conn, "Lunch SGD 12.00")
+        proposal = result["parser_output"]
+        content_hash = compute_effective_proposal_content_hash(conn, {"id": proposal["id"]})
+        conn.execute(
+            "INSERT INTO openclaw_human_action_references "
+            "(reference_public_id, reference_sha256, issuance_idempotency_key, "
+            "parser_output_id, action, proposal_version, proposal_content_hash, "
+            "authenticated_actor_id, channel, channel_account_id, "
+            "channel_conversation_id, conversation_binding_id, ttl_seconds, "
+            "expires_at, issued_at) VALUES (?, ?, ?, ?, 'edit', 0, ?, "
+            "'111', 'telegram', 'finance-account', '111', 'binding-1', "
+            "600, 4102444800, '2026-09-26')",
+            (
+                "haref_" + "a" * 32,
+                "b" * 64,
+                "bridge-human-action-issue:" + "c" * 32,
+                proposal["id"],
+                content_hash,
+            ),
+        )
+        reference_id = conn.execute("SELECT id FROM openclaw_human_action_references").fetchone()[0]
+        conn.execute(
+            "INSERT INTO openclaw_guided_edit_sessions "
+            "(session_public_id, source_reference_id, current_parser_output_id, "
+            "current_proposal_version, current_content_hash, authenticated_actor_id, "
+            "channel_account_id, channel_conversation_id, conversation_binding_id, "
+            "status, expires_at, last_claimed_message_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, 0, ?, '111', 'finance-account', '111', 'binding-1', "
+            "'active', 4102444800, 20, '2026-09-26', '2026-09-26')",
+            (session_id, reference_id, proposal["id"], content_hash),
+        )
+        conn.commit()
+        session = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        guided_edit.request_update(
             conn,
             session,
             message_id=21,
             operation_key=commands.canonical_edit_key(
-                proposal_public_id=str(session["proposal_public_id"]),
-                version=int(session["current_proposal_version"]),
-                content_hash=str(session["current_content_hash"]),
+                proposal_public_id=str(proposal["public_id"]),
+                version=0,
+                content_hash=content_hash,
             ),
-            field_name="amount",
-            field_value="13.00",
+            field_name="merchant",
+            field_value="Cafe Two",
         )
-        commands._pending_guided_update(conn, pending)
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         assert (
             conn.execute(
-                "SELECT COUNT(*) FROM finance_capture_interaction_routes "
-                "WHERE telegram_message_id = 21"
+                "SELECT COUNT(*) FROM finance_legacy_guided_pending_admissions"
             ).fetchone()[0]
-            == 0
+            == 1
         )
+    return workspace, session_id
 
 
 def test_initial_text_is_adopted_without_parser_then_worker_parses(
@@ -318,12 +355,15 @@ def test_active_guided_value_accepts_exact_1024_byte_limit(
 
 
 def test_historical_guided_message_must_match_original_operation_content(
-    workspace: support.BridgeWorkspace,
+    tmp_path: Path,
 ) -> None:
-    _proposal, session, _redemption = _begin(workspace)
-    _stage_pre_route_guided_update(workspace, session)
+    workspace, session = _pre_055_pending_workspace(tmp_path)
     request = _request(
-        workspace, "amount=99.00", message_id=21, account="finance-account", binding="binding-1"
+        workspace,
+        "merchant=Wrong Cafe",
+        message_id=21,
+        account="finance-account",
+        binding="binding-1",
     )
     captured = support.run_cli(request)
     assert captured.exit_code == errors.EXIT_OK, captured.response
@@ -334,12 +374,15 @@ def test_historical_guided_message_must_match_original_operation_content(
 
 
 def test_historical_guided_exact_applied_message_recovers_original_route(
-    workspace: support.BridgeWorkspace,
+    tmp_path: Path,
 ) -> None:
-    _proposal, session, _redemption = _begin(workspace)
-    _stage_pre_route_guided_update(workspace, session)
+    workspace, session = _pre_055_pending_workspace(tmp_path)
     request = _request(
-        workspace, "amount=13.00", message_id=21, account="finance-account", binding="binding-1"
+        workspace,
+        "merchant=Cafe Two",
+        message_id=21,
+        account="finance-account",
+        binding="binding-1",
     )
     captured = support.run_cli(request)
     assert captured.exit_code == errors.EXIT_OK, captured.response
@@ -347,8 +390,104 @@ def test_historical_guided_exact_applied_message_recovers_original_route(
     assert route["route_kind"] == "guided_update"
     assert route["guided_session_public_id"] == session
     assert route["operation_key"] == f"bridge-guided-edit-update:{session}:21"
-    assert route["field_name"] == "amount"
-    assert route["field_value_json"] == '"13.00"'
+    assert route["field_name"] == "merchant"
+    assert route["field_value_json"] == '"Cafe Two"'
+    applied = _apply(workspace, session, 21, "merchant", "Cafe Two")
+    assert applied.exit_code == errors.EXIT_OK, applied.response
+    assert applied.response["result"]["final_transaction_created"] is False
+    replay = _apply(workspace, session, 21, "merchant", "Cafe Two")
+    assert replay.exit_code == errors.EXIT_OK, replay.response
+    with support.open_database(workspace) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM openclaw_guided_edit_events "
+                "WHERE event_type = 'update_applied'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_post_cutover_guided_pending_cannot_be_forged_without_route(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    proposal, session_id, _redemption = _begin(workspace)
+    with support.open_database(workspace) as conn:
+        session = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        operation_key = commands.canonical_edit_key(
+            proposal_public_id=proposal,
+            version=int(session["current_proposal_version"]),
+            content_hash=str(session["current_content_hash"]),
+        )
+        with pytest.raises(guided_edit.GuidedEditError, match="interaction_route_required"):
+            guided_edit.request_update(
+                conn,
+                session,
+                message_id=21,
+                operation_key=operation_key,
+                field_name="amount",
+                field_value="13.00",
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="requires a frozen route"):
+            conn.execute(
+                "UPDATE openclaw_guided_edit_sessions SET pending_message_id = 21, "
+                "pending_operation_key = ?, pending_field_name = 'amount', "
+                "pending_field_value_json = '\"13.00\"', last_claimed_message_id = 21 "
+                "WHERE session_public_id = ?",
+                (operation_key, session_id),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="event requires a frozen route"):
+            conn.execute(
+                "INSERT INTO openclaw_guided_edit_events "
+                "(event_public_id, session_id, sequence_number, event_type, "
+                "telegram_message_id, operation_key, field_name, field_value_json, "
+                "created_at) VALUES (?, ?, 2, 'update_requested', 21, ?, 'amount', "
+                "'\"13.00\"', '2026-09-26')",
+                ("geditev_" + "e" * 32, session["id"], operation_key),
+            )
+        conn.rollback()
+        context = human_actions.HumanActionContext(
+            actor_id="111",
+            account_id="finance-account",
+            conversation_id="111",
+            binding_id="binding-1",
+        )
+        with pytest.raises(guided_edit.GuidedEditError, match="interaction_route_required"):
+            guided_edit.complete_session(conn, session, context=context, message_id=21)
+        with pytest.raises(sqlite3.IntegrityError, match="completion requires a frozen route"):
+            conn.execute(
+                "UPDATE openclaw_guided_edit_sessions SET status = 'completed', "
+                "completed_message_id = 21, last_claimed_message_id = 21 "
+                "WHERE session_public_id = ?",
+                (session_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="event requires a frozen route"):
+            conn.execute(
+                "INSERT INTO openclaw_guided_edit_events "
+                "(event_public_id, session_id, sequence_number, event_type, "
+                "telegram_message_id, created_at) "
+                "VALUES (?, ?, 2, 'completed', 21, '2026-09-26')",
+                ("geditev_" + "f" * 32, session["id"]),
+            )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM finance_legacy_guided_pending_admissions"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT pending_message_id FROM openclaw_guided_edit_sessions "
+                "WHERE session_public_id = ?",
+                (session_id,),
+            ).fetchone()[0]
+            is None
+        )
+        assert support.count_final_facts(conn)["transactions"] == 0
 
 
 @pytest.mark.parametrize(

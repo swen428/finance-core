@@ -91,6 +91,22 @@ uses `WITHOUT ROWID` so hidden SQLite
 row identifiers cannot replace frozen evidence; primary, message, and operation
 key collisions are also refused before SQLite conflict replacement executes.
 
+The same gate covers every source-to-proposal binding direction: a Telegram
+text source cannot change its identity, adopt a pre-existing parser by raw
+pointer update, or accept a parser whose source identity is assigned later.
+The initial intake route remains required for new parser and AI work. Migration
+055 separately snapshots only guided updates already pending with one matching
+request event. Recovery without a route must match that immutable snapshot and
+the current pending material; a newly inserted request event or an old-looking
+timestamp cannot create historical authority. New guided requests and
+completions require a frozen route at both the Python call and the session or
+event write boundary. Normal settlement of an admitted pending update may
+clear it after recovering the existing result.
+An admitted old text source may advance to its direct parser child when the
+child retains the same source identity, or when a sealed AI fallback result
+links that child to the admitted source and current parent. This preserves
+pre-055 fallback recovery without admitting an unrelated proposal.
+
 New receipt captions resembling a card, guided command or ambiguous control
 are refused before intake publication with a request to send the instruction as
 text. Exact replay of an already saved receipt compares its original caption

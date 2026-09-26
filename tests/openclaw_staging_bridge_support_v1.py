@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from migrated_staging_snapshot_v1 import (
     MigratedStagingTemplate,
@@ -131,13 +131,18 @@ class BridgeWorkspace:
     database_path: Path
 
 
-def create_bridge_workspace(tmp_path: Path, *, name: str | None = None) -> BridgeWorkspace:
+def create_bridge_workspace(
+    tmp_path: Path, *, name: str | None = None, migration_paths: Sequence[Path] | None = None
+) -> BridgeWorkspace:
     """Create a runner workspace plus a migrated staging database inside it."""
     suffix = name or uuid.uuid4().hex[:8]
     workspace_path = str((tmp_path / f"workspace_{suffix}").resolve())
     manifest = parse_runner_manifest(make_manifest_bytes())
     workspace = create_runner_workspace(workspace_path, manifest)
-    conn = create_staging_database(workspace.database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    conn = create_staging_database(
+        workspace.database_path,
+        migration_paths=TEMP_DB_MIGRATION_PATHS if migration_paths is None else migration_paths,
+    )
     conn.close()
     return BridgeWorkspace(
         workspace_path=Path(workspace.workspace_path),
