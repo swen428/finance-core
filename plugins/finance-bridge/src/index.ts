@@ -23,6 +23,7 @@ import {
 import { createBridgeRequest } from "./protocol.js";
 import { BridgeCliRunner } from "./subprocess.js";
 import { createDisabledTools } from "./tools.js";
+import { hasTrustedFinanceIngress, TrustedIngressCapture } from "./trusted-ingress.js";
 import {
   requireFinanceDeliveryHost,
   type FinanceDeliveryReceiptRecorder,
@@ -126,6 +127,7 @@ export function registerFinanceBridge(
   validateLoadedFinancePluginRootV2(hostConfig, api.rootDir);
   let healthy = false;
   let controller: FinanceInboundController | undefined;
+  let trustedIngress: TrustedIngressCapture | undefined;
   let humanActionRuntime: { workspaceRoot: string; runner: BridgeRunner } | undefined;
   let deliveryReceiptRecorder: FinanceDeliveryReceiptRecorder | undefined;
   const ready = dependencies.validateConfig(api.pluginConfig).then(async (config) => {
@@ -147,16 +149,20 @@ export function registerFinanceBridge(
         health.result.database_verified !== true) {
       throw new Error("Finance bridge private health check failed.");
     }
+    const media = await dependencies.createMediaAdapter();
+    const handoff = dependencies.createHandoffPublisher(config, () => { healthy = false; });
     controller = new FinanceInboundController(
       config.workspaceRoot,
       runner,
       {
-        media: await dependencies.createMediaAdapter(),
-        handoff: dependencies.createHandoffPublisher(config, () => { healthy = false; }),
+        media,
+        handoff,
       },
       undefined,
       hostLlmRuntime(api, config),
     );
+    trustedIngress = new TrustedIngressCapture(config.workspaceRoot, runner, media, handoff);
+    await trustedIngress.resumePendingReclaims();
     humanActionRuntime = { workspaceRoot: config.workspaceRoot, runner };
     healthy = true;
   }).catch(() => {
@@ -192,7 +198,12 @@ export function registerFinanceBridge(
   api.on("inbound_claim", async (event, context) => {
     await ready;
     if (!healthy || controller === undefined) {
+      if (hasTrustedFinanceIngress(event)) return { handled: false };
       return { handled: true, reply: { text: FINANCE_FAILURE_REPLY } };
+    }
+    if (hasTrustedFinanceIngress(event)) {
+      if (trustedIngress === undefined) return { handled: false };
+      return await trustedIngress.handle(event, context);
     }
     return await controller.handle(event, context);
   }, { timeoutMs: 120_000 });

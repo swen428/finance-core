@@ -2,12 +2,13 @@ import { createHash } from "node:crypto";
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { flock } from "fs-ext";
-import { chmodDescriptor, closeDescriptor, constants, descriptorIdentity, descriptorIdentitySync, freeBytes as descriptorFreeBytes, listAt, openDirectory, openExistingDirectoryAt, openFileAt, openPrivateDirectoryAt, readDescriptor, renameNoReplaceAt, syncDescriptor, writeDescriptor, } from "./posix.js";
+import { chmodDescriptor, closeDescriptor, constants, descriptorIdentity, descriptorIdentitySync, freeBytes as descriptorFreeBytes, listAt, openDirectory, openExistingDirectoryAt, openFileAt, openPrivateDirectoryAt, readDescriptor, renameNoReplaceAt, syncDescriptor, unlinkAtIfIdentity, writeDescriptor, } from "./posix.js";
 import { captureIdentities } from "./protocol.js";
 export const HANDOFF_PENDING_RECORD = ".finance-bridge.record.pending";
 export const HANDOFF_PENDING_PAYLOAD = ".finance-bridge.payload.pending";
 const LOCK_BASENAME = ".finance-bridge.lock.v1";
 const RECORD_SUFFIX = ".handoff.json";
+const RECLAIM_SUFFIX = ".reclaim.json";
 const MAX_RECORDS = 32;
 const MAX_PAYLOAD_BYTES = 320_000_000;
 const MAX_TREE_BYTES = 321_000_000;
@@ -81,6 +82,76 @@ async function requireCallbackBoundary(directoryFd, published, payloadFd, expect
 }
 function sha256(bytes) {
     return createHash("sha256").update(bytes).digest("hex");
+}
+function saveIdentity(value) {
+    return {
+        dev: value.dev.toString(), ino: value.ino.toString(), uid: value.uid,
+        mode: value.mode, size: value.size, ctimeNs: value.ctimeNs.toString(),
+        mtimeNs: value.mtimeNs.toString(),
+    };
+}
+function restoreIdentity(value) {
+    return {
+        dev: BigInt(value.dev), ino: BigInt(value.ino), uid: value.uid,
+        mode: value.mode, size: value.size, ctimeNs: BigInt(value.ctimeNs),
+        mtimeNs: BigInt(value.mtimeNs), isFile: true, isDirectory: false,
+    };
+}
+function sameSavedIdentity(left, right) {
+    return Object.keys(left).every((key) => left[key] === right[key]);
+}
+function validateClaim(claim) {
+    if (!PUBLIC_ID.test(claim.rawIntakePublicId) ||
+        !/^fcj_[0-9a-f]{40}$/u.test(claim.jobPublicId) ||
+        claim.jobPublicId !== `fcj_${sha256(`finance-capture-job-v1\0${claim.rawIntakePublicId}`).slice(0, 40)}` ||
+        ![claim.canonicalKeyHash, claim.ingressIdentityDigest, claim.attachmentContentHash]
+            .every((value) => /^[0-9a-f]{64}$/u.test(value))) {
+        throw new Error("Reclaim claim identity is invalid.");
+    }
+}
+function parseIntent(bytes) {
+    if (bytes.byteLength > 4_096)
+        throw new Error("Reclaim intent exceeds its bounded size.");
+    let value;
+    try {
+        value = JSON.parse(bytes.toString("utf8"));
+    }
+    catch (error) {
+        throw new Error("Reclaim intent is invalid JSON.", { cause: error });
+    }
+    if (!isRecord(value) || value.schema_version !== "finance-bridge-reclaim-v1" ||
+        !isRecord(value.claim) || !isRecord(value.record_identity) ||
+        !isRecord(value.payload_identity) || !isRecord(value.directory_identity) ||
+        typeof value.record_basename !== "string" || typeof value.payload_basename !== "string" ||
+        typeof value.record_sha256 !== "string" || typeof value.payload_sha256 !== "string") {
+        throw new Error("Reclaim intent fields are invalid.");
+    }
+    const intent = value;
+    validateClaim(intent.claim);
+    if (Object.keys(value).sort().join() !== [
+        "claim", "directory_identity", "payload_basename", "payload_identity",
+        "payload_sha256", "record_basename", "record_identity", "record_sha256", "schema_version",
+    ].sort().join() ||
+        Object.keys(intent.claim).sort().join() !== [
+            "rawIntakePublicId", "jobPublicId", "canonicalKeyHash", "ingressIdentityDigest",
+            "attachmentContentHash",
+        ].sort().join() ||
+        intent.record_basename !== `${intent.claim.rawIntakePublicId}${RECORD_SUFFIX}` ||
+        ![".jpg", ".png"].some((suffix) => intent.payload_basename === `${intent.claim.rawIntakePublicId}${suffix}`) ||
+        intent.payload_sha256 !== intent.claim.attachmentContentHash ||
+        ![intent.record_sha256, intent.payload_sha256].every((hash) => /^[0-9a-f]{64}$/u.test(hash))) {
+        throw new Error("Reclaim intent identity is invalid.");
+    }
+    for (const item of [intent.record_identity, intent.payload_identity, intent.directory_identity]) {
+        if (Object.keys(item).sort().join() !== [
+            "dev", "ino", "uid", "mode", "size", "ctimeNs", "mtimeNs",
+        ].sort().join() ||
+            ![item.dev, item.ino, item.ctimeNs, item.mtimeNs].every((part) => typeof part === "string" && /^(?:0|[1-9][0-9]*)$/u.test(part)) ||
+            ![item.uid, item.mode, item.size].every((part) => Number.isSafeInteger(part) && part >= 0)) {
+            throw new Error("Reclaim intent inode evidence is invalid.");
+        }
+    }
+    return intent;
 }
 function lockOperation(fileDescriptor, operation) {
     return new Promise((resolve, reject) => {
@@ -169,6 +240,63 @@ async function readRegularAt(directoryFd, name, maximum) {
     }
     finally {
         await closeDescriptor(fd);
+    }
+}
+async function readIntentAt(directoryFd, name) {
+    return parseIntent(await readRegularAt(directoryFd, name, 4_096));
+}
+async function sealReclaimIntent(directoryFd, claim, recordName, payloadName, recordIdentity, payloadIdentity) {
+    validateClaim(claim);
+    const intentName = `${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`;
+    const recordBytes = await readRegularAt(directoryFd, recordName, 4_096);
+    const payloadBytes = await readRegularAt(directoryFd, payloadName, 10_000_000);
+    if (!sameEntryIdentity(await entryIdentityAt(directoryFd, recordName), recordIdentity) ||
+        !sameEntryIdentity(await entryIdentityAt(directoryFd, payloadName), payloadIdentity) ||
+        sha256(payloadBytes) !== claim.attachmentContentHash ||
+        parseRecord(recordBytes).canonical_key_hash !== claim.canonicalKeyHash) {
+        throw new Error("Reclaim source changed before intent was sealed.");
+    }
+    const directoryIdentity = await descriptorIdentity(directoryFd);
+    const intent = {
+        schema_version: "finance-bridge-reclaim-v1", claim,
+        record_basename: recordName, payload_basename: payloadName,
+        record_sha256: sha256(recordBytes), payload_sha256: sha256(payloadBytes),
+        record_identity: saveIdentity(recordIdentity), payload_identity: saveIdentity(payloadIdentity),
+        directory_identity: saveIdentity(directoryIdentity),
+    };
+    const bytes = Buffer.from(`${JSON.stringify(intent)}\n`, "utf8");
+    if (bytes.length > 4_096)
+        throw new Error("Reclaim intent exceeds its bounded size.");
+    try {
+        const existing = await readRegularAt(directoryFd, intentName, 4_096);
+        const prior = parseIntent(existing);
+        if (JSON.stringify(prior.claim) !== JSON.stringify(claim) ||
+            prior.record_basename !== recordName || prior.payload_basename !== payloadName ||
+            prior.record_sha256 !== intent.record_sha256 ||
+            prior.payload_sha256 !== intent.payload_sha256 ||
+            !sameSavedIdentity(prior.record_identity, intent.record_identity) ||
+            !sameSavedIdentity(prior.payload_identity, intent.payload_identity) ||
+            prior.directory_identity.dev !== intent.directory_identity.dev ||
+            prior.directory_identity.ino !== intent.directory_identity.ino) {
+            throw new Error("Reclaim intent conflicts with pinned slot.");
+        }
+        return;
+    }
+    catch (error) {
+        if (error.code !== "ENOENT")
+            throw error;
+    }
+    const fd = openFileAt(directoryFd, intentName, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    try {
+        await writeDescriptor(fd, bytes);
+        await syncDescriptor(fd);
+    }
+    finally {
+        await closeDescriptor(fd);
+    }
+    await syncDescriptor(directoryFd);
+    if (!(await readRegularAt(directoryFd, intentName, 4_096)).equals(bytes)) {
+        throw new Error("Reclaim intent changed after durable write.");
     }
 }
 async function publishPending(directoryFd, pendingName, finalName, bytes, afterFsync, afterPin, afterPublish, hook) {
@@ -261,6 +389,7 @@ async function defaultFreeBytes(directoryFd) {
 async function inventory(directoryFd) {
     const entries = listAt(directoryFd);
     const records = new Map();
+    const intents = new Map();
     let treeBytes = 0;
     let payloadBytes = 0;
     const payloadNames = new Set();
@@ -300,6 +429,16 @@ async function inventory(directoryFd) {
             records.set(id, record);
             continue;
         }
+        if (name.endsWith(RECLAIM_SUFFIX)) {
+            const id = name.slice(0, -RECLAIM_SUFFIX.length);
+            if (!PUBLIC_ID.test(id))
+                throw new Error("Handoff tree contains an unknown reclaim intent.");
+            const intent = await readIntentAt(directoryFd, name);
+            if (intent.claim.rawIntakePublicId !== id)
+                throw new Error("Reclaim intent filename mismatch.");
+            intents.set(id, intent);
+            continue;
+        }
         if (/^raw_intake_bridge_[0-9a-f]{32}\.(?:jpg|png)$/u.test(name)) {
             payloadBytes += status.size;
             payloadNames.add(name);
@@ -337,6 +476,17 @@ async function inventory(directoryFd) {
             throw new Error("Handoff tree contains an unknown orphan payload.");
         }
     }
+    for (const [id, intent] of intents) {
+        const record = records.get(id);
+        if (record === undefined || record.payload_basename !== intent.payload_basename ||
+            record.canonical_key_hash !== intent.claim.canonicalKeyHash ||
+            record.content_hash !== intent.claim.attachmentContentHash ||
+            sha256(await readRegularAt(directoryFd, intent.record_basename, 4_096)) !== intent.record_sha256 ||
+            !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.record_basename), restoreIdentity(intent.record_identity)) ||
+            !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.payload_basename), restoreIdentity(intent.payload_identity))) {
+            throw new Error("Reclaim intent does not match its retained slot.");
+        }
+    }
     return { recordCount: records.size, payloadBytes, treeBytes, incompleteRecords };
 }
 export class HandoffPublisher {
@@ -346,10 +496,293 @@ export class HandoffPublisher {
         this.workspaceRoot = workspaceRoot;
         this.options = options;
     }
+    async withReclaimLock(callback, deadlineAt) {
+        const handoffPath = join(this.workspaceRoot, "handoff");
+        const workspaceFd = openDirectory(this.workspaceRoot);
+        let directoryFd;
+        try {
+            try {
+                directoryFd = openExistingDirectoryAt(workspaceFd, "handoff");
+            }
+            catch (error) {
+                if (error.code === "ENOENT")
+                    return undefined;
+                throw error;
+            }
+        }
+        finally {
+            await closeDescriptor(workspaceFd);
+        }
+        if (directoryFd === undefined)
+            return undefined;
+        let lockFd;
+        try {
+            const directoryIdentity = await descriptorIdentity(directoryFd);
+            if (!directoryIdentity.isDirectory || directoryIdentity.uid !== process.getuid?.() ||
+                (directoryIdentity.mode & 0o077) !== 0) {
+                throw new Error("Reclaim handoff directory is not private.");
+            }
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW);
+            const lockIdentity = await descriptorIdentity(lockFd);
+            if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
+                (lockIdentity.mode & 0o077) !== 0) {
+                throw new Error("Reclaim handoff lock is not private.");
+            }
+            const remaining = deadlineAt === undefined ? DEFAULT_LOCK_TIMEOUT_MS :
+                Math.min(DEFAULT_LOCK_TIMEOUT_MS, Math.ceil(deadlineAt - performance.now()));
+            if (remaining <= 0)
+                throw new Error("Reclaim deadline exceeded before lock.");
+            await acquireExclusiveLock(lockFd, Math.min(this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, remaining));
+            try {
+                await requireDirectoryPathIdentity(handoffPath, directoryIdentity);
+                await requireLockIdentity(directoryFd, lockFd, lockIdentity);
+                const result = await callback(directoryFd, directoryIdentity);
+                await requireDirectoryPathIdentity(handoffPath, directoryIdentity);
+                await requireLockIdentity(directoryFd, lockFd, lockIdentity);
+                return result;
+            }
+            finally {
+                await lockOperation(lockFd, "un");
+            }
+        }
+        catch (error) {
+            this.options.markUnhealthy?.();
+            throw error;
+        }
+        finally {
+            if (lockFd !== undefined)
+                await closeDescriptor(lockFd);
+            await closeDescriptor(directoryFd);
+        }
+    }
+    /** Lists only durable intents. The caller must query Core outside the flock. */
+    async pendingReclaims() {
+        return await this.withReclaimLock(async (directoryFd) => {
+            const names = listAt(directoryFd);
+            if (names.includes(HANDOFF_PENDING_RECORD) || names.includes(HANDOFF_PENDING_PAYLOAD)) {
+                throw new Error("Unresolved handoff pending residue blocks reclaim.");
+            }
+            const claims = [];
+            for (const name of names) {
+                if (!name.endsWith(RECLAIM_SUFFIX))
+                    continue;
+                const intent = await readIntentAt(directoryFd, name);
+                if (name !== `${intent.claim.rawIntakePublicId}${RECLAIM_SUFFIX}`) {
+                    throw new Error("Reclaim intent filename mismatch.");
+                }
+                claims.push(intent.claim);
+            }
+            if (claims.length === 0) {
+                const current = await inventory(directoryFd);
+                if (current.incompleteRecords.size > 0) {
+                    throw new Error("Incomplete handoff residue blocks reclaim.");
+                }
+            }
+            else {
+                for (const claim of claims) {
+                    await this.verifyReclaimInventory(directoryFd, names, await readIntentAt(directoryFd, `${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`));
+                }
+            }
+            return claims;
+        }) ?? [];
+    }
+    /** A host replay can seal an older retained slot after Core commit lost its response. */
+    async prepareRetainedReclaim(canonicalKey, claim) {
+        validateClaim(claim);
+        let found = false;
+        await this.withRetained(canonicalKey, claim.rawIntakePublicId, async () => {
+            found = true;
+        }, this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, claim);
+        return found;
+    }
+    async isReclaimed(claim) {
+        validateClaim(claim);
+        return await this.withReclaimLock(async (directoryFd) => {
+            const names = listAt(directoryFd);
+            const current = await inventory(directoryFd);
+            if (current.incompleteRecords.size > 0) {
+                throw new Error("Incomplete handoff residue blocks reclaim proof.");
+            }
+            return !names.includes(`${claim.rawIntakePublicId}${RECORD_SUFFIX}`) &&
+                !names.includes(`${claim.rawIntakePublicId}.jpg`) &&
+                !names.includes(`${claim.rawIntakePublicId}.png`) &&
+                !names.includes(`${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`);
+        }) ?? true;
+    }
+    /** Proof is obtained from Core outside the flock before *every* cleanup attempt. */
+    async reclaimVerified(claim, proveCoreCustody, deadlineAt) {
+        validateClaim(claim);
+        const intentName = `${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`;
+        const candidate = await this.withReclaimLock(async (directoryFd) => {
+            const names = listAt(directoryFd);
+            if (!names.includes(intentName))
+                return false;
+            const intent = await readIntentAt(directoryFd, intentName);
+            if (JSON.stringify(intent.claim) !== JSON.stringify(claim)) {
+                throw new Error("Reclaim identity conflicts with durable intent.");
+            }
+            return true;
+        }, deadlineAt);
+        if (candidate !== true)
+            return false;
+        if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+            throw new Error("Reclaim deadline exceeded before Core proof.");
+        }
+        if (!await proveCoreCustody(claim))
+            return false;
+        if (deadlineAt !== undefined && performance.now() >= deadlineAt) {
+            throw new Error("Reclaim deadline exceeded after Core proof.");
+        }
+        return await this.withReclaimLock(async (directoryFd, directoryIdentity) => {
+            const names = listAt(directoryFd);
+            if (!names.includes(intentName)) {
+                if (names.includes(`${claim.rawIntakePublicId}${RECORD_SUFFIX}`) ||
+                    names.some((name) => name === `${claim.rawIntakePublicId}.jpg` ||
+                        name === `${claim.rawIntakePublicId}.png`)) {
+                    throw new Error("Reclaim intent disappeared while its slot remains.");
+                }
+                return true; // Another process completed this verified reclaim.
+            }
+            const intentIdentity = await entryIdentityAtPinned(directoryFd, intentName);
+            const intent = await readIntentAt(directoryFd, intentName);
+            if (JSON.stringify(intent.claim) !== JSON.stringify(claim) ||
+                directoryIdentity.dev.toString() !== intent.directory_identity.dev ||
+                directoryIdentity.ino.toString() !== intent.directory_identity.ino) {
+                throw new Error("Reclaim ticket or directory identity changed.");
+            }
+            await this.verifyReclaimInventory(directoryFd, names, intent);
+            const payloadPresent = names.includes(intent.payload_basename);
+            const recordPresent = names.includes(intent.record_basename);
+            if (payloadPresent) {
+                const bytes = await readRegularAt(directoryFd, intent.payload_basename, 10_000_000);
+                if (sha256(bytes) !== intent.payload_sha256 ||
+                    !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.payload_basename), restoreIdentity(intent.payload_identity))) {
+                    throw new Error("Reclaim payload identity changed.");
+                }
+            }
+            if (recordPresent) {
+                const bytes = await readRegularAt(directoryFd, intent.record_basename, 4_096);
+                if (sha256(bytes) !== intent.record_sha256 ||
+                    !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.record_basename), restoreIdentity(intent.record_identity))) {
+                    throw new Error("Reclaim record identity changed.");
+                }
+            }
+            if (payloadPresent) {
+                unlinkAtIfIdentity(directoryFd, intent.payload_basename, restoreIdentity(intent.payload_identity));
+                await this.options.hook?.("after-reclaim-payload-unlink");
+                await syncDescriptor(directoryFd);
+                await this.options.hook?.("after-reclaim-payload-fsync");
+                await this.verifyReclaimInventory(directoryFd, listAt(directoryFd), intent);
+            }
+            if (recordPresent) {
+                unlinkAtIfIdentity(directoryFd, intent.record_basename, restoreIdentity(intent.record_identity));
+                await this.options.hook?.("after-reclaim-record-unlink");
+                await syncDescriptor(directoryFd);
+                await this.options.hook?.("after-reclaim-record-fsync");
+                await this.verifyReclaimInventory(directoryFd, listAt(directoryFd), intent);
+            }
+            unlinkAtIfIdentity(directoryFd, intentName, intentIdentity);
+            await this.options.hook?.("after-reclaim-intent-unlink");
+            await syncDescriptor(directoryFd);
+            await this.options.hook?.("after-reclaim-intent-fsync");
+            return true;
+        }, deadlineAt) ?? false;
+    }
+    async verifyReclaimInventory(directoryFd, names, target) {
+        const nameSet = new Set(names);
+        const directoryIdentity = await descriptorIdentity(directoryFd);
+        if (names.includes(HANDOFF_PENDING_RECORD) || names.includes(HANDOFF_PENDING_PAYLOAD)) {
+            throw new Error("Unresolved handoff pending residue blocks reclaim.");
+        }
+        const records = new Map();
+        const intents = new Map();
+        const payloads = new Set();
+        for (const name of names) {
+            if (name === LOCK_BASENAME || name.endsWith(RECLAIM_SUFFIX) &&
+                /^raw_intake_bridge_[0-9a-f]{32}\.reclaim\.json$/u.test(name) ||
+                /^raw_intake_bridge_[0-9a-f]{32}\.handoff\.json$/u.test(name) ||
+                /^raw_intake_bridge_[0-9a-f]{32}\.(?:jpg|png)$/u.test(name)) {
+                if (name.endsWith(RECORD_SUFFIX)) {
+                    const record = parseRecord(await readRegularAt(directoryFd, name, 4_096));
+                    if (name !== `${record.raw_intake_public_id}${RECORD_SUFFIX}`) {
+                        throw new Error("Handoff record filename mismatch.");
+                    }
+                    records.set(record.raw_intake_public_id, record);
+                }
+                else if (name.endsWith(RECLAIM_SUFFIX)) {
+                    const intent = await readIntentAt(directoryFd, name);
+                    if (name !== `${intent.claim.rawIntakePublicId}${RECLAIM_SUFFIX}`) {
+                        throw new Error("Reclaim intent filename mismatch.");
+                    }
+                    intents.set(intent.claim.rawIntakePublicId, intent);
+                }
+                else if (name !== LOCK_BASENAME)
+                    payloads.add(name);
+                continue;
+            }
+            throw new Error("Handoff tree contains an unknown reclaim residue.");
+        }
+        if (intents.get(target.claim.rawIntakePublicId) === undefined) {
+            throw new Error("Reclaim target intent disappeared.");
+        }
+        for (const [id, record] of records) {
+            const intent = intents.get(id);
+            if (payloads.has(record.payload_basename)) {
+                const bytes = await readRegularAt(directoryFd, record.payload_basename, 10_000_000);
+                if (bytes.length !== record.byte_size || sha256(bytes) !== record.content_hash) {
+                    throw new Error("Handoff payload does not match its slot record.");
+                }
+            }
+            else if (intent === undefined) {
+                throw new Error("Unexplained incomplete handoff slot blocks reclaim.");
+            }
+            if (intent !== undefined &&
+                (intent.record_basename !== `${id}${RECORD_SUFFIX}` ||
+                    intent.payload_basename !== record.payload_basename ||
+                    intent.claim.canonicalKeyHash !== record.canonical_key_hash ||
+                    intent.claim.attachmentContentHash !== record.content_hash)) {
+                throw new Error("Reclaim intent conflicts with its slot record.");
+            }
+        }
+        for (const payload of payloads) {
+            if (![...records.values()].some((record) => record.payload_basename === payload)) {
+                throw new Error("Unknown orphan payload blocks reclaim.");
+            }
+        }
+        for (const [id, intent] of intents) {
+            if (intent.directory_identity.dev !== directoryIdentity.dev.toString() ||
+                intent.directory_identity.ino !== directoryIdentity.ino.toString()) {
+                throw new Error("Reclaim directory evidence changed.");
+            }
+            if (!records.has(id) && payloads.has(intent.payload_basename)) {
+                throw new Error("Reclaim payload has no pinned record.");
+            }
+            if (records.has(id)) {
+                const recordBytes = await readRegularAt(directoryFd, intent.record_basename, 4_096);
+                if (sha256(recordBytes) !== intent.record_sha256 ||
+                    !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.record_basename), restoreIdentity(intent.record_identity))) {
+                    throw new Error("Reclaim record evidence changed.");
+                }
+            }
+            if (payloads.has(intent.payload_basename)) {
+                const payloadBytes = await readRegularAt(directoryFd, intent.payload_basename, 10_000_000);
+                if (sha256(payloadBytes) !== intent.payload_sha256 ||
+                    !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.payload_basename), restoreIdentity(intent.payload_identity))) {
+                    throw new Error("Reclaim payload evidence changed.");
+                }
+            }
+        }
+        const payload = nameSet.has(target.payload_basename);
+        const record = nameSet.has(target.record_basename);
+        // Only P+R+I, R+I, and I are valid crash states. A payload with no record
+        // is not one of them, even when an intent survived.
+        if (payload && !record)
+            throw new Error("Reclaim payload has no pinned record.");
+    }
     async publish(canonicalKey, rawIntakePublicId, media) {
         return await this.withPublished(canonicalKey, rawIntakePublicId, media, async (published) => published);
     }
-    async withRetained(canonicalKey, rawIntakePublicId, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS) {
+    async withRetained(canonicalKey, rawIntakePublicId, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, reclaimClaim) {
         if (!PUBLIC_ID.test(rawIntakePublicId) ||
             captureIdentities(canonicalKey).rawIntakePublicId !== rawIntakePublicId) {
             throw new Error("Handoff replay identity is invalid.");
@@ -441,11 +874,30 @@ export class HandoffPublisher {
                     await this.options.hook?.("before-callback");
                     await requireLockIdentity(directoryFd, lockFd, lockIdentity);
                     await requireCallbackBoundary(directoryFd, published, payloadFd, payloadIdentity, recordIdentity, expectedNames);
-                    const result = await callback(published, payloadFd, media);
+                    let result;
+                    let callbackError;
+                    let callbackFailed = false;
+                    try {
+                        result = await callback(published, payloadFd, media);
+                    }
+                    catch (error) {
+                        callbackError = error;
+                        callbackFailed = true;
+                    }
                     await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
                     await requireLockIdentity(directoryFd, lockFd, lockIdentity);
                     await requireCallbackBoundary(directoryFd, published, payloadFd, payloadIdentity, recordIdentity, expectedNames);
                     await requireDirectoryPathIdentity(handoffPath, directoryStatus);
+                    if (reclaimClaim !== undefined) {
+                        if (reclaimClaim.rawIntakePublicId !== rawIntakePublicId ||
+                            reclaimClaim.canonicalKeyHash !== sha256(canonicalKey) ||
+                            reclaimClaim.attachmentContentHash !== media.contentHash) {
+                            throw new Error("Retained reclaim claim does not match its slot.");
+                        }
+                        await sealReclaimIntent(directoryFd, reclaimClaim, recordName, published.handoffFilename, recordIdentity, payloadIdentity);
+                    }
+                    if (callbackFailed)
+                        throw callbackError;
                     return result;
                 }
                 finally {
@@ -487,7 +939,7 @@ export class HandoffPublisher {
             await closeDescriptor(directoryFd);
         }
     }
-    async withPublished(canonicalKey, rawIntakePublicId, media, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS) {
+    async withPublished(canonicalKey, rawIntakePublicId, media, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, reclaimClaim) {
         try {
             if (!PUBLIC_ID.test(rawIntakePublicId) || media.byteSize !== media.bytes.byteLength ||
                 captureIdentities(canonicalKey).rawIntakePublicId !== rawIntakePublicId ||
@@ -536,11 +988,30 @@ export class HandoffPublisher {
                         await this.options.hook?.("before-callback");
                         await requireLockIdentity(directoryFd, lockFd, lockIdentity);
                         await requireCallbackBoundary(directoryFd, published, payloadFd, slot.payloadIdentity, slot.recordIdentity, expectedNames);
-                        const result = await callback(published, payloadFd);
+                        let result;
+                        let callbackError;
+                        let callbackFailed = false;
+                        try {
+                            result = await callback(published, payloadFd);
+                        }
+                        catch (error) {
+                            callbackError = error;
+                            callbackFailed = true;
+                        }
                         await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
                         await requireLockIdentity(directoryFd, lockFd, lockIdentity);
                         await requireCallbackBoundary(directoryFd, published, payloadFd, slot.payloadIdentity, slot.recordIdentity, expectedNames);
                         await requireDirectoryPathIdentity(handoffPath, directoryStatus);
+                        if (reclaimClaim !== undefined) {
+                            if (reclaimClaim.rawIntakePublicId !== rawIntakePublicId ||
+                                reclaimClaim.canonicalKeyHash !== sha256(canonicalKey) ||
+                                reclaimClaim.attachmentContentHash !== media.contentHash) {
+                                throw new Error("Published reclaim claim does not match its slot.");
+                            }
+                            await sealReclaimIntent(directoryFd, reclaimClaim, `${rawIntakePublicId}${RECORD_SUFFIX}`, published.handoffFilename, slot.recordIdentity, slot.payloadIdentity);
+                        }
+                        if (callbackFailed)
+                            throw callbackError;
                         return result;
                     }
                     finally {
