@@ -99,8 +99,15 @@ without declaring the plugin unhealthy. Under the handoff flock, only a replay
 of that trusted photo message with the same canonical key and exact original
 image bytes/hash may finish publication. Other photos and text are refused
 until it finishes. An orphan payload, corrupt pending bytes, or unknown residue
-remains fail closed;
-the Bridge never deletes or rebuilds a pending original to clear the slot.
+remains fail closed; the Bridge never deletes or rebuilds a pending original to
+clear the slot. Every photo adoption checks the same-key publication state
+under the flock and requires it to be clear after verified reclaim. Before a
+first pending write, the Bridge repeats authenticated Core discovery under the
+flock and probes the deterministic intake ID. A missing intake permits first
+publication. An existing partial photo intake without a job permits only an
+exact local-slot replay; Core checks the stored caption, source and original
+bytes. Query errors, incomplete identity, and existing intake without a local
+slot block publication.
 Unknown residue, altered image/record evidence, or unavailable Core proof
 blocks cleanup and adoption. A crash after Core commit but before intent
 creation depends on host spool replay to reseal that slot. Older slots with
@@ -117,15 +124,17 @@ receipt.
 The capture path admits up to eight concurrent operations and does not wait for
 the old controller's OCR/AI queue. On pressure, startup failure, Core outage,
 identity conflict, or uncertain status, it returns `handled=false` with no
-adoption. A missing original returns the host's matching
-`finance-ingress-refusal-v1` / `reupload_required` only when Core says the intake
-does not exist or the matching job's original is missing. The host persists that
-refusal as quarantine and asks for reupload. No Bridge outbound posting or
-runtime activation is included in this contract.
+adoption. If the original image is unavailable, the Bridge returns
+`handled=false` without `reupload_required`: a missing job does not prove no
+older intake or financial action exists, and a job whose original is missing
+does not prove its downstream facts are absent. The Host retains the update for
+review without claiming that a new upload can safely replace it. No Bridge
+outbound posting or runtime activation is included in this contract.
 
 Validation uses synthetic temporary Core workspaces and fake host events,
 including 40 distinct JPEG/PNG updates, restart and response loss, each
-reclaim unlink/fsync stage, a tampered Core original, and a separate-process
+reclaim unlink/fsync stage, partial-intake replay, two-instance stale discovery,
+pending publication recovery, a tampered Core original, and a separate-process
 handoff lock. The CI Bridge matrix runs it on Ubuntu and macOS. The tested
 recovery scope is process crash/restart with the documented fsync calls and
 cooperating processes. It does not claim arbitrary power-loss durability or

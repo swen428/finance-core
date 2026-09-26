@@ -371,6 +371,14 @@ test("registered plugin starts with a pending photo and resumes only its trusted
             source_identity_sha256: "c".repeat(64),
           } });
         }
+        if (request.command === "get_status" && request.arguments.intake_public_id === intakeId &&
+            storedIngress === undefined) {
+          return {
+            envelopeVersion: "v1", requestId: request.request_id,
+            operationId: "op_0123456789abcdef0123456789abcdef", status: "error",
+            error: { code: "INTAKE_NOT_FOUND", message: "Synthetic intake has not been captured.", retryable: false },
+          };
+        }
         if (request.command === "capture") {
           captureCalls += 1;
           storedIngress = request.arguments.finance_ingress as JsonObject;

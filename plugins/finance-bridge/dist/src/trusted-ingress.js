@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { HandoffPublicationRefused } from "./handoff.js";
 import { canonicalCaptureKey, captureIdentities, createBridgeRequest } from "./protocol.js";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const INTAKE_ID = /^(?:raw_intake_bridge_[0-9a-f]{32}|raw_intake_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/u;
@@ -295,10 +296,6 @@ export class TrustedIngressCapture {
                     }
                     return { adoption };
                 }
-                if (turn.photo && response.result.capture_attachment_integrity === "missing" &&
-                    checkedStatus({ ...response.result, capture_attachment_integrity: "verified" }, turn, jobId)) {
-                    return { reupload: true };
-                }
                 return {};
             };
             const discover = async () => {
@@ -331,17 +328,61 @@ export class TrustedIngressCapture {
                 (turn.photo !== true || pendingKeyHash !== createHash("sha256").update(key).digest("hex"))) {
                 return { handled: false };
             }
+            const allowPhotoPublication = async (hasLocalSlot) => {
+                try {
+                    const fresh = await discover();
+                    if (fresh.found) {
+                        if (!hasLocalSlot || fresh.jobId !== photoClaim().jobPublicId)
+                            return false;
+                        const verified = await status(fresh.jobId);
+                        return verified.adoption?.intakeId === photoClaim().rawIntakePublicId;
+                    }
+                    const intakeResponse = await this.runner.run(createBridgeRequest("get_status", {
+                        workspace_path: this.workspaceRoot,
+                        intake_public_id: photoClaim().rawIntakePublicId,
+                    }), COMMAND_DEADLINE_MS);
+                    if (intakeResponse.status === "error") {
+                        return intakeResponse.error.code === "INTAKE_NOT_FOUND";
+                    }
+                    // Core commits the raw photo intake before its original evidence and
+                    // capture job. An exact local slot can replay that partial intake;
+                    // Core then verifies the persisted caption, source and image bytes.
+                    const prior = intakeResponse.result;
+                    return hasLocalSlot && prior.identity_kind === "intake" &&
+                        prior.intake_public_id === photoClaim().rawIntakePublicId &&
+                        prior.source_type === "telegram_image" &&
+                        prior.capture_job === null &&
+                        prior.final_transaction_created === false;
+                }
+                catch {
+                    return false;
+                }
+            };
             const adoptPhoto = async (adoption) => {
                 const claim = photoClaim();
                 if (adoption.jobId !== claim.jobPublicId || adoption.intakeId !== claim.rawIntakePublicId) {
                     return { handled: false };
                 }
-                if (!await this.handoff.isReclaimed(claim)) {
+                let state = await this.handoff.claimState(claim);
+                if (state === "incomplete") {
+                    if (turn.ingress.attachmentUnavailable === true || event.metadata === undefined) {
+                        return { handled: false };
+                    }
+                    const media = await this.media.acquireTrustedInbound(event.metadata, COMMAND_DEADLINE_MS);
+                    if (media.contentHash !== claim.attachmentContentHash)
+                        return { handled: false };
+                    await this.handoff.withPublished(key, claim.rawIntakePublicId, media, async () => adoption.jobId, COMMAND_DEADLINE_MS, claim, allowPhotoPublication);
+                    state = await this.handoff.claimState(claim);
+                }
+                if (state === "retained") {
                     await this.handoff.prepareRetainedReclaim(key, claim);
+                }
+                if (state === "retained" || state === "reclaiming") {
                     if (!await this.handoff.reclaimVerified(claim, async (candidate) => await this.verifyCoreCustody(candidate)))
                         return { handled: false };
                 }
-                return { handled: true, adoption };
+                return await this.handoff.claimState(claim) === "clear"
+                    ? { handled: true, adoption } : { handled: false };
             };
             const found = await discover();
             if (found.found && found.jobId !== undefined) {
@@ -350,22 +391,10 @@ export class TrustedIngressCapture {
                     return turn.photo
                         ? await adoptPhoto(existing.adoption)
                         : { handled: true, adoption: existing.adoption };
-                if (turn.ingress.attachmentUnavailable === true && existing.reupload === true) {
-                    return { handled: false, financeIngressRefusal: {
-                            ...turn.ingress, schema: "finance-ingress-refusal-v1", kind: "reupload_required",
-                        } };
-                }
                 return { handled: false };
             }
             if (turn.ingress.attachmentUnavailable === true) {
-                return {
-                    handled: false,
-                    financeIngressRefusal: {
-                        ...turn.ingress,
-                        schema: "finance-ingress-refusal-v1",
-                        kind: "reupload_required",
-                    },
-                };
+                return { handled: false };
             }
             let capturedJobId;
             if (turn.photo) {
@@ -416,9 +445,11 @@ export class TrustedIngressCapture {
                             return undefined;
                         }
                         return job.public_id;
-                    }, COMMAND_DEADLINE_MS, photoClaim());
+                    }, COMMAND_DEADLINE_MS, photoClaim(), allowPhotoPublication);
                 }
-                catch {
+                catch (error) {
+                    if (error instanceof HandoffPublicationRefused)
+                        return { handled: false };
                     // A lost response may follow a durable Core commit. Only a matching read can adopt it.
                     const recoveredId = await discover();
                     if (recoveredId.jobId === undefined)

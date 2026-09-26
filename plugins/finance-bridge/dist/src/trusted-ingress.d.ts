@@ -1,6 +1,6 @@
 import type { PluginHookInboundClaimContext, PluginHookInboundClaimEvent, PluginHookInboundClaimResult } from "openclaw-sdk/plugin-sdk/plugin-entry";
 import type { BridgeRunner } from "./controller.js";
-import type { HandoffPublisher } from "./handoff.js";
+import { type HandoffPublisher } from "./handoff.js";
 import type { ReceiptMediaAdapter } from "./media.js";
 /** These fields are copied from the pinned host contract; SDK packages may lag the pinned host. */
 export interface TrustedFinanceIngress {

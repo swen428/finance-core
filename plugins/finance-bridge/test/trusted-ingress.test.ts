@@ -8,7 +8,7 @@ import type {
 } from "openclaw-sdk/plugin-sdk/plugin-entry";
 
 import type { BridgeRunner } from "../src/controller.js";
-import type { HandoffPublisher } from "../src/handoff.js";
+import { HandoffPublicationRefused, type HandoffPublisher } from "../src/handoff.js";
 import type { ReceiptMediaAdapter, ValidatedMedia } from "../src/media.js";
 import { canonicalCaptureKey, captureIdentities, type BridgeRequest, type BridgeResponse, type JsonObject } from "../src/protocol.js";
 import { photoIntakeFingerprint, TrustedIngressCapture, type TrustedFinanceIngress } from "../src/trusted-ingress.js";
@@ -78,6 +78,12 @@ class FakeCore implements BridgeRunner {
   routeMalformed = false;
   routeUnavailable = false;
   statusRawCaption?: string;
+  finalTransactionCreated = false;
+  discoveryWrongIdentity = false;
+  failSecondDiscovery = false;
+  intakeProbe: "missing" | "existing" | "partial" | "error" | "malformed" = "missing";
+  historicalIntakeWithoutJob = false;
+  private discoveryCalls = 0;
   readonly intakeByMessage = new Map<string, string>();
 
   private jobId(intakeId: string): string {
@@ -88,10 +94,12 @@ class FakeCore implements BridgeRunner {
     this.calls.push(request);
     if (!this.available) throw new Error("Core unavailable");
     if (request.command === "get_capture_job_for_message") {
+      this.discoveryCalls += 1;
+      if (this.failSecondDiscovery && this.discoveryCalls >= 2) throw new Error("Core discovery unavailable");
       const messageId = String(request.arguments.telegram_message_id);
       const intakeId = this.intakeByMessage.get(messageId);
-      return success(request, { candidate: intakeId === undefined ? null : {
-        job_public_id: this.jobId(intakeId), telegram_message_id: messageId,
+      return success(request, { candidate: intakeId === undefined || this.historicalIntakeWithoutJob ? null : {
+        job_public_id: this.jobId(intakeId), telegram_message_id: this.discoveryWrongIdentity ? "999" : messageId,
         source_identity_sha256: "c".repeat(64),
       } });
     }
@@ -120,13 +128,28 @@ class FakeCore implements BridgeRunner {
       });
     }
     if (request.command === "get_status") {
+      if (request.arguments.intake_public_id !== undefined) {
+        if (this.intakeProbe === "existing") return success(request, {
+          identity_kind: "intake", intake_public_id: request.arguments.intake_public_id,
+          source_type: "telegram_image",
+          capture_job: null, final_transaction_created: true,
+        });
+        if (this.intakeProbe === "partial") return success(request, {
+          identity_kind: "intake", intake_public_id: request.arguments.intake_public_id,
+          source_type: "telegram_image", capture_job: null, final_transaction_created: false,
+        });
+        if (this.intakeProbe === "error") throw new Error("Core status unavailable");
+        if (this.intakeProbe === "malformed") return success(request, { capture_job: null });
+        return missing(request);
+      }
       const jobId = request.arguments.job_public_id as string;
       const intakeId = [...this.stored.keys()].find((id) => this.jobId(id) === jobId);
       if (intakeId === undefined) return missing(request);
       const item = this.stored.get(intakeId);
       if (item === undefined) return missing(request);
       return success(request, {
-        identity_kind: "intake", intake_public_id: intakeId, final_transaction_created: false,
+        identity_kind: "intake", intake_public_id: intakeId,
+        final_transaction_created: this.finalTransactionCreated,
         capture_attachment_integrity: item.attachment === null ? null :
           this.originalAvailable ? "verified" : "missing",
         capture_job: {
@@ -223,6 +246,7 @@ function capture(core: FakeCore, options: {
   const handoff = {
     pendingReclaims: async () => [],
     pendingPublicationKeyHash: async () => undefined,
+    claimState: async () => retained ? "retained" : "clear",
     isReclaimed: async () => !retained,
     prepareRetainedReclaim: async () => retained,
     reclaimVerified: async (_claim: unknown, prove: (claim: never) => Promise<boolean>) => {
@@ -232,7 +256,11 @@ function capture(core: FakeCore, options: {
       return true;
     },
     withPublished: async (_key: string, _intake: string, _media: ValidatedMedia,
-      callback: (published: { handoffFilename: string }, fd: number) => Promise<unknown>) => {
+      callback: (published: { handoffFilename: string }, fd: number) => Promise<unknown>,
+      _timeout: number, _claim: unknown, beforePublication?: (hasLocalSlot: boolean) => Promise<boolean>) => {
+      if (beforePublication !== undefined && !await beforePublication(retained)) {
+        throw new HandoffPublicationRefused("Core refused publication");
+      }
       if (options.meter) options.meter.publish += 1;
       retained = true;
       return await callback({ handoffFilename: "original.jpg" }, 3);
@@ -298,7 +326,8 @@ for (const image of [jpeg, png]) {
     assert.equal(result.adoption?.attachmentStatus, "stored");
     assert.equal(result.adoption?.attachmentSha256, ingress.attachmentSha256);
     assert.deepEqual(core.calls.map((call) => call.command), [
-      "get_capture_job_for_message", "capture", "get_status", "get_status",
+      "get_capture_job_for_message", "get_capture_job_for_message", "get_status",
+      "capture", "get_status", "get_status",
     ]);
   });
 }
@@ -332,7 +361,8 @@ test("control caption photo is refused by Core without adoption or inline proces
   assert.deepEqual(result, { handled: false });
   assert.equal(core.stored.size, 0);
   assert.deepEqual(core.calls.map((call) => call.command), [
-    "get_capture_job_for_message", "capture", "get_capture_job_for_message",
+    "get_capture_job_for_message", "get_capture_job_for_message", "get_status",
+    "capture", "get_capture_job_for_message",
   ]);
 });
 
@@ -409,14 +439,48 @@ test("trusted photo reader is unreachable without host ingress and refuses attac
   assert.equal(core.calls.length, 1); // authenticated discovery only
 });
 
-test("missing photo without prior Core custody returns typed reupload refusal", async () => {
+test("missing photo without prior Core custody remains unacknowledged without reupload claim", async () => {
   const core = new FakeCore();
   const { event, context } = turn({ image: jpeg, unavailable: true });
   const result = await capture(core).handle(event, context);
   assert.equal(result.handled, false);
-  assert.equal(result.financeIngressRefusal?.kind, "reupload_required");
+  assert.equal(result.financeIngressRefusal, undefined);
   assert.equal(result.adoption, undefined);
   assert.deepEqual(core.calls.map((call) => call.command), ["get_capture_job_for_message"]);
+});
+
+test("historical intake without a job and missing original never claims reupload or creates facts", async () => {
+  const core = new FakeCore();
+  core.historicalIntakeWithoutJob = true;
+  core.intakeProbe = "existing";
+  const old = turn({ image: jpeg, unavailable: true, messageId: "85" });
+  assert.deepEqual(await capture(core).handle(old.event, old.context), { handled: false });
+  assert.deepEqual(core.calls.map((call) => call.command), ["get_capture_job_for_message"]);
+  assert.equal(core.calls.filter((call) => call.command === "capture").length, 0);
+});
+
+for (const probe of ["existing", "partial", "error", "malformed"] as const) {
+  test(`photo first publication refuses Core intake probe ${probe} before any pending write`, async () => {
+    const core = new FakeCore();
+    core.intakeProbe = probe;
+    const meter = { acquire: 0, publish: 0 };
+    const input = turn({ image: jpeg, messageId: "86" });
+    assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(input.event, input.context),
+      { handled: false });
+    assert.deepEqual(meter, { acquire: 1, publish: 0 });
+    assert.equal(core.calls.filter((call) => call.command === "capture").length, 0);
+  });
+}
+
+test("lock-held Core discovery failure refuses before the first pending write", async () => {
+  const core = new FakeCore();
+  core.failSecondDiscovery = true;
+  const meter = { acquire: 0, publish: 0 };
+  const input = turn({ image: jpeg, messageId: "87" });
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(input.event, input.context),
+    { handled: false });
+  assert.deepEqual(meter, { acquire: 1, publish: 0 });
+  assert.equal(core.calls.filter((call) => call.command === "capture").length, 0);
 });
 
 test("missing replay photo can adopt only an existing verified original", async () => {
@@ -453,7 +517,7 @@ test("concurrent duplicate photo waits for one capture and never downloads or wr
   assert.deepEqual(meter, { acquire: 1, publish: 1 });
 });
 
-test("persisted photo with lost original returns reupload refusal", async () => {
+test("persisted photo with lost original remains unacknowledged without reupload claim", async () => {
   const core = new FakeCore();
   const first = turn({ image: jpeg });
   await capture(core, { image: jpeg }).handle(first.event, first.context);
@@ -461,8 +525,31 @@ test("persisted photo with lost original returns reupload refusal", async () => 
   const replay = turn({ image: jpeg, unavailable: true });
   const result = await capture(core).handle(replay.event, replay.context);
   assert.equal(result.handled, false);
-  assert.equal(result.financeIngressRefusal?.kind, "reupload_required");
+  assert.equal(result.financeIngressRefusal, undefined);
   assert.equal(result.adoption, undefined);
+});
+
+for (const booked of [false, true]) {
+  test(`persisted ${booked ? "booked or corrected" : "captured"} photo with missing original has no reupload refusal`, async () => {
+    const core = new FakeCore();
+    const first = turn({ image: jpeg, messageId: booked ? "89" : "88" });
+    await capture(core, { image: jpeg }).handle(first.event, first.context);
+    core.originalAvailable = false;
+    core.finalTransactionCreated = booked;
+    const replay = turn({ image: jpeg, unavailable: true, messageId: first.event.messageId });
+    assert.deepEqual(await capture(core).handle(replay.event, replay.context), { handled: false });
+    assert.equal(core.calls.filter((call) => call.command === "capture").length, 1);
+  });
+}
+
+test("wrong Core discovery binding with missing original refuses without a reupload claim", async () => {
+  const core = new FakeCore();
+  const first = turn({ image: jpeg, messageId: "90" });
+  await capture(core, { image: jpeg }).handle(first.event, first.context);
+  core.discoveryWrongIdentity = true;
+  const replay = turn({ image: jpeg, unavailable: true, messageId: "90" });
+  assert.deepEqual(await capture(core).handle(replay.event, replay.context), { handled: false });
+  assert.equal(core.calls.filter((call) => call.command === "capture").length, 1);
 });
 
 test("Core outage and forged digest never produce adoption or reupload refusal", async () => {
@@ -491,7 +578,8 @@ test("lost Core response is recovered by read only status after durable commit",
   const result = await capture(core, { image: jpeg }).handle(event, context);
   assert.equal(result.adoption?.attachmentStatus, "stored");
   assert.deepEqual(core.calls.map((call) => call.command), [
-    "get_capture_job_for_message", "capture", "get_capture_job_for_message", "get_status", "get_status",
+    "get_capture_job_for_message", "get_capture_job_for_message", "get_status",
+    "capture", "get_capture_job_for_message", "get_status", "get_status",
   ]);
 });
 

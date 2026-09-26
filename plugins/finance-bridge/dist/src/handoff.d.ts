@@ -12,6 +12,10 @@ export interface ReclaimClaim {
     attachmentContentHash: string;
     intakeFingerprint: string;
 }
+export type HandoffClaimState = "clear" | "incomplete" | "retained" | "reclaiming";
+/** Core evidence changed while an inbound photo was waiting for the publication flock. */
+export declare class HandoffPublicationRefused extends Error {
+}
 export interface PublishedHandoff {
     handoffFilename: string;
     recordPath: string;
@@ -37,12 +41,14 @@ export declare class HandoffPublisher {
     /** A host replay can seal an older retained slot after Core commit lost its response. */
     prepareRetainedReclaim(canonicalKey: string, claim: ReclaimClaim): Promise<boolean>;
     isReclaimed(claim: ReclaimClaim): Promise<boolean>;
+    /** One flock snapshot covers pending names, the final record, payload and intent. */
+    claimState(claim: ReclaimClaim): Promise<HandoffClaimState>;
     /** Proof is obtained from Core outside the flock before *every* cleanup attempt. */
     reclaimVerified(claim: ReclaimClaim, proveCoreCustody: (claim: ReclaimClaim) => Promise<boolean>, deadlineAt?: number): Promise<boolean>;
     private verifyReclaimInventory;
     publish(canonicalKey: string, rawIntakePublicId: string, media: ValidatedMedia): Promise<PublishedHandoff>;
     withRetained<T>(canonicalKey: string, rawIntakePublicId: string, callback: (published: PublishedHandoff, payloadFd: number, media: ValidatedMedia) => Promise<T>, lockTimeoutMs?: number, reclaimClaim?: ReclaimClaim): Promise<T | undefined>;
-    withPublished<T>(canonicalKey: string, rawIntakePublicId: string, media: ValidatedMedia, callback: (published: PublishedHandoff, payloadFd: number) => Promise<T>, lockTimeoutMs?: number, reclaimClaim?: ReclaimClaim): Promise<T>;
+    withPublished<T>(canonicalKey: string, rawIntakePublicId: string, media: ValidatedMedia, callback: (published: PublishedHandoff, payloadFd: number) => Promise<T>, lockTimeoutMs?: number, reclaimClaim?: ReclaimClaim, beforePublication?: (hasLocalSlot: boolean) => Promise<boolean>): Promise<T>;
     private publishLocked;
 }
 export {};

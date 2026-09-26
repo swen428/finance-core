@@ -15,6 +15,9 @@ const MAX_TREE_BYTES = 321_000_000;
 const FREE_SPACE_RESERVE = 16 * 1024 * 1024;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const PUBLIC_ID = /^raw_intake_bridge_[0-9a-f]{32}$/u;
+/** Core evidence changed while an inbound photo was waiting for the publication flock. */
+export class HandoffPublicationRefused extends Error {
+}
 async function verifyPublishedHandoff(directoryFd, published, media, canonicalKey) {
     const payload = await readRegularAt(directoryFd, published.handoffFilename, 10_000_000);
     if (payload.byteLength !== media.byteSize || sha256(payload) !== media.contentHash) {
@@ -655,18 +658,44 @@ export class HandoffPublisher {
         return found;
     }
     async isReclaimed(claim) {
+        return await this.claimState(claim) === "clear";
+    }
+    /** One flock snapshot covers pending names, the final record, payload and intent. */
+    async claimState(claim) {
         validateClaim(claim);
-        return await this.withReclaimLock(async (directoryFd) => {
+        const state = await this.withReclaimLock(async (directoryFd) => {
             const names = listAt(directoryFd);
-            const current = await inventory(directoryFd);
-            if (current.incompleteRecords.size > 0) {
-                throw new Error("Incomplete handoff residue blocks reclaim proof.");
+            const pendingKeyHash = await pendingPublication(directoryFd);
+            if (pendingKeyHash !== undefined && pendingKeyHash !== claim.canonicalKeyHash) {
+                throw new Error("Foreign pending publication blocks reclaim proof.");
             }
-            return !names.includes(`${claim.rawIntakePublicId}${RECORD_SUFFIX}`) &&
-                !names.includes(`${claim.rawIntakePublicId}.jpg`) &&
-                !names.includes(`${claim.rawIntakePublicId}.png`) &&
-                !names.includes(`${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`);
-        }) ?? true;
+            const recordName = `${claim.rawIntakePublicId}${RECORD_SUFFIX}`;
+            if (names.includes(recordName)) {
+                const record = parseRecord(await readRegularAt(directoryFd, recordName, 4_096));
+                if (record.canonical_key_hash !== claim.canonicalKeyHash ||
+                    record.content_hash !== claim.attachmentContentHash) {
+                    throw new Error("Handoff claim conflicts with its record.");
+                }
+            }
+            if (pendingKeyHash !== undefined)
+                return "incomplete";
+            if (names.includes(`${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`))
+                return "reclaiming";
+            if (names.includes(recordName) &&
+                !names.some((name) => name === `${claim.rawIntakePublicId}.jpg` ||
+                    name === `${claim.rawIntakePublicId}.png`) &&
+                !names.includes(`${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`)) {
+                return "incomplete";
+            }
+            return names.includes(recordName) ||
+                names.some((name) => name === `${claim.rawIntakePublicId}.jpg` ||
+                    name === `${claim.rawIntakePublicId}.png`) ||
+                names.includes(`${claim.rawIntakePublicId}${RECLAIM_SUFFIX}`)
+                ? "retained" : "clear";
+        });
+        if (state === undefined)
+            throw new Error("Handoff directory is unavailable for reclaim proof.");
+        return state;
     }
     /** Proof is obtained from Core outside the flock before *every* cleanup attempt. */
     async reclaimVerified(claim, proveCoreCustody, deadlineAt) {
@@ -695,6 +724,9 @@ export class HandoffPublisher {
         return await this.withReclaimLock(async (directoryFd, directoryIdentity) => {
             const names = listAt(directoryFd);
             if (!names.includes(intentName)) {
+                if (await pendingPublication(directoryFd) !== undefined) {
+                    throw new Error("Pending publication blocks completed reclaim proof.");
+                }
                 if (names.includes(`${claim.rawIntakePublicId}${RECORD_SUFFIX}`) ||
                     names.some((name) => name === `${claim.rawIntakePublicId}.jpg` ||
                         name === `${claim.rawIntakePublicId}.png`)) {
@@ -998,7 +1030,7 @@ export class HandoffPublisher {
             await closeDescriptor(directoryFd);
         }
     }
-    async withPublished(canonicalKey, rawIntakePublicId, media, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, reclaimClaim) {
+    async withPublished(canonicalKey, rawIntakePublicId, media, callback, lockTimeoutMs = this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS, reclaimClaim, beforePublication) {
         try {
             if (!PUBLIC_ID.test(rawIntakePublicId) || media.byteSize !== media.bytes.byteLength ||
                 captureIdentities(canonicalKey).rawIntakePublicId !== rawIntakePublicId ||
@@ -1031,6 +1063,18 @@ export class HandoffPublisher {
                 await this.options.hook?.("after-lock");
                 try {
                     await requireDirectoryPathIdentity(handoffPath, directoryStatus);
+                    if (beforePublication !== undefined) {
+                        const names = listAt(directoryFd);
+                        const pendingKeyHash = await pendingPublication(directoryFd);
+                        if (pendingKeyHash !== undefined && pendingKeyHash !== sha256(canonicalKey)) {
+                            throw new Error("Foreign pending publication blocks capture.");
+                        }
+                        const hasLocalSlot = pendingKeyHash !== undefined ||
+                            names.includes(`${rawIntakePublicId}${RECORD_SUFFIX}`);
+                        if (!await beforePublication(hasLocalSlot)) {
+                            throw new HandoffPublicationRefused("Core could not authorize photo publication.");
+                        }
+                    }
                     const slot = await this.publishLocked(directoryFd, handoffPath, canonicalKey, rawIntakePublicId, media);
                     const { published } = slot;
                     await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
@@ -1106,7 +1150,8 @@ export class HandoffPublisher {
             }
         }
         catch (error) {
-            this.options.markUnhealthy?.();
+            if (!(error instanceof HandoffPublicationRefused))
+                this.options.markUnhealthy?.();
             throw error;
         }
     }

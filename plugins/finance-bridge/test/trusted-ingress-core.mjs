@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
+import { flock } from "fs-ext";
 
 import { HandoffPublisher } from "../dist/src/handoff.js";
 import { ReceiptMediaAdapter } from "../dist/src/media.js";
-import { createBridgeRequest } from "../dist/src/protocol.js";
+import { canonicalCaptureKey, captureIdentities, createBridgeRequest } from "../dist/src/protocol.js";
 import { TrustedIngressCapture } from "../dist/src/trusted-ingress.js";
 
 const repositoryRoot = resolve(import.meta.dirname, "../../..");
@@ -143,6 +144,37 @@ function seedHistoricalText(input) {
   { cwd: repositoryRoot, env: environment, encoding: "utf8" });
   assert.equal(outcome.status, 0, outcome.stderr);
 }
+function seedPartialPhotoIntake(input) {
+  const key = canonicalCaptureKey("111", String(input.event.messageId));
+  const script = [
+    "import json, sys",
+    "from pathlib import Path",
+    "from openclaw_staging_bridge_support_v1 import BridgeWorkspace, open_database",
+    "from finance_core.intake.raw_text_repository import create_raw_intake_record, TELEGRAM_PHOTO_FINGERPRINT_VERSION",
+    "from finance_core.telegram_source_context import TelegramSourceContext, record_telegram_source_context",
+    "workspace_path, database_path, source_json = sys.argv[1:]",
+    "source = json.loads(source_json)",
+    "message_id = str(source['message_id'])",
+    "workspace = BridgeWorkspace(Path(workspace_path), Path(database_path))",
+    "with open_database(workspace) as conn:",
+    "    conn.execute('BEGIN IMMEDIATE')",
+    "    intake = create_raw_intake_record(conn, source['caption'], source_type='telegram_image', source_channel='telegram', source_metadata={'chat_id': '111', 'message_id': message_id, 'source_message_id': message_id, 'idempotency_key': 'raw-intake:telegram:111:' + message_id, 'handoff_filename': source['handoff_filename'], 'attachment_hash': source['attachment_hash'], 'telegram_update_id': str(source['update_id']), 'sender_id': '111'}, public_id=source['intake_id'], fingerprint_version=TELEGRAM_PHOTO_FINGERPRINT_VERSION)",
+    "    record_telegram_source_context(conn, raw_intake_record_id=int(intake['id']), context=TelegramSourceContext(authenticated_actor_id='111', account_id='finance', conversation_id='111', binding_id='bind-1', message_id=message_id), captured_at=str(intake['received_at']))",
+    "    conn.commit()",
+    "    assert conn.execute('SELECT count(*) FROM finance_capture_jobs WHERE raw_intake_record_id = ?', (int(intake['id']),)).fetchone()[0] == 0",
+  ].join("\n");
+  const source = {
+    message_id: Number(input.event.messageId), caption: input.event.content,
+    intake_id: captureIdentities(key).rawIntakePublicId,
+    handoff_filename: `${captureIdentities(key).rawIntakePublicId}.jpg`,
+    attachment_hash: input.event.financeIngress.attachmentSha256,
+    update_id: input.event.financeIngress.updateId,
+  };
+  const outcome = spawnSync(python, ["-c", script, workspace,
+    join(workspace, "database", "staging.sqlite"), JSON.stringify(source)],
+  { cwd: repositoryRoot, env: environment, encoding: "utf8" });
+  assert.equal(outcome.status, 0, outcome.stderr);
+}
 function bridge(handoff = new HandoffPublisher(workspace)) {
   return new TrustedIngressCapture(workspace, runner, media, handoff);
 }
@@ -197,6 +229,101 @@ try {
   assert.equal(lostReplay.adoption?.jobId, lost.adoption.jobId);
   const alteredAfterLoss = { ...lostInput.event, content: "changed after response loss" };
   assert.deepEqual(await bridge().handle(alteredAfterLoss, lostInput.context), { handled: false });
+
+  for (const [index, phase] of [
+    "after-record-fsync", "after-record-publish", "after-payload-fsync",
+  ].entries()) {
+    const messageId = 340 + index;
+    const input = turn(messageId, jpeg(140 + index), "receipt with committed Core job");
+    const first = await bridge().handle(input.event, input.context);
+    assert.equal(first.handled, true);
+    const key = canonicalCaptureKey("111", String(messageId));
+    const intakeId = first.adoption?.intakeId;
+    assert.ok(intakeId);
+    await assert.rejects(new HandoffPublisher(workspace, {
+      hook: (candidate) => { if (candidate === phase) throw new Error("synthetic prior-job crash"); },
+    }).publish(key, intakeId, {
+      bytes: jpeg(140 + index), byteSize: jpeg(140 + index).length,
+      contentHash: sha256(jpeg(140 + index)), detectedMimeType: "image/jpeg",
+      canonicalExtension: ".jpg",
+    }), /synthetic prior-job crash/u);
+    const recovered = await bridge().handle(input.event, input.context);
+    assert.equal(recovered.handled, true, `${phase}: ${JSON.stringify(recovered)}`);
+    await assertHandoffEmpty();
+  }
+
+  const raced = turn(350, jpeg(150), "raced receipt");
+  let releaseStaleDiscovery;
+  let signalStaleDiscovery;
+  const staleDiscoveryReached = new Promise((resolve) => { signalStaleDiscovery = resolve; });
+  const releaseStale = new Promise((resolve) => { releaseStaleDiscovery = resolve; });
+  let pauseDiscovery = true;
+  const staleRunner = {
+    async run(request, deadline, fd) {
+      const response = await runner.run(request, deadline, fd);
+      if (pauseDiscovery && request.command === "get_capture_job_for_message") {
+        pauseDiscovery = false;
+        assert.equal(response.result.candidate, null);
+        signalStaleDiscovery();
+        await releaseStale;
+      }
+      return response;
+    },
+  };
+  let stalePublishWrites = 0;
+  const staleHandoff = new HandoffPublisher(workspace, {
+    hook: (phase) => { if (phase === "after-record-fsync") stalePublishWrites += 1; },
+  });
+  const staleBridge = new TrustedIngressCapture(workspace, staleRunner, media, staleHandoff);
+  const firstRacer = staleBridge.handle(raced.event, raced.context);
+  await staleDiscoveryReached;
+  const secondRacer = await bridge().handle(raced.event, raced.context);
+  assert.equal(secondRacer.adoption?.attachmentStatus, "stored");
+  await assertHandoffEmpty();
+  const capturesAfterSecond = calls.filter((value) => value === "capture").length;
+  releaseStaleDiscovery();
+  assert.deepEqual(await firstRacer, { handled: false });
+  assert.equal(stalePublishWrites, 0);
+  assert.equal(calls.filter((value) => value === "capture").length, capturesAfterSecond);
+  await assertHandoffEmpty();
+  assert.equal((await bridge().handle(raced.event, raced.context)).adoption?.jobId,
+    secondRacer.adoption.jobId);
+  await assertHandoffEmpty();
+
+  const partial = turn(355, jpeg(155), "partial intake receipt");
+  const partialKey = canonicalCaptureKey("111", "355");
+  const partialIntakeId = captureIdentities(partialKey).rawIntakePublicId;
+  await new HandoffPublisher(workspace).publish(partialKey, partialIntakeId, {
+    bytes: jpeg(155), byteSize: jpeg(155).length, contentHash: sha256(jpeg(155)),
+    detectedMimeType: "image/jpeg", canonicalExtension: ".jpg",
+  });
+  seedPartialPhotoIntake(partial);
+  const intakeCountBeforePartialReplay = Object.keys(coreRawInputs()).length;
+  const partialStatus = await runner.run(createBridgeRequest("get_status", {
+    workspace_path: workspace, intake_public_id: partialIntakeId,
+  }));
+  assert.equal(partialStatus.status, "ok");
+  assert.equal(partialStatus.result.capture_job, null);
+  const partialRecovered = await bridge().handle(partial.event, partial.context);
+  assert.equal(partialRecovered.adoption?.intakeId, partialIntakeId,
+    JSON.stringify(partialRecovered));
+  await assertHandoffEmpty();
+  const raw = coreRawInputs();
+  assert.equal(Object.keys(raw).length, intakeCountBeforePartialReplay);
+  assert.equal(Object.keys(raw).filter((id) => id === partialIntakeId).length, 1);
+
+  const lockHandle = await open(join(workspace, "handoff", ".finance-bridge.lock.v1"), "r+");
+  const lock = (operation) => new Promise((resolve, reject) =>
+    flock(lockHandle.fd, operation, (error) => error ? reject(error) : resolve()));
+  await lock("ex");
+  try {
+    assert.deepEqual(await bridge(new HandoffPublisher(workspace, { lockTimeoutMs: 20 }))
+      .handle(raced.event, raced.context), { handled: false });
+  } finally {
+    await lock("un");
+    await lockHandle.close();
+  }
+  await assertHandoffEmpty();
 
   for (const [index, phase] of [
     "after-record-fsync", "after-record-publish", "after-payload-fsync",
