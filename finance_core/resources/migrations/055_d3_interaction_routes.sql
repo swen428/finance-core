@@ -476,6 +476,39 @@ BEGIN
     SELECT RAISE(ABORT, 'Telegram text parser source type mismatch');
 END;
 
+-- SQLite REPLACE may silently delete the conflicting target before an ordinary
+-- identity trigger can inspect it. Protect both the linked parser id and its
+-- public identity, even when the incoming row claims an unrelated source.
+-- A distinct new child keeps its own id/public_id and remains admissible.
+CREATE TRIGGER trg_finance_telegram_text_parser_no_insert_collision
+BEFORE INSERT ON parser_outputs
+WHEN EXISTS (
+    SELECT 1 FROM parser_outputs AS existing
+    JOIN raw_intake_records AS intake
+      ON intake.source_type = 'telegram_text'
+     AND (intake.parser_output_id = existing.id
+          OR intake.public_id = existing.source_public_id)
+    WHERE existing.id = NEW.id OR existing.public_id = NEW.public_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Telegram text parser identity collision');
+END;
+
+CREATE TRIGGER trg_finance_telegram_text_parser_no_update_collision
+BEFORE UPDATE ON parser_outputs
+WHEN EXISTS (
+    SELECT 1 FROM parser_outputs AS existing
+    JOIN raw_intake_records AS intake
+      ON intake.source_type = 'telegram_text'
+     AND (intake.parser_output_id = existing.id
+          OR intake.public_id = existing.source_public_id)
+    WHERE existing.id <> OLD.id
+      AND (existing.id = NEW.id OR existing.public_id = NEW.public_id)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'Telegram text parser identity collision');
+END;
+
 CREATE TRIGGER trg_finance_interaction_no_control_parser
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (

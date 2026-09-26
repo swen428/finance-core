@@ -307,19 +307,17 @@ def classify_interaction(
     shape, normalized = classify_control_text_shape(text)
     if shape == "invalid":
         return {"route_kind": "control_refused", "refusal_code": "invalid_control_text"}
-    if shape == "ambiguous":
-        return {"route_kind": "control_refused", "refusal_code": "ambiguous_control"}
     assert normalized is not None
     try:
         historical = _historical_guided_session(conn, context, message_id)
     except InteractionRouteConflictError:
         return {"route_kind": "control_refused", "refusal_code": "ambiguous_guided_history"}
     if historical is not None:
-        if shape == "card":
-            return {"route_kind": "control_refused", "refusal_code": "ambiguous_control"}
         return _historical_guided_route(
             conn, session_id=historical, message_id=message_id, normalized=normalized
         )
+    if shape == "ambiguous":
+        return {"route_kind": "control_refused", "refusal_code": "ambiguous_control"}
     if shape == "card":
         card = parse_human_draft_card_structure_for_routing(normalized)
         if card is None:

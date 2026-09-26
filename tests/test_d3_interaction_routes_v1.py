@@ -83,7 +83,9 @@ def _full_card(reference: str) -> str:
     )
 
 
-def _pre_055_pending_workspace(tmp_path: Path) -> tuple[support.BridgeWorkspace, str]:
+def _pre_055_pending_workspace(
+    tmp_path: Path, *, field_name: str = "merchant", field_value: str = "Cafe Two"
+) -> tuple[support.BridgeWorkspace, str]:
     """Create an actual pre-cutover pending claim, then migrate that same DB."""
     workspace = support.create_bridge_workspace(
         tmp_path, migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
@@ -137,8 +139,8 @@ def _pre_055_pending_workspace(tmp_path: Path) -> tuple[support.BridgeWorkspace,
                 version=0,
                 content_hash=content_hash,
             ),
-            field_name="merchant",
-            field_value="Cafe Two",
+            field_name=field_name,
+            field_value=field_value,
         )
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         assert (
@@ -227,6 +229,118 @@ def test_initial_route_cannot_bind_a_parser_from_another_source(
         )
 
 
+def test_unbound_parser_source_link_cannot_be_replaced(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    captured = support.run_cli(_request(workspace, "lunch 12.50"))
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    intake_id = captured.response["result"]["intake_public_id"]
+    with support.open_database(workspace) as conn:
+        conn.execute(
+            "INSERT INTO parser_outputs "
+            "(public_id, source_type, source_public_id, parse_status) "
+            "VALUES ('unbound_telegram_parser', 'telegram_text', ?, "
+            "'parsed_pending_confirmation')",
+            (intake_id,),
+        )
+        parser_id = conn.execute(
+            "SELECT id FROM parser_outputs WHERE public_id = 'unbound_telegram_parser'"
+        ).fetchone()[0]
+        assert (
+            conn.execute(
+                "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?", (intake_id,)
+            ).fetchone()[0]
+            is None
+        )
+        conn.execute("PRAGMA recursive_triggers = OFF")
+        with pytest.raises(sqlite3.IntegrityError, match="parser identity collision"):
+            conn.execute(
+                "INSERT OR REPLACE INTO parser_outputs "
+                "(id, public_id, source_type, source_public_id, parse_status) "
+                "VALUES (?, 'replacement_parser', 'manual_entry', 'other', "
+                "'parsed_pending_confirmation')",
+                (parser_id,),
+            )
+        assert (
+            conn.execute(
+                "SELECT source_public_id FROM parser_outputs WHERE id = ?", (parser_id,)
+            ).fetchone()[0]
+            == intake_id
+        )
+
+
+@pytest.mark.parametrize("replacement", ["insert", "update"])
+@pytest.mark.parametrize("collision_key", ["id", "rowid", "public_id"])
+def test_parser_conflict_replace_cannot_change_bound_telegram_source(
+    workspace: support.BridgeWorkspace, replacement: str, collision_key: str
+) -> None:
+    captured = support.run_cli(_request(workspace, "lunch 12.50"))
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    job_id = captured.response["result"]["capture_job"]["public_id"]
+    processed = support.run_cli(
+        support.make_request(
+            "process_capture_job",
+            {"workspace_path": str(workspace.workspace_path), "job_public_id": job_id},
+            idempotency_key="fcp_"
+            + identity.canonical_digest("finance-process-capture-job-v1", job_id),
+        )
+    )
+    assert processed.exit_code == errors.EXIT_OK, processed.response
+    with support.open_database(workspace) as conn:
+        conn.execute("PRAGMA recursive_triggers = OFF")
+        source = conn.execute(
+            "SELECT public_id, parser_output_id FROM raw_intake_records WHERE public_id = ?",
+            (captured.response["result"]["intake_public_id"],),
+        ).fetchone()
+        assert source["parser_output_id"] is not None
+        parser_id = int(source["parser_output_id"])
+        original = conn.execute(
+            "SELECT * FROM parser_outputs WHERE id = ?", (parser_id,)
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO parser_outputs "
+            "(public_id, source_type, source_public_id, parse_status) "
+            "VALUES ('unrelated_manual_parser', 'manual_entry', 'other', "
+            "'parsed_pending_confirmation')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="Telegram text parser identity collision"):
+            if replacement == "insert":
+                if collision_key in {"id", "rowid"}:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO parser_outputs "
+                        f"({collision_key}, public_id, source_type, "
+                        "source_public_id, parse_status) "
+                        "VALUES (?, 'replacement_parser', 'manual_entry', 'other', "
+                        "'parsed_pending_confirmation')",
+                        (parser_id,),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO parser_outputs "
+                        "(public_id, source_type, source_public_id, parse_status) "
+                        "VALUES (?, 'manual_entry', 'other', 'parsed_pending_confirmation')",
+                        (original["public_id"],),
+                    )
+            else:
+                conn.execute(
+                    f"UPDATE OR REPLACE parser_outputs SET {collision_key} = ? "
+                    "WHERE public_id = 'unrelated_manual_parser'",
+                    (parser_id if collision_key != "public_id" else original["public_id"],),
+                )
+        bound = conn.execute("SELECT * FROM parser_outputs WHERE id = ?", (parser_id,)).fetchone()
+        assert bound["public_id"] == original["public_id"]
+        assert bound["source_type"] == "telegram_text"
+        assert bound["source_public_id"] == source["public_id"]
+        assert (
+            conn.execute(
+                "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?",
+                (source["public_id"],),
+            ).fetchone()[0]
+            == parser_id
+        )
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 @pytest.mark.parametrize(
     ("text", "route_kind", "refusal"),
     [
@@ -253,6 +367,7 @@ def test_initial_route_cannot_bind_a_parser_from_another_source(
             "control_refused",
             "ambiguous_control",
         ),
+        ("description=d1card_" + "a" * 32, "control_refused", "ambiguous_control"),
         ("Card Ref d1card_" + "a" * 32, "control_refused", "invalid_whole_card"),
         (
             "note\rCard Ref: d1card_" + "a" * 32 + "\rAmount: 12",
@@ -449,6 +564,56 @@ def test_historical_guided_exact_applied_message_recovers_original_route(
             ).fetchone()[0]
             == 1
         )
+
+
+def test_historical_guided_card_marker_replay_recovers_original_update(tmp_path: Path) -> None:
+    value = "d1card_" + "a" * 32
+    workspace, session = _pre_055_pending_workspace(
+        tmp_path, field_name="description", field_value=value
+    )
+    captured = support.run_cli(
+        _request(
+            workspace,
+            f"description={value}",
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    assert captured.response["result"]["interaction_route"]["route_kind"] == "guided_update"
+    applied = _apply(workspace, session, 21, "description", value)
+    assert applied.exit_code == errors.EXIT_OK, applied.response
+    assert _apply(workspace, session, 21, "description", value).exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM openclaw_guided_edit_events "
+                "WHERE event_type = 'update_applied'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert support.count_final_facts(conn)["transactions"] == 0
+
+
+def test_historical_guided_card_marker_changed_value_is_refused(tmp_path: Path) -> None:
+    value = "d1card_" + "a" * 32
+    workspace, _session = _pre_055_pending_workspace(
+        tmp_path, field_name="description", field_value=value
+    )
+    changed = support.run_cli(
+        _request(
+            workspace,
+            "description=d1card_" + "b" * 32,
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert changed.exit_code == errors.EXIT_OK, changed.response
+    route = changed.response["result"]["interaction_route"]
+    assert route["route_kind"] == "control_refused"
+    assert route["refusal_code"] == "historical_guided_mismatch"
 
 
 def test_post_cutover_guided_pending_cannot_be_forged_without_route(

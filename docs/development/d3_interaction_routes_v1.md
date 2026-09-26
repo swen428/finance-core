@@ -109,7 +109,9 @@ child retains the same source identity, or when a sealed AI fallback result
 links that child to the admitted source and current parent. This preserves
 pre-055 fallback recovery without admitting an unrelated proposal.
 Even an `initial_intake` route cannot bind a Telegram text raw record to a
-parser with a different source type or identity.
+parser with a different source type or identity. Insert and update collision
+guards also prevent SQLite `REPLACE` from substituting an already bound parser
+row by its database or public identity.
 
 D1 whole-card writes require the saved card route, original reply bytes,
 message/context, card generation and operation identity. The Core transaction
@@ -120,6 +122,9 @@ matching guided route and pending request, or the exact migration-time pending
 admission. The synthetic one-field card is checked against the guided field
 and value rather than compared to the original Telegram text. Existing D1
 operations replay by their original evidence and do not create new writes.
+At cutover, a re-delivered guided message is matched to its persisted request
+before the generic card/control shape rules. This also covers an old guided
+value that happens to contain a card marker; changed text remains refused.
 
 New receipt captions resembling a card, guided command or ambiguous control
 are refused before intake publication with a request to send the instruction as

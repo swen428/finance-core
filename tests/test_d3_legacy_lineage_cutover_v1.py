@@ -59,6 +59,21 @@ def test_055_cutover_preserves_admitted_history_but_blocks_new_unrouted_text(
         old_intake["public_id"],
         old_proposal["id"],
     )
+    conn.execute("PRAGMA recursive_triggers = OFF")
+    with pytest.raises(sqlite3.IntegrityError, match="parser identity collision"):
+        conn.execute(
+            "INSERT OR REPLACE INTO parser_outputs "
+            "(id, public_id, source_type, source_public_id, parse_status) "
+            "VALUES (?, 'legacy_replacement', 'manual_entry', 'other', "
+            "'parsed_pending_confirmation')",
+            (old_proposal["id"],),
+        )
+    assert (
+        conn.execute(
+            "SELECT source_public_id FROM parser_outputs WHERE id = ?", (old_proposal["id"],)
+        ).fetchone()[0]
+        == old_intake["public_id"]
+    )
 
     child = save_parser_proposal(conn, old_intake["id"], old_proposal["proposal"])
     assert child["id"] != old_proposal["id"]
