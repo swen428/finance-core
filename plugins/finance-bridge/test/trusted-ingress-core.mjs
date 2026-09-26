@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { chmodSync, writeFileSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 
 import { HandoffPublisher } from "../dist/src/handoff.js";
+import { ReceiptMediaAdapter } from "../dist/src/media.js";
 import { TrustedIngressCapture } from "../dist/src/trusted-ingress.js";
 
 const repositoryRoot = resolve(import.meta.dirname, "../../..");
 const python = process.env.FINANCE_TEST_PYTHON;
 if (!python) throw new Error("Set FINANCE_TEST_PYTHON to the Finance test Python 3.12 executable.");
 const temporary = await mkdtemp(join(tmpdir(), "d3-bridge-core-reclaim-"));
+const hostMediaRoot = join(temporary, "host-media");
+const hostInbound = join(hostMediaRoot, "inbound");
+await mkdir(hostInbound, { recursive: true, mode: 0o700 });
+await chmod(hostMediaRoot, 0o700);
+await chmod(hostInbound, 0o700);
 const environment = {
   ...process.env,
   PYTHONPATH: `${repositoryRoot}:${join(repositoryRoot, "tests")}`,
@@ -27,10 +34,12 @@ assert.ok(workspace.startsWith(`${canonicalTemporary}/`) && workspace !== join(r
   "Core integration must use a newly created temporary workspace.");
 let passed = false;
 const calls = [];
+const captureArguments = [];
 let loseNextCaptureResponse = false;
 const runner = {
   async run(request, _deadline, fd) {
     calls.push(request.command);
+    if (request.command === "capture") captureArguments.push(request.arguments);
     const result = spawnSync(python, ["-m", "finance_core.openclaw_staging_bridge.cli"], {
       input: JSON.stringify(request), cwd: repositoryRoot, env: environment, encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe", fd === undefined ? "ignore" : fd],
@@ -49,14 +58,10 @@ const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jpeg = (index) => Buffer.from([0xff, 0xd8, 0xff, 0xe0, index & 255, index >> 8, 0xff, 0xd9]);
 const png = (index) => Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, index & 255, index >> 8]);
 let downloads = 0;
-const media = { async acquire(metadata) {
+const actualMedia = new ReceiptMediaAdapter(() => hostMediaRoot);
+const media = { async acquireTrustedInbound(metadata, timeoutMs) {
   downloads += 1;
-  const bytes = metadata.syntheticBytes;
-  return {
-    bytes, byteSize: bytes.length, contentHash: sha256(bytes),
-    detectedMimeType: bytes[0] === 0xff ? "image/jpeg" : "image/png",
-    canonicalExtension: bytes[0] === 0xff ? ".jpg" : ".png",
-  };
+  return await actualMedia.acquireTrustedInbound(metadata, timeoutMs);
 } };
 const binding = {
   bindingId: "bind-1", pluginId: "finance-bridge", pluginRoot: "/synthetic",
@@ -64,6 +69,11 @@ const binding = {
   parentConversationId: "111", data: { senderId: "111" },
 };
 function turn(messageId, bytes, content = "receipt") {
+  const mime = bytes[0] === 0xff ? "image/jpeg" : "image/png";
+  const extension = mime === "image/jpeg" ? "jpg" : "png";
+  const mediaPath = join(hostInbound, `telegram-${messageId}.${extension}`);
+  writeFileSync(mediaPath, bytes, { mode: 0o644 });
+  chmodSync(mediaPath, 0o644);
   const ingress = {
     channel: "telegram", accountId: "finance", updateId: 10_000 + messageId,
     chatId: "111", messageId: String(messageId), senderId: "111", bindingId: "bind-1",
@@ -76,7 +86,10 @@ function turn(messageId, bytes, content = "receipt") {
       conversationId: "111", parentConversationId: "111", senderId: "111",
       messageId: String(messageId), isGroup: false, commandAuthorized: true,
       senderIsOwner: true, financeIngress: ingress,
-      metadata: { mediaUrl: `synthetic://${messageId}`, syntheticBytes: bytes },
+      metadata: {
+        mediaPath, mediaUrl: mediaPath, mediaPaths: [mediaPath], mediaUrls: [mediaPath],
+        mediaType: mime, mediaTypes: [mime],
+      },
     },
     context: {
       channelId: "telegram", accountId: "finance", conversationId: "111",
@@ -90,6 +103,18 @@ function bridge(handoff = new HandoffPublisher(workspace)) {
 async function assertHandoffEmpty() {
   const names = await readdir(join(workspace, "handoff"));
   assert.deepEqual(names, [".finance-bridge.lock.v1"]);
+}
+function coreRawInputs() {
+  const database = join(workspace, "database", "staging.sqlite");
+  const query = spawnSync(python, ["-c", [
+    "import json, sqlite3, sys",
+    "from pathlib import Path",
+    "uri = Path(sys.argv[1]).resolve().as_uri() + '?mode=ro'",
+    "with sqlite3.connect(uri, uri=True) as conn:",
+    "    print(json.dumps(dict(conn.execute('SELECT public_id, raw_input FROM raw_intake_records'))))",
+  ].join("\n"), database], { cwd: repositoryRoot, env: environment, encoding: "utf8" });
+  assert.equal(query.status, 0, query.stderr);
+  return JSON.parse(query.stdout);
 }
 try {
   const claimant = bridge();
@@ -136,6 +161,19 @@ try {
   const next = await bridge().handle(turn(242, png(42)).event, turn(242, png(42)).context);
   assert.equal(next.adoption?.attachmentStatus, "stored");
   assert.equal((await new HandoffPublisher(workspace).pendingReclaims()).length, 1);
+
+  const emptyCaption = turn(243, jpeg(43), "");
+  const emptyResult = await bridge().handle(emptyCaption.event, emptyCaption.context);
+  assert.equal(emptyResult.adoption?.attachmentStatus, "stored");
+  assert.equal("caption" in captureArguments.at(-1), false);
+  assert.equal(coreRawInputs()[emptyResult.adoption.intakeId], "[telegram receipt image]");
+  const literalMarker = turn(244, png(44), "<media:image>");
+  const markerResult = await bridge().handle(literalMarker.event, literalMarker.context);
+  assert.equal(markerResult.adoption?.attachmentStatus, "stored");
+  assert.equal(captureArguments.at(-1).caption, "<media:image>");
+  const rawInputs = coreRawInputs();
+  assert.equal(rawInputs[markerResult.adoption.intakeId], "<media:image>");
+  assert.equal(Object.values(rawInputs).includes("完成"), false);
 
   const changed = adopted[0].input;
   const forged = {
@@ -204,7 +242,7 @@ try {
   assert.ok(retainedNames.some((name) => name === `${partialClaim.rawIntakePublicId}.png`));
   assert.ok(retainedNames.includes(`${partialClaim.rawIntakePublicId}.reclaim.json`));
   process.stdout.write(JSON.stringify({
-    photosAdopted: 48, uniquePhotosBeforeQuota: 40, rejectedCaptionRetained: 1,
+    photosAdopted: 50, uniquePhotosBeforeQuota: 40, rejectedCaptionRetained: 1,
     crashStagesRecovered: crashPhases.length, coreTamperPreservedIntent: true,
     tornIntentPreservedOriginalWithoutAdoption: true,
     captureCalls: calls.filter((value) => value === "capture").length,

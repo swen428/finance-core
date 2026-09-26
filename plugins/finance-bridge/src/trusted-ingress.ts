@@ -356,7 +356,7 @@ export class TrustedIngressCapture {
         if (event.metadata === undefined) return { handled: false };
         let media: ValidatedMedia;
         try {
-          media = await this.media.acquire(event.metadata, COMMAND_DEADLINE_MS);
+          media = await this.media.acquireTrustedInbound(event.metadata, COMMAND_DEADLINE_MS);
         } catch {
           return { handled: false };
         }

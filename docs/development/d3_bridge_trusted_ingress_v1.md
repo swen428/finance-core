@@ -26,6 +26,23 @@ through the pinned handoff descriptor. These commands create or replay a durable
 raw intake and capture job. They do not run OCR, AI, finalization, or Telegram
 send. Later processing resumes from the Core job.
 
+The pinned Host's Finance hook must set photo `event.content` to the original
+Telegram caption (`''` when absent). The Bridge omits Core `caption` for an
+empty string and preserves a literal user caption such as `<media:image>`.
+The public repository tests the consumer behavior; the fixed Host's producer
+projection and same-version interoperability remain separate host acceptance.
+
+For a trusted photo, the Host supplies one local original with matching
+`mediaPath`, `mediaUrl`, one-element `mediaPaths` and `mediaUrls`, and matching
+`mediaType` and one-element `mediaTypes`. Only after trusted ingress validation
+does the Bridge read a direct child of `getMediaDir()/inbound` (allowing the
+macOS `/var` to `/private/var` spelling). It pins the private 0700 directory
+and opens the leaf without following a symlink. The original must be an
+owner-owned regular file with mode 0600 or 0644; its size, inode, timestamps,
+permissions, and content are checked across the read. The older controller's
+opaque `media://inbound/` reader and the handoff 0600 reader retain their
+existing stricter contracts. No Host original is chmodded or removed.
+
 Core currently refuses a photo whose caption resembles a control message (for
 example `完成`). The Bridge preserves that caption and returns no adoption. The
 pinned host retains the original in its Finance spool, records a queryable

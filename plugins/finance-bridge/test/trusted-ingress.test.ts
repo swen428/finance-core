@@ -161,7 +161,7 @@ function capture(core: FakeCore, options: {
     canonicalExtension: bytes === png ? ".png" : ".jpg",
   };
   const mediaAdapter = {
-    acquire: async () => {
+    acquireTrustedInbound: async () => {
       if (options.meter) options.meter.acquire += 1;
       if (options.unavailable) {
         throw new Error("missing media");
@@ -242,6 +242,20 @@ test("control caption photo is refused by Core without adoption or inline proces
   ]);
 });
 
+test("trusted photo preserves empty raw caption separately from literal media marker", async () => {
+  for (const [messageId, original, expectedCaption] of [
+    ["75", "", undefined], ["76", "<media:image>", "<media:image>"],
+  ] as const) {
+    const core = new FakeCore();
+    const { event, context } = turn({ image: jpeg, text: original, messageId });
+    const result = await capture(core, { image: jpeg }).handle(event, context);
+    assert.equal(result.adoption?.attachmentStatus, "stored");
+    const request = core.calls.find((call) => call.command === "capture");
+    assert.ok(request);
+    assert.equal(request.arguments.caption, expectedCaption);
+  }
+});
+
 for (const [name, value] of [
   ["mediaStagingPending", false], ["mediaType", "image/jpeg"],
   ["mediaTypes", []], ["originalFilename", "receipt.jpg"],
@@ -263,6 +277,24 @@ test("text without attachment digest refuses malformed metadata", async () => {
   event.metadata = [] as unknown as Record<string, unknown>;
   assert.deepEqual(await capture(core).handle(event, context), { handled: false });
   assert.deepEqual(core.calls, []);
+});
+
+test("trusted photo reader is unreachable without host ingress and refuses attachment hash drift", async () => {
+  const core = new FakeCore();
+  const noTrust = turn({ image: jpeg });
+  delete (noTrust.event as { financeIngress?: TrustedFinanceIngress }).financeIngress;
+  const meter = { acquire: 0, publish: 0 };
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(noTrust.event, noTrust.context),
+    { handled: false });
+  assert.deepEqual(meter, { acquire: 0, publish: 0 });
+  assert.deepEqual(core.calls, []);
+
+  const mismatch = turn({ image: jpeg });
+  mismatch.ingress.attachmentSha256 = "b".repeat(64);
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(mismatch.event, mismatch.context),
+    { handled: false });
+  assert.deepEqual(meter, { acquire: 1, publish: 0 });
+  assert.equal(core.calls.length, 1); // authenticated discovery only
 });
 
 test("missing photo without prior Core custody returns typed reupload refusal", async () => {
