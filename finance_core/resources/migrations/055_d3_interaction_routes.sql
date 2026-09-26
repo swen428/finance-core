@@ -476,19 +476,100 @@ BEGIN
     SELECT RAISE(ABORT, 'Telegram text parser source type mismatch');
 END;
 
--- SQLite REPLACE may silently delete the conflicting target before an ordinary
--- identity trigger can inspect it. Protect both the linked parser id and its
--- public identity, even when the incoming row claims an unrelated source.
--- A distinct new child keeps its own id/public_id and remains admissible.
+-- A permanent reference makes SQLite's implicit REPLACE delete fail even
+-- with recursive_triggers OFF. BEFORE INSERT sees NEW.id = -1 for an omitted
+-- INTEGER PRIMARY KEY, so it cannot safely decide whether an id collision is
+-- explicit. Include the older AI seals whose 042 trigger has the same issue.
+CREATE TABLE finance_parser_identity_seals (
+    parser_output_id INTEGER PRIMARY KEY
+        REFERENCES parser_outputs(id) ON DELETE RESTRICT ON UPDATE RESTRICT
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO finance_parser_identity_seals (parser_output_id)
+SELECT proposal.id FROM parser_outputs AS proposal
+WHERE EXISTS (SELECT 1 FROM raw_intake_records AS intake
+              WHERE intake.source_type = 'telegram_text'
+                AND (intake.public_id = proposal.source_public_id
+                     OR intake.parser_output_id = proposal.id))
+   OR EXISTS (SELECT 1 FROM ai_fallback_attempts AS attempt
+              WHERE attempt.parent_parser_output_id = proposal.id)
+   OR EXISTS (SELECT 1 FROM ai_fallback_proposal_links AS link
+              WHERE link.parser_output_id = proposal.id);
+
+CREATE TRIGGER trg_finance_parser_identity_seals_no_update
+BEFORE UPDATE ON finance_parser_identity_seals
+BEGIN
+    SELECT RAISE(ABORT, 'parser identity seal is immutable');
+END;
+
+CREATE TRIGGER trg_finance_parser_identity_seals_no_delete
+BEFORE DELETE ON finance_parser_identity_seals
+BEGIN
+    SELECT RAISE(ABORT, 'parser identity seal cannot be deleted');
+END;
+
+CREATE TRIGGER trg_finance_parser_identity_seals_no_replace
+BEFORE INSERT ON finance_parser_identity_seals
+WHEN EXISTS (SELECT 1 FROM finance_parser_identity_seals AS existing
+             WHERE existing.parser_output_id = NEW.parser_output_id)
+BEGIN
+    SELECT RAISE(ABORT, 'parser identity seal cannot be replaced');
+END;
+
+-- Register the real id only after SQLite has allocated it. A source link or
+-- pointer protects even historical negative ids and malformed old lineage.
+CREATE TRIGGER trg_finance_telegram_text_parser_seal_insert
+AFTER INSERT ON parser_outputs
+WHEN EXISTS (SELECT 1 FROM raw_intake_records AS intake
+             WHERE intake.source_type = 'telegram_text'
+               AND (intake.public_id = NEW.source_public_id
+                    OR intake.parser_output_id = NEW.id))
+BEGIN
+    INSERT INTO finance_parser_identity_seals (parser_output_id) VALUES (NEW.id);
+END;
+
+CREATE TRIGGER trg_finance_ai_attempt_parser_seal
+AFTER INSERT ON ai_fallback_attempts
+WHEN NOT EXISTS (SELECT 1 FROM finance_parser_identity_seals
+                 WHERE parser_output_id = NEW.parent_parser_output_id)
+BEGIN
+    INSERT INTO finance_parser_identity_seals (parser_output_id)
+    VALUES (NEW.parent_parser_output_id);
+END;
+
+CREATE TRIGGER trg_finance_ai_link_parser_seal
+AFTER INSERT ON ai_fallback_proposal_links
+WHEN NOT EXISTS (SELECT 1 FROM finance_parser_identity_seals
+                 WHERE parser_output_id = NEW.parser_output_id)
+BEGIN
+    INSERT INTO finance_parser_identity_seals (parser_output_id)
+    VALUES (NEW.parser_output_id);
+END;
+
+-- Preserve 042's public-id collision rule; the seal's FK now handles id
+-- collisions, including -1, without mistaking an omitted id for an attack.
+DROP TRIGGER trg_ai_fallback_parser_outputs_no_insert_collision;
+CREATE TRIGGER trg_ai_fallback_parser_outputs_no_insert_collision
+BEFORE INSERT ON parser_outputs
+WHEN EXISTS (
+    SELECT 1 FROM parser_outputs AS existing
+    WHERE existing.public_id = NEW.public_id
+      AND (EXISTS (SELECT 1 FROM ai_fallback_attempts AS attempt
+                   WHERE attempt.parent_parser_output_id = existing.id)
+           OR EXISTS (SELECT 1 FROM ai_fallback_proposal_links AS link
+                      WHERE link.parser_output_id = existing.id))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'AI fallback sealed parser output cannot be replaced');
+END;
+
 CREATE TRIGGER trg_finance_telegram_text_parser_no_insert_collision
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (
     SELECT 1 FROM parser_outputs AS existing
-    JOIN raw_intake_records AS intake
-      ON intake.source_type = 'telegram_text'
-     AND (intake.parser_output_id = existing.id
-          OR intake.public_id = existing.source_public_id)
-    WHERE existing.id = NEW.id OR existing.public_id = NEW.public_id
+    JOIN finance_parser_identity_seals AS seal
+      ON seal.parser_output_id = existing.id
+    WHERE existing.public_id = NEW.public_id
 )
 BEGIN
     SELECT RAISE(ABORT, 'Telegram text parser identity collision');
@@ -498,10 +579,8 @@ CREATE TRIGGER trg_finance_telegram_text_parser_no_update_collision
 BEFORE UPDATE ON parser_outputs
 WHEN EXISTS (
     SELECT 1 FROM parser_outputs AS existing
-    JOIN raw_intake_records AS intake
-      ON intake.source_type = 'telegram_text'
-     AND (intake.parser_output_id = existing.id
-          OR intake.public_id = existing.source_public_id)
+    JOIN finance_parser_identity_seals AS seal
+      ON seal.parser_output_id = existing.id
     WHERE existing.id <> OLD.id
       AND (existing.id = NEW.id OR existing.public_id = NEW.public_id)
 )
@@ -541,7 +620,9 @@ WHEN (NEW.id IS NOT OLD.id OR NEW.public_id IS NOT OLD.public_id
       OR NEW.source_public_id IS NOT OLD.source_public_id
       OR NEW.parent_parser_output_id IS NOT OLD.parent_parser_output_id
       OR NEW.attachment_id IS NOT OLD.attachment_id)
- AND (EXISTS (SELECT 1 FROM raw_intake_records AS intake
+ AND (EXISTS (SELECT 1 FROM finance_parser_identity_seals AS seal
+              WHERE seal.parser_output_id = OLD.id)
+      OR EXISTS (SELECT 1 FROM raw_intake_records AS intake
               WHERE intake.public_id = OLD.source_public_id
                 AND intake.source_type = 'telegram_text')
       OR EXISTS (SELECT 1 FROM raw_intake_records AS intake
@@ -549,6 +630,14 @@ WHEN (NEW.id IS NOT OLD.id OR NEW.public_id IS NOT OLD.public_id
                    AND intake.source_type = 'telegram_text'))
 BEGIN
     SELECT RAISE(ABORT, 'Telegram text parser source identity is immutable');
+END;
+
+CREATE TRIGGER trg_finance_telegram_text_parser_no_delete
+BEFORE DELETE ON parser_outputs
+WHEN EXISTS (SELECT 1 FROM finance_parser_identity_seals AS seal
+             WHERE seal.parser_output_id = OLD.id)
+BEGIN
+    SELECT RAISE(ABORT, 'sealed parser cannot be deleted');
 END;
 
 -- Binding a raw source to a parser is another authority transition.  The
@@ -608,6 +697,17 @@ WHEN OLD.source_type = 'telegram_text'
  )
 BEGIN
     SELECT RAISE(ABORT, 'Telegram text requires initial intake route before parser binding');
+END;
+
+CREATE TRIGGER trg_finance_telegram_text_pointer_seal_update
+AFTER UPDATE OF parser_output_id ON raw_intake_records
+WHEN NEW.source_type = 'telegram_text'
+ AND NEW.parser_output_id IS NOT NULL
+ AND NOT EXISTS (SELECT 1 FROM finance_parser_identity_seals
+                 WHERE parser_output_id = NEW.parser_output_id)
+BEGIN
+    INSERT INTO finance_parser_identity_seals (parser_output_id)
+    VALUES (NEW.parser_output_id);
 END;
 
 CREATE TRIGGER trg_finance_interaction_no_control_ai

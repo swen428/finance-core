@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,6 +32,14 @@ from finance_core.parser_proposals.human_drafts import (
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from tests.test_openclaw_staging_bridge_guided_edit_v1 import _apply, _begin, _complete
 from tests.test_parser_human_drafts_v1 import _card_text, _start
+
+PRE_055_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[
+    : next(
+        index
+        for index, path in enumerate(TEMP_DB_MIGRATION_PATHS)
+        if path.name == "055_d3_interaction_routes.sql"
+    )
+]
 
 
 @pytest.fixture()
@@ -87,9 +96,7 @@ def _pre_055_pending_workspace(
     tmp_path: Path, *, field_name: str = "merchant", field_value: str = "Cafe Two"
 ) -> tuple[support.BridgeWorkspace, str]:
     """Create an actual pre-cutover pending claim, then migrate that same DB."""
-    workspace = support.create_bridge_workspace(
-        tmp_path, migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
-    )
+    workspace = support.create_bridge_workspace(tmp_path, migration_paths=PRE_055_MIGRATION_PATHS)
     session_id = "gedit_" + "a" * 32
     with support.open_database(workspace) as conn:
         result = process_raw_text_input(conn, "Lunch SGD 12.00")
@@ -253,7 +260,7 @@ def test_unbound_parser_source_link_cannot_be_replaced(
             is None
         )
         conn.execute("PRAGMA recursive_triggers = OFF")
-        with pytest.raises(sqlite3.IntegrityError, match="parser identity collision"):
+        with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY constraint failed"):
             conn.execute(
                 "INSERT OR REPLACE INTO parser_outputs "
                 "(id, public_id, source_type, source_public_id, parse_status) "
@@ -303,7 +310,12 @@ def test_parser_conflict_replace_cannot_change_bound_telegram_source(
             "VALUES ('unrelated_manual_parser', 'manual_entry', 'other', "
             "'parsed_pending_confirmation')"
         )
-        with pytest.raises(sqlite3.IntegrityError, match="Telegram text parser identity collision"):
+        expected_error = (
+            "FOREIGN KEY constraint failed"
+            if replacement == "insert" and collision_key in {"id", "rowid"}
+            else "Telegram text parser identity collision"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match=expected_error):
             if replacement == "insert":
                 if collision_key in {"id", "rowid"}:
                     conn.execute(
@@ -596,6 +608,71 @@ def test_historical_guided_card_marker_replay_recovers_original_update(tmp_path:
         assert support.count_final_facts(conn)["transactions"] == 0
 
 
+@pytest.mark.parametrize(
+    ("persisted_value", "replayed_text"),
+    [
+        ("A=B", "description=A=B"),
+        ("Cafe", "description=Cafe\u00a0"),
+        ("A＝B", "description=A＝B"),
+        ("界" * 600, "description=" + "界" * 600),
+        ("  spaced  ", "description=  spaced  "),
+    ],
+)
+def test_historical_guided_replays_original_legacy_value(
+    tmp_path: Path, persisted_value: str, replayed_text: str
+) -> None:
+    workspace, session = _pre_055_pending_workspace(
+        tmp_path, field_name="description", field_value=persisted_value
+    )
+    captured = support.run_cli(
+        _request(
+            workspace,
+            replayed_text,
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "guided_update"
+    assert route["guided_session_public_id"] == session
+    assert route["field_name"] == "description"
+    assert json.loads(route["field_value_json"]) == persisted_value
+    applied = _apply(workspace, session, 21, "description", persisted_value)
+    assert applied.exit_code == errors.EXIT_OK, applied.response
+    assert applied.response["result"]["final_transaction_created"] is False
+    with support.open_database(workspace) as conn:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM openclaw_guided_edit_events "
+                "WHERE event_type = 'update_applied'"
+            ).fetchone()[0]
+            == 1
+        )
+        assert support.count_final_facts(conn)["transactions"] == 0
+
+
+def test_historical_guided_changed_legacy_value_is_refused(tmp_path: Path) -> None:
+    workspace, _session = _pre_055_pending_workspace(
+        tmp_path, field_name="description", field_value="A=B"
+    )
+    captured = support.run_cli(
+        _request(
+            workspace,
+            "description=A=C",
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "control_refused"
+    assert route["refusal_code"] == "historical_guided_mismatch"
+    assert route["guided_session_public_id"] == "gedit_" + "a" * 32
+
+
 def test_historical_guided_card_marker_changed_value_is_refused(tmp_path: Path) -> None:
     value = "d1card_" + "a" * 32
     workspace, _session = _pre_055_pending_workspace(
@@ -703,7 +780,7 @@ def test_post_cutover_d1_direct_api_cannot_use_old_lineage_for_new_reply(
     temp_db_connection: sqlite3.Connection,
 ) -> None:
     conn = temp_db_connection
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:-1])
+    apply_migration_paths(conn, PRE_055_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
@@ -760,7 +837,7 @@ def test_pre_cutover_d1_operation_replays_exactly_after_upgrade(
     from finance_core.parser_proposals import human_drafts
 
     conn = temp_db_connection
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:-1])
+    apply_migration_paths(conn, PRE_055_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     command = HumanDraftCommand(
@@ -810,9 +887,7 @@ def test_pre_cutover_pending_guided_d1_recovers_without_new_route(
 ) -> None:
     from finance_core.parser_proposals import human_drafts
 
-    workspace = support.create_bridge_workspace(
-        tmp_path, migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
-    )
+    workspace = support.create_bridge_workspace(tmp_path, migration_paths=PRE_055_MIGRATION_PATHS)
     monkeypatch.setattr(guided_edit, "_now_epoch", lambda: 1001)
     monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
     session_id = "gedit_" + "b" * 32

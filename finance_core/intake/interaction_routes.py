@@ -75,6 +75,18 @@ def _guided_shape(normalized: str) -> tuple[str, str | None, str | None]:
     return "update", field, field_value
 
 
+def _historical_guided_matches(normalized: str, *, field: str, value: str) -> bool:
+    """Match an already recorded request using its original, broader grammar.
+
+    Migration admission binds the message and request before this is called.
+    New guided messages still use the stricter D3 grammar above.
+    """
+    alias, separator, original_tail = normalized.partition("=")
+    if not separator or _FIELD_ALIASES.get(alias.strip().lower()) != field:
+        return False
+    return original_tail == value or original_tail.strip() == value
+
+
 def classify_control_text_shape(text: str) -> tuple[str, str | None]:
     """Classify control candidates before they can acquire ordinary parser rights.
 
@@ -242,9 +254,8 @@ def _historical_guided_route(
         pending_field,
         pending_value_json,
     ) = rows[0]
-    kind, field, value = _guided_shape(normalized)
     if event_type == "completed":
-        if kind != "complete" or completed_id != message_id:
+        if normalized.strip() != "完成" or completed_id != message_id:
             return refusal
         return {
             "route_kind": "guided_complete",
@@ -252,13 +263,15 @@ def _historical_guided_route(
             "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}",
         }
     operation_key = f"bridge-guided-edit-update:{session_id}:{message_id}"
-    if kind != "update" or field != original_field or not original_key:
+    if not original_key:
         return refusal
     try:
         original_value = json.loads(str(original_value_json))
     except (TypeError, ValueError):
         return refusal
-    if value != original_value:
+    if not isinstance(original_value, str) or not _historical_guided_matches(
+        normalized, field=str(original_field), value=original_value
+    ):
         return refusal
     # A route key identifies the Telegram message; the execution key recorded
     # by the guided edit authority identifies the proposal/version operation.
@@ -289,8 +302,8 @@ def _historical_guided_route(
         "guided_session_public_id": session_id,
         "operation_key": operation_key,
         "d1_compatibility_operation_public_id": _guided_d1_operation_id(session_id, message_id),
-        "field_name": field,
-        "field_value_json": json.dumps(value, ensure_ascii=False),
+        "field_name": original_field,
+        "field_value_json": original_value_json,
     }
 
 

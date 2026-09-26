@@ -658,8 +658,11 @@ def test_raw_intake_insert_or_replace_rejected_per_identity(
         "public_id": (str(bound["public_id"]), {}),
         "idempotency_key": ("raw_bkrior_new", {"idempotency_key": "idem_bkrior"}),
     }[identity]
+    # Exercise the source-neutral 035 collision guard without D3 text ingress.
     with pytest.raises(sqlite3.IntegrityError, match=_RAW_INTAKE_COLLISION):
-        _insert_raw_intake(conn, new_public_id, or_replace=True, **collision)
+        _insert_raw_intake(
+            conn, new_public_id, or_replace=True, source_type="telegram_image", **collision
+        )
     conn.rollback()
 
     survived = conn.execute(
@@ -717,14 +720,15 @@ def _insert_parser_output(
     conn: sqlite3.Connection,
     public_id: str,
     *,
+    source_type: str = "telegram_text",
     source_public_id: str | None = None,
     parent_parser_output_id: int | None = None,
 ) -> int:
     cursor = conn.execute(
         "INSERT INTO parser_outputs "
         "(public_id, source_type, source_public_id, parse_status, parent_parser_output_id) "
-        "VALUES (?, 'telegram_text', ?, 'parsed', ?)",
-        (public_id, source_public_id, parent_parser_output_id),
+        "VALUES (?, ?, ?, 'parsed', ?)",
+        (public_id, source_type, source_public_id, parent_parser_output_id),
     )
     assert cursor.lastrowid is not None
     return int(cursor.lastrowid)
@@ -804,9 +808,15 @@ def test_raw_intake_pointer_first_bind_and_supersession_repoint_allowed(
     conn = migrated_temp_db_connection
     seed_people(conn)
 
-    # First bind: an unbound intake row may establish its pointer once.
-    _insert_raw_intake(conn, "raw_bkrbind", raw_input="fresh body")
-    fresh_po = _insert_parser_output(conn, "po_bkrbind", source_public_id="raw_bkrbind")
+    # First bind: an unbound image intake may establish its pointer once;
+    # new Telegram text requires a separately frozen D3 route.
+    _insert_raw_intake(conn, "raw_bkrbind", source_type="telegram_image", raw_input="fresh body")
+    fresh_po = _insert_parser_output(
+        conn,
+        "po_bkrbind",
+        source_type="telegram_image",
+        source_public_id="raw_bkrbind",
+    )
     conn.execute(
         "UPDATE raw_intake_records SET parser_output_id = ?, "
         "status = 'parsed_pending_confirmation' WHERE public_id = 'raw_bkrbind'",
@@ -1153,7 +1163,10 @@ def test_raw_intake_update_or_replace_rejected_per_identity(
         "UPDATE raw_intake_records SET idempotency_key = 'idem_bkriuor' WHERE id = ?",
         (bound["id"],),
     )
-    _insert_raw_intake(conn, "raw_bkriuor_attacker", raw_input="attacker body")
+    # Keep the attacker in the image domain to isolate the 035 collision guard.
+    _insert_raw_intake(
+        conn, "raw_bkriuor_attacker", source_type="telegram_image", raw_input="attacker body"
+    )
     conn.commit()
     bound_before = _raw_intake_row_snapshot(conn, int(bound["id"]))
 

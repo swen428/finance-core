@@ -109,9 +109,11 @@ child retains the same source identity, or when a sealed AI fallback result
 links that child to the admitted source and current parent. This preserves
 pre-055 fallback recovery without admitting an unrelated proposal.
 Even an `initial_intake` route cannot bind a Telegram text raw record to a
-parser with a different source type or identity. Insert and update collision
-guards also prevent SQLite `REPLACE` from substituting an already bound parser
-row by its database or public identity.
+parser with a different source type or identity. Migration 055 permanently
+seals parser IDs linked to Telegram text or AI fallback. The seal's restrictive
+foreign key blocks SQLite `REPLACE` by database ID, including negative IDs;
+insert and update guards protect public identities. Staging write connections
+must keep SQLite foreign keys enabled for this protection.
 
 D1 whole-card writes require the saved card route, original reply bytes,
 message/context, card generation and operation identity. The Core transaction
@@ -124,7 +126,9 @@ and value rather than compared to the original Telegram text. Existing D1
 operations replay by their original evidence and do not create new writes.
 At cutover, a re-delivered guided message is matched to its persisted request
 before the generic card/control shape rules. This also covers an old guided
-value that happens to contain a card marker; changed text remains refused.
+value that happens to contain a card marker, another equals sign, or a value
+accepted by the earlier text normalization rules. The saved field and value
+remain authoritative; changed text is refused. New messages use the D3 grammar.
 
 New receipt captions resembling a card, guided command or ambiguous control
 are refused before intake publication with a request to send the instruction as

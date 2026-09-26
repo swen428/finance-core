@@ -848,11 +848,13 @@ def test_mutation_at_hook_second_raw_intake_pointer_rolls_back(
     before_evidence = evidence_rows(conn)
 
     def mutate() -> None:
+        # Preserve the receipt source kind so D3 text ingress does not preempt
+        # the conversion's duplicate-pointer revalidation.
         conn.execute(
             "INSERT INTO raw_intake_records "
             "(public_id, source_type, source_channel, raw_input, received_at, "
             "parser_output_id) "
-            "VALUES ('raw_mutptr_dup', 'telegram_text', 'telegram', 'dup', "
+            "VALUES ('raw_mutptr_dup', 'telegram_image', 'telegram', 'dup', "
             "'2026-07-19T15:00:00+00:00', ?)",
             (pid,),
         )

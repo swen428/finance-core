@@ -11,7 +11,7 @@ def insert_proposal(db_path: Path, raw_input: str) -> dict:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    result = process_raw_text_input(conn, raw_input)
+    result = process_raw_text_input(conn, raw_input, source_type="manual_entry")
     conn.commit()
     conn.close()
     return result
