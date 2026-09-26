@@ -2623,9 +2623,8 @@ def handle_resume_capture_recovery(request: BridgeRequest, deadline: Deadline) -
                 key,
                 {"workspace_path": str(workspace), "job_public_id": job_id},
             )
-            handle_process_capture_job(step, deadline)
-            performed = "process_capture_job"
-            replay = False
+            _, replay = handle_process_capture_job(step, deadline)
+            performed = "none" if replay else "process_capture_job"
         elif action in {"d1_command_required", "guided_command_required"}:
             performed, replay = _replay_frozen_capture_control(
                 request, job_id=job_id, context=context, workspace=workspace, deadline=deadline

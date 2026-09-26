@@ -10,10 +10,13 @@ command, prepare an initial or eligible child D2 review, resume an accepted D2
 posting attempt, or enqueue one already committed result reply. The Bridge
 then returns a fresh view and token for the next step.
 
-If the token is stale, RESUME returns the current view with
+If the token is stale at command selection, RESUME returns the current view with
 `stale_recovery_step=true` and `performed_action=none`; it does not advance the
 newly available step. Replaying the old request therefore cannot repeat the
-next action. Neither command scans for jobs. Both require the complete
+next action. If another worker advances a stage after selection, the underlying
+processor or business command checks its own persisted authority and replay
+key; a processor replay reports `performed_action=none`. Selection and
+dispatch are not one atomic transaction. Neither command scans for jobs. Both require the complete
 authenticated Telegram actor, account, conversation and binding context.
 Their response keeps the original interaction's outcome separate from the
 source economic event's current state. An edit refusal never becomes a
@@ -44,6 +47,9 @@ result cannot become a review. An accepted D2 attempt resumes with its original
 attempt ID. Recovery never creates a confirmation or invokes a model. A
 claimed AI invocation without a result remains `outcome_unknown`, even after a
 restart or lease expiry. Local OCR keeps the D3-2 lease and retry budget.
+Terminal receipt failures show `attention_required`; a retry waiting for its
+saved deadline shows `capture_retry_deferred`; an active lease shows
+`capture_in_progress`. RESUME does not claim that these states ran OCR.
 
 After a posting or D2b correction commits, recovery verifies the existing
 transaction and current effective correction head before enqueueing any
@@ -68,9 +74,9 @@ material failure boundary is not exercised end to end.
 | --- | --- | --- | --- |
 | Recovery step token | GET returns a token; RESUME requires it and an idempotency key bound to job plus token. A replayed old token returns current state without advancing. | `tests/test_d3_capture_recovery_bridge_v1.py::test_known_initial_capture_can_resume_local_processing_without_new_fact`, `::test_resume_key_must_bind_one_job`, `::test_resume_requires_a_well_formed_step_token`, `::test_corrected_result_reopens_exact_policy_database_and_recovers_one_fact`, `::test_frozen_whole_card_recovery_applies_once_and_returns_original_card`; `tests/test_d3_capture_recovery_v1.py::test_committed_posting_restarts_and_enqueues_once` | Covered for missing/malformed tokens, key refusal, refreshed tokens, stale replay, and service reread mismatch. Concurrent state change during command selection is not separately injected. |
 | Caller binding and known job | Recovery reads only the requested job under its saved actor/account/conversation/binding; an invalid binding fails closed. | `tests/test_d3_capture_recovery_v1.py::test_query_authenticates_full_identity_and_frozen_route`; `tests/test_d3_capture_recovery_bridge_v1.py::test_recovery_rejects_wrong_authenticated_binding` | Partial: wrong-binding GET and RESUME are covered; missing/ambiguous jobs and changed frozen-source cases are not. |
-| One local processing action | A known captured text or JPEG receipt job advances through the existing processor and creates no final transaction. | `tests/test_d3_capture_recovery_bridge_v1.py::test_known_initial_capture_can_resume_local_processing_without_new_fact`, `::test_receipt_resume_uses_local_ocr_and_preserves_source`; processor lease/OCR cases in `tests/test_d3_capture_processing_v1.py` | Partial: lost response between sequential local stages is not separately injected. |
+| One local processing action | A known captured text or JPEG receipt job advances through the existing processor and creates no final transaction. Terminal/deferred receipt states do not claim that processing ran. | `tests/test_d3_capture_recovery_bridge_v1.py::test_known_initial_capture_can_resume_local_processing_without_new_fact`, `::test_receipt_resume_uses_local_ocr_and_preserves_source`, `::test_receipt_failure_projection_does_not_claim_processing`, `::test_processing_advanced_after_token_check_reports_no_second_action`; processor lease/OCR cases in `tests/test_d3_capture_processing_v1.py` | Partial: lost response between sequential local stages is not separately injected. |
 | Persisted AI outcome unknown | Recovery takes no action and creates no review; it never invokes the provider again. | `tests/test_d3_capture_recovery_v1.py::test_unknown_ai_never_reinvokes_or_prepares_card`; persisted-claim behavior in `tests/test_d3_capture_processing_v1.py::test_existing_ai_claim_without_result_is_unknown_and_never_reclaimed` | Partial: recovery sets the job status directly in its test; no reopened, claim-backed recovery case counts provider calls. |
-| Frozen guided operation replay | After the business edit commits but settlement fails, replay the same operation and settle it once. | `tests/test_d3_capture_recovery_bridge_v1.py::test_guided_business_commit_before_settlement_replays_same_operation`; service-level lost-ack view in `tests/test_d3_capture_recovery_v1.py::test_guided_committed_edit_with_lost_ack_still_requests_replay` | Covered for guided update; guided completion's commit-before-settlement boundary is not separately covered. |
+| Frozen guided operation replay | After the business edit commits but settlement fails, replay the same operation and settle it once. A completed session whose review batch was not claimed resumes the original completion command. | `tests/test_d3_capture_recovery_bridge_v1.py::test_guided_business_commit_before_settlement_replays_same_operation`, `::test_guided_completion_commit_before_batch_claim_recovers_same_batch`; service-level lost-ack view in `tests/test_d3_capture_recovery_v1.py::test_guided_committed_edit_with_lost_ack_still_requests_replay` | Covered for guided update and completion's commit-before-batch boundary. |
 | Frozen whole-card replay and D1 child review | Replay the frozen whole-card operation once, preserve the original card identity, then prepare one child review with the new step token. | `tests/test_d3_capture_recovery_bridge_v1.py::test_frozen_whole_card_recovery_applies_once_and_returns_original_card` | Covered for Bridge replay, stale-token replay and D1 child review; crash between card commit and review preparation is not injected here. |
 | AI child review | Prepare a review only for a sealed, linked `proposal_created` child; never review a classification-only or unlinked result, and keep the capture job's original proposal ID. | `tests/test_d3_capture_recovery_v1.py::test_saved_ai_child_prepares_review_without_rebinding_capture_job`, `::test_non_child_ai_result_never_becomes_a_review` | Partial: service-level boundary is covered; no Bridge RESUME test prepares an AI child review with a recovery step token. |
 | Accepted D2 attempt | Resume the same accepted attempt without a second confirmation; commit at most one transaction. | `tests/test_d3_capture_recovery_v1.py::test_accepted_d2_attempt_resumes_without_new_confirmation` | Partial: the recovery service is exercised after a crash immediately after acceptance commit; Bridge command dispatch and token replay are not. |
@@ -78,7 +84,7 @@ material failure boundary is not exercised end to end.
 | Historical lineage and changed context | Admit only the documented legacy lineage; do not create a new route or recover against changed source identity. | Migration/route contracts in `tests/test_d3_legacy_lineage_cutover_v1.py` and `tests/test_d3_route_entry_authority_v1.py` | Partial: no recovery case starts from an admitted historical no-route job or a changed/ambiguous control source. |
 
 These tests do not establish a full failure-injection matrix across capture,
-OCR, proposal, review, guided completion, every D1/AI child lineage, D2b
+OCR, proposal, review, every D1/AI child lineage, D2b
 multiple-correction replay and outbox commits. The
 processing-stage failure tests are documented separately in
 [`d3_capture_processing_v1.md`](d3_capture_processing_v1.md); D3-3-specific

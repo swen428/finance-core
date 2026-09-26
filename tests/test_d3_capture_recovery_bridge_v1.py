@@ -8,11 +8,17 @@ import openclaw_staging_bridge_support_v1 as support
 import pytest
 from test_receipt_ocr_evidence import FakeEngine
 
+from finance_core.application import capture_processing
 from finance_core.application.corrections import CorrectionService
 from finance_core.correction_adapters import local_authority
 from finance_core.correction_adapters.d2_source import D2OriginalSourceVerifier
 from finance_core.correction_adapters.local_authority import LocalApprovalAuthority
 from finance_core.correction_adapters.policy import open_local_authority_connection, provision
+from finance_core.intake.capture_jobs import claim_capture_job
+from finance_core.intake.receipt_ocr_evidence import (
+    OcrAttachmentIntegrityConflictError,
+    OcrDeadlineExceededError,
+)
 from finance_core.openclaw_staging_bridge import (
     capture_review,
     commands,
@@ -27,6 +33,7 @@ from tests.test_openclaw_staging_bridge_guided_edit_v1 import (
     _apply,
     _begin,
     _capture_routed_message,
+    _complete,
     _draft_from_redemption,
     _whole_card_text,
 )
@@ -60,6 +67,36 @@ def _capture(workspace: support.BridgeWorkspace, text: str) -> str:
     )
     assert outcome.exit_code == 0, outcome.response
     return str(outcome.response["result"]["capture_job"]["public_id"])
+
+
+def _capture_bound_receipt(workspace: support.BridgeWorkspace) -> str:
+    support.write_handoff_file(workspace, "d3-recover.jpg", support.JPEG_BYTES)
+    capture_arguments = support.capture_receipt_arguments(
+        workspace, handoff_filename="d3-recover.jpg"
+    )
+    capture_arguments.update(
+        authenticated_actor_id="111",
+        telegram_account_id="finance-account",
+        telegram_conversation_id="111",
+        conversation_binding_id="binding-1",
+    )
+    captured = support.run_cli(
+        support.make_request(
+            "capture",
+            capture_arguments,
+            idempotency_key=support.canonical_capture_key(message_id=20),
+        )
+    )
+    assert captured.exit_code == 0, captured.response
+    return str(captured.response["result"]["capture_job"]["public_id"])
+
+
+def _receipt_context(workspace: support.BridgeWorkspace, job_id: str) -> dict[str, object]:
+    return {
+        **_context(workspace, job_id),
+        "telegram_account_id": "finance-account",
+        "conversation_binding_id": "binding-1",
+    }
 
 
 def _resume(workspace: support.BridgeWorkspace, job_id: str) -> support.CliOutcome:
@@ -101,35 +138,37 @@ def test_known_initial_capture_can_resume_local_processing_without_new_fact(
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
 
+def test_processing_advanced_after_token_check_reports_no_second_action(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_id = _capture(workspace, "lunch 12.50")
+    original = commands.handle_process_capture_job
+
+    def other_worker_wins(
+        request: commands.BridgeRequest, deadline: commands.Deadline
+    ) -> commands.HandlerResult:
+        first, first_replay = original(request, deadline)
+        assert first_replay is False
+        assert first["capture_job"]["proposal_public_id"] is not None
+        return original(request, deadline)
+
+    monkeypatch.setattr(commands, "handle_process_capture_job", other_worker_wins)
+    resumed = _resume(workspace, job_id)
+    assert resumed.exit_code == 0, resumed.response
+    assert resumed.response["result"]["performed_action"] == "none"
+    assert resumed.response["result"]["next_action"] == "prepare_initial_review"
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+
 def test_receipt_resume_uses_local_ocr_and_preserves_source(
     workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    support.write_handoff_file(workspace, "d3-recover.jpg", support.JPEG_BYTES)
-    capture_arguments = support.capture_receipt_arguments(
-        workspace, handoff_filename="d3-recover.jpg"
-    )
-    capture_arguments.update(
-        authenticated_actor_id="111",
-        telegram_account_id="finance-account",
-        telegram_conversation_id="111",
-        conversation_binding_id="binding-1",
-    )
-    captured = support.run_cli(
-        support.make_request(
-            "capture",
-            capture_arguments,
-            idempotency_key=support.canonical_capture_key(message_id=20),
-        )
-    )
-    assert captured.exit_code == 0, captured.response
-    job_id = str(captured.response["result"]["capture_job"]["public_id"])
+    job_id = _capture_bound_receipt(workspace)
     engine = FakeEngine()
     monkeypatch.setattr(commands, "build_ocr_engine", lambda _workspace: engine)
-    arguments = {
-        **_context(workspace, job_id),
-        "telegram_account_id": "finance-account",
-        "conversation_binding_id": "binding-1",
-    }
+    arguments = _receipt_context(workspace, job_id)
     viewed = support.run_cli(support.make_request("get_capture_recovery", arguments))
     assert viewed.exit_code == 0, viewed.response
     assert viewed.response["result"]["next_action"] == "capture_processing_required"
@@ -146,6 +185,46 @@ def test_receipt_resume_uses_local_ocr_and_preserves_source(
     assert engine.calls == 1
     with support.open_database(workspace) as conn:
         assert conn.execute("SELECT COUNT(*) FROM receipt_ocr_extractions").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("failure", ["permanent", "deferred"])
+def test_receipt_failure_projection_does_not_claim_processing(
+    workspace: support.BridgeWorkspace, failure: str
+) -> None:
+    job_id = _capture_bound_receipt(workspace)
+
+    def fail_ocr(_source: object) -> None:
+        if failure == "permanent":
+            raise OcrAttachmentIntegrityConflictError("synthetic original mismatch")
+        raise OcrDeadlineExceededError("synthetic timeout")
+
+    with support.open_database(workspace) as conn:
+        lease = claim_capture_job(conn, public_id=job_id, owner="recovery-fault")
+        persisted = capture_processing.process_claimed_capture_job(
+            conn, lease=lease, engine=FakeEngine(callback=fail_ocr)
+        )
+        assert persisted["status"] == (
+            "needs_attention" if failure == "permanent" else "processing"
+        )
+    arguments = _receipt_context(workspace, job_id)
+    viewed = support.run_cli(support.make_request("get_capture_recovery", arguments))
+    assert viewed.exit_code == 0, viewed.response
+    expected = "attention_required" if failure == "permanent" else "capture_retry_deferred"
+    assert viewed.response["result"]["next_action"] == expected
+    token = str(viewed.response["result"]["recovery_step_token"])
+    resumed = support.run_cli(
+        support.make_request(
+            "resume_capture_recovery",
+            {**arguments, "recovery_step_token": token},
+            idempotency_key=commands._capture_recovery_key(job_id, token),
+        )
+    )
+    assert resumed.exit_code == 0, resumed.response
+    assert resumed.response["result"]["performed_action"] == "none"
+    assert resumed.response["result"]["next_action"] == expected
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
 
@@ -399,6 +478,77 @@ def test_guided_business_commit_before_settlement_replays_same_operation(
             conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0]
             == before_count
         )
+
+
+def test_guided_completion_commit_before_batch_claim_recovers_same_batch(
+    workspace: support.BridgeWorkspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    _apply(workspace, session, 21, "merchant", "Cafe Two")
+    original_claim = guided_edit.claim_review_batch
+
+    def fail_after_completion(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("synthetic crash before review batch")
+
+    monkeypatch.setattr(guided_edit, "claim_review_batch", fail_after_completion)
+    crashed = _complete(workspace, session, 22)
+    assert crashed.exit_code == errors.EXIT_INTERNAL
+    with support.open_database(workspace) as conn:
+        job_id = str(
+            conn.execute(
+                "SELECT job_public_id FROM finance_capture_interaction_routes "
+                "WHERE guided_session_public_id = ? AND telegram_message_id = 22",
+                (session,),
+            ).fetchone()[0]
+        )
+        assert (
+            conn.execute(
+                "SELECT status FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session,),
+            ).fetchone()[0]
+            == "completed"
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_guided_edit_review_generations").fetchone()[
+                0
+            ]
+            == 0
+        )
+    monkeypatch.setattr(guided_edit, "claim_review_batch", original_claim)
+    arguments = {
+        "workspace_path": str(workspace.workspace_path),
+        "job_public_id": job_id,
+        "operator_actor_id": "111",
+        "telegram_account_id": "finance-account",
+        "telegram_conversation_id": "111",
+        "conversation_binding_id": "binding-1",
+    }
+    pending = support.run_cli(support.make_request("get_capture_recovery", arguments))
+    assert pending.exit_code == 0, pending.response
+    assert pending.response["result"]["interaction_outcome"] == "completed"
+    assert pending.response["result"]["next_action"] == "guided_command_required"
+    token = str(pending.response["result"]["recovery_step_token"])
+    request = support.make_request(
+        "resume_capture_recovery",
+        {**arguments, "recovery_step_token": token},
+        idempotency_key=commands._capture_recovery_key(job_id, token),
+    )
+    resumed = support.run_cli(request)
+    assert resumed.exit_code == 0, resumed.response
+    batch_id = resumed.response["result"]["interaction_review_batch_id"]
+    assert isinstance(batch_id, str)
+    replay = support.run_cli(request)
+    assert replay.exit_code == 0, replay.response
+    assert replay.response["result"]["interaction_review_batch_id"] == batch_id
+    assert replay.response["result"]["stale_recovery_step"] is True
+    with support.open_database(workspace) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM openclaw_guided_edit_review_generations").fetchone()[
+                0
+            ]
+            == 1
+        )
+        assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
 
 
 def test_frozen_whole_card_recovery_applies_once_and_returns_original_card(

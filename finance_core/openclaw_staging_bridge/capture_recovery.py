@@ -213,6 +213,49 @@ def _interaction_outcome(conn: sqlite3.Connection, route: dict[str, Any] | None)
     raise CaptureRecoveryConflict("Unknown frozen route")
 
 
+def _guided_completion_batch(
+    conn: sqlite3.Connection, route: dict[str, Any]
+) -> tuple[str | None, bool]:
+    """Project the same usable review generation that guided completion claims."""
+    from finance_core.openclaw_staging_bridge.guided_edit import (
+        REVIEW_REFERENCE_MIN_REMAINING_SECONDS,
+    )
+
+    session = conn.execute(
+        "SELECT id, status, completed_message_id FROM openclaw_guided_edit_sessions "
+        "WHERE session_public_id = ?",
+        (route["guided_session_public_id"],),
+    ).fetchone()
+    if (
+        session is None
+        or session["status"] != "completed"
+        or session["completed_message_id"] != route["telegram_message_id"]
+    ):
+        raise CaptureRecoveryConflict("Guided completion session differs from frozen route")
+    latest = conn.execute(
+        "SELECT generations.reference_batch_id, COUNT(refs.id) AS reference_count, "
+        "MIN(refs.expires_at) AS min_reference_expiry, "
+        "COUNT(redemptions.id) AS redemption_count "
+        "FROM openclaw_guided_edit_review_generations generations "
+        "LEFT JOIN openclaw_human_action_references refs "
+        "ON refs.issuance_idempotency_key = "
+        "'bridge-human-action-issue:' || generations.reference_batch_id "
+        "LEFT JOIN openclaw_human_action_redemptions redemptions "
+        "ON redemptions.reference_id = refs.id "
+        "WHERE generations.session_id = ? GROUP BY generations.id "
+        "ORDER BY generations.generation DESC LIMIT 1",
+        (session["id"],),
+    ).fetchone()
+    if latest is None:
+        return None, True
+    reusable = int(latest["reference_count"]) == 0 or (
+        int(latest["redemption_count"]) == 0
+        and int(latest["min_reference_expiry"])
+        > int(time.time()) + REVIEW_REFERENCE_MIN_REMAINING_SECONDS
+    )
+    return str(latest["reference_batch_id"]), not reusable
+
+
 def _reviews(conn: sqlite3.Connection, source_job: dict[str, Any]) -> list[dict[str, Any]]:
     rows = conn.execute(
         "SELECT r.review_public_id, r.source_kind, r.parser_output_id, "
@@ -412,6 +455,16 @@ def _recovery(
             if len(matching) > 1:
                 raise CaptureRecoveryConflict("Multiple current child reviews claim one source")
             review = matching[0] if matching else None
+    if (
+        route_kind == "guided_complete"
+        and route is not None
+        and response["interaction_outcome"] == "completed"
+    ):
+        batch_id, needs_claim = _guided_completion_batch(conn, route)
+        response["interaction_review_batch_id"] = batch_id
+        if needs_claim and (review is None or review["attempt_public_id"] is None):
+            response["next_action"] = "guided_command_required"
+            return response
     if review is None:
         if route_kind in {"initial_intake", "legacy_initial_intake", "receipt_intake"}:
             linked = (
@@ -478,6 +531,13 @@ def _recovery(
                 if linked is not None
                 and job["ai_attempt_public_id"] is None
                 and job["status"] in {"processing", "awaiting_user"}
+                else "attention_required"
+                if job["status"] in {"needs_attention", "result_ready"}
+                else "capture_retry_deferred"
+                if int(job["ocr_retry_not_before_ms"]) > time.time_ns() // 1_000_000
+                else "capture_in_progress"
+                if job["lease_expires_at"] is not None
+                and int(job["lease_expires_at"]) > time.time_ns() // 1_000_000
                 else "attention_required"
                 if job["proposal_public_id"]
                 else "capture_processing_required"
