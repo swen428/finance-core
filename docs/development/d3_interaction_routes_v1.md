@@ -70,8 +70,10 @@ Text adoption rejects payloads that also contain Telegram media fields before
 any persistence; those attachments require the separate receipt capture path.
 An expired guided session cannot claim a newly arriving ordinary expense.
 
-A worker may run `process_capture_job` only for `initial_intake`; for text it
-creates the deterministic parser proposal after adoption. For `whole_card`,
+For new routed jobs, a worker may run `process_capture_job` only for
+`initial_intake`; for text it creates the deterministic parser proposal after
+adoption. Historical pre-055 jobs without a route remain subject to the
+migration's narrow compatibility gates. For `whole_card`,
 `guided_update`, and `guided_complete`, a later worker must pass the frozen
 material to the existing D1/guided authority commands. Each new business write
 checks route kind, original message/context and operation material inside its
