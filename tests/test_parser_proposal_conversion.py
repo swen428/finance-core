@@ -19,8 +19,8 @@ from finance_core.parser_proposals.conversion import (
 
 
 @pytest.fixture()
-def conversion_db(migrated_temp_db_connection: sqlite3.Connection) -> sqlite3.Connection:
-    return migrated_temp_db_connection
+def conversion_db(legacy_temp_db_connection: sqlite3.Connection) -> sqlite3.Connection:
+    return legacy_temp_db_connection
 
 
 def test_confirmed_simple_proposal_can_be_converted(
@@ -511,8 +511,10 @@ def test_conversion_tests_use_temporary_database_only(
     assert database_path == temp_db_path
 
 
-def create_confirmed_simple_proposal(conn: sqlite3.Connection) -> int:
-    result = process_raw_text_input(conn, "Coffee SGD 6.40 at Starbucks")
+def create_confirmed_simple_proposal(
+    conn: sqlite3.Connection, *, source_type: str = "telegram_text"
+) -> int:
+    result = process_raw_text_input(conn, "Coffee SGD 6.40 at Starbucks", source_type=source_type)
     parser_output_id = result["parser_output"]["id"]
     update_payload(conn, parser_output_id, {"transaction_date": "2026-06-01"})
     confirm_proposal(conn, parser_output_id, actor="owner", reason="looks correct")

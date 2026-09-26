@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from migrated_staging_snapshot_v1 import (
     MigratedStagingTemplate,
@@ -33,6 +33,7 @@ from finance_core.intake.receipt_ocr_evidence import (
 )
 from finance_core.openclaw_staging_bridge import cli as bridge_cli
 from finance_core.openclaw_staging_bridge import envelope as bridge_envelope
+from finance_core.openclaw_staging_bridge import identity as bridge_identity
 from finance_core.receipt_staging_runner.models import parse_runner_manifest
 from finance_core.receipt_staging_runner.workspace import create_runner_workspace
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
@@ -130,13 +131,18 @@ class BridgeWorkspace:
     database_path: Path
 
 
-def create_bridge_workspace(tmp_path: Path, *, name: str | None = None) -> BridgeWorkspace:
+def create_bridge_workspace(
+    tmp_path: Path, *, name: str | None = None, migration_paths: Sequence[Path] | None = None
+) -> BridgeWorkspace:
     """Create a runner workspace plus a migrated staging database inside it."""
     suffix = name or uuid.uuid4().hex[:8]
     workspace_path = str((tmp_path / f"workspace_{suffix}").resolve())
     manifest = parse_runner_manifest(make_manifest_bytes())
     workspace = create_runner_workspace(workspace_path, manifest)
-    conn = create_staging_database(workspace.database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    conn = create_staging_database(
+        workspace.database_path,
+        migration_paths=TEMP_DB_MIGRATION_PATHS if migration_paths is None else migration_paths,
+    )
     conn.close()
     return BridgeWorkspace(
         workspace_path=Path(workspace.workspace_path),
@@ -250,6 +256,51 @@ def capture_text_arguments(workspace: BridgeWorkspace, update: dict[str, Any]) -
         "kind": "text",
         "telegram_update": update,
     }
+
+
+def authenticated_text_capture_arguments(
+    workspace: BridgeWorkspace,
+    update: dict[str, Any],
+    *,
+    account_id: str = "finance-account",
+    binding_id: str = "binding-1",
+    payload_sha256: str = "a" * 64,
+) -> dict[str, Any]:
+    """Synthetic D3 ingress facts for an explicit routed text capture."""
+    message = update["message"]
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+    sender_id = message["from"]["id"]
+    return {
+        **capture_text_arguments(workspace, update),
+        "authenticated_actor_id": str(sender_id),
+        "telegram_account_id": account_id,
+        "telegram_conversation_id": str(chat_id),
+        "conversation_binding_id": binding_id,
+        "finance_ingress": {
+            "channel": "telegram",
+            "accountId": account_id,
+            "updateId": update["update_id"],
+            "chatId": chat_id,
+            "messageId": message_id,
+            "senderId": sender_id,
+            "payloadSha256": payload_sha256,
+            "bindingId": binding_id,
+        },
+    }
+
+
+def process_captured_text(workspace: BridgeWorkspace, capture: CliOutcome) -> CliOutcome:
+    """Explicitly advance a captured initial-intake job to its parser proposal."""
+    job_id = capture.response["result"]["capture_job"]["public_id"]
+    return run_cli(
+        make_request(
+            "process_capture_job",
+            {"workspace_path": str(workspace.workspace_path), "job_public_id": job_id},
+            idempotency_key="fcp_"
+            + bridge_identity.canonical_digest("finance-process-capture-job-v1", job_id),
+        )
+    )
 
 
 def capture_receipt_arguments(

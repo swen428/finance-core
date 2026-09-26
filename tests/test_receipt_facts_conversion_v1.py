@@ -741,7 +741,7 @@ def test_unsupported_simple_text_proposal_rejected(
 ) -> None:
     conn = migrated_temp_db_connection
     seed_people(conn)
-    pid = create_confirmed_simple_proposal(conn)
+    pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     public_id = conn.execute(
         "SELECT public_id FROM parser_outputs WHERE id = ?", (pid,)
     ).fetchone()["public_id"]
@@ -1050,7 +1050,7 @@ def test_raw_intake_pointer_zero_and_repointed_and_double(
     conn.execute(
         "INSERT INTO raw_intake_records "
         "(public_id, source_type, source_channel, raw_input, received_at, parser_output_id) "
-        "VALUES ('raw_ocr_ptr_dup', 'telegram_text', 'telegram', 'dup', "
+        "VALUES ('raw_ocr_ptr_dup', 'telegram_image', 'telegram', 'dup', "
         "'2026-07-19T15:00:00+00:00', ?)",
         (pid,),
     )

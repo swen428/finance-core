@@ -21,8 +21,8 @@ from finance_core.parsers.text_expense_parser import parse_text_expense
 
 
 @pytest.fixture()
-def raw_intake_db(migrated_temp_db_connection: sqlite3.Connection) -> sqlite3.Connection:
-    return migrated_temp_db_connection
+def raw_intake_db(legacy_temp_db_connection: sqlite3.Connection) -> sqlite3.Connection:
+    return legacy_temp_db_connection
 
 
 def transaction_count(conn: sqlite3.Connection) -> int:

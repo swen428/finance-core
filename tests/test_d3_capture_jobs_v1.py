@@ -29,7 +29,7 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 def _text_request(workspace: support.BridgeWorkspace, text: str = "lunch 12.50") -> dict:
     return support.make_request(
         "capture",
-        support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+        support.authenticated_text_capture_arguments(workspace, support.telegram_text_update(text)),
         idempotency_key=support.canonical_capture_key(message_id=10),
     )
 
@@ -94,6 +94,8 @@ def test_text_job_commits_with_raw_intake_and_replays_same_identity(
     first_result = first.response["result"]
     replay_result = replay.response["result"]
     assert first_result["capture_job"]["status"] == "captured"
+    assert first_result["proposal_public_id"] is None
+    assert replay_result["proposal_public_id"] is None
     assert replay_result["capture_job"]["public_id"] == first_result["capture_job"]["public_id"]
     status = support.run_cli(
         support.make_request(
@@ -118,10 +120,15 @@ def test_text_adapter_replay_after_job_preserves_typed_idempotency(
 ) -> None:
     first = support.run_cli(_text_request(workspace))
     assert first.exit_code == errors.EXIT_OK
+    assert first.response["result"]["proposal_public_id"] is None
+    processed = support.process_captured_text(workspace, first)
+    assert processed.exit_code == errors.EXIT_OK, processed.response
+    proposal_public_id = processed.response["result"]["capture_job"]["proposal_public_id"]
+    assert proposal_public_id is not None
     with support.open_database(workspace) as conn:
         same = process_telegram_text_update(conn, support.telegram_text_update("lunch 12.50"))
         assert same["intake"]["public_id"] == first.response["result"]["intake_public_id"]
-        assert same["parser_output"]["public_id"] == first.response["result"]["proposal_public_id"]
+        assert same["parser_output"]["public_id"] == proposal_public_id
         with pytest.raises(RawIntakeIdempotencyConflictError):
             process_telegram_text_update(conn, support.telegram_text_update("lunch 13.50"))
         assert conn.execute("SELECT count(*) FROM raw_intake_records").fetchone()[0] == 1

@@ -596,7 +596,7 @@ def test_present_empty_registry_keeps_conversion_and_replay_working(
     # migration 035 registry; eligible simple proposals convert normally.
     conn = migrated_temp_db_connection
     assert _registry_rows(conn) == []
-    pid = create_confirmed_simple_proposal(conn)
+    pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
 
     first = convert_confirmed_parser_proposal(conn, pid)
     replay = convert_confirmed_parser_proposal(conn, pid)
@@ -611,7 +611,7 @@ def test_registry_row_blocks_legacy_conversion_with_zero_writes(
     migrated_temp_db_connection: sqlite3.Connection,
 ) -> None:
     conn = migrated_temp_db_connection
-    pid = create_confirmed_simple_proposal(conn)
+    pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     cmd_id, receipt_id = _insert_registry_row(conn, pid, "excl_blocked")
     before = _financial_state(conn)
 
@@ -646,7 +646,7 @@ def test_registry_guard_precedes_legacy_replay(
     migrated_temp_db_connection: sqlite3.Connection,
 ) -> None:
     conn = migrated_temp_db_connection
-    pid = create_confirmed_simple_proposal(conn)
+    pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     first = convert_confirmed_parser_proposal(conn, pid)
     assert first["idempotent"] is False
     cmd_id, receipt_id = _insert_registry_row(conn, pid, "excl_replay")

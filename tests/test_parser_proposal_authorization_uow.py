@@ -7,6 +7,7 @@ import inspect
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,6 +45,8 @@ from tests.test_parser_human_drafts_v1 import (
     _complete_validator,
     _start,
 )
+
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
 
 
 def _proposal(
@@ -107,6 +110,18 @@ def _published_d1_card(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
         ),
         publish=publish_human_revision_in_transaction,
     )
+
+
+@pytest.fixture()
+def legacy_d1_connection(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = create_staging_database(
+        tmp_path / "legacy-d1.sqlite", migration_paths=LEGACY_D1_MIGRATION_PATHS
+    )
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _redeemed_d1_action(
@@ -183,11 +198,12 @@ def test_human_confirmation_is_authoritative_and_conversion_is_canonical(
 
 
 def test_d1_confirm_requires_redeemed_current_generation_and_closes_head_atomically(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from finance_core.parser_proposals import service
 
+    migrated_temp_db_connection = legacy_d1_connection
     card = _published_d1_card(migrated_temp_db_connection, monkeypatch)
     proposal_id = migrated_temp_db_connection.execute(
         "SELECT id FROM parser_outputs WHERE public_id = ?",
@@ -281,7 +297,7 @@ def test_d1_confirm_requires_redeemed_current_generation_and_closes_head_atomica
 
 
 def test_d1_confirm_rechecks_generation_after_redemption_before_decision(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from finance_core.parser_proposals import service
@@ -293,6 +309,7 @@ def test_d1_confirm_rechecks_generation_after_redemption_before_decision(
     )
     from finance_core.parser_proposals.human_drafts import HumanDraftContext
 
+    migrated_temp_db_connection = legacy_d1_connection
     card = _published_d1_card(migrated_temp_db_connection, monkeypatch)
     redeemed = _redeemed_d1_action(
         migrated_temp_db_connection,
@@ -368,11 +385,12 @@ def test_d1_confirm_rechecks_generation_after_redemption_before_decision(
 
 
 def test_d1_incomplete_reject_closes_head_and_expired_replay_fails_closed(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from finance_core.parser_proposals import service
 
+    migrated_temp_db_connection = legacy_d1_connection
     incomplete = _start(
         migrated_temp_db_connection,
         payload={
@@ -441,11 +459,12 @@ def test_d1_incomplete_reject_closes_head_and_expired_replay_fails_closed(
 
 
 def test_d1_forged_cross_context_action_and_target_bindings_write_nothing(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from finance_core.parser_proposals import service
 
+    migrated_temp_db_connection = legacy_d1_connection
     card = _published_d1_card(migrated_temp_db_connection, monkeypatch)
     proposal_id = migrated_temp_db_connection.execute(
         "SELECT id FROM parser_outputs WHERE public_id = ?",
@@ -495,12 +514,13 @@ def test_d1_forged_cross_context_action_and_target_bindings_write_nothing(
 
 @pytest.mark.parametrize("decision", ["confirmed", "rejected"])
 def test_d1_terminal_cleanup_failure_rolls_back_every_decision_write(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
     decision: str,
 ) -> None:
     from finance_core.parser_proposals import service
 
+    migrated_temp_db_connection = legacy_d1_connection
     card = _published_d1_card(migrated_temp_db_connection, monkeypatch)
     proposal_id = migrated_temp_db_connection.execute(
         "SELECT id FROM parser_outputs WHERE public_id = ?",
@@ -542,13 +562,14 @@ def test_d1_terminal_cleanup_failure_rolls_back_every_decision_write(
 @pytest.mark.parametrize("action", ["confirm", "reject"])
 @pytest.mark.parametrize("expiry_boundary", ["reference", "generation"])
 def test_d1_decision_refuses_both_expiry_boundaries_at_equality_without_writes(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_d1_connection: sqlite3.Connection,
     monkeypatch: pytest.MonkeyPatch,
     action: str,
     expiry_boundary: str,
 ) -> None:
     from finance_core.parser_proposals import service
 
+    migrated_temp_db_connection = legacy_d1_connection
     card = _published_d1_card(migrated_temp_db_connection, monkeypatch)
     key = b"d1-expiry-boundary-test-key"
     context = human_actions.HumanActionContext("111", "acct", "111", "binding")
@@ -638,7 +659,7 @@ def test_d1_confirm_and_generation_reissue_have_exactly_one_two_connection_winne
     from finance_core.parser_proposals.human_drafts import HumanDraftContext
 
     database_path = tmp_path / "d1-confirm-reissue-race.sqlite"
-    setup = create_staging_database(database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    setup = create_staging_database(database_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
     setup.row_factory = sqlite3.Row
     card = _published_d1_card(setup, monkeypatch)
     proposal_id = setup.execute(

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -651,6 +652,137 @@ def find_refused_replay(
     )
 
 
+def is_exact_historical_pending_update(
+    conn: sqlite3.Connection,
+    *,
+    session: dict[str, Any],
+    context: HumanActionContext,
+    message_id: int,
+    field_name: str,
+    field_value: str,
+) -> bool:
+    """Allow only recovery of the same previously claimed guided message."""
+    if (
+        session["authenticated_actor_id"] != context.actor_id
+        or session["channel_account_id"] != context.account_id
+        or session["channel_conversation_id"] != context.conversation_id
+        or session["conversation_binding_id"] != context.binding_id
+        or session["pending_message_id"] != message_id
+        or session["pending_field_name"] != field_name
+        or json.loads(str(session["pending_field_value_json"])) != field_value
+    ):
+        return False
+    # The migration snapshots pending work before installing the route gate.
+    # A matching event alone can be forged after cutover and is not history.
+    rows = conn.execute(
+        "SELECT event.field_name, event.field_value_json, event.operation_key "
+        "FROM finance_legacy_guided_pending_admissions AS legacy "
+        "JOIN openclaw_guided_edit_sessions AS current "
+        "ON current.id = legacy.session_id "
+        "JOIN openclaw_guided_edit_events AS event "
+        "ON event.id = legacy.request_event_id "
+        "WHERE legacy.session_id = ? AND legacy.session_public_id = ? "
+        "AND legacy.telegram_message_id = ? "
+        "AND legacy.operation_key = ? AND legacy.field_name = ? "
+        "AND legacy.field_value_json = ? "
+        "AND legacy.authenticated_actor_id = ? "
+        "AND legacy.channel_account_id = ? "
+        "AND legacy.channel_conversation_id = ? "
+        "AND legacy.conversation_binding_id = ? "
+        "AND current.status = 'active' "
+        "AND current.pending_message_id = legacy.telegram_message_id "
+        "AND current.pending_operation_key = legacy.operation_key "
+        "AND current.pending_field_name = legacy.field_name "
+        "AND current.pending_field_value_json = legacy.field_value_json "
+        "AND event.session_id = legacy.session_id "
+        "AND event.telegram_message_id = legacy.telegram_message_id "
+        "AND event.event_type = 'update_requested'",
+        (
+            session["id"],
+            session["session_public_id"],
+            message_id,
+            session["pending_operation_key"],
+            field_name,
+            session["pending_field_value_json"],
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
+    ).fetchall()
+    return len(rows) == 1 and (
+        rows[0][0] == field_name
+        and json.loads(str(rows[0][1])) == field_value
+        and rows[0][2] == session["pending_operation_key"]
+    )
+
+
+def _require_guided_route(
+    conn: sqlite3.Connection,
+    *,
+    session: dict[str, Any],
+    message_id: int,
+    route_kind: str,
+    operation_key: str | None = None,
+    field_name: str | None = None,
+    field_value: str | None = None,
+) -> None:
+    """Enforce cutover authority even for callers without a validator callback."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'finance_capture_interaction_routes'"
+        ).fetchone()
+        is None
+    ):
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+            ).fetchone()
+            is not None
+            and conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id = '055'"
+            ).fetchone()
+            is not None
+        ):
+            raise GuidedEditError("interaction_route_required")
+        return  # The pre-055 application has no frozen ingress routes.
+    rows = conn.execute(
+        "SELECT field_name, field_value_json FROM finance_capture_interaction_routes "
+        "WHERE route_kind = ? AND guided_session_public_id = ? "
+        "AND telegram_message_id = ? AND authenticated_actor_id = ? "
+        "AND telegram_account_id = ? AND telegram_conversation_id = ? "
+        "AND conversation_binding_id = ?",
+        (
+            route_kind,
+            session["session_public_id"],
+            message_id,
+            session["authenticated_actor_id"],
+            session["channel_account_id"],
+            session["channel_conversation_id"],
+            session["conversation_binding_id"],
+        ),
+    ).fetchall()
+    if len(rows) != 1 or (
+        route_kind == "guided_update"
+        and (rows[0][0] != field_name or json.loads(str(rows[0][1])) != field_value)
+    ):
+        raise GuidedEditError("interaction_route_required")
+    if route_kind == "guided_update":
+        proposal = conn.execute(
+            "SELECT public_id FROM parser_outputs WHERE id = ?",
+            (session["current_parser_output_id"],),
+        ).fetchone()
+        expected = (
+            None
+            if proposal is None
+            else f"bridge-edit:{proposal[0]}:v{session['current_proposal_version']}:"
+            f"{session['current_content_hash']}"
+        )
+        if operation_key != expected:
+            raise GuidedEditError("interaction_route_required")
+
+
 def request_update(
     conn: sqlite3.Connection,
     session: dict[str, Any],
@@ -659,6 +791,7 @@ def request_update(
     operation_key: str,
     field_name: str,
     field_value: str,
+    authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> dict[str, Any]:
     if field_name not in ALLOWED_FIELDS or not field_value:
         raise GuidedEditError("invalid_update")
@@ -666,6 +799,8 @@ def request_update(
     created_at = _now_text()
     _begin(conn)
     try:
+        if authority_validator is not None:
+            authority_validator(conn)
         current = _row(
             conn.execute(
                 "SELECT * FROM openclaw_guided_edit_sessions WHERE id = ?",
@@ -674,6 +809,15 @@ def request_update(
         )
         if current is None or current["status"] != "active":
             raise GuidedEditError("session_terminal")
+        _require_guided_route(
+            conn,
+            session=current,
+            message_id=message_id,
+            route_kind="guided_update",
+            operation_key=operation_key,
+            field_name=field_name,
+            field_value=field_value,
+        )
         if int(current["expires_at"]) <= _now_epoch():
             raise GuidedEditError("session_expired")
         if current["pending_message_id"] is not None:
@@ -858,10 +1002,13 @@ def complete_session(
     *,
     context: HumanActionContext,
     message_id: int,
+    authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> dict[str, Any]:
     created_at = _now_text()
     _begin(conn)
     try:
+        if authority_validator is not None:
+            authority_validator(conn)
         current = _row(
             conn.execute(
                 "SELECT * FROM openclaw_guided_edit_sessions WHERE id = ?", (session["id"],)
@@ -872,6 +1019,9 @@ def complete_session(
         if current["status"] == "completed" and current["completed_message_id"] == message_id:
             conn.commit()
             return current
+        _require_guided_route(
+            conn, session=current, message_id=message_id, route_kind="guided_complete"
+        )
         if current["status"] != "active" or current["pending_message_id"] is not None:
             raise GuidedEditError("session_not_completable")
         if int(current["expires_at"]) <= _now_epoch():
@@ -1019,6 +1169,7 @@ __all__ = [
     "get_active_session",
     "get_context_session",
     "get_session_by_public_id",
+    "is_exact_historical_pending_update",
     "pending_core_state",
     "record_update_applied",
     "record_update_refused",

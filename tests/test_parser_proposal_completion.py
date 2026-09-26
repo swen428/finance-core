@@ -44,6 +44,15 @@ from finance_core.parser_proposals.lifecycle import (
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
 
+
+@pytest.fixture()
+def migrated_temp_db_connection(
+    legacy_temp_db_connection: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Preserve pre-D3 Telegram intake coverage for proposal lifecycle tests."""
+    return legacy_temp_db_connection
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------

@@ -43,6 +43,14 @@ _LABELS = {
 _REFERENCE_LABELS = frozenset({"资料卡编号", "card ref"})
 _HEX = frozenset("0123456789abcdef")
 _REASON_POLICY_VERSION = "d1-reason-policy-v1"
+_GUIDED_D1_LABELS = {
+    "amount": "Amount",
+    "currency": "Currency",
+    "transaction_date": "Date",
+    "merchant": "Merchant",
+    "description": "Description",
+    "category": "Category",
+}
 
 
 def _now_epoch() -> int:
@@ -119,6 +127,126 @@ class HumanDraftCommand:
     conversation_binding_id: str
     raw_card_text: str
     field_values: dict[str, str]
+
+
+def _require_d3_reply_route(
+    conn: sqlite3.Connection,
+    *,
+    command: HumanDraftCommand,
+    draft: sqlite3.Row,
+    raw_hash: str,
+) -> None:
+    """Bind each new Telegram reply to its frozen route or exact cutover claim."""
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'finance_capture_interaction_routes'"
+        ).fetchone()
+        is None
+    ):
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+            ).fetchone()
+            is not None
+            and conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id = '055'"
+            ).fetchone()
+            is not None
+        ):
+            raise HumanDraftError("interaction_route_required")
+        return  # A pre-055 database has no interaction-route contract.
+    context = (
+        command.authenticated_actor_id,
+        command.telegram_account_id,
+        command.telegram_conversation_id,
+        command.conversation_binding_id,
+        command.telegram_message_id,
+    )
+    whole = conn.execute(
+        "SELECT intake.raw_input FROM finance_capture_interaction_routes AS route "
+        "JOIN finance_capture_jobs AS job ON job.public_id = route.job_public_id "
+        "JOIN raw_intake_records AS intake ON intake.id = job.raw_intake_record_id "
+        "WHERE route.route_kind = 'whole_card' "
+        "AND route.authenticated_actor_id = ? AND route.telegram_account_id = ? "
+        "AND route.telegram_conversation_id = ? "
+        "AND route.conversation_binding_id = ? AND route.telegram_message_id = ? "
+        "AND route.card_generation_public_id = ? AND route.operation_key = ? "
+        "AND route.raw_text_sha256 = ?",
+        (*context, command.card_generation_public_id, command.operation_public_id, raw_hash),
+    ).fetchone()
+    if whole is not None and whole[0] == command.raw_card_text:
+        return
+
+    rows = conn.execute(
+        "SELECT session.session_public_id, session.pending_field_name, "
+        "session.pending_field_value_json, legacy.session_id, "
+        "route.d1_compatibility_operation_public_id "
+        "FROM openclaw_guided_edit_sessions AS session "
+        "JOIN openclaw_guided_edit_events AS event "
+        "ON event.session_id = session.id AND event.event_type = 'update_requested' "
+        "AND event.telegram_message_id = session.pending_message_id "
+        "AND event.operation_key = session.pending_operation_key "
+        "AND event.field_name = session.pending_field_name "
+        "AND event.field_value_json = session.pending_field_value_json "
+        "LEFT JOIN finance_legacy_guided_pending_admissions AS legacy "
+        "ON legacy.session_id = session.id "
+        "AND legacy.request_event_id = event.id "
+        "AND legacy.telegram_message_id = session.pending_message_id "
+        "AND legacy.operation_key = session.pending_operation_key "
+        "AND legacy.field_name = session.pending_field_name "
+        "AND legacy.field_value_json = session.pending_field_value_json "
+        "LEFT JOIN finance_capture_interaction_routes AS route "
+        "ON route.guided_session_public_id = session.session_public_id "
+        "AND route.route_kind = 'guided_update' "
+        "AND route.telegram_message_id = session.pending_message_id "
+        "AND route.field_name = session.pending_field_name "
+        "AND json_extract(route.field_value_json, '$') "
+        "= json_extract(session.pending_field_value_json, '$') "
+        "AND route.authenticated_actor_id = session.authenticated_actor_id "
+        "AND route.telegram_account_id = session.channel_account_id "
+        "AND route.telegram_conversation_id = session.channel_conversation_id "
+        "AND route.conversation_binding_id = session.conversation_binding_id "
+        "WHERE session.source_reference_id = ? AND session.status = 'active' "
+        "AND session.authenticated_actor_id = ? "
+        "AND session.channel_account_id = ? "
+        "AND session.channel_conversation_id = ? "
+        "AND session.conversation_binding_id = ? "
+        "AND session.pending_message_id = ? "
+        "AND (route.job_public_id IS NOT NULL OR legacy.session_id IS NOT NULL)",
+        (draft["source_edit_reference_id"], *context),
+    ).fetchall()
+    if len(rows) != 1:
+        raise HumanDraftError("interaction_route_required")
+    session_id, field, field_json, _legacy_id, routed_d1_operation = rows[0]
+    try:
+        value = json.loads(str(field_json))
+    except (TypeError, ValueError) as exc:
+        raise HumanDraftError("interaction_route_required") from exc
+    if not isinstance(value, str) or command.field_values != {field: value}:
+        raise HumanDraftError("interaction_route_required")
+    expected_operation = (
+        "d1op_"
+        + hashlib.sha256(
+            "\x00".join(
+                (
+                    "d1-guided-edit-compatibility-v1",
+                    str(session_id),
+                    str(command.telegram_message_id),
+                )
+            ).encode()
+        ).hexdigest()[:32]
+    )
+    label = _GUIDED_D1_LABELS.get(str(field))
+    if label is None:
+        raise HumanDraftError("interaction_route_required")
+    expected_text = f"Card Ref: {command.card_generation_public_id}\n{label}: {value}"
+    if (
+        command.operation_public_id != expected_operation
+        or (routed_d1_operation is not None and routed_d1_operation != expected_operation)
+        or command.raw_card_text != expected_text
+    ):
+        raise HumanDraftError("interaction_route_required")
 
 
 @dataclass(frozen=True)
@@ -774,6 +902,22 @@ def _parse_card_fields(raw_card_text: str) -> tuple[str, dict[str, str]]:
     return reference, fields
 
 
+def parse_human_draft_card_structure_for_routing(raw_card_text: str) -> str | None:
+    """Require executable D1 card material without applying it or creating facts."""
+    try:
+        if len(raw_card_text.encode("utf-8", errors="strict")) > 16_384:
+            return None
+    except UnicodeEncodeError:
+        return None
+    try:
+        reference, fields = _parse_card_fields(raw_card_text)
+    except _HumanDraftRefusal:
+        return None
+    if set(fields) != set(_FIELDS):
+        return None
+    return reference
+
+
 def _validate_human_draft_adapter(
     current_payload: dict[str, object],
     field_values: dict[str, str],
@@ -1133,6 +1277,7 @@ def apply_human_draft_card(
         assert draft is not None
         if _context_from_row(draft) != _command_context(command):
             raise HumanDraftError("actor_or_context_mismatch")
+        _require_d3_reply_route(conn, command=command, draft=draft, raw_hash=raw_hash)
         now = _now_epoch()
         if draft["state"] != "active":
             raise HumanDraftError("draft_terminal")

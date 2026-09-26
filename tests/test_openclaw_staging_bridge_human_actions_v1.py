@@ -23,6 +23,8 @@ from tests.test_parser_human_drafts_v1 import (
     _start,
 )
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 ACTOR = "111"
 ACCOUNT = "finance-account"
 CONVERSATION = "111"
@@ -34,7 +36,7 @@ def _d1_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     return conn
 
 
@@ -52,15 +54,21 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 
 
 def proposal(workspace: support.BridgeWorkspace, text: str = "lunch 12.50") -> str:
+    update = support.telegram_text_update(text)
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
-    return str(capture.response["result"]["proposal_public_id"])
+    assert capture.response["result"]["proposal_public_id"] is None
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    proposal_public_id = processed.response["result"]["capture_job"]["proposal_public_id"]
+    assert proposal_public_id is not None
+    return str(proposal_public_id)
 
 
 def issue_arguments(
@@ -475,7 +483,7 @@ def test_d1_issuance_is_atomic_and_reconstructs_across_restart(
         opened.execute("PRAGMA foreign_keys = ON")
         return opened
 
-    conn = create_staging_database(database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    conn = create_staging_database(database_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
     conn.row_factory = sqlite3.Row
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)

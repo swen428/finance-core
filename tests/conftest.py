@@ -92,6 +92,28 @@ def migrated_temp_db_connection(
 
 
 @pytest.fixture()
+def legacy_temp_db_path(temp_db_path: Path) -> Path:
+    """Keep pre-D3 one-step Telegram adapter contracts on their original schema."""
+    conn = connect_temp_db(temp_db_path)
+    try:
+        assert MIGRATION_PATHS[-1].name == "055_d3_interaction_routes.sql"
+        apply_migrations(conn, MIGRATION_PATHS[:-1])
+        conn.commit()
+    finally:
+        conn.close()
+    return temp_db_path
+
+
+@pytest.fixture()
+def legacy_temp_db_connection(legacy_temp_db_path: Path) -> Iterator[sqlite3.Connection]:
+    conn = connect_temp_db(legacy_temp_db_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@pytest.fixture()
 def tc001_db(migrated_temp_db_connection: sqlite3.Connection) -> sqlite3.Connection:
     _seed_owner_participant(migrated_temp_db_connection)
     apply_sql(migrated_temp_db_connection, TC001_SEED_PATH)

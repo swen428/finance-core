@@ -21,7 +21,11 @@ from finance_core.intake.receipt_ocr_evidence import (
     ReceiptOcrExtractionStatus,
 )
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
-from finance_core.openclaw_staging_bridge import ocr_boundary
+from finance_core.openclaw_staging_bridge import ocr_boundary, workspace_access
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+from finance_core.staging_guard import open_staging_database
+
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
 
 
 @pytest.fixture()
@@ -29,57 +33,82 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
     return support.create_bridge_workspace(tmp_path)
 
 
+@pytest.fixture()
+def legacy_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> support.BridgeWorkspace:
+    workspace = support.create_bridge_workspace(tmp_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
+    monkeypatch.setattr(
+        workspace_access,
+        "open_workspace_database",
+        lambda target: open_staging_database(
+            workspace_access.database_path_for(target),
+            migration_paths=LEGACY_D1_MIGRATION_PATHS,
+        ),
+    )
+    return workspace
+
+
 def test_d2_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
-    workspace: support.BridgeWorkspace,
+    legacy_workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     d2_posting_cases.test_raw_delivery_fields_without_host_consumer_proof_cannot_activate(
-        workspace, monkeypatch
+        legacy_workspace, monkeypatch
     )
 
 
 def test_d2_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
-    workspace: support.BridgeWorkspace,
+    legacy_workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     d2_posting_cases.test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant(
-        workspace, monkeypatch, tmp_path
+        legacy_workspace, monkeypatch, tmp_path
     )
 
 
 def test_d2_one_confirm_posts_once_and_status_recovers_same_result(
-    workspace: support.BridgeWorkspace,
+    legacy_workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     d2_posting_cases.test_one_confirm_posts_once_and_status_recovers_same_result(
-        workspace, monkeypatch
+        legacy_workspace, monkeypatch
     )
 
 
 def test_d2_personal_total_receipt_uses_python_card_and_posts_once(
-    workspace: support.BridgeWorkspace,
+    legacy_workspace: support.BridgeWorkspace,
 ) -> None:
-    d2_posting_cases.test_personal_total_receipt_uses_python_card_and_posts_once(workspace)
+    d2_posting_cases.test_personal_total_receipt_uses_python_card_and_posts_once(legacy_workspace)
 
 
 def test_d2_posting_status_reference_is_context_bound(
-    workspace: support.BridgeWorkspace,
+    legacy_workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    d2_posting_cases.test_posting_status_reference_is_context_bound(workspace, monkeypatch)
+    d2_posting_cases.test_posting_status_reference_is_context_bound(legacy_workspace, monkeypatch)
 
 
 def capture_text(workspace: support.BridgeWorkspace, text: str, key: str) -> dict:
+    update = support.telegram_text_update(text)
     outcome = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert outcome.exit_code == bridge_errors.EXIT_OK
-    return outcome.response["result"]
+    capture_result = outcome.response["result"]
+    assert capture_result["proposal_public_id"] is None
+    processed = support.process_captured_text(workspace, outcome)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    capture_job = processed.response["result"]["capture_job"]
+    assert capture_job["proposal_public_id"] is not None
+    return {
+        **capture_result,
+        "capture_job": capture_job,
+        "proposal_public_id": capture_job["proposal_public_id"],
+    }
 
 
 def capture_receipt(

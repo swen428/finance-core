@@ -34,7 +34,7 @@ def capture(workspace: support.BridgeWorkspace, *, receipt: bool = False) -> str
         arguments = support.capture_receipt_arguments(workspace, handoff_filename="receipt.jpg")
         message_id = 20
     else:
-        arguments = support.capture_text_arguments(
+        arguments = support.authenticated_text_capture_arguments(
             workspace, support.telegram_text_update("lunch 12.50")
         )
         message_id = 10
@@ -47,7 +47,9 @@ def capture(workspace: support.BridgeWorkspace, *, receipt: bool = False) -> str
     )
     assert result.exit_code == errors.EXIT_OK
     if not receipt:
-        return result.response["result"]["proposal_public_id"]
+        processed = support.process_captured_text(workspace, result)
+        assert processed.exit_code == errors.EXIT_OK, processed.response
+        return str(processed.response["result"]["capture_job"]["proposal_public_id"])
     intake = result.response["result"]["intake_public_id"]
     result = support.run_cli(
         support.make_request(

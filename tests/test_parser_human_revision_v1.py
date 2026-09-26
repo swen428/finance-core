@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import openclaw_staging_bridge_support_v1 as support
 import pytest
 
 from finance_core.parser_proposals import human_drafts
@@ -33,6 +34,28 @@ from tests.test_ai_fallback_service_v1 import (
     record_ai_fallback_result,
 )
 from tests.test_parser_human_drafts_v1 import _connection, _start, _validation_payload
+
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
+
+def _capture_current_d1_reply(workspace: object, text: str) -> str:
+    """Give a current-schema D1 reply its real frozen Telegram route."""
+    update = support.telegram_text_update(text, update_id=101, message_id=101)
+    arguments = support.authenticated_text_capture_arguments(
+        workspace, update, account_id="acct", binding_id="binding"
+    )
+    arguments.pop("kind")
+    captured = support.run_cli(
+        support.make_request(
+            "capture_interaction",
+            arguments,
+            idempotency_key=support.canonical_capture_key(message_id=101),
+        )
+    )
+    assert captured.exit_code == 0, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "whole_card"
+    return str(route["operation_key"])
 
 
 def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
@@ -61,7 +84,8 @@ def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
         assert "parser_human_draft_publications" in new_sql
         assert "operation.result_completeness = 'complete'" in new_sql
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
-        assert migration_ledger_rows(conn)[-1]["migration_id"] == "054"
+        latest_migration_id = TEMP_DB_MIGRATION_PATHS[-1].name[:3]
+        assert migration_ledger_rows(conn)[-1]["migration_id"] == latest_migration_id
         rows = [tuple(row) for row in migration_ledger_rows(conn)]
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         assert [tuple(row) for row in migration_ledger_rows(conn)] == rows
@@ -72,7 +96,7 @@ def test_migration_048_narrowly_admits_sealed_d1_pointer_edges() -> None:
 
 def _publish_text_revision(monkeypatch: pytest.MonkeyPatch):
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn, payload=_validation_payload(merchant="Original Cafe"))
     monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
     fields = {**started.field_values, "merchant": "Cafe"}
@@ -403,7 +427,7 @@ def test_sealed_ai_child_then_exact_human_edge_verifies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A D1 child inherits AI origin only through its verified sealed ancestor."""
-    _workspace, conn, attempt, claim = _prepared_claim(
+    workspace, conn, attempt, claim = _prepared_claim(
         tmp_path, "paid SGD 12.34 at Cafe on 2026-08-13"
     )
     try:
@@ -441,12 +465,13 @@ def test_sealed_ai_child_then_exact_human_edge_verifies(
             f"日期: {fields['transaction_date']}\n商户: {fields['merchant']}\n"
             f"描述: {fields['description']}\n分类: {fields['category']}"
         )
+        operation_id = _capture_current_d1_reply(workspace, text)
         result = apply_human_draft_card(
             conn,
             HumanDraftCommand(
                 started.card_generation_public_id,
                 101,
-                "d1op-ai-human-101",
+                operation_id,
                 "111",
                 "acct",
                 "111",
@@ -468,7 +493,7 @@ def test_sealed_ai_child_then_exact_human_edge_verifies(
         )
         assert lineage is not None
         assert lineage["root_proposal_origin"] == "ai_fallback"
-        assert lineage["human_operation_ids"] == ("d1op-ai-human-101",)
+        assert lineage["human_operation_ids"] == (operation_id,)
         conn.execute("DROP TRIGGER trg_ai_fallback_child_no_hash_update")
         conn.execute("DROP TRIGGER trg_ai_fallback_parent_no_hash_update")
         conn.execute(
@@ -490,7 +515,7 @@ def test_sealed_ai_child_then_exact_human_edge_verifies(
 def test_low_confidence_ai_root_remains_unresolved_after_unrelated_human_edit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _workspace, conn, attempt, claim = _prepared_claim(
+    workspace, conn, attempt, claim = _prepared_claim(
         tmp_path, "paid SGD 12.34 at Cafe on 2026-08-13"
     )
     try:
@@ -525,22 +550,24 @@ def test_low_confidence_ai_root_remains_unresolved_after_unrelated_human_edit(
         )
         monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
         fields = {**started.field_values, "merchant": "Human Cafe"}
+        text = (
+            f"资料卡编号：{started.card_generation_public_id}\n"
+            f"金额: {fields['amount']}\n币种: {fields['currency']}\n"
+            f"日期: {fields['transaction_date']}\n商户: {fields['merchant']}\n"
+            f"描述: {fields['description']}\n分类: {fields['category']}"
+        )
+        operation_id = _capture_current_d1_reply(workspace, text)
         result = apply_human_draft_card(
             conn,
             HumanDraftCommand(
                 started.card_generation_public_id,
                 101,
-                "d1op-ai-low-confidence-human-101",
+                operation_id,
                 "111",
                 "acct",
                 "111",
                 "binding",
-                (
-                    f"资料卡编号：{started.card_generation_public_id}\n"
-                    f"金额: {fields['amount']}\n币种: {fields['currency']}\n"
-                    f"日期: {fields['transaction_date']}\n商户: {fields['merchant']}\n"
-                    f"描述: {fields['description']}\n分类: {fields['category']}"
-                ),
+                text,
                 fields,
             ),
             publish=publish_human_revision_in_transaction,

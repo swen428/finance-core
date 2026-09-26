@@ -58,12 +58,14 @@ from finance_core.telegram_source_context import (
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 
 def _connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     return conn
 
 
@@ -78,7 +80,7 @@ def _file_connection(tmp_path: Path) -> sqlite3.Connection:
     key_path.chmod(0o600)
     return create_staging_database(
         database / "staging.sqlite",
-        migration_paths=TEMP_DB_MIGRATION_PATHS,
+        migration_paths=LEGACY_D1_MIGRATION_PATHS,
     )
 
 
@@ -574,7 +576,7 @@ def test_delivery_writer_refuses_alternate_workspace_hard_link(tmp_path: Path) -
     legitimate_database_path = legitimate_database_dir / "staging.sqlite"
     conn = create_staging_database(
         legitimate_database_path,
-        migration_paths=TEMP_DB_MIGRATION_PATHS,
+        migration_paths=LEGACY_D1_MIGRATION_PATHS,
     )
     context = HumanActionContext("111", "acct", "111", "binding")
     proposal_public_id = _seed_initial_text(conn)

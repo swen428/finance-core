@@ -75,18 +75,22 @@ from tests.test_receipt_item_allocation_facts_supersession_v1 import (
 
 def all_rows(conn: sqlite3.Connection) -> dict[str, list[tuple[str, ...]]]:
     tables = [
-        str(row[0])
+        (str(row[0]), "WITHOUT ROWID" in str(row[1]).upper())
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
             "AND name NOT LIKE 'sqlite_%' ORDER BY name"
         ).fetchall()
     ]
     return {
         table: [
             tuple(repr(value) for value in row)
-            for row in conn.execute(f"SELECT rowid, * FROM {table} ORDER BY rowid").fetchall()
+            for row in conn.execute(
+                f"SELECT * FROM {table} ORDER BY 1"
+                if without_rowid
+                else f"SELECT rowid, * FROM {table} ORDER BY rowid"
+            ).fetchall()
         ]
-        for table in tables
+        for table, without_rowid in tables
     }
 
 

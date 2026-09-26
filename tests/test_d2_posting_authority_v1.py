@@ -60,12 +60,14 @@ from finance_core.staging_guard import (
 from tests.test_parser_human_drafts_v1 import _complete_validator, _start
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 
 def _connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     return conn
 
 
@@ -80,7 +82,7 @@ def _file_connection(tmp_path: Path) -> sqlite3.Connection:
     key_path.chmod(0o600)
     return create_staging_database(
         database / "staging.sqlite",
-        migration_paths=TEMP_DB_MIGRATION_PATHS,
+        migration_paths=LEGACY_D1_MIGRATION_PATHS,
     )
 
 
@@ -555,7 +557,7 @@ def test_status_uses_one_snapshot_across_concurrent_correction_evidence(
     assert target is not None
     assert reader.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     database_path = Path(str(reader.execute("PRAGMA database_list").fetchone()[2]))
-    writer = open_staging_database(database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    writer = open_staging_database(database_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
     try:
 
         def commit_correction_evidence() -> None:

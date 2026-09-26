@@ -762,7 +762,7 @@ class TestReceiptCrashReplayAndConflict:
         text_outcome = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
+                support.authenticated_text_capture_arguments(
                     workspace,
                     support.telegram_text_update("caption text", message_id=30),
                 ),

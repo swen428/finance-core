@@ -27,6 +27,8 @@ from tests.test_parser_human_drafts_v1 import _connection
 from tests.test_parser_human_revision_v1 import _start_existing_text_proposal
 from tests.test_receipt_proposal_revision_v1 import _seed_receipt_proposal
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 
 def _card_text(card_id: str, fields: dict[str, str]) -> str:
     return (
@@ -112,7 +114,7 @@ def _publish_receipt(
     updates: dict[str, str],
 ):
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     parser_output_id, _source_hash = _seed_receipt_proposal(conn, tmp_path, suffix)
     started = _start_existing_text_proposal(conn, parser_output_id, suffix=suffix)
     monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
@@ -948,7 +950,7 @@ def test_receipt_d1_publication_failure_rolls_back_every_write(
     updates: dict[str, str],
 ) -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     parent_id, _source_hash = _seed_receipt_proposal(
         conn, tmp_path, f"rollback-{next(iter(updates))}"
     )

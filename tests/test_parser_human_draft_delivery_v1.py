@@ -22,6 +22,8 @@ from tests.test_parser_human_drafts_v1 import (
     _start,
 )
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 CONTEXT = HumanDraftContext("111", "acct", "111", "binding")
 
 
@@ -42,7 +44,7 @@ def _connection(path: Path | str = ":memory:") -> sqlite3.Connection:
 
 def test_delivery_attempt_outcome_projection_and_exact_replay() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation = started.card_generation_public_id
     initial = get_human_draft_card(conn, context=CONTEXT, card_generation_public_id=generation)
@@ -137,7 +139,7 @@ def test_delivery_attempt_outcome_projection_and_exact_replay() -> None:
 
 def test_delivery_rejects_wrong_slot_and_fake_success_receipt() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "replace")
     begin_human_draft_card_delivery(
@@ -187,7 +189,7 @@ def test_operation_identity_recovers_committed_noop_or_refusal(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(
         conn,
         payload={
@@ -239,7 +241,7 @@ def test_operation_identity_recovers_committed_noop_or_refusal(
 def test_delivery_attempt_context_is_closed_to_its_card() -> None:
     """A forged context must not enter the append-only delivery audit chain."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
@@ -261,7 +263,7 @@ def test_delivery_attempt_context_is_closed_to_its_card() -> None:
 def test_delivery_resolution_rejects_regressed_wall_clock() -> None:
     """Causal resolution cannot be hidden behind an earlier wall-clock timestamp."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -309,7 +311,7 @@ def test_delivery_resolution_rejects_regressed_wall_clock() -> None:
 def test_latest_delivery_attempt_controls_projection_and_recovery_reason() -> None:
     """An older attempt's resolution cannot override a later durable attempt."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation = started.card_generation_public_id
 
@@ -409,7 +411,7 @@ def test_latest_delivery_attempt_controls_projection_and_recovery_reason() -> No
 def test_delivery_rejects_preexisting_cross_context_attempt_defensively() -> None:
     """Repository reads/writes must fail closed even for a legacy-corrupt attempt row."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     conn.execute("PRAGMA foreign_keys = OFF")
     conn.execute(
@@ -445,7 +447,7 @@ def test_delivery_rejects_preexisting_cross_context_attempt_defensively() -> Non
 def test_delivery_schema_rejects_resolution_earlier_than_initial() -> None:
     """Direct SQL cannot make wall-clock order contradict causal observation slots."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -484,7 +486,7 @@ def test_delivery_schema_rejects_resolution_earlier_than_initial() -> None:
 
 def test_delivery_repository_rejects_attempt_before_card_issue() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
 
@@ -509,7 +511,7 @@ def test_delivery_repository_rejects_attempt_before_card_issue() -> None:
 
 def test_delivery_repository_rejects_outcome_before_attempt() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -545,7 +547,7 @@ def test_delivery_repository_rejects_outcome_before_attempt() -> None:
 
 def test_delivery_repository_rejects_successor_before_consumed_evidence() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation = started.card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
@@ -600,7 +602,7 @@ def test_delivery_repository_rejects_successor_before_consumed_evidence() -> Non
 
 def test_delivery_schema_rejects_attempt_before_card_issue() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
 
     with pytest.raises(sqlite3.IntegrityError, match="delivery attempt time precedes card issue"):
@@ -626,7 +628,7 @@ def test_delivery_schema_rejects_attempt_before_card_issue() -> None:
 
 def test_delivery_schema_rejects_outcome_before_attempt() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -661,7 +663,7 @@ def test_delivery_schema_rejects_outcome_before_attempt() -> None:
 
 def test_delivery_schema_rejects_successor_before_consumed_evidence() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -733,7 +735,7 @@ def test_delivery_schema_rejects_successor_before_consumed_evidence() -> None:
 
 def test_unknown_delivery_reissue_is_one_successor_and_exact_replay() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation = started.card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
@@ -794,7 +796,7 @@ def test_exact_attempt_and_outcome_replay_survive_terminal_head_and_later_clock(
     from finance_core.parser_proposals.human_drafts import reject_active_human_draft_in_transaction
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation = started.card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
@@ -882,7 +884,7 @@ def test_exact_attempt_and_outcome_replay_survive_terminal_head_and_later_clock(
 
 def test_controlled_persisted_success_is_read_only_projection() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     generation = _start(conn).card_generation_public_id
     attempt_id = _frame("d1-card-delivery-v1", generation, "reply")
     begin_human_draft_card_delivery(
@@ -925,7 +927,7 @@ def test_controlled_persisted_success_is_read_only_projection() -> None:
 
 def test_late_g1_resolution_stays_historical_after_g2_reissue() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation_1 = started.card_generation_public_id
     attempt_1 = _frame("d1-card-delivery-v1", generation_1, "reply")
@@ -1087,7 +1089,7 @@ def test_g2_durable_issuer_stub_recovers_exact_batch_at_every_crash_boundary(
     """Replacing the durable stub with a disconnected callback loses crash evidence."""
     path = tmp_path / f"issuer-{crash_boundary}.db"
     conn = _connection(path)
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _create_durable_issuer_stub(conn)
     started = _start(conn)
     generation_1 = started.card_generation_public_id
@@ -1219,7 +1221,7 @@ def test_two_attempt_slots_are_bounded_and_terminal_head_invalidates_all_generat
     from finance_core.parser_proposals.human_drafts import reject_active_human_draft_in_transaction
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     generation_1 = started.card_generation_public_id
     for mode, material, target in (

@@ -38,6 +38,15 @@ from finance_core.parser_proposals.conversion import (
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
 
+
+@pytest.fixture()
+def migrated_temp_db_connection(
+    legacy_temp_db_connection: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Exercise the historical one-step workflow on its pre-D3 schema."""
+    return legacy_temp_db_connection
+
+
 # ---------------------------------------------------------------------------
 #  Shared helpers
 # ---------------------------------------------------------------------------

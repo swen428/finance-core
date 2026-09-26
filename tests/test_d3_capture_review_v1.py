@@ -38,34 +38,29 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 def _capture_processed_text(
     workspace: support.BridgeWorkspace,
     *,
-    with_context: bool = True,
     eligible_proposal: bool = False,
 ) -> str:
-    arguments = support.capture_text_arguments(
+    arguments = support.authenticated_text_capture_arguments(
         workspace,
         support.telegram_text_update(
             "Lunch SGD 12.50 at ExampleCafe paid by Owner" if eligible_proposal else "lunch 12.50"
         ),
+        account_id="synthetic-account",
+        binding_id="synthetic-binding",
     )
-    if with_context:
-        arguments.update(
-            {
-                "authenticated_actor_id": "111",
-                "telegram_account_id": "synthetic-account",
-                "telegram_conversation_id": "111",
-                "conversation_binding_id": "synthetic-binding",
-            }
-        )
     captured = support.run_cli(
         support.make_request(
             "capture", arguments, idempotency_key=support.canonical_capture_key(message_id=10)
         )
     )
     assert captured.exit_code == 0, captured.stderr
-    job_public_id = str(captured.response["result"]["capture_job"]["public_id"])
+    assert captured.response["result"]["proposal_public_id"] is None
+    processed_capture = support.process_captured_text(workspace, captured)
+    assert processed_capture.exit_code == 0, processed_capture.response
+    job_public_id = str(processed_capture.response["result"]["capture_job"]["public_id"])
     with support.open_database(workspace) as conn:
-        lease = claim_capture_job(conn, public_id=job_public_id, owner="synthetic-worker")
-        processed = capture_processing.process_claimed_capture_job(conn, lease=lease)
+        processed = get_capture_job(conn, public_id=job_public_id)
+        assert processed is not None
         assert processed["status"] == "processing"
         assert processed["proposal_public_id"]
         if eligible_proposal:
@@ -343,8 +338,16 @@ def test_concurrent_expired_review_replays_one_stop(
 
 def test_missing_capture_context_refuses_review_without_state_change(
     workspace: support.BridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    job_public_id = _capture_processed_text(workspace, with_context=False)
+    job_public_id = _capture_processed_text(workspace)
+
+    def missing_context(*_args: object, **_kwargs: object) -> None:
+        raise capture_review.CaptureReviewConflictError(
+            "Captured Telegram source context is unavailable"
+        )
+
+    monkeypatch.setattr(capture_review, "_source_context", missing_context)
     with support.open_database(workspace) as conn:
         with pytest.raises(capture_review.CaptureReviewConflictError, match="context"):
             capture_review.ensure_capture_review(conn, job_public_id=job_public_id)

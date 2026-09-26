@@ -16,6 +16,8 @@ from finance_core.reconciliation.migrations import (
     migration_ledger_rows,
 )
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 TABLES_047 = {
     "parser_human_drafts",
     "parser_human_draft_reply_evidence",
@@ -326,7 +328,7 @@ def test_start_and_apply_preserve_exact_reply_and_replay(monkeypatch: pytest.Mon
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
 
@@ -395,7 +397,7 @@ def test_refusal_claims_high_water_but_not_financial_version(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
 
@@ -448,7 +450,7 @@ def test_apply_rejects_nested_transaction_without_touching_it() -> None:
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     conn.execute("BEGIN")
     conn.execute("CREATE TEMP TABLE caller_work(value TEXT)")
     command = HumanDraftCommand(
@@ -469,7 +471,7 @@ def test_start_requires_matching_redemption_and_shared_uow_rollback() -> None:
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     row, reference_material, redemption_hash = _seed_start_material(conn)
     conn.execute("BEGIN IMMEDIATE")
     locked = conn.execute(
@@ -589,7 +591,7 @@ def test_publication_result_must_match_persisted_current_child(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
@@ -637,7 +639,7 @@ def test_publication_payload_substitution_rolls_back_entire_operation(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
@@ -682,7 +684,7 @@ def test_publisher_context_mutation_cannot_rewrite_operation_evidence(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn, payload=_validation_payload())
     fields = {**started.field_values, "description": ""}
     text = (
@@ -726,7 +728,7 @@ def test_publisher_context_mutation_cannot_rewrite_operation_evidence(
 
 def test_head_rejects_incoherent_direct_sql_updates() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     with pytest.raises(sqlite3.IntegrityError, match="mutation shape"):
         conn.execute("UPDATE parser_human_drafts SET current_draft_content_hash = ?", ("f" * 64,))
@@ -742,7 +744,7 @@ def test_head_rejects_incoherent_direct_sql_updates() -> None:
 
 def test_operation_evidence_and_action_binding_have_exact_relational_closure() -> None:
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     draft = conn.execute("SELECT * FROM parser_human_drafts").fetchone()
     card = conn.execute("SELECT * FROM parser_human_draft_cards").fetchone()
@@ -888,7 +890,7 @@ def test_publication_terminal_unrelated_or_stale_rolls_back(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
@@ -949,7 +951,7 @@ def test_publisher_cannot_commit_outside_owned_transaction(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
@@ -983,7 +985,7 @@ def test_start_exact_replay_survives_connection_restart(tmp_path: Path) -> None:
 
     path = tmp_path / "draft-restart.db"
     conn = _file_connection(path)
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     row, reference_material, redemption_hash = _seed_start_material(conn)
     conn.execute("BEGIN IMMEDIATE")
     conn.execute(
@@ -1046,7 +1048,7 @@ def test_two_connections_cannot_both_advance_the_same_card(
 
     path = tmp_path / "draft-race.db"
     first_conn = _file_connection(path)
-    apply_migration_paths(first_conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(first_conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(first_conn)
     second_conn = _file_connection(path)
     text, fields = _card_text(started.card_generation_public_id)
@@ -1097,7 +1099,7 @@ def test_publisher_cannot_commit_outside_repository_transaction(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
@@ -1154,7 +1156,7 @@ def test_apply_proves_current_unconverted_decision_target_before_any_d1_write(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     target_id = conn.execute(
         "SELECT decision_target_parser_output_id FROM parser_human_drafts"
@@ -1323,7 +1325,7 @@ def test_first_and_consecutive_second_publication_use_the_current_leaf(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", _complete_validator)
     clock = iter((1001, 1002))
@@ -1420,7 +1422,7 @@ def test_first_and_consecutive_second_publication_use_the_current_leaf(
 def test_raw_intake_pointer_move_is_refused_before_publisher_or_d1_write() -> None:
     """Removing the landed raw-pointer trigger would detach the active D1 target."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     conn.execute(
         """
@@ -1477,7 +1479,7 @@ def test_evidence_context_must_match_its_draft(
 ) -> None:
     """Dropping the evidence-to-head composite FK admits a cross-context row."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     draft_id = conn.execute("SELECT id FROM parser_human_drafts").fetchone()[0]
     context = {
@@ -1634,7 +1636,7 @@ def _insert_minimal_card(
 def test_card_operation_relationships_cannot_cross_draft_context(cross_relation: str) -> None:
     """Dropping any closure FK admits a cross-draft predecessor/operation/card edge."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     _start_second_context(conn)
     drafts = conn.execute("SELECT * FROM parser_human_drafts ORDER BY id").fetchall()
@@ -1929,7 +1931,7 @@ def _start_second_context(conn: sqlite3.Connection):
 def test_fully_shaped_forged_terminal_operation_cannot_mutate_head() -> None:
     """Removing terminal decision evidence checks permits a forged terminal head."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     with pytest.raises(sqlite3.IntegrityError):
         _insert_terminal_operation(
@@ -1946,7 +1948,7 @@ def test_fully_shaped_forged_terminal_operation_cannot_mutate_head() -> None:
 def test_confirmed_terminal_operation_requires_redeemed_confirm_reference() -> None:
     """Removing the Confirm redemption guard admits a bare confirmed operation."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     _insert_decision(conn, decision_public_id="decision-confirmed", state="confirmed")
     with pytest.raises(sqlite3.IntegrityError):
@@ -1981,7 +1983,7 @@ def test_reject_helper_requires_exact_persisted_rejected_decision(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     target_id = conn.execute(
         "SELECT decision_target_parser_output_id FROM parser_human_drafts"
@@ -2015,7 +2017,7 @@ def test_real_legacy_rejected_decision_is_terminal_and_exact_replay_is_idempoten
     from finance_core.parser_proposals.human_drafts import reject_active_human_draft_in_transaction
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     target_id = _insert_decision(
         conn, decision_public_id="decision-legacy-reject", state="rejected"
@@ -2057,7 +2059,7 @@ def test_legacy_reject_without_binding_refuses_ambiguous_active_draft_ownership(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     _start_second_context(conn)
     target_id = _insert_decision(
@@ -2104,7 +2106,7 @@ def test_d1_reject_requires_redeemed_reject_action(
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     reference_public_id = _insert_d1_action_binding(
         conn,
@@ -2153,7 +2155,7 @@ def test_valid_older_generation_d1_reject_terminates_current_head() -> None:
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     reference_public_id = _insert_d1_action_binding(
         conn,
@@ -2238,7 +2240,7 @@ def test_rejected_decision_uow_rolls_back_when_head_update_fails() -> None:
     from finance_core.parser_proposals.human_drafts import reject_active_human_draft_in_transaction
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     target_id = conn.execute(
         "SELECT decision_target_parser_output_id FROM parser_human_drafts"
@@ -2295,7 +2297,7 @@ def test_rejected_decision_uow_rolls_back_when_head_update_fails() -> None:
 def test_terminal_operation_and_head_transition_must_share_one_transaction() -> None:
     """Splitting terminal evidence from the head transition must fail at commit."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     _insert_decision(
         conn,
@@ -2338,7 +2340,7 @@ def test_multiple_refused_operations_can_share_one_historical_result_card(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
 
@@ -3171,7 +3173,7 @@ def test_repository_maps_publishable_validation_and_persists_clear_material(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id, merchant="Cafe 2")
     fields["currency"] = "USD"
@@ -3210,7 +3212,7 @@ def test_repository_catches_only_typed_validation_error(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
@@ -3240,7 +3242,7 @@ def test_repository_catches_only_typed_validation_error(
     monkeypatch.undo()
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)
     monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
@@ -3288,13 +3290,13 @@ def test_validation_currency_without_amount_is_canonical_but_incomplete() -> Non
 
 def test_start_completeness_uses_money_and_source_specific_validation() -> None:
     unsupported = _connection()
-    apply_migration_paths(unsupported, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(unsupported, LEGACY_D1_MIGRATION_PATHS)
     unsupported_result = _start(unsupported)
     assert unsupported_result.completeness == "incomplete"
     unsupported.close()
 
     receipt = _connection()
-    apply_migration_paths(receipt, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(receipt, LEGACY_D1_MIGRATION_PATHS)
     receipt_result = _start(
         receipt,
         source_type="telegram_image",
@@ -3364,7 +3366,7 @@ def test_validation_canonical_hash_identity_does_not_replace_raw_replay_identity
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     payload = _validation_payload()
     started = _start(conn, payload=payload)
     fields = {
@@ -3420,7 +3422,7 @@ def test_legacy_date_full_card_noop_then_real_date_edit_publishes_once(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(
         conn,
         payload={
@@ -3589,7 +3591,7 @@ def test_validation_rejects_malformed_inherited_snapshot_text(bad_merchant: obje
 def test_publication_requires_exact_accepted_operation_lineage() -> None:
     """A start operation cannot anchor an arbitrary durable publication revision."""
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     _start(conn)
     draft = conn.execute("SELECT * FROM parser_human_drafts").fetchone()
     operation = conn.execute(
@@ -3629,7 +3631,7 @@ def test_d1_reject_replay_revalidates_binding_and_expiry() -> None:
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     started = _start(conn)
     reference_public_id = _insert_d1_action_binding(
         conn,
@@ -3686,7 +3688,7 @@ def test_bound_d1_reject_selects_its_context_before_legacy_ambiguity() -> None:
     )
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     first = _start(conn)
     first_draft_id = conn.execute("SELECT id FROM parser_human_drafts").fetchone()[0]
     reference_public_id = _insert_d1_action_binding(
@@ -3733,7 +3735,7 @@ def test_repository_persists_reason_before_after_hashes_and_resolution_binding(
     from finance_core.parser_proposals.human_drafts import HumanDraftCommand, apply_human_draft_card
 
     conn = _connection()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     payload = _validation_payload(amount=None)
     started = _start(conn, payload=payload)
     assert started.unresolved_flags == ("missing_amount",)
