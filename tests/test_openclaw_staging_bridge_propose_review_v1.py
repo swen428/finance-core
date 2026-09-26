@@ -71,15 +71,26 @@ def test_d2_posting_status_reference_is_context_bound(
 
 
 def capture_text(workspace: support.BridgeWorkspace, text: str, key: str) -> dict:
+    update = support.telegram_text_update(text)
     outcome = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert outcome.exit_code == bridge_errors.EXIT_OK
-    return outcome.response["result"]
+    capture_result = outcome.response["result"]
+    assert capture_result["proposal_public_id"] is None
+    processed = support.process_captured_text(workspace, outcome)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    capture_job = processed.response["result"]["capture_job"]
+    assert capture_job["proposal_public_id"] is not None
+    return {
+        **capture_result,
+        "capture_job": capture_job,
+        "proposal_public_id": capture_job["proposal_public_id"],
+    }
 
 
 def capture_receipt(

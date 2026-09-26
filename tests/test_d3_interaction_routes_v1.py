@@ -10,7 +10,16 @@ import openclaw_staging_bridge_support_v1 as support
 import pytest
 
 from finance_core.intake import interaction_routes
-from finance_core.openclaw_staging_bridge import commands, errors, identity
+from finance_core.intake.capture_jobs import ensure_capture_job
+from finance_core.intake.raw_text_repository import create_raw_intake_record
+from finance_core.intake.telegram_text_adapter import validate_telegram_text_update
+from finance_core.openclaw_staging_bridge import (
+    commands,
+    errors,
+    guided_edit,
+    human_actions,
+    identity,
+)
 from tests.test_openclaw_staging_bridge_guided_edit_v1 import _apply, _begin, _complete
 
 
@@ -55,6 +64,45 @@ def _request(
         args,
         idempotency_key=support.canonical_capture_key(message_id=message_id),
     )
+
+
+def _full_card(reference: str) -> str:
+    return (
+        f"Card Ref: {reference}\nAmount: 12\nCurrency: USD\nDate: 2026-09-26"
+        "\nMerchant: Shop\nDescription: Lunch\nCategory: Meals"
+    )
+
+
+def _stage_pre_route_guided_update(
+    workspace: support.BridgeWorkspace, session_id: str
+) -> None:
+    """Model an update accepted before D3 began freezing interaction routes."""
+    context = human_actions.HumanActionContext(
+        actor_id="111",
+        account_id="finance-account",
+        conversation_id="111",
+        binding_id="binding-1",
+    )
+    with support.open_database(workspace) as conn:
+        session = guided_edit.get_session_by_public_id(conn, session_id, context)
+        assert session is not None
+        pending = guided_edit.request_update(
+            conn,
+            session,
+            message_id=21,
+            operation_key=commands.canonical_edit_key(
+                proposal_public_id=str(session["proposal_public_id"]),
+                version=int(session["current_proposal_version"]),
+                content_hash=str(session["current_content_hash"]),
+            ),
+            field_name="amount",
+            field_value="13.00",
+        )
+        commands._pending_guided_update(conn, pending)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM finance_capture_interaction_routes "
+            "WHERE telegram_message_id = 21"
+        ).fetchone()[0] == 0
 
 
 def test_initial_text_is_adopted_without_parser_then_worker_parses(
@@ -129,10 +177,19 @@ def test_initial_text_is_adopted_without_parser_then_worker_parses(
             "control_refused",
             "invalid_whole_card",
         ),
-        ("\rCard Ref: d1card_" + "a" * 32 + "\rAmount: 12", "whole_card", None),
+        (
+            "\rCard Ref: d1card_" + "a" * 32 + "\rAmount: 12",
+            "control_refused",
+            "invalid_whole_card",
+        ),
         ("\u0085Card Ref: d1card_" + "a" * 32, "control_refused", "invalid_control_text"),
         ("\u2028Card Ref: d1card_" + "a" * 32, "control_refused", "invalid_control_text"),
-        ("Card Ref: d1card_" + "a" * 32 + "\nAmount: 12", "whole_card", None),
+        (
+            "Card Ref: d1card_" + "a" * 32 + "\nAmount: 12",
+            "control_refused",
+            "invalid_whole_card",
+        ),
+        (_full_card("d1card_" + "a" * 32), "whole_card", None),
     ],
 )
 def test_control_text_never_enters_parser(
@@ -263,7 +320,7 @@ def test_historical_guided_message_must_match_original_operation_content(
     workspace: support.BridgeWorkspace,
 ) -> None:
     _proposal, session, _redemption = _begin(workspace)
-    assert _apply(workspace, session, 21, "amount", "13.00").exit_code == errors.EXIT_OK
+    _stage_pre_route_guided_update(workspace, session)
     request = _request(
         workspace, "amount=99.00", message_id=21, account="finance-account", binding="binding-1"
     )
@@ -273,6 +330,24 @@ def test_historical_guided_message_must_match_original_operation_content(
     assert route["route_kind"] == "control_refused"
     assert route["refusal_code"] == "historical_guided_mismatch"
     assert support.run_cli(request).response["result"]["interaction_route"] == route
+
+
+def test_historical_guided_exact_applied_message_recovers_original_route(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session, _redemption = _begin(workspace)
+    _stage_pre_route_guided_update(workspace, session)
+    request = _request(
+        workspace, "amount=13.00", message_id=21, account="finance-account", binding="binding-1"
+    )
+    captured = support.run_cli(request)
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    route = captured.response["result"]["interaction_route"]
+    assert route["route_kind"] == "guided_update"
+    assert route["guided_session_public_id"] == session
+    assert route["operation_key"] == f"bridge-guided-edit-update:{session}:21"
+    assert route["field_name"] == "amount"
+    assert route["field_value_json"] == '"13.00"'
 
 
 @pytest.mark.parametrize(
@@ -345,6 +420,38 @@ def test_replay_conflict_preserves_original_route_and_source(
         assert conn.execute("SELECT COUNT(*) FROM finance_capture_jobs").fetchone()[0] == 1
 
 
+def test_authenticated_job_without_route_cannot_enter_parser(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    update = support.telegram_text_update("Amount: 12", message_id=77)
+    validated = validate_telegram_text_update(update)
+    with support.open_database(workspace) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        intake = create_raw_intake_record(
+            conn,
+            validated.text,
+            source_type="telegram_text",
+            source_channel="telegram",
+            source_metadata=validated.source_metadata,
+        )
+        ensure_capture_job(
+            conn,
+            intake_id=int(intake["id"]),
+            capture_kind="text",
+            ingress_identity_digest="a" * 64,
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM finance_capture_interaction_routes"
+        ).fetchone()[0] == 0
+        with pytest.raises(sqlite3.IntegrityError, match="cannot enter parser"):
+            conn.execute(
+                "INSERT INTO parser_outputs "
+                "(public_id, source_type, source_public_id, parse_status) "
+                "VALUES (?, 'telegram_text', ?, 'parsed_pending_confirmation')",
+                ("forbidden_unrouted", intake["public_id"]),
+            )
+
+
 def test_route_insert_failure_rolls_back_intake_job_and_source(
     workspace: support.BridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
@@ -384,7 +491,7 @@ def test_duplicate_operation_cannot_replace_a_different_frozen_route(
     workspace: support.BridgeWorkspace,
 ) -> None:
     card = "d1card_" + "a" * 32
-    first = support.run_cli(_request(workspace, f"Card Ref: {card}\nAmount: 12"))
+    first = support.run_cli(_request(workspace, _full_card(card)))
     assert first.exit_code == errors.EXIT_OK, first.response
     original = first.response["result"]["interaction_route"]
     second = _request(workspace, "lunch 13", message_id=22)
@@ -412,9 +519,12 @@ def test_duplicate_operation_cannot_replace_a_different_frozen_route(
         saved = conn.execute(
             "SELECT job_public_id, operation_key FROM finance_capture_interaction_routes"
         ).fetchall()
-        assert len(saved) == 1
-        assert saved[0]["job_public_id"] == original["job_public_id"]
-        assert saved[0]["operation_key"] == original["operation_key"]
+        assert len(saved) == 2
+        assert any(
+            row["job_public_id"] == original["job_public_id"]
+            and row["operation_key"] == original["operation_key"]
+            for row in saved
+        )
 
 
 @pytest.mark.parametrize("rowid_alias", ["rowid", "oid", "_rowid_"])
@@ -450,9 +560,12 @@ def test_hidden_rowid_cannot_replace_a_frozen_route(
         saved = conn.execute(
             "SELECT job_public_id, route_kind FROM finance_capture_interaction_routes"
         ).fetchall()
-        assert len(saved) == 1
-        assert saved[0]["job_public_id"] == original["job_public_id"]
-        assert saved[0]["route_kind"] == "control_refused"
+        assert len(saved) == 2
+        assert any(
+            row["job_public_id"] == original["job_public_id"]
+            and row["route_kind"] == "control_refused"
+            for row in saved
+        )
 
     next_message = support.run_cli(_request(workspace, "lunch 14", message_id=23))
     assert next_message.exit_code == errors.EXIT_OK, next_message.response

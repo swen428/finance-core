@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -651,6 +652,39 @@ def find_refused_replay(
     )
 
 
+def is_exact_historical_pending_update(
+    conn: sqlite3.Connection,
+    *,
+    session: dict[str, Any],
+    context: HumanActionContext,
+    message_id: int,
+    field_name: str,
+    field_value: str,
+) -> bool:
+    """Allow only recovery of the same previously claimed guided message."""
+    if (
+        session["authenticated_actor_id"] != context.actor_id
+        or session["channel_account_id"] != context.account_id
+        or session["channel_conversation_id"] != context.conversation_id
+        or session["conversation_binding_id"] != context.binding_id
+        or session["pending_message_id"] != message_id
+        or session["pending_field_name"] != field_name
+        or json.loads(str(session["pending_field_value_json"])) != field_value
+    ):
+        return False
+    rows = conn.execute(
+        "SELECT field_name, field_value_json, operation_key "
+        "FROM openclaw_guided_edit_events WHERE session_id = ? "
+        "AND telegram_message_id = ? AND event_type = 'update_requested'",
+        (session["id"], message_id),
+    ).fetchall()
+    return len(rows) == 1 and (
+        rows[0][0] == field_name
+        and json.loads(str(rows[0][1])) == field_value
+        and rows[0][2] == session["pending_operation_key"]
+    )
+
+
 def request_update(
     conn: sqlite3.Connection,
     session: dict[str, Any],
@@ -659,6 +693,7 @@ def request_update(
     operation_key: str,
     field_name: str,
     field_value: str,
+    authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> dict[str, Any]:
     if field_name not in ALLOWED_FIELDS or not field_value:
         raise GuidedEditError("invalid_update")
@@ -666,6 +701,8 @@ def request_update(
     created_at = _now_text()
     _begin(conn)
     try:
+        if authority_validator is not None:
+            authority_validator(conn)
         current = _row(
             conn.execute(
                 "SELECT * FROM openclaw_guided_edit_sessions WHERE id = ?",
@@ -858,10 +895,13 @@ def complete_session(
     *,
     context: HumanActionContext,
     message_id: int,
+    authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> dict[str, Any]:
     created_at = _now_text()
     _begin(conn)
     try:
+        if authority_validator is not None:
+            authority_validator(conn)
         current = _row(
             conn.execute(
                 "SELECT * FROM openclaw_guided_edit_sessions WHERE id = ?", (session["id"],)
@@ -1019,6 +1059,7 @@ __all__ = [
     "get_active_session",
     "get_context_session",
     "get_session_by_public_id",
+    "is_exact_historical_pending_update",
     "pending_core_state",
     "record_update_applied",
     "record_update_refused",

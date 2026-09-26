@@ -73,7 +73,7 @@ def _captured_text_proposal(
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update(text),
             ),
@@ -81,6 +81,8 @@ def _captured_text_proposal(
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     proposed = support.run_cli(
         support.make_request(
@@ -739,7 +741,7 @@ def test_claim_rechecks_current_parent_state_before_model_invocation(tmp_path: P
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update("paid SGD 12.34 at Cafe"),
             ),
@@ -747,6 +749,8 @@ def test_claim_rechecks_current_parent_state_before_model_invocation(tmp_path: P
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     proposed = support.run_cli(
         support.make_request(
@@ -792,7 +796,7 @@ def test_prepare_rolls_back_after_fault_injection(
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update("paid SGD 12.34 at Cafe"),
             ),
@@ -800,6 +804,8 @@ def test_prepare_rolls_back_after_fault_injection(
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     proposed = support.run_cli(
         support.make_request(
@@ -1286,13 +1292,16 @@ def test_claim_rechecks_global_raw_intake_pointer_cardinality(tmp_path: Path) ->
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update("paid SGD 12.34 at Cafe"),
             ),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
+    assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     support.run_cli(
         support.make_request(
@@ -1922,13 +1931,16 @@ def test_concurrent_prepare_has_one_attempt_winner(tmp_path: Path) -> None:
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update("paid SGD 12.34 at Cafe"),
             ),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
+    assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     support.run_cli(
         support.make_request(
@@ -1967,13 +1979,16 @@ def test_concurrent_claim_has_one_invocation_winner(tmp_path: Path) -> None:
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(
+            support.authenticated_text_capture_arguments(
                 workspace,
                 support.telegram_text_update("paid SGD 12.34 at Cafe"),
             ),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
+    assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
     intake_public_id = capture.response["result"]["intake_public_id"]
     support.run_cli(
         support.make_request(
@@ -2371,6 +2386,29 @@ def test_sensitive_text_policy_rejects_complete_scalar_before_claim_or_model(
     tmp_path: Path,
     text: str,
 ) -> None:
+    if "=" in text:
+        # D3 reserves equals-sign control shapes before a parser or AI attempt.
+        workspace = support.create_bridge_workspace(tmp_path)
+        capture = support.run_cli(
+            support.make_request(
+                "capture",
+                support.authenticated_text_capture_arguments(
+                    workspace, support.telegram_text_update(text)
+                ),
+                idempotency_key=support.canonical_capture_key(message_id=10),
+            )
+        )
+        assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
+        assert capture.response["result"]["interaction_route"]["route_kind"] == "control_refused"
+        with support.open_database(workspace) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 0
+            assert _fallback_counts(conn) == {
+                "ai_fallback_attempts": 0,
+                "ai_fallback_invocation_claims": 0,
+                "ai_fallback_results": 0,
+                "ai_fallback_proposal_links": 0,
+            }
+        return
     _workspace, conn, intake_public_id, _parent_id = _captured_text_proposal(tmp_path, text)
     try:
         with pytest.raises(AiFallbackServiceError) as error:

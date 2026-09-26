@@ -49,14 +49,21 @@ def _prepare_edit_redemption(
     *,
     callback_id: str = "guided-edit-callback",
 ) -> tuple[str, dict[str, object]]:
+    capture_arguments = support.authenticated_text_capture_arguments(
+        workspace, support.telegram_text_update("lunch 12.50")
+    )
+    capture_arguments.pop("kind")
     capture = support.run_cli(
         support.make_request(
-            "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update("lunch 12.50")),
+            "capture_interaction",
+            capture_arguments,
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
-    proposal = str(capture.response["result"]["proposal_public_id"])
+    assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    proposal = str(processed.response["result"]["capture_job"]["proposal_public_id"])
     review = support.run_cli(
         support.make_request(
             "get_review",
@@ -101,6 +108,35 @@ def _begin(workspace: support.BridgeWorkspace) -> tuple[str, str, dict[str, obje
     return proposal, session, redemption_request
 
 
+def _capture_routed_message(
+    workspace: support.BridgeWorkspace, text: str, message_id: int
+) -> dict[str, object]:
+    """Freeze one Telegram route before a fresh guided or D1 business write."""
+    with support.open_database(workspace) as conn:
+        existing = conn.execute(
+            "SELECT r.operation_key FROM finance_capture_interaction_routes r "
+            "WHERE r.authenticated_actor_id = ? AND r.telegram_account_id = ? "
+            "AND r.telegram_conversation_id = ? AND r.conversation_binding_id = ? "
+            "AND r.telegram_message_id = ?",
+            (ACTOR, ACCOUNT, CONVERSATION, BINDING, message_id),
+        ).fetchone()
+    if existing is not None:
+        return {"operation_key": existing[0]}
+    arguments = support.authenticated_text_capture_arguments(
+        workspace, support.telegram_text_update(text, message_id=message_id)
+    )
+    arguments.pop("kind")
+    captured = support.run_cli(
+        support.make_request(
+            "capture_interaction",
+            arguments,
+            idempotency_key=support.canonical_capture_key(message_id=message_id),
+        )
+    )
+    assert captured.exit_code == bridge_errors.EXIT_OK, captured.response
+    return dict(captured.response["result"]["interaction_route"])
+
+
 def _apply(
     workspace: support.BridgeWorkspace,
     session: str,
@@ -108,6 +144,8 @@ def _apply(
     field: str,
     value: str,
 ) -> support.CliOutcome:
+    if "\n" not in value and "\r" not in value:
+        _capture_routed_message(workspace, f"{field}={value}", message_id)
     return support.run_cli(
         support.make_request(
             "apply_guided_edit_update",
@@ -166,8 +204,9 @@ def _apply_whole_card(
     operation_public_id: str | None = None,
     idempotency_key: str | None = None,
 ) -> support.CliOutcome:
-    operation_id = operation_public_id or f"d1op_message_{message_id}"
     raw_card_text = _whole_card_text(card_public_id, merchant=merchant)
+    route = _capture_routed_message(workspace, raw_card_text, message_id)
+    operation_id = operation_public_id or str(route["operation_key"])
     return support.run_cli(
         support.make_request(
             "apply_human_draft_card",
@@ -319,6 +358,7 @@ def _decide_without_d1_binding(
 def _complete(
     workspace: support.BridgeWorkspace, session: str, message_id: int
 ) -> support.CliOutcome:
+    _capture_routed_message(workspace, "完成", message_id)
     return support.run_cli(
         support.make_request(
             "complete_guided_edit",
@@ -513,6 +553,7 @@ def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
         "description": "午餐",
         "category": "餐饮",
     }
+    operation_1 = str(_capture_routed_message(workspace, chinese, 30)["operation_key"])
     first = support.run_cli(
         support.make_request(
             "apply_human_draft_card",
@@ -520,11 +561,11 @@ def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
                 **_context(workspace),
                 "card_generation_public_id": card_0,
                 "telegram_message_id": 30,
-                "operation_public_id": "d1op_plugin_zh_30",
+                "operation_public_id": operation_1,
                 "raw_card_text": chinese,
                 "field_values": fields_1,
             },
-            idempotency_key="bridge-human-draft-apply:d1op_plugin_zh_30",
+            idempotency_key=f"bridge-human-draft-apply:{operation_1}",
         )
     )
     assert first.exit_code == bridge_errors.EXIT_OK, first.response
@@ -547,6 +588,7 @@ def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
         "transaction_date": "2026-09-20",
         "merchant": "Branch: Two",
     }
+    operation_2 = str(_capture_routed_message(workspace, mixed, 31)["operation_key"])
     second = support.run_cli(
         support.make_request(
             "apply_human_draft_card",
@@ -554,11 +596,11 @@ def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
                 **_context(workspace),
                 "card_generation_public_id": card_1,
                 "telegram_message_id": 31,
-                "operation_public_id": "d1op_plugin_mixed_31",
+                "operation_public_id": operation_2,
                 "raw_card_text": mixed,
                 "field_values": fields_2,
             },
-            idempotency_key="bridge-human-draft-apply:d1op_plugin_mixed_31",
+            idempotency_key=f"bridge-human-draft-apply:{operation_2}",
         )
     )
     assert second.exit_code == bridge_errors.EXIT_OK, second.response
@@ -572,11 +614,11 @@ def test_plugin_shaped_bilingual_whole_cards_preserve_exact_utf8_evidence(
             "JOIN parser_human_draft_reply_evidence AS evidence "
             "ON evidence.id = operations.human_reply_evidence_id "
             "WHERE operations.operation_public_id IN (?, ?) ORDER BY operations.id",
-            ("d1op_plugin_zh_30", "d1op_plugin_mixed_31"),
+            (operation_1, operation_2),
         ).fetchall()
         assert [(row[0], bytes(row[1])) for row in evidence] == [
-            ("d1op_plugin_zh_30", chinese.encode("utf-8")),
-            ("d1op_plugin_mixed_31", mixed.encode("utf-8")),
+            (operation_1, chinese.encode("utf-8")),
+            (operation_2, mixed.encode("utf-8")),
         ]
         assert all(row[2] == hashlib.sha256(bytes(row[1])).hexdigest() for row in evidence)
         assert conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
@@ -592,6 +634,9 @@ def test_whole_card_exact_replay_and_read_only_recovery_preserve_one_result(
     card_id = str(initial["card_generation_public_id"])
     first = _apply_whole_card(workspace, card_id)
     replay = _apply_whole_card(workspace, card_id)
+    operation_id = str(
+        _capture_routed_message(workspace, _whole_card_text(card_id), 30)["operation_key"]
+    )
     assert first.exit_code == bridge_errors.EXIT_OK, first.response
     assert replay.exit_code == bridge_errors.EXIT_OK, replay.response
     assert replay.response["idempotent_replay"] is True
@@ -602,7 +647,7 @@ def test_whole_card_exact_replay_and_read_only_recovery_preserve_one_result(
 
     recovered = _get_human_draft_card(
         workspace,
-        operation_public_id="d1op_message_30",
+        operation_public_id=operation_id,
         card_generation_public_id=first.response["result"]["card_generation_public_id"],
     )
     assert recovered.exit_code == bridge_errors.EXIT_OK, recovered.response
@@ -742,7 +787,7 @@ def test_delivery_unknown_query_and_reissue_are_restart_safe(
     recovery_id = _framed_hash(
         "d1-card-recovery-v1",
         str(card["draft_public_id"]),
-        "d1op_message_30",
+        str(card["original_operation_or_start_public_id"]),
         card_id,
     )
     reissue_request = support.make_request(
@@ -750,7 +795,7 @@ def test_delivery_unknown_query_and_reissue_are_restart_safe(
         {
             **_context(workspace),
             "expected_current_generation_public_id": card_id,
-            "original_operation_or_start_public_id": "d1op_message_30",
+            "original_operation_or_start_public_id": card["original_operation_or_start_public_id"],
             "recovery_public_id": recovery_id,
             "recovery_material_hash": "b" * 64,
             "queried_delivery_state_hash": queried.response["result"]["delivery_state_hash"],

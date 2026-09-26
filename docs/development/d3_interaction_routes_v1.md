@@ -21,21 +21,29 @@ using any capture as a host adoption receipt. A replay first verifies the
 original content fingerprint, authenticated source context, ingress digest,
 and saved route. It never reclassifies from the current session. An old
 capture with no route cannot be treated as a successful interaction adoption.
+The older `capture(kind=text)` name uses the same route transaction for new
+authenticated ingress. Fresh text without authenticated context and ingress is
+refused. An existing no-route capture can only return an exact saved result
+when its raw fingerprint, context and job ingress identity match; replay never
+creates a new route or parser proposal.
 
 Core owns route precedence under the same capture transaction. It preserves the
 original text and SHA-256 exactly; only a classification copy normalizes CRLF
 and CR to LF. Other control or format characters, including NEL, Unicode line
 separators and zero-width controls, become `control_refused`. A line beginning
 with a D1 field/reference label, or text containing a `d1card_` marker, is a
-card candidate. D1's structural parser must accept the whole candidate before
-it can become `whole_card`; malformed, mixed card/guided, extra-line, duplicate
-or unsupported content is refused. Any ASCII/full-width equals sign or
+card candidate. D1's structural parser must accept all six supported fields
+within its 16,384-byte evidence limit before the candidate becomes
+`whole_card`; partial, malformed, mixed card/guided, extra-line, duplicate or
+unsupported content is refused. Any ASCII/full-width equals sign or
 standalone `完成` is a guided candidate, even with an unknown field or malformed
 value. A guided update is actionable only with one ASCII equals sign, a known
 field, one nonempty logical line and a safe value of at most 1024 UTF-8 bytes.
 
-A historical guided message is checked against its original append-only event;
-a different field, value, operation key or completion text is refused instead
+A historical guided message is checked against its original append-only request
+and pending or settled result. The route's Telegram message lookup key and the
+guided edit's proposal/version execution key are distinct. A different field,
+value, execution key or completion text is refused instead
 of being reinterpreted under the current session. An unexpired active guided
 session owns a new non-card message, accepting only valid guided syntax;
 malformed syntax is refused. At `expires_at <=` the capture-time clock, an
@@ -61,17 +69,23 @@ An expired guided session cannot claim a newly arriving ordinary expense.
 A worker may run `process_capture_job` only for `initial_intake`; for text it
 creates the deterministic parser proposal after adoption. For `whole_card`,
 `guided_update`, and `guided_complete`, a later worker must pass the frozen
-material to the existing D1/guided authority commands. Their validation,
-expiry, and idempotency decisions remain authoritative. `control_refused`
+material to the existing D1/guided authority commands. Each new business write
+checks route kind, original message/context and operation material inside its
+write transaction. Their validation, expiry, and idempotency decisions remain
+authoritative. `control_refused`
 requires a refusal/status reply using the saved reason and creates no parser
 proposal. A job's `captured` state says only that evidence and routing were
 saved. It does not say an edit or economic event succeeded.
 
 Migration 055 rejects direct parser-output and AI-attempt inserts tied to a
-saved non-intake route, so an older worker cannot silently process that
-message as a new expense. Its route table uses `WITHOUT ROWID` so hidden SQLite
+saved non-intake route or an authenticated text job missing a route, so an older
+worker cannot silently process that message as a new expense. Its route table
+uses `WITHOUT ROWID` so hidden SQLite
 row identifiers cannot replace frozen evidence; primary, message, and operation
 key collisions are also refused before SQLite conflict replacement executes.
 
-The pre-existing `capture` command remains compatible for initial receipt
-images. Migration 055 does not rewrite attachment evidence or older jobs.
+New receipt captions resembling a card, guided command or ambiguous control
+are refused before intake publication with a request to send the instruction as
+text. Exact replay of an already saved receipt compares its original caption
+without reclassification. OCR text is never treated as a user command.
+Migration 055 does not rewrite attachment evidence or older jobs.

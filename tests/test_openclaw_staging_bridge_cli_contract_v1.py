@@ -352,7 +352,7 @@ class TestGetStatus:
         capture = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(workspace, update),
+                support.authenticated_text_capture_arguments(workspace, update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -371,16 +371,20 @@ class TestGetStatus:
         assert outcome.exit_code == bridge_errors.EXIT_OK
         result = outcome.response["result"]
         assert result["identity_kind"] == "intake"
-        assert result["intake_status"] == "parsed_pending_confirmation"
-        assert result["parse_status"] == "parsed_pending_confirmation"
+        assert result["intake_status"] == "pending_parse"
+        assert result["parse_status"] is None
         assert result["final_transaction_created"] is False
+
+        processed = support.process_captured_text(workspace, capture)
+        assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+        proposal_public_id = processed.response["result"]["capture_job"]["proposal_public_id"]
 
         proposal_status = support.run_cli(
             support.make_request(
                 "get_status",
                 {
                     "workspace_path": str(workspace.workspace_path),
-                    "proposal_public_id": result["proposal_public_id"],
+                    "proposal_public_id": proposal_public_id,
                 },
             )
         )
@@ -402,14 +406,8 @@ class TestCaptureText:
         self, workspace: support.BridgeWorkspace
     ) -> None:
         update = support.telegram_text_update("coffee 6.40")
-        arguments = support.capture_text_arguments(workspace, update)
-        arguments.update(
-            {
-                "authenticated_actor_id": "111",
-                "telegram_account_id": "finance-bot",
-                "telegram_conversation_id": "111",
-                "conversation_binding_id": "session-111",
-            }
+        arguments = support.authenticated_text_capture_arguments(
+            workspace, update, account_id="finance-bot", binding_id="session-111"
         )
         request = support.make_request(
             "capture",
@@ -438,6 +436,9 @@ class TestCaptureText:
 
         conflicting_arguments = dict(arguments)
         conflicting_arguments["telegram_account_id"] = "other-bot"
+        conflicting_arguments["finance_ingress"] = {
+            **arguments["finance_ingress"], "accountId": "other-bot"
+        }
         conflict = support.run_cli(
             support.make_request(
                 "capture",
@@ -448,14 +449,14 @@ class TestCaptureText:
         assert conflict.exit_code == bridge_errors.EXIT_AUTHORITY_REFUSED
         assert conflict.response["error"]["code"] == bridge_errors.IDEMPOTENCY_CONFLICT
 
-    def test_capture_persists_raw_intake_and_proposal(
+    def test_capture_persists_raw_intake_then_worker_proposal(
         self, workspace: support.BridgeWorkspace
     ) -> None:
         update = support.telegram_text_update("coffee 6.40")
         outcome = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(workspace, update),
+                support.authenticated_text_capture_arguments(workspace, update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -464,11 +465,19 @@ class TestCaptureText:
         assert result["capture_kind"] == "text"
         uuid_pattern = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
         assert re.fullmatch(rf"raw_intake_{uuid_pattern}", result["intake_public_id"])
-        assert re.fullmatch(rf"parser_output_{uuid_pattern}", result["proposal_public_id"])
-        assert result["parse_status"] == "parsed_pending_confirmation"
+        assert result["proposal_public_id"] is None
+        assert result["parse_status"] is None
+        assert result["interaction_route"]["route_kind"] == "initial_intake"
         assert result["final_transaction_created"] is False
         assert outcome.response["idempotent_replay"] is False
         assert outcome.response["operation_id"].startswith("op_")
+
+        processed = support.process_captured_text(workspace, outcome)
+        assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+        assert re.fullmatch(
+            rf"parser_output_{uuid_pattern}",
+            processed.response["result"]["capture_job"]["proposal_public_id"],
+        )
 
         conn = support.open_database(workspace)
         try:
@@ -489,7 +498,7 @@ class TestCaptureText:
         update = support.telegram_text_update("taxi 15")
         request = support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, update),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
         first = support.run_cli(request)
@@ -516,7 +525,7 @@ class TestCaptureText:
         first = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
+                support.authenticated_text_capture_arguments(
                     workspace, support.telegram_text_update("original text")
                 ),
                 idempotency_key=support.canonical_capture_key(message_id=10),
@@ -526,7 +535,7 @@ class TestCaptureText:
         conflicting = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
+                support.authenticated_text_capture_arguments(
                     workspace, support.telegram_text_update("different text")
                 ),
                 idempotency_key=support.canonical_capture_key(message_id=10),
@@ -579,7 +588,7 @@ class TestCaptureText:
         update = support.telegram_text_update("concurrent capture")
         request = support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, update),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
         outcomes: list[support.CliOutcome] = []
@@ -599,8 +608,14 @@ class TestCaptureText:
         assert all(outcome.exit_code == bridge_errors.EXIT_OK for outcome in outcomes)
         public_ids = {outcome.response["result"]["intake_public_id"] for outcome in outcomes}
         assert len(public_ids) == 1
-        proposal_ids = {outcome.response["result"]["proposal_public_id"] for outcome in outcomes}
-        assert len(proposal_ids) == 1
+        route_jobs = {
+            outcome.response["result"]["interaction_route"]["job_public_id"]
+            for outcome in outcomes
+        }
+        assert len(route_jobs) == 1
+        assert all(
+            outcome.response["result"]["proposal_public_id"] is None for outcome in outcomes
+        )
         # At least one invocation performed the original insert; any other
         # invocation replayed through raw-intake key-level idempotency.
         replay_flags = [outcome.response["idempotent_replay"] for outcome in outcomes]
@@ -650,7 +665,7 @@ class TestCrossCuttingContract:
         outcome = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(workspace, update),
+                support.authenticated_text_capture_arguments(workspace, update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )

@@ -39,15 +39,25 @@ def key_path(workspace: support.BridgeWorkspace) -> Path:
 
 
 def setup_text_proposal(workspace: support.BridgeWorkspace, text: str, key: str) -> dict:
+    update = support.telegram_text_update(text)
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
-    return capture.response["result"]
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    capture_result = capture.response["result"]
+    capture_job = processed.response["result"]["capture_job"]
+    assert capture_job["proposal_public_id"] is not None
+    return {
+        **capture_result,
+        "capture_job": capture_job,
+        "proposal_public_id": capture_job["proposal_public_id"],
+    }
 
 
 def setup_receipt_proposal(

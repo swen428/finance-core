@@ -163,9 +163,21 @@ def require_telegram_source_context(
     return digest
 
 
+def has_telegram_source_context(
+    conn: sqlite3.Connection, *, raw_intake_record_id: int
+) -> bool:
+    """Whether the intake has a frozen capture identity that replay must supply."""
+    row = conn.execute(
+        "SELECT 1 FROM d2_telegram_source_contexts WHERE raw_intake_record_id = ?",
+        (raw_intake_record_id,),
+    ).fetchone()
+    return row is not None
+
+
 __all__ = [
     "TelegramSourceContext",
     "TelegramSourceContextError",
+    "has_telegram_source_context",
     "record_telegram_source_context",
     "require_telegram_source_context",
     "telegram_source_identity_sha256",

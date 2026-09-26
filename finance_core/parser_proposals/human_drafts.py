@@ -775,10 +775,17 @@ def _parse_card_fields(raw_card_text: str) -> tuple[str, dict[str, str]]:
 
 
 def parse_human_draft_card_structure_for_routing(raw_card_text: str) -> str | None:
-    """Use D1's syntax authority without applying a card or creating facts."""
+    """Require executable D1 card material without applying it or creating facts."""
     try:
-        reference, _fields = _parse_card_fields(raw_card_text)
+        if len(raw_card_text.encode("utf-8", errors="strict")) > 16_384:
+            return None
+    except UnicodeEncodeError:
+        return None
+    try:
+        reference, fields = _parse_card_fields(raw_card_text)
     except _HumanDraftRefusal:
+        return None
+    if set(fields) != set(_FIELDS):
         return None
     return reference
 

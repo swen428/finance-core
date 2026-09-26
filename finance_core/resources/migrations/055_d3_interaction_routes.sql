@@ -89,15 +89,19 @@ BEGIN
 END;
 
 -- A worker or older API must not reinterpret adopted edit/control source as
--- a fresh parser proposal or a new AI fallback attempt.
+-- a fresh parser proposal or a new AI fallback attempt. An authenticated
+-- ingress job without a route is quarantined rather than assumed ordinary.
 CREATE TRIGGER trg_finance_interaction_no_control_parser
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (
-    SELECT 1 FROM finance_capture_interaction_routes AS route
-    JOIN finance_capture_jobs AS job ON job.public_id = route.job_public_id
+    SELECT 1 FROM finance_capture_jobs AS job
     JOIN raw_intake_records AS intake ON intake.id = job.raw_intake_record_id
+    LEFT JOIN finance_capture_interaction_routes AS route
+      ON route.job_public_id = job.public_id
     WHERE intake.public_id = NEW.source_public_id
-      AND route.route_kind != 'initial_intake'
+      AND job.capture_kind = 'text'
+      AND (route.route_kind != 'initial_intake'
+           OR (job.ingress_identity_digest IS NOT NULL AND route.job_public_id IS NULL))
 )
 BEGIN
     SELECT RAISE(ABORT, 'control interaction cannot enter parser');
@@ -106,10 +110,13 @@ END;
 CREATE TRIGGER trg_finance_interaction_no_control_ai
 BEFORE INSERT ON ai_fallback_attempts
 WHEN EXISTS (
-    SELECT 1 FROM finance_capture_interaction_routes AS route
-    JOIN finance_capture_jobs AS job ON job.public_id = route.job_public_id
+    SELECT 1 FROM finance_capture_jobs AS job
+    LEFT JOIN finance_capture_interaction_routes AS route
+      ON route.job_public_id = job.public_id
     WHERE job.raw_intake_record_id = NEW.raw_intake_record_id
-      AND route.route_kind != 'initial_intake'
+      AND job.capture_kind = 'text'
+      AND (route.route_kind != 'initial_intake'
+           OR (job.ingress_identity_digest IS NOT NULL AND route.job_public_id IS NULL))
 )
 BEGIN
     SELECT RAISE(ABORT, 'control interaction cannot enter AI fallback');

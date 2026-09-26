@@ -52,15 +52,21 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 
 
 def proposal(workspace: support.BridgeWorkspace, text: str = "lunch 12.50") -> str:
+    update = support.telegram_text_update(text)
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK
-    return str(capture.response["result"]["proposal_public_id"])
+    assert capture.response["result"]["proposal_public_id"] is None
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    proposal_public_id = processed.response["result"]["capture_job"]["proposal_public_id"]
+    assert proposal_public_id is not None
+    return str(proposal_public_id)
 
 
 def issue_arguments(

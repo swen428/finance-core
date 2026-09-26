@@ -46,13 +46,13 @@ from finance_core.intake.capture_jobs import (
     DurableCaptureConnectionError,
     claim_capture_job,
     ensure_capture_job,
-    ensure_replayed_text_capture_job,
     get_capture_job,
     require_durable_capture_connection,
 )
 from finance_core.intake.interaction_routes import (
     InteractionRouteConflictError,
     begin_interaction_capture,
+    classify_control_text_shape,
     find_interaction_route_job,
     freeze_interaction_route,
     get_interaction_route,
@@ -77,8 +77,6 @@ from finance_core.intake.receipt_ocr_proposal import (
 )
 from finance_core.intake.telegram_text_adapter import (
     TelegramTextUpdateValidationError,
-    process_openclaw_telegram_text_message,
-    process_telegram_text_update,
     validate_openclaw_telegram_text_message,
     validate_telegram_text_update,
 )
@@ -246,6 +244,7 @@ from finance_core.receipt_staging_runner.participants import read_participants
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     TelegramSourceContextError,
+    has_telegram_source_context,
     record_telegram_source_context,
     require_telegram_source_context,
 )
@@ -1139,7 +1138,7 @@ def _validated_capture_source_context(
     actor_id = _require_string(
         arguments["authenticated_actor_id"],
         "authenticated_actor_id",
-        max_length=_MAX_ACTOR_ID_LENGTH,
+        max_length=32,
     )
     account_id = _require_string(
         arguments["telegram_account_id"], "telegram_account_id", max_length=200
@@ -1147,14 +1146,26 @@ def _validated_capture_source_context(
     conversation_id = _require_string(
         arguments["telegram_conversation_id"],
         "telegram_conversation_id",
-        max_length=200,
+        max_length=32,
     )
     binding_id = _require_string(
         arguments["conversation_binding_id"],
         "conversation_binding_id",
-        max_length=500,
+        max_length=200,
     )
-    if sender_id is None or actor_id != str(sender_id) or conversation_id != str(chat_id):
+    if (
+        sender_id is None
+        or actor_id != str(sender_id)
+        or conversation_id != str(chat_id)
+        or not actor_id.isascii()
+        or not actor_id.isdecimal()
+        or actor_id.startswith("0")
+        or any(
+            not identifier.isascii()
+            or any(ord(character) < 0x21 or ord(character) > 0x7E for character in identifier)
+            for identifier in (account_id, binding_id)
+        )
+    ):
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
             "D2 capture source context does not match the Telegram message.",
@@ -1191,38 +1202,6 @@ def _capture_context_effect(
             ) from exc
 
     return persist
-
-
-def _capture_text_effect(
-    source_context: TelegramSourceContext | None,
-    ingress_identity_digest: str | None,
-) -> Callable[[sqlite3.Connection, dict[str, Any]], None]:
-    context_effect = _capture_context_effect(source_context)
-
-    def persist(conn: sqlite3.Connection, intake: dict[str, Any]) -> None:
-        if context_effect is not None:
-            context_effect(conn, intake)
-        ensure_capture_job(
-            conn,
-            intake_id=int(intake["id"]),
-            capture_kind="text",
-            ingress_identity_digest=ingress_identity_digest,
-        )
-
-    return persist
-
-
-def _ensure_replayed_capture_job(
-    conn: sqlite3.Connection, *, intake_id: int, ingress_identity_digest: str | None
-) -> dict[str, Any]:
-    # A pre-D3 capture may exist without a job. Enlist it before reporting
-    # successful D3 capture, including when replay wins a concurrent insert.
-    try:
-        return ensure_replayed_text_capture_job(
-            conn, intake_id=intake_id, ingress_identity_digest=ingress_identity_digest
-        )
-    except CaptureJobConflictError as exc:
-        raise _capture_job_conflict(exc) from exc
 
 
 def _capture_job_conflict(exc: CaptureJobConflictError) -> errors.BridgeError:
@@ -1314,6 +1293,12 @@ def _require_replay_source_context(
     source_context: TelegramSourceContext | None,
 ) -> None:
     if source_context is None:
+        if has_telegram_source_context(conn, raw_intake_record_id=int(intake["id"])):
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Capture replay is missing its persisted source context.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
         return
     try:
         require_telegram_source_context(
@@ -1389,6 +1374,27 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             else errors.ARGUMENTS_REFUSED
         )
         raise errors.bridge_error(code, str(exc), errors.EXIT_VALIDATION_REFUSED) from exc
+    message = payload["message"] if has_update else payload
+    if any(
+        field in message
+        for field in (
+            "photo",
+            "document",
+            "audio",
+            "voice",
+            "video",
+            "video_note",
+            "animation",
+            "sticker",
+            "paid_media",
+            "media_group_id",
+        )
+    ):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Text capture cannot preserve attached media.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
     source_context = _validated_capture_source_context(
         request.arguments,
         chat_id=validated.chat_id,
@@ -1411,64 +1417,83 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         canonical_capture_key(chat_id=validated.chat_id, message_id=validated.message_id),
     )
 
-    workspace, conn = _open_context(request.arguments, deadline)
+    # All newly adopted text, including callers of the older capture command,
+    # must freeze its work route in the same durable source/job transaction.
+    if source_context is not None and ingress_digest is not None:
+        # An already committed pre-route capture may be read as an exact
+        # replay. It cannot acquire a fresh route from a later session.
+        _workspace, historical_conn = _open_context(request.arguments, deadline)
+        try:
+            historical = get_raw_intake_record_by_idempotency_key(
+                historical_conn,
+                f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}",
+            )
+            if historical is not None:
+                historical_job = get_capture_job(
+                    historical_conn, intake_public_id=str(historical["public_id"])
+                )
+                if (
+                    historical_job is not None
+                    and get_interaction_route(
+                        historical_conn, str(historical_job["public_id"])
+                    )
+                    is None
+                ):
+                    if (
+                        historical["content_fingerprint"] != _expected_text_fingerprint(validated)
+                        or historical_job["capture_kind"] != "text"
+                        or historical_job["ingress_identity_digest"] != ingress_digest
+                    ):
+                        raise errors.bridge_error(
+                            errors.IDEMPOTENCY_CONFLICT,
+                            "Historical text capture differs from persisted evidence.",
+                            errors.EXIT_AUTHORITY_REFUSED,
+                        )
+                    _require_replay_source_context(historical_conn, historical, source_context)
+                    return _text_capture_result(historical_conn, historical), True
+        finally:
+            historical_conn.close()
+        forwarded = BridgeRequest(
+            envelope_version=request.envelope_version,
+            command="capture_interaction",
+            request_id=request.request_id,
+            idempotency_key=request.idempotency_key,
+            arguments={key: value for key, value in request.arguments.items() if key != "kind"},
+        )
+        return handle_capture_interaction(forwarded, deadline)
+
+    _workspace, conn = _open_context(request.arguments, deadline)
     try:
         _require_durable_capture_connection(conn)
         deadline.check("capture replay inspection")
         idempotency_key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
         existing = get_raw_intake_record_by_idempotency_key(conn, idempotency_key)
-        if existing is not None:
-            expected_fingerprint = _expected_text_fingerprint(validated)
-            if existing.get("content_fingerprint") != expected_fingerprint:
-                raise errors.bridge_error(
-                    errors.IDEMPOTENCY_CONFLICT,
-                    "Capture idempotency key is already bound to different content.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            _require_replay_source_context(conn, existing, source_context)
-            _ensure_replayed_capture_job(
-                conn, intake_id=int(existing["id"]), ingress_identity_digest=ingress_digest
+        if existing is None:
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "New text capture requires authenticated source and ingress identity.",
+                errors.EXIT_AUTHORITY_REFUSED,
             )
-            return _text_capture_result(conn, existing), True
-
-        deadline.check("capture persistence")
-        try:
-            persistence_effect = _capture_text_effect(source_context, ingress_digest)
-            if has_update:
-                result = process_telegram_text_update(
-                    conn, payload, persistence_effect=persistence_effect
-                )
-            else:
-                result = process_openclaw_telegram_text_message(
-                    conn, payload, persistence_effect=persistence_effect
-                )
-        except RawIntakeIdempotencyConflictError as exc:
+        if existing.get("content_fingerprint") != _expected_text_fingerprint(validated):
             raise errors.bridge_error(
                 errors.IDEMPOTENCY_CONFLICT,
                 "Capture idempotency key is already bound to different content.",
                 errors.EXIT_AUTHORITY_REFUSED,
-            ) from exc
-        except sqlite3.IntegrityError as exc:
-            # Concurrent first-capture race on the deterministic identity:
-            # classify through the persisted winner's fingerprint instead of
-            # surfacing a retryable internal error.
-            winner = get_raw_intake_record_by_idempotency_key(conn, idempotency_key)
-            if winner is None or winner.get("content_fingerprint") != _expected_text_fingerprint(
-                validated
-            ):
-                raise errors.bridge_error(
-                    errors.IDEMPOTENCY_CONFLICT,
-                    "Capture idempotency key is already bound to different content.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                ) from exc
-            _require_replay_source_context(conn, winner, source_context)
-            _ensure_replayed_capture_job(
-                conn, intake_id=int(winner["id"]), ingress_identity_digest=ingress_digest
             )
-            return _text_capture_result(conn, winner), True
-        except CaptureJobConflictError as exc:
-            raise _capture_job_conflict(exc) from exc
-        return _text_capture_result(conn, result["intake"]), False
+        _require_replay_source_context(conn, existing, source_context)
+        job = get_capture_job(conn, intake_public_id=str(existing["public_id"]))
+        if (
+            job is None
+            or job["capture_kind"] != "text"
+            or job["ingress_identity_digest"] != ingress_digest
+            or get_interaction_route(conn, str(job["public_id"])) is not None
+        ):
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Historical capture lacks matching job or route evidence.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        return _text_capture_result(conn, existing), True
     finally:
         conn.close()
 
@@ -1646,13 +1671,7 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
         except BaseException:
             conn.rollback()
             raise
-        return {
-            "capture_kind": "text",
-            "intake_public_id": intake["public_id"],
-            "capture_job": get_capture_job(conn, intake_public_id=str(intake["public_id"])),
-            "interaction_route": route,
-            "final_transaction_created": False,
-        }, replay
+        return {**_text_capture_result(conn, intake), "interaction_route": route}, replay
     except (
         InteractionRouteConflictError,
         CaptureJobConflictError,
@@ -1982,6 +2001,12 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
         if existing is not None:
             _require_replay_caption_matches(existing, caption)
             _require_replay_source_context(conn, existing, source_context)
+        elif caption and classify_control_text_shape(caption)[0] != "ordinary":
+            raise errors.bridge_error(
+                errors.ARGUMENTS_REFUSED,
+                "Receipt caption resembles a control message; send the instruction as text.",
+                errors.EXIT_VALIDATION_REFUSED,
+            )
 
         deadline.check("receipt handoff publication")
         handoff_dir = workspace_access.ensure_handoff_directory(workspace)
@@ -4285,6 +4310,16 @@ def _canonical_supersession_updates(
     return canonical
 
 
+def _require_guided_business_authority(
+    locked: sqlite3.Connection,
+    session_id: int,
+    route_validator: Callable[[sqlite3.Connection], None] | None,
+) -> None:
+    guided_edit.require_pending_authority_in_transaction(locked, session_id)
+    if route_validator is not None:
+        route_validator(locked)
+
+
 def _edit_completion(
     conn: sqlite3.Connection,
     request: BridgeRequest,
@@ -4293,6 +4328,7 @@ def _edit_completion(
     current_hash: str,
     *,
     guided_session_id: int | None = None,
+    route_authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> HandlerResult:
     assert request.idempotency_key is not None
     try:
@@ -4307,8 +4343,8 @@ def _edit_completion(
             transaction_guard=(
                 None
                 if guided_session_id is None
-                else lambda locked: guided_edit.require_pending_authority_in_transaction(
-                    locked, guided_session_id
+                else lambda locked: _require_guided_business_authority(
+                    locked, guided_session_id, route_authority_validator
                 )
             ),
         )
@@ -4357,6 +4393,7 @@ def _edit_receipt_monetary(
     current_hash: str,
     *,
     guided_session_id: int | None = None,
+    route_authority_validator: Callable[[sqlite3.Connection], None] | None = None,
 ) -> HandlerResult:
     if not has_receipt_ocr_proposal_link(conn, int(proposal["id"])):
         raise errors.bridge_error(
@@ -4377,8 +4414,8 @@ def _edit_receipt_monetary(
             transaction_guard=(
                 None
                 if guided_session_id is None
-                else lambda locked: guided_edit.require_pending_authority_in_transaction(
-                    locked, guided_session_id
+                else lambda locked: _require_guided_business_authority(
+                    locked, guided_session_id, route_authority_validator
                 )
             ),
         )
@@ -4610,6 +4647,28 @@ def _pending_guided_update(
     )
     updates = {str(session["pending_field_name"]): field_value}
     current_hash = str(session["current_content_hash"])
+    pending_context = human_actions.HumanActionContext(
+        actor_id=str(session["authenticated_actor_id"]),
+        account_id=str(session["channel_account_id"]),
+        conversation_id=str(session["channel_conversation_id"]),
+        binding_id=str(session["conversation_binding_id"]),
+    )
+
+    def authorize_pending_route(locked: sqlite3.Connection) -> None:
+        _require_frozen_command_route(
+            locked,
+            context=pending_context,
+            message_id=int(session["pending_message_id"]),
+            route_kind="guided_update",
+            operation_key=canonical_guided_edit_update_key(
+                str(session["session_public_id"]), int(session["pending_message_id"])
+            ),
+            session_id=str(session["session_public_id"]),
+            field_name=str(session["pending_field_name"]),
+            field_value=field_value,
+            historical_pending_session=session,
+        )
+
     try:
         persisted_state = guided_edit.pending_core_state(conn, session)
     except guided_edit.GuidedEditError as exc:
@@ -4662,6 +4721,7 @@ def _pending_guided_update(
             if guided_edit.pending_core_state(locked, session) is not None:
                 raise guided_edit.GuidedEditError("pending_core_committed")
             guided_edit.require_pending_authority_in_transaction(locked, int(session["id"]))
+            authorize_pending_route(locked)
 
         try:
             d1_result = apply_human_draft_card(
@@ -4768,6 +4828,7 @@ def _pending_guided_update(
                 updates,
                 current_hash,
                 guided_session_id=int(session["id"]),
+                route_authority_validator=authorize_pending_route,
             )
             if frozenset(updates) & _MONETARY_FIELDS
             else _edit_completion(
@@ -4777,6 +4838,7 @@ def _pending_guided_update(
                 updates,
                 current_hash,
                 guided_session_id=int(session["id"]),
+                route_authority_validator=authorize_pending_route,
             )
         )
     except guided_edit.GuidedEditError as exc:
@@ -4910,6 +4972,19 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
             version=int(session["current_proposal_version"]),
             content_hash=str(session["current_content_hash"]),
         )
+
+        def authorize_guided_update(locked: sqlite3.Connection) -> None:
+            _require_frozen_command_route(
+                locked,
+                context=context,
+                message_id=message_id,
+                route_kind="guided_update",
+                operation_key=canonical_guided_edit_update_key(session_public_id, message_id),
+                session_id=session_public_id,
+                field_name=field_name,
+                field_value=field_value,
+            )
+
         try:
             pending = guided_edit.request_update(
                 conn,
@@ -4918,6 +4993,7 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
                 operation_key=operation_key,
                 field_name=field_name,
                 field_value=field_value,
+                authority_validator=authorize_guided_update,
             )
         except guided_edit.GuidedEditError as exc:
             _raise_guided_edit_error(exc)
@@ -4978,7 +5054,20 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
             assert session is not None
         try:
             completed = guided_edit.complete_session(
-                conn, session, context=context, message_id=message_id
+                conn,
+                session,
+                context=context,
+                message_id=message_id,
+                authority_validator=lambda locked: _require_frozen_command_route(
+                    locked,
+                    context=context,
+                    message_id=message_id,
+                    route_kind="guided_complete",
+                    operation_key=canonical_guided_edit_complete_key(
+                        session_public_id, message_id
+                    ),
+                    session_id=session_public_id,
+                ),
             )
             review_batch_id = guided_edit.claim_review_batch(
                 conn, completed, context=context, message_id=message_id
@@ -5155,6 +5244,17 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
     _workspace, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("human draft whole-card apply")
+        def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
+            _require_frozen_command_route(
+                locked,
+                context=context,
+                message_id=message_id,
+                route_kind="whole_card",
+                operation_key=operation_id,
+                card_id=card_id,
+                raw_text=raw_card_text,
+            )
+
         try:
             result = apply_human_draft_card(
                 conn,
@@ -5170,6 +5270,7 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
                     field_values=field_values,
                 ),
                 publish=publish_human_revision_in_transaction,
+                authority_validator=authorize_whole_card_write,
             )
         except HumanDraftError as exc:
             _raise_human_draft_error(exc)
@@ -5244,6 +5345,75 @@ def _human_draft_context(context: human_actions.HumanActionContext) -> HumanDraf
         telegram_conversation_id=context.conversation_id,
         conversation_binding_id=context.binding_id,
     )
+
+
+def _require_frozen_command_route(
+    conn: sqlite3.Connection,
+    *,
+    context: human_actions.HumanActionContext,
+    message_id: int,
+    route_kind: str,
+    operation_key: str,
+    card_id: str | None = None,
+    session_id: str | None = None,
+    raw_text: str | None = None,
+    field_name: str | None = None,
+    field_value: str | None = None,
+    historical_pending_session: dict[str, Any] | None = None,
+) -> None:
+    """Consume the immutable ingress decision under the business write lock."""
+    try:
+        job_id = find_interaction_route_job(conn, context=context, message_id=message_id)
+        if job_id is None:
+            if (
+                route_kind == "guided_update"
+                and historical_pending_session is not None
+                and field_name is not None
+                and field_value is not None
+                and guided_edit.is_exact_historical_pending_update(
+                    conn,
+                    session=historical_pending_session,
+                    context=context,
+                    message_id=message_id,
+                    field_name=field_name,
+                    field_value=field_value,
+                )
+            ):
+                return
+            raise InteractionRouteConflictError("No frozen route for this message")
+        job = get_capture_job(conn, public_id=job_id)
+        if job is None or job["capture_kind"] != "text":
+            raise InteractionRouteConflictError("Frozen route has no text capture job")
+        intake = get_raw_intake_record_by_public_id(conn, str(job["intake_public_id"]))
+        if intake is None or not isinstance(intake["raw_input"], str):
+            raise InteractionRouteConflictError("Frozen route has no raw text evidence")
+        source_text = str(intake["raw_input"])
+        route = require_replayed_interaction_route(
+            conn,
+            job_public_id=job_id,
+            text=source_text,
+            context=context,
+            message_id=message_id,
+        )
+        if (
+            route["route_kind"] != route_kind
+            or route["operation_key"] != operation_key
+            or route["card_generation_public_id"] != card_id
+            or route["guided_session_public_id"] != session_id
+            or (raw_text is not None and source_text != raw_text)
+            or (field_name is not None and route["field_name"] != field_name)
+            or (
+                field_value is not None
+                and json.loads(str(route["field_value_json"])) != field_value
+            )
+        ):
+            raise InteractionRouteConflictError("Command differs from frozen route material")
+    except (InteractionRouteConflictError, ValueError, TypeError) as exc:
+        raise errors.bridge_error(
+            errors.IDEMPOTENCY_CONFLICT,
+            "Command does not match its frozen Telegram interaction route.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
 
 
 def handle_begin_human_draft_card_delivery(

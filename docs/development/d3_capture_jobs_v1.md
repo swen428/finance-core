@@ -38,12 +38,18 @@ images it checks `attachmentSha256` against the published original. It stores
 `ingress_identity_digest`, SHA-256 of UTF-8 JSON with lexicographically sorted
 keys, no insignificant spaces, and no ASCII escaping. The Bridge must
 independently compare that digest before telling the host that it adopted an
-event. Legacy capture without `finance_ingress` remains possible for existing
-clients and has a null digest; a null digest must never be used as an adoption
-receipt.
+event. Receipt-image capture without `finance_ingress` remains possible for
+existing clients and has a null digest; a null digest must never be used as an
+adoption receipt. Migration 055 changes the text command: fresh text requires
+authenticated source context and non-null ingress identity, including under
+the older `capture(kind=text)` name. Exact old text capture may be read as a
+replay but never upgraded to a new adoption receipt.
 
-For text, raw intake, parser proposal, authenticated source context, and job
-share one SQLite transaction. For receipt images, raw intake may already exist
+Migration 052 originally wrote text intake, parser proposal, authenticated
+source context and job together. After migration 055, new text intake, source
+context, job and frozen interaction route share one transaction;
+`process_capture_job` creates the parser proposal later for `initial_intake`.
+For receipt images, raw intake may already exist
 from an earlier interrupted attempt. The immutable original file is published
 first, then its attachment source and job share one SQLite transaction. A
 failed source/job transaction leaves the prior raw intake and possibly an

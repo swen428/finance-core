@@ -33,11 +33,14 @@ def workspace(tmp_path: Path) -> support.BridgeWorkspace:
 def _capture_text(workspace: support.BridgeWorkspace) -> str:
     request = support.make_request(
         "capture",
-        support.capture_text_arguments(workspace, support.telegram_text_update("lunch 12.50")),
+        support.authenticated_text_capture_arguments(
+            workspace, support.telegram_text_update("lunch 12.50")
+        ),
         idempotency_key=support.canonical_capture_key(message_id=10),
     )
     result = support.run_cli(request)
     assert result.exit_code == 0
+    assert result.response["result"]["proposal_public_id"] is None
     return str(result.response["result"]["capture_job"]["public_id"])
 
 

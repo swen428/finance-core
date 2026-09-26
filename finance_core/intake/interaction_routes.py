@@ -221,7 +221,9 @@ def _historical_guided_route(
     }
     rows = conn.execute(
         "SELECT e.event_type, e.operation_key, e.field_name, e.field_value_json, "
-        "s.completed_message_id FROM openclaw_guided_edit_events e "
+        "s.completed_message_id, s.pending_message_id, s.pending_operation_key, "
+        "s.pending_field_name, s.pending_field_value_json "
+        "FROM openclaw_guided_edit_events e "
         "JOIN openclaw_guided_edit_sessions s ON s.id = e.session_id "
         "WHERE s.session_public_id = ? AND e.telegram_message_id = ? "
         "AND e.event_type IN ('update_requested', 'completed')",
@@ -229,7 +231,17 @@ def _historical_guided_route(
     ).fetchall()
     if len(rows) != 1:
         return refusal
-    event_type, original_key, original_field, original_value_json, completed_id = rows[0]
+    (
+        event_type,
+        original_key,
+        original_field,
+        original_value_json,
+        completed_id,
+        pending_id,
+        pending_key,
+        pending_field,
+        pending_value_json,
+    ) = rows[0]
     kind, field, value = _guided_shape(normalized)
     if event_type == "completed":
         if kind != "complete" or completed_id != message_id:
@@ -240,13 +252,37 @@ def _historical_guided_route(
             "operation_key": f"bridge-guided-edit-complete:{session_id}:{message_id}",
         }
     operation_key = f"bridge-guided-edit-update:{session_id}:{message_id}"
-    if kind != "update" or field != original_field or original_key != operation_key:
+    if kind != "update" or field != original_field or not original_key:
         return refusal
     try:
         original_value = json.loads(str(original_value_json))
     except (TypeError, ValueError):
         return refusal
     if value != original_value:
+        return refusal
+    # A route key identifies the Telegram message; the execution key recorded
+    # by the guided edit authority identifies the proposal/version operation.
+    # Bind recovery to the original pending request or its persisted outcome.
+    pending_matches = (
+        pending_id == message_id
+        and pending_key == original_key
+        and pending_field == original_field
+        and pending_value_json == original_value_json
+    )
+    settled = conn.execute(
+        "SELECT e.operation_key, e.field_name, e.field_value_json "
+        "FROM openclaw_guided_edit_events e "
+        "JOIN openclaw_guided_edit_sessions s ON s.id = e.session_id "
+        "WHERE s.session_public_id = ? AND e.telegram_message_id = ? "
+        "AND e.event_type IN ('update_applied', 'update_refused')",
+        (session_id, message_id),
+    ).fetchall()
+    settled_matches = len(settled) == 1 and tuple(settled[0]) == (
+        original_key,
+        original_field,
+        original_value_json,
+    )
+    if not pending_matches and not settled_matches:
         return refusal
     return {
         "route_kind": "guided_update",

@@ -53,15 +53,25 @@ def key_path(workspace: support.BridgeWorkspace) -> Path:
 
 
 def setup_text_proposal(workspace: support.BridgeWorkspace, text: str) -> dict:
+    update = support.telegram_text_update(text)
     capture = support.run_cli(
         support.make_request(
             "capture",
-            support.capture_text_arguments(workspace, support.telegram_text_update(text)),
+            support.authenticated_text_capture_arguments(workspace, update),
             idempotency_key=support.canonical_capture_key(message_id=10),
         )
     )
     assert capture.exit_code == bridge_errors.EXIT_OK, capture.response
-    return capture.response["result"]
+    processed = support.process_captured_text(workspace, capture)
+    assert processed.exit_code == bridge_errors.EXIT_OK, processed.response
+    capture_result = capture.response["result"]
+    capture_job = processed.response["result"]["capture_job"]
+    assert capture_job["proposal_public_id"] is not None
+    return {
+        **capture_result,
+        "capture_job": capture_job,
+        "proposal_public_id": capture_job["proposal_public_id"],
+    }
 
 
 def get_review(workspace: support.BridgeWorkspace, proposal_public_id: str) -> dict:
@@ -258,12 +268,11 @@ class TestExpectedStateGuardClosesToctou:
 
 class TestTelegramPrivateDmBoundary:
     def test_private_text_dm_succeeds(self, workspace: support.BridgeWorkspace) -> None:
+        update = support.telegram_text_update("coffee 4.50")
         outcome = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
-                    workspace, support.telegram_text_update("coffee 4.50")
-                ),
+                support.authenticated_text_capture_arguments(workspace, update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -273,14 +282,12 @@ class TestTelegramPrivateDmBoundary:
         self, workspace: support.BridgeWorkspace
     ) -> None:
         update = support.telegram_text_update("coffee 4.50")
+        arguments = support.authenticated_text_capture_arguments(workspace, update)
+        arguments["telegram_message"] = arguments.pop("telegram_update")["message"]
         outcome = support.run_cli(
             support.make_request(
                 "capture",
-                {
-                    "workspace_path": str(workspace.workspace_path),
-                    "kind": "text",
-                    "telegram_message": update["message"],
-                },
+                arguments,
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -491,12 +498,11 @@ class TestCanonicalIdempotencyBinding:
     def test_capture_conflict_creates_no_additional_rows(
         self, workspace: support.BridgeWorkspace
     ) -> None:
+        first_update = support.telegram_text_update("original text")
         first = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
-                    workspace, support.telegram_text_update("original text")
-                ),
+                support.authenticated_text_capture_arguments(workspace, first_update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -509,12 +515,11 @@ class TestCanonicalIdempotencyBinding:
         finally:
             conn.close()
 
+        conflict_update = support.telegram_text_update("different text")
         conflict = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
-                    workspace, support.telegram_text_update("different text")
-                ),
+                support.authenticated_text_capture_arguments(workspace, conflict_update),
                 idempotency_key=support.canonical_capture_key(message_id=10),
             )
         )
@@ -604,17 +609,20 @@ class TestCanonicalIdempotencyBinding:
         assert confirm_a.exit_code == bridge_errors.EXIT_OK
 
         # Second proposal in a fresh message identity.
+        second_update = support.telegram_text_update("tea 5", message_id=11)
         capture_b = support.run_cli(
             support.make_request(
                 "capture",
-                support.capture_text_arguments(
-                    workspace, support.telegram_text_update("tea 5", message_id=11)
-                ),
+                support.authenticated_text_capture_arguments(workspace, second_update),
                 idempotency_key=support.canonical_capture_key(message_id=11),
             )
         )
         assert capture_b.exit_code == bridge_errors.EXIT_OK
-        review_b = get_review(workspace, capture_b.response["result"]["proposal_public_id"])
+        processed_b = support.process_captured_text(workspace, capture_b)
+        assert processed_b.exit_code == bridge_errors.EXIT_OK, processed_b.response
+        proposal_b = processed_b.response["result"]["capture_job"]["proposal_public_id"]
+        assert proposal_b is not None
+        review_b = get_review(workspace, proposal_b)
         before = decision_write_counts(workspace)
 
         # Reusing proposal A's canonical confirm key against proposal B must
