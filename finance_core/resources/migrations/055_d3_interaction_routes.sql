@@ -94,30 +94,33 @@ END;
 CREATE TRIGGER trg_finance_interaction_no_control_parser
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (
-    SELECT 1 FROM finance_capture_jobs AS job
-    JOIN raw_intake_records AS intake ON intake.id = job.raw_intake_record_id
+    SELECT 1 FROM raw_intake_records AS intake
+    LEFT JOIN finance_capture_jobs AS job ON job.raw_intake_record_id = intake.id
     LEFT JOIN finance_capture_interaction_routes AS route
       ON route.job_public_id = job.public_id
     WHERE intake.public_id = NEW.source_public_id
-      AND job.capture_kind = 'text'
-      AND (route.route_kind != 'initial_intake'
-           OR (job.ingress_identity_digest IS NOT NULL AND route.job_public_id IS NULL))
+      AND intake.source_type = 'telegram_text'
+      AND intake.source_channel = 'telegram'
+      AND (job.public_id IS NULL OR job.capture_kind != 'text'
+           OR route.route_kind IS NULL OR route.route_kind != 'initial_intake')
 )
 BEGIN
-    SELECT RAISE(ABORT, 'control interaction cannot enter parser');
+    SELECT RAISE(ABORT, 'Telegram text requires initial intake route before parser');
 END;
 
 CREATE TRIGGER trg_finance_interaction_no_control_ai
 BEFORE INSERT ON ai_fallback_attempts
 WHEN EXISTS (
-    SELECT 1 FROM finance_capture_jobs AS job
+    SELECT 1 FROM raw_intake_records AS intake
+    LEFT JOIN finance_capture_jobs AS job ON job.raw_intake_record_id = intake.id
     LEFT JOIN finance_capture_interaction_routes AS route
       ON route.job_public_id = job.public_id
-    WHERE job.raw_intake_record_id = NEW.raw_intake_record_id
-      AND job.capture_kind = 'text'
-      AND (route.route_kind != 'initial_intake'
-           OR (job.ingress_identity_digest IS NOT NULL AND route.job_public_id IS NULL))
+    WHERE intake.id = NEW.raw_intake_record_id
+      AND intake.source_type = 'telegram_text'
+      AND intake.source_channel = 'telegram'
+      AND (job.public_id IS NULL OR job.capture_kind != 'text'
+           OR route.route_kind IS NULL OR route.route_kind != 'initial_intake')
 )
 BEGIN
-    SELECT RAISE(ABORT, 'control interaction cannot enter AI fallback');
+    SELECT RAISE(ABORT, 'Telegram text requires initial intake route before AI fallback');
 END;

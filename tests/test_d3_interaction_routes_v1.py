@@ -219,7 +219,7 @@ def test_control_text_never_enters_parser(
     with support.open_database(workspace) as conn:
         assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 0
         intake_id = captured.response["result"]["intake_public_id"]
-        with pytest.raises(sqlite3.IntegrityError, match="cannot enter parser"):
+        with pytest.raises(sqlite3.IntegrityError, match="route before parser"):
             conn.execute(
                 "INSERT INTO parser_outputs "
                 "(public_id, source_type, source_public_id, parse_status) "
@@ -454,7 +454,7 @@ def test_authenticated_job_without_route_cannot_enter_parser(
             conn.execute("SELECT COUNT(*) FROM finance_capture_interaction_routes").fetchone()[0]
             == 0
         )
-        with pytest.raises(sqlite3.IntegrityError, match="cannot enter parser"):
+        with pytest.raises(sqlite3.IntegrityError, match="route before parser"):
             conn.execute(
                 "INSERT INTO parser_outputs "
                 "(public_id, source_type, source_public_id, parse_status) "

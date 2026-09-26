@@ -1093,11 +1093,6 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "parse_status": parse_status,
             "final_transaction_created": False,
             "capture_job": capture_job,
-            "interaction_route": (
-                None
-                if capture_job is None
-                else get_interaction_route(conn, str(capture_job["public_id"]))
-            ),
             "capture_attachment_integrity": capture_attachment_integrity,
         }, False
     finally:

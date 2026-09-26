@@ -60,7 +60,9 @@ text SHA-256, message/context identity, and applicable card, session,
 operation, field and field-value material. `get_interaction_route` retrieves
 it read-only under the same authenticated context by original message ID or
 operation key, including after a guided session ends. `get_status` also
-returns the route for a known intake/job.
+returns capture and processing status for a known intake/job, but does not
+expose the route's actor, conversation, or field-value material without the
+authenticated route lookup.
 
 Text adoption rejects payloads that also contain Telegram media fields before
 any persistence; those attachments require the separate receipt capture path.
@@ -77,9 +79,10 @@ requires a refusal/status reply using the saved reason and creates no parser
 proposal. A job's `captured` state says only that evidence and routing were
 saved. It does not say an edit or economic event succeeded.
 
-Migration 055 rejects direct parser-output and AI-attempt inserts tied to a
-saved non-intake route or an authenticated text job missing a route, so an older
-worker cannot silently process that message as a new expense. Its route table
+Migration 055 rejects direct parser-output and AI-attempt inserts for any new
+Telegram text intake without an `initial_intake` route, including the older
+one-step Python intake API with no capture job. Older pre-055 databases retain
+their historical behavior. Its route table
 uses `WITHOUT ROWID` so hidden SQLite
 row identifiers cannot replace frozen evidence; primary, message, and operation
 key collisions are also refused before SQLite conflict replacement executes.

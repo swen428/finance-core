@@ -23,6 +23,15 @@ from finance_core.intake.telegram_text_adapter import (
     validate_telegram_text_update,
 )
 
+
+@pytest.fixture()
+def migrated_temp_db_connection(
+    legacy_temp_db_connection: sqlite3.Connection,
+) -> sqlite3.Connection:
+    """Exercise the historical one-step adapter on its pre-D3 schema."""
+    return legacy_temp_db_connection
+
+
 # ---------------------------------------------------------------------------
 #  Shared helpers
 # ---------------------------------------------------------------------------

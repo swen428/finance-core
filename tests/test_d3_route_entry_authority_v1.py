@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import openclaw_staging_bridge_support_v1 as support
@@ -11,7 +12,11 @@ import pytest
 
 from finance_core.intake.capture_jobs import ensure_capture_job
 from finance_core.intake.raw_text_repository import create_raw_intake_record
-from finance_core.intake.telegram_text_adapter import validate_telegram_text_update
+from finance_core.intake.telegram_text_adapter import (
+    process_openclaw_telegram_text_message,
+    process_telegram_text_update,
+    validate_telegram_text_update,
+)
 from finance_core.openclaw_staging_bridge import errors, identity
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
@@ -70,6 +75,59 @@ def _capture(
             idempotency_key=support.canonical_capture_key(message_id=message_id),
         )
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "lunch 12.50",
+        "完成",
+        "Card Ref: d1card_" + "a" * 32 + "\nAmount: 12.50",
+    ],
+)
+@pytest.mark.parametrize("entry", ["bot_api", "openclaw"])
+def test_legacy_public_telegram_entry_cannot_bypass_d3_route(
+    workspace: support.BridgeWorkspace, text: str, entry: str
+) -> None:
+    with support.open_database(workspace) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="route"):
+            update = support.telegram_text_update(text)
+            if entry == "bot_api":
+                process_telegram_text_update(conn, update)
+            else:
+                process_openclaw_telegram_text_message(conn, update["message"])
+        assert conn.execute("SELECT COUNT(*) FROM raw_intake_records").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 0
+
+
+def test_status_does_not_disclose_frozen_route_without_context(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    captured = _capture(workspace, "lunch 12.50", message_id=26)
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    intake_id = captured.response["result"]["intake_public_id"]
+    job_id = captured.response["result"]["capture_job"]["public_id"]
+    for key, value in (("intake_public_id", intake_id), ("job_public_id", job_id)):
+        status = support.run_cli(
+            support.make_request(
+                "get_status", {"workspace_path": str(workspace.workspace_path), key: value}
+            )
+        )
+        assert status.exit_code == errors.EXIT_OK, status.response
+        assert "interaction_route" not in status.response["result"]
+    wrong_context = {**_context(workspace), "conversation_binding_id": "other-binding"}
+    denied = support.run_cli(
+        support.make_request("get_interaction_route", {**wrong_context, "telegram_message_id": 26})
+    )
+    assert denied.exit_code == errors.EXIT_OK
+    assert denied.response["result"]["found"] is False
+    allowed = support.run_cli(
+        support.make_request(
+            "get_interaction_route", {**_context(workspace), "telegram_message_id": 26}
+        )
+    )
+    assert allowed.exit_code == errors.EXIT_OK
+    assert allowed.response["result"]["interaction_route"]["route_kind"] == "initial_intake"
 
 
 def _begin_guided(workspace: support.BridgeWorkspace) -> tuple[str, str]:
