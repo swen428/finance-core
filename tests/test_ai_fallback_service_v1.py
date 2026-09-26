@@ -172,6 +172,69 @@ def _fallback_counts(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def _insert_duplicate_raw_intake_pointer(
+    conn: sqlite3.Connection,
+    *,
+    parser_output_id: int,
+    public_id: str,
+    idempotency_key: str,
+) -> None:
+    """Prove the live insert guards, then model corruption for service checks."""
+    insert_sql = """
+        INSERT INTO raw_intake_records (
+            public_id, source_type, source_channel, raw_input, received_at,
+            status, parser_output_id, idempotency_key
+        ) VALUES (
+            ?, 'telegram_text', 'telegram',
+            'paid SGD 12.34 at Cafe', '2026-01-01T00:00:00Z',
+            'parsed_pending_confirmation', ?, ?
+        )
+    """
+    arguments = (public_id, parser_output_id, idempotency_key)
+    guards = (
+        "trg_ai_fallback_raw_intake_no_insert_pointer_collision",
+        "trg_finance_telegram_text_no_prebound_insert",
+    )
+    guard_sql = {}
+    for name in guards:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (name,),
+        ).fetchone()
+        assert row is not None and row["sql"] is not None
+        guard_sql[name] = row["sql"]
+
+    with pytest.raises(
+        sqlite3.IntegrityError, match="Telegram text cannot adopt a prebound parser"
+    ):
+        conn.execute(insert_sql, arguments)
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM raw_intake_records WHERE parser_output_id = ?",
+            (parser_output_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+    try:
+        for name in guards:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute(insert_sql, arguments)
+        conn.commit()
+    finally:
+        for name in guards:
+            conn.execute(guard_sql[name])
+        conn.commit()
+
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM raw_intake_records WHERE parser_output_id = ?",
+            (parser_output_id,),
+        ).fetchone()[0]
+        == 2
+    )
+
+
 def _prepared_attempt(
     tmp_path: Path,
     text: str = "paid SGD 12.34 at Cafe",
@@ -1239,7 +1302,6 @@ def test_result_rechecks_global_raw_intake_pointer_cardinality(
 ) -> None:
     _workspace, conn, attempt, claim = _prepared_claim(tmp_path)
     try:
-        conn.execute("DROP TRIGGER trg_ai_fallback_raw_intake_no_insert_pointer_collision")
         parent_id = int(
             conn.execute(
                 """
@@ -1250,20 +1312,14 @@ def test_result_rechecks_global_raw_intake_pointer_cardinality(
                 (attempt["attempt_public_id"],),
             ).fetchone()[0]
         )
-        conn.execute(
-            """
-            INSERT INTO raw_intake_records (
-                public_id, source_type, source_channel, raw_input, received_at,
-                status, parser_output_id, idempotency_key
-            ) VALUES (
-                'raw_duplicate_pointer_s5e', 'telegram_text', 'telegram',
-                'paid SGD 12.34 at Cafe', '2026-01-01T00:00:00Z',
-                'parsed_pending_confirmation', ?, 'duplicate-pointer-s5e'
-            )
-            """,
-            (parent_id,),
+        _insert_duplicate_raw_intake_pointer(
+            conn,
+            parser_output_id=parent_id,
+            public_id="raw_duplicate_pointer_s5e",
+            idempotency_key="duplicate-pointer-s5e",
         )
-        conn.commit()
+        counts_before = _fallback_counts(conn)
+        proposals_before = conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0]
         body, arguments = _response_body(claim)
         with pytest.raises(AiFallbackServiceError, match="exactly one raw-intake binding"):
             record_ai_fallback_result(
@@ -1274,8 +1330,8 @@ def test_result_rechecks_global_raw_intake_pointer_cardinality(
                 now_ms=100_002,
             )
         conn.rollback()
-        assert conn.execute("SELECT COUNT(*) FROM ai_fallback_results").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 1
+        assert _fallback_counts(conn) == counts_before
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == proposals_before
         assert (
             conn.execute(
                 "SELECT COUNT(*) FROM raw_intake_records WHERE parser_output_id = ?",
@@ -1316,32 +1372,26 @@ def test_claim_rechecks_global_raw_intake_pointer_cardinality(tmp_path: Path) ->
     conn = support.open_database(workspace)
     try:
         attempt = prepare_ai_fallback(conn, intake_public_id=intake_public_id, now_ms=100_000)
-        conn.execute("DROP TRIGGER trg_ai_fallback_raw_intake_no_insert_pointer_collision")
         parent_id = conn.execute(
             "SELECT parent_parser_output_id FROM ai_fallback_attempts WHERE attempt_public_id = ?",
             (attempt["attempt_public_id"],),
         ).fetchone()[0]
-        conn.execute(
-            """
-            INSERT INTO raw_intake_records (
-                public_id, source_type, source_channel, raw_input, received_at,
-                status, parser_output_id, idempotency_key
-            ) VALUES (
-                'raw_duplicate_claim_s5e', 'telegram_text', 'telegram',
-                'paid SGD 12.34 at Cafe', '2026-01-01T00:00:00Z',
-                'parsed_pending_confirmation', ?, 'duplicate-claim-s5e'
-            )
-            """,
-            (parent_id,),
+        _insert_duplicate_raw_intake_pointer(
+            conn,
+            parser_output_id=int(parent_id),
+            public_id="raw_duplicate_claim_s5e",
+            idempotency_key="duplicate-claim-s5e",
         )
-        conn.commit()
+        counts_before = _fallback_counts(conn)
+        proposals_before = conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0]
         with pytest.raises(AiFallbackServiceError, match="exactly one raw-intake binding"):
             claim_ai_fallback_invocation(
                 conn,
                 attempt_public_id=attempt["attempt_public_id"],
                 now_ms=100_001,
             )
-        assert conn.execute("SELECT COUNT(*) FROM ai_fallback_invocation_claims").fetchone()[0] == 0
+        assert _fallback_counts(conn) == counts_before
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == proposals_before
     finally:
         conn.close()
 
@@ -1501,21 +1551,14 @@ def test_committed_child_replay_and_reader_refuse_duplicate_child_pointer(
             "(SELECT id FROM ai_fallback_results WHERE result_public_id = ?)",
             (result["result_public_id"],),
         ).fetchone()[0]
-        conn.execute("DROP TRIGGER trg_ai_fallback_raw_intake_no_insert_pointer_collision")
-        conn.execute(
-            """
-            INSERT INTO raw_intake_records (
-                public_id, source_type, source_channel, raw_input, received_at,
-                status, parser_output_id, idempotency_key
-            ) VALUES (
-                'raw_duplicate_child_s5e', 'telegram_text', 'telegram',
-                'paid SGD 12.34 at Cafe', '2026-01-01T00:00:00Z',
-                'parsed_pending_confirmation', ?, 'duplicate-child-s5e'
-            )
-            """,
-            (child_id,),
+        _insert_duplicate_raw_intake_pointer(
+            conn,
+            parser_output_id=int(child_id),
+            public_id="raw_duplicate_child_s5e",
+            idempotency_key="duplicate-child-s5e",
         )
-        conn.commit()
+        counts_before = _fallback_counts(conn)
+        proposals_before = conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0]
         with pytest.raises(AiFallbackServiceError, match="exactly one raw-intake binding"):
             record_ai_fallback_result(
                 conn,
@@ -1534,6 +1577,8 @@ def test_committed_child_replay_and_reader_refuse_duplicate_child_pointer(
                 proposal_version=version,
                 require_resolved=False,
             )
+        assert _fallback_counts(conn) == counts_before
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == proposals_before
     finally:
         conn.close()
 

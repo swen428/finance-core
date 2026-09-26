@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+import openclaw_staging_bridge_support_v1 as support
 import pytest
 
 from finance_core.application.corrections import CorrectionService
@@ -16,6 +17,7 @@ from finance_core.intake.capture_jobs import (
     DurableCaptureConnectionError,
     capture_job_public_id,
 )
+from finance_core.openclaw_staging_bridge import capture_review
 from finance_core.openclaw_staging_bridge.capture_reply_outbox import (
     ReplyOutboxConflict,
     begin_reply_attempt,
@@ -34,6 +36,12 @@ from finance_core.posting_authority import (
     confirm_and_post,
     prepare_posting_review,
 )
+from finance_core.reconciliation.migrations import (
+    TEMP_DB_MIGRATION_PATHS,
+    MigrationHistoryError,
+    apply_migration_paths,
+    verify_migration_history,
+)
 from tests.test_correction_adapters_d2_source import _Terminal
 from tests.test_d2_initial_card_delivery_authority_v1 import (
     _file_connection as _initial_file_connection,
@@ -43,6 +51,7 @@ from tests.test_d2_initial_card_delivery_authority_v1 import (
     _seed_initial_text,
 )
 from tests.test_d2_posting_authority_v1 import _issue_and_activate, _published_text_card
+from tests.test_d3_capture_review_v1 import _activate_review, _capture_processed_text
 
 
 def _committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -95,6 +104,10 @@ def _committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         clock=lambda: 1004,
     )
     assert posted.state == "finalized"
+    # The D2 setup is historical; D3 recovery must run against the complete
+    # current schema, including the route-entry guards introduced by 055.
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
     return conn, job_id, review.review_public_id, context, posted
 
 
@@ -141,7 +154,27 @@ def _committed_initial(tmp_path: Path):
         callback_message_id=901,
         clock=lambda: 1003,
     )
+    assert posted.state == "finalized"
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
     return conn, job_id, review_id, context, posted
+
+
+def test_incomplete_historical_ledger_cannot_provision_current_correction_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "owner_runtime"
+    (runtime_root / "database").mkdir(parents=True, mode=0o700)
+    monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(runtime_root.resolve()))
+    conn = _initial_file_connection(tmp_path)
+    try:
+        database = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+        database.chmod(0o600)
+        with pytest.raises(MigrationHistoryError, match="incomplete"):
+            provision(database, "111")
+        assert not (runtime_root / "correction_authority" / "policy.json").exists()
+    finally:
+        conn.close()
 
 
 def test_committed_result_reply_loss_and_duplicate_replay(
@@ -330,13 +363,33 @@ def test_canonical_result_does_not_override_an_active_processing_lease(
         conn.close()
 
 
+@pytest.mark.parametrize("source", ["historical_054_upgraded", "fresh_055"])
 def test_older_correction_reply_replays_current_verified_head(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
     runtime_root = tmp_path / "owner_runtime"
     (runtime_root / "database").mkdir(parents=True, mode=0o700)
     monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(runtime_root.resolve()))
-    conn, job_id, review_id, context, posted = _committed_initial(tmp_path)
+    if source == "fresh_055":
+        workspace = support.create_bridge_workspace(tmp_path)
+        job_id = _capture_processed_text(workspace, eligible_proposal=True)
+        conn = support.open_database(workspace)
+        verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
+        job, review, _ = capture_review.ensure_capture_review(conn, job_public_id=job_id)
+        assert review is not None
+        context, key, reference = _activate_review(conn, job=job, review=review)
+        posted = confirm_and_post(
+            conn,
+            key=key,
+            reference=reference,
+            context=context,
+            callback_id="d3-fresh-corrected-confirm",
+            callback_message_id=54321,
+        )
+        assert posted.state == "finalized"
+        review_id = review.review_public_id
+    else:
+        conn, job_id, review_id, context, posted = _committed_initial(tmp_path)
     database = Path(
         next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
     )
