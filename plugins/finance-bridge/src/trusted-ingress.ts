@@ -169,7 +169,7 @@ function caption(text: string): string | undefined {
   return text;
 }
 
-/** Mirror Core's raw-intake-v1 canonical_fingerprint for Telegram image intake. */
+/** Mirror Core's exact-caption Telegram photo fingerprint. */
 export function photoIntakeFingerprint(
   chatId: number, messageId: number, rawCaption: string, attachmentHash: string,
 ): string {
@@ -177,11 +177,11 @@ export function photoIntakeFingerprint(
   // The fixed object keys below are already in sorted order. Without /u, the
   // replacement escapes each UTF-16 surrogate separately, as Python does.
   const canonical = JSON.stringify({
-    fingerprint_schema_version: "raw-intake-v1",
+    fingerprint_schema_version: "raw-intake-telegram-photo-v2",
     material: {
       attachment_content_hash: attachmentHash,
       external_source_id: `telegram:${chatId}:${messageId}`,
-      raw_input: rawCaption === "" ? "[telegram receipt image]" : rawCaption,
+      raw_input: rawCaption,
       source_channel: "telegram",
       source_message_id: String(messageId),
       source_type: "telegram_image",
@@ -255,7 +255,8 @@ export class TrustedIngressCapture {
       job.intake_public_id === claim.rawIntakePublicId &&
       job.capture_kind === "receipt_image" &&
       job.ingress_identity_digest === claim.ingressIdentityDigest &&
-      job.attachment_content_hash === claim.attachmentContentHash;
+      job.attachment_content_hash === claim.attachmentContentHash &&
+      job.intake_fingerprint === claim.intakeFingerprint;
   }
 
   /** Called at plugin readiness, including when the Host has already ACKed. */
@@ -306,6 +307,9 @@ export class TrustedIngressCapture {
           canonicalKeyHash: createHash("sha256").update(key).digest("hex"),
           ingressIdentityDigest: ingressDigest(coreIdentity(turn.ingress)),
           attachmentContentHash: turn.ingress.attachmentSha256!,
+          intakeFingerprint: photoIntakeFingerprint(
+            turn.chatId, turn.messageId, turn.text, turn.ingress.attachmentSha256!,
+          ),
         };
       };
       const status = async (jobId: string): Promise<{
@@ -378,6 +382,11 @@ export class TrustedIngressCapture {
       // A prior turn may have ACKed immediately before a cleanup crash. Each
       // restart rechecks Core custody before resuming any durable intent.
       await this.resumePendingReclaims();
+      const pendingKeyHash = await this.handoff.pendingPublicationKeyHash();
+      if (pendingKeyHash !== undefined &&
+          (turn.photo !== true || pendingKeyHash !== createHash("sha256").update(key).digest("hex"))) {
+        return { handled: false };
+      }
       const adoptPhoto = async (adoption: FinanceIngressAdoption): Promise<TrustedClaimResult> => {
         const claim = photoClaim();
         if (adoption.jobId !== claim.jobPublicId || adoption.intakeId !== claim.rawIntakePublicId) {

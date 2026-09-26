@@ -72,6 +72,7 @@ export interface ReclaimClaim {
   canonicalKeyHash: string;
   ingressIdentityDigest: string;
   attachmentContentHash: string;
+  intakeFingerprint: string;
 }
 
 interface SavedIdentity {
@@ -85,7 +86,7 @@ interface SavedIdentity {
 }
 
 interface ReclaimIntent {
-  schema_version: "finance-bridge-reclaim-v1";
+  schema_version: "finance-bridge-reclaim-v2";
   claim: ReclaimClaim;
   record_basename: string;
   payload_basename: string;
@@ -244,7 +245,8 @@ function validateClaim(claim: ReclaimClaim): void {
   if (!PUBLIC_ID.test(claim.rawIntakePublicId) ||
       !/^fcj_[0-9a-f]{40}$/u.test(claim.jobPublicId) ||
       claim.jobPublicId !== `fcj_${sha256(`finance-capture-job-v1\0${claim.rawIntakePublicId}`).slice(0, 40)}` ||
-      ![claim.canonicalKeyHash, claim.ingressIdentityDigest, claim.attachmentContentHash]
+      ![claim.canonicalKeyHash, claim.ingressIdentityDigest, claim.attachmentContentHash,
+        claim.intakeFingerprint]
         .every((value) => /^[0-9a-f]{64}$/u.test(value))) {
     throw new Error("Reclaim claim identity is invalid.");
   }
@@ -256,7 +258,7 @@ function parseIntent(bytes: Buffer): ReclaimIntent {
   try { value = JSON.parse(bytes.toString("utf8")); } catch (error) {
     throw new Error("Reclaim intent is invalid JSON.", { cause: error });
   }
-  if (!isRecord(value) || value.schema_version !== "finance-bridge-reclaim-v1" ||
+  if (!isRecord(value) || value.schema_version !== "finance-bridge-reclaim-v2" ||
       !isRecord(value.claim) || !isRecord(value.record_identity) ||
       !isRecord(value.payload_identity) || !isRecord(value.directory_identity) ||
       typeof value.record_basename !== "string" || typeof value.payload_basename !== "string" ||
@@ -271,7 +273,7 @@ function parseIntent(bytes: Buffer): ReclaimIntent {
   ].sort().join() ||
       Object.keys(intent.claim).sort().join() !== [
         "rawIntakePublicId", "jobPublicId", "canonicalKeyHash", "ingressIdentityDigest",
-        "attachmentContentHash",
+        "attachmentContentHash", "intakeFingerprint",
       ].sort().join() ||
       intent.record_basename !== `${intent.claim.rawIntakePublicId}${RECORD_SUFFIX}` ||
       ![".jpg", ".png"].some((suffix) =>
@@ -407,7 +409,7 @@ async function sealReclaimIntent(
   }
   const directoryIdentity = await descriptorIdentity(directoryFd);
   const intent: ReclaimIntent = {
-    schema_version: "finance-bridge-reclaim-v1", claim,
+    schema_version: "finance-bridge-reclaim-v2", claim,
     record_basename: recordName, payload_basename: payloadName,
     record_sha256: sha256(recordBytes), payload_sha256: sha256(payloadBytes),
     record_identity: saveIdentity(recordIdentity), payload_identity: saveIdentity(payloadIdentity),
@@ -601,7 +603,7 @@ async function inventory(directoryFd: number): Promise<DirectoryInventory> {
   for (const [id, record] of records) {
     referencedPayloads.add(record.payload_basename);
     if (!entries.includes(record.payload_basename)) {
-      incompleteRecords.add(id);
+      if (!intents.has(id)) incompleteRecords.add(id);
       continue;
     }
     if (record.byte_size > 10_000_000) {
@@ -628,18 +630,70 @@ async function inventory(directoryFd: number): Promise<DirectoryInventory> {
   }
   for (const [id, intent] of intents) {
     const record = records.get(id);
-    if (record === undefined || record.payload_basename !== intent.payload_basename ||
-        record.canonical_key_hash !== intent.claim.canonicalKeyHash ||
-        record.content_hash !== intent.claim.attachmentContentHash ||
-        sha256(await readRegularAt(directoryFd, intent.record_basename, 4_096)) !== intent.record_sha256 ||
-        !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.record_basename),
-          restoreIdentity(intent.record_identity)) ||
-        !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.payload_basename),
-          restoreIdentity(intent.payload_identity))) {
+    const payloadPresent = payloadNames.has(intent.payload_basename);
+    if ((record === undefined && payloadPresent) ||
+        (record !== undefined && (record.payload_basename !== intent.payload_basename ||
+          record.canonical_key_hash !== intent.claim.canonicalKeyHash ||
+          record.content_hash !== intent.claim.attachmentContentHash ||
+          sha256(await readRegularAt(directoryFd, intent.record_basename, 4_096)) !== intent.record_sha256 ||
+          !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.record_basename),
+            restoreIdentity(intent.record_identity)))) ||
+        (payloadPresent &&
+          !sameEntryIdentity(await entryIdentityAt(directoryFd, intent.payload_basename),
+            restoreIdentity(intent.payload_identity)))) {
       throw new Error("Reclaim intent does not match its retained slot.");
     }
   }
   return { recordCount: records.size, payloadBytes, treeBytes, incompleteRecords };
+}
+
+/** A crash may leave one unpublished slot; it is never reclaimable without a trusted replay. */
+async function pendingPublication(directoryFd: number): Promise<string | undefined> {
+  const names = listAt(directoryFd);
+  const recordPending = names.includes(HANDOFF_PENDING_RECORD);
+  const payloadPending = names.includes(HANDOFF_PENDING_PAYLOAD);
+  if (recordPending && payloadPending) {
+    throw new Error("Conflicting handoff pending publication residue.");
+  }
+  const current = await inventory(directoryFd);
+  if (current.incompleteRecords.size > 1) {
+    throw new Error("Multiple incomplete handoff publications block recovery.");
+  }
+  const incompleteId = [...current.incompleteRecords][0];
+  if (recordPending) {
+    if (incompleteId !== undefined) throw new Error("Foreign incomplete handoff publication.");
+    const record = parseRecord(await readRegularAt(directoryFd, HANDOFF_PENDING_RECORD, 4_096));
+    if (record.byte_size > 10_000_000) throw new Error("Pending handoff record exceeds receipt limit.");
+    if (names.includes(`${record.raw_intake_public_id}${RECORD_SUFFIX}`) ||
+        names.includes(record.payload_basename)) {
+      throw new Error("Pending handoff record conflicts with a published slot.");
+    }
+    return record.canonical_key_hash;
+  }
+  if (payloadPending) {
+    if (incompleteId === undefined) throw new Error("Orphan handoff pending payload.");
+    const record = parseRecord(await readRegularAt(directoryFd,
+      `${incompleteId}${RECORD_SUFFIX}`, 4_096));
+    if (record.byte_size > 10_000_000) throw new Error("Pending handoff record exceeds receipt limit.");
+    const payload = await readRegularAt(directoryFd, HANDOFF_PENDING_PAYLOAD, 10_000_000);
+    if (record.byte_size !== payload.byteLength || record.content_hash !== sha256(payload)) {
+      throw new Error("Pending handoff payload does not match its record.");
+    }
+    const jpeg = payload.length >= 3 && payload[0] === 0xff &&
+      payload[1] === 0xd8 && payload[2] === 0xff;
+    const png = payload.length >= 8 && payload.subarray(0, 8).equals(
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if ((record.detected_mime_type === "image/jpeg" && !jpeg) ||
+        (record.detected_mime_type === "image/png" && !png)) {
+      throw new Error("Pending handoff payload magic does not match its record.");
+    }
+    return record.canonical_key_hash;
+  }
+  if (incompleteId === undefined) return undefined;
+  const record = parseRecord(await readRegularAt(directoryFd,
+    `${incompleteId}${RECORD_SUFFIX}`, 4_096));
+  if (record.byte_size > 10_000_000) throw new Error("Incomplete handoff record exceeds receipt limit.");
+  return record.canonical_key_hash;
 }
 
 export class HandoffPublisher {
@@ -701,9 +755,7 @@ export class HandoffPublisher {
   async pendingReclaims(): Promise<ReclaimClaim[]> {
     return await this.withReclaimLock(async (directoryFd) => {
       const names = listAt(directoryFd);
-      if (names.includes(HANDOFF_PENDING_RECORD) || names.includes(HANDOFF_PENDING_PAYLOAD)) {
-        throw new Error("Unresolved handoff pending residue blocks reclaim.");
-      }
+      if (await pendingPublication(directoryFd) !== undefined) return [];
       const claims: ReclaimClaim[] = [];
       for (const name of names) {
         if (!name.endsWith(RECLAIM_SUFFIX)) continue;
@@ -726,6 +778,12 @@ export class HandoffPublisher {
       }
       return claims;
     }) ?? [];
+  }
+
+  /** A pending publication can only resume for its original trusted message. */
+  async pendingPublicationKeyHash(): Promise<string | undefined> {
+    return await this.withReclaimLock(async (directoryFd) =>
+      await pendingPublication(directoryFd));
   }
 
   /** A host replay can seal an older retained slot after Core commit lost its response. */

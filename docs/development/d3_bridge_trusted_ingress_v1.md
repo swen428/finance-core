@@ -56,9 +56,11 @@ The Bridge returns `finance-ingress-adoption-v1` only after `get_status` confirm
 the expected intake and deterministic job ID, the independently computed ingress
 identity digest, and the capture kind. For a photo, Core must also reopen and
 verify the linked original and report `capture_attachment_integrity=verified`.
-The Bridge compares Core's saved `raw-intake-v1` fingerprint with the exact
-Telegram image intake material: original caption (or Core's absent-caption
-placeholder), message source, and attachment hash. A prior photo job with the
+The Bridge compares Core's saved `raw-intake-telegram-photo-v2` fingerprint with the exact
+Telegram image intake material: original caption (including the empty string),
+message source, and attachment hash. The literal caption `[telegram receipt image]`
+is distinct from an absent caption; historical `raw-intake-v1` photo jobs fail closed.
+A prior photo job with the
 same ingress identity and original bytes but a different caption cannot be
 adopted, including on replay or after a lost capture response.
 For text, including control text, the Bridge additionally queries Core's
@@ -69,8 +71,10 @@ without a frozen route, an incomplete route, or a failed lookup cannot be adopte
 including after a lost capture response or on replay.
 For newly captured photos, adoption also requires a durable per-slot reclaim
 intent and completed handoff cleanup. The intent is only a request to check
-Core; it is never proof that Core holds an original. Core `get_status` must match
-the saved intake, job, ingress digest, and original hash immediately before any
+Core; it is never proof that Core holds an original. Version 2 of the reclaim
+intent binds the expected photo intake fingerprint; old intents fail closed.
+Core `get_status` must match the saved intake, job, ingress digest, original hash,
+and exact-caption fingerprint immediately before any
 cleanup. This read can recover a lost capture response after a committed write. The
 Bridge first calls `get_capture_job_for_message` within the authenticated
 binding. An already captured message is read and verified without downloading
@@ -90,6 +94,13 @@ unlink and a directory fsync after each removal. On startup, it enumerates
 intents and rechecks Core before resuming only the recognized crash states:
 image+record+intent, record+intent, or intent alone. A failed Core capture
 leaves the image and intent in place; the same host ingress can retry capture.
+Startup also retains a structurally valid unfinished record or payload publication
+without declaring the plugin unhealthy. Under the handoff flock, only a replay
+of that trusted photo message with the same canonical key and exact original
+image bytes/hash may finish publication. Other photos and text are refused
+until it finishes. An orphan payload, corrupt pending bytes, or unknown residue
+remains fail closed;
+the Bridge never deletes or rebuilds a pending original to clear the slot.
 Unknown residue, altered image/record evidence, or unavailable Core proof
 blocks cleanup and adoption. A crash after Core commit but before intent
 creation depends on host spool replay to reseal that slot. Older slots with

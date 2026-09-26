@@ -36,6 +36,7 @@ function reclaimClaim(key: string): ReclaimClaim {
     canonicalKeyHash: createHash("sha256").update(key).digest("hex"),
     ingressIdentityDigest: "a".repeat(64),
     attachmentContentHash: media.contentHash,
+    intakeFingerprint: "b".repeat(64),
   };
 }
 
@@ -258,10 +259,80 @@ test("publication failures retain fixed residue and exact restart resumes withou
   await assert.rejects(new HandoffPublisher(fixture.path, { hook }).publish(key, identity, media));
   const handoff = join(fixture.path, "handoff");
   assert.equal((await lstat(join(handoff, HANDOFF_PENDING_PAYLOAD))).isFile(), true);
-  const recovered = await new HandoffPublisher(fixture.path).publish(key, identity, media);
+  const restarted = new HandoffPublisher(fixture.path);
+  assert.deepEqual(await restarted.pendingReclaims(), []);
+  assert.equal(await restarted.pendingPublicationKeyHash(),
+    createHash("sha256").update(key).digest("hex"));
+  const recovered = await restarted.publish(key, identity, media);
   assert.equal((await readFile(recovered.payloadPath)).equals(bytes), true);
   await assert.rejects(lstat(join(handoff, HANDOFF_PENDING_PAYLOAD)), /ENOENT/u);
   await assert.rejects(lstat(join(handoff, HANDOFF_PENDING_RECORD)), /ENOENT/u);
+});
+
+test("record-only crash starts healthy and only exact publication resumes", async () => {
+  await using fixture = await workspace();
+  const key = canonicalCaptureKey("111", "39");
+  const identity = captureIdentities(key).rawIntakePublicId;
+  await assert.rejects(new HandoffPublisher(fixture.path, {
+    hook: (phase) => { if (phase === "after-record-fsync") throw new Error("crash"); },
+  }).publish(key, identity, media), /crash/u);
+  const restarted = new HandoffPublisher(fixture.path);
+  assert.deepEqual(await restarted.pendingReclaims(), []);
+  assert.equal(await restarted.pendingPublicationKeyHash(),
+    createHash("sha256").update(key).digest("hex"));
+  const otherKey = canonicalCaptureKey("111", "40");
+  await assert.rejects(restarted.publish(otherKey,
+    captureIdentities(otherKey).rawIntakePublicId, media), /pending residue/u);
+  assert.equal((await restarted.publish(key, identity, media)).contentHash, media.contentHash);
+  assert.equal(await restarted.pendingPublicationKeyHash(), undefined);
+});
+
+test("pending publication coexists with a retained reclaim intent without deleting either", async () => {
+  await using fixture = await workspace();
+  const priorKey = canonicalCaptureKey("111", "51");
+  const priorClaim = reclaimClaim(priorKey);
+  const publisher = new HandoffPublisher(fixture.path);
+  await assert.rejects(publisher.withPublished(priorKey, priorClaim.rawIntakePublicId, media,
+    async () => { throw new Error("Core refused"); }, 30_000, priorClaim), /Core refused/u);
+  await assert.rejects(new HandoffPublisher(fixture.path, {
+    hook: (phase) => { if (phase === "after-reclaim-payload-unlink") throw new Error("reclaim crash"); },
+  }).reclaimVerified(priorClaim, async () => true), /reclaim crash/u);
+  const key = canonicalCaptureKey("111", "52");
+  const identity = captureIdentities(key).rawIntakePublicId;
+  await assert.rejects(new HandoffPublisher(fixture.path, {
+    hook: (phase) => { if (phase === "after-payload-fsync") throw new Error("crash"); },
+  }).publish(key, identity, media), /crash/u);
+  assert.deepEqual(await publisher.pendingReclaims(), []);
+  assert.equal(await publisher.pendingPublicationKeyHash(),
+    createHash("sha256").update(key).digest("hex"));
+  await publisher.publish(key, identity, media);
+  assert.deepEqual(await publisher.pendingReclaims(), [priorClaim]);
+});
+
+test("old reclaim intent and corrupted pending payload remain fail closed", async () => {
+  await using fixture = await workspace();
+  const key = canonicalCaptureKey("111", "53");
+  const claim = reclaimClaim(key);
+  const publisher = new HandoffPublisher(fixture.path);
+  await assert.rejects(publisher.withPublished(key, claim.rawIntakePublicId, media,
+    async () => { throw new Error("Core refused"); }, 30_000, claim), /Core refused/u);
+  const intentPath = join(fixture.path, "handoff", `${claim.rawIntakePublicId}.reclaim.json`);
+  const intent = JSON.parse(await readFile(intentPath, "utf8"));
+  intent.schema_version = "finance-bridge-reclaim-v1";
+  await writeFile(intentPath, JSON.stringify(intent), { mode: 0o600 });
+  await assert.rejects(publisher.pendingReclaims(), /intent fields are invalid/u);
+  assert.equal((await lstat(intentPath)).isFile(), true);
+
+  await using other = await workspace();
+  const otherKey = canonicalCaptureKey("111", "54");
+  const otherId = captureIdentities(otherKey).rawIntakePublicId;
+  await assert.rejects(new HandoffPublisher(other.path, {
+    hook: (phase) => { if (phase === "after-payload-fsync") throw new Error("crash"); },
+  }).publish(otherKey, otherId, media), /crash/u);
+  const pendingPath = join(other.path, "handoff", HANDOFF_PENDING_PAYLOAD);
+  await writeFile(pendingPath, Buffer.from("corrupt"), { mode: 0o600 });
+  await assert.rejects(new HandoffPublisher(other.path).pendingReclaims(), /payload does not match/u);
+  assert.equal((await readFile(pendingPath)).toString(), "corrupt");
 });
 
 test("exact pending resume does not reserve the handoff payload twice", async () => {

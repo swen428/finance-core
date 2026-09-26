@@ -10,6 +10,7 @@ export interface ReclaimClaim {
     canonicalKeyHash: string;
     ingressIdentityDigest: string;
     attachmentContentHash: string;
+    intakeFingerprint: string;
 }
 export interface PublishedHandoff {
     handoffFilename: string;
@@ -31,6 +32,8 @@ export declare class HandoffPublisher {
     private withReclaimLock;
     /** Lists only durable intents. The caller must query Core outside the flock. */
     pendingReclaims(): Promise<ReclaimClaim[]>;
+    /** A pending publication can only resume for its original trusted message. */
+    pendingPublicationKeyHash(): Promise<string | undefined>;
     /** A host replay can seal an older retained slot after Core commit lost its response. */
     prepareRetainedReclaim(canonicalKey: string, claim: ReclaimClaim): Promise<boolean>;
     isReclaimed(claim: ReclaimClaim): Promise<boolean>;

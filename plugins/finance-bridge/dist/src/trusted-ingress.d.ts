@@ -30,7 +30,7 @@ export type TrustedClaimResult = PluginHookInboundClaimResult & {
     financeIngressRefusal?: FinanceIngressRefusal;
 };
 export declare function hasTrustedFinanceIngress(event: PluginHookInboundClaimEvent): boolean;
-/** Mirror Core's raw-intake-v1 canonical_fingerprint for Telegram image intake. */
+/** Mirror Core's exact-caption Telegram photo fingerprint. */
 export declare function photoIntakeFingerprint(chatId: number, messageId: number, rawCaption: string, attachmentHash: string): string;
 export declare class TrustedIngressCapture {
     private readonly workspaceRoot;

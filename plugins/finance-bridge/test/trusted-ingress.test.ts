@@ -187,13 +187,14 @@ class FakeCore implements BridgeRunner {
 
 test("photo intake fingerprint matches Core Python canonical_fingerprint golden vectors", () => {
   const vectors = [
-    ["", "cef9fd89382718fe1c637b35c23ebcf4cabb9633a186fba08ca2819182dea2de"],
-    ["收据咖啡", "44312b54def3be26174d833b250b65bcdbfb644e12f61f1bb7a6536939e95f6a"],
-    ["🧾😀", "a223f4c9ee85239ba083ddb1100db1b96ac772edd94461f21a81ac545188f550"],
-    ["line1\r\nline2", "baf309c8ce7cd72d76a00dffae0e11b841bda953ff02de53fda7a44bc7390ebb"],
-    ["tab\tbell\b nul\x00", "18b6cc793dd42111c30e36be1745a1c13ac66f2effb052ab10e64ecbabcdcfe8"],
-    ["  shop  ", "a7602481d54b7b558cf5f704014c672615e3550b02971c4752dec6cb63574a94"],
-    ["<media:image>", "e422fb72cb37731f4ed74e2226e7a5353bdfa42eab10a1e066e1306942602806"],
+    ["", "c3e14f0ceae9ed2e66989594c03767ce1e9cc8746d2f99bf287125bf2ac306b3"],
+    ["收据咖啡", "29451c3358e083e5aa21f6506ea22552780ed692f23cbe66c9787308965c3037"],
+    ["🧾😀", "ed3f1f1d7ca86fd33c0d233f3dd39c2c832ef1fbf348f7058a64995546fd75e5"],
+    ["line1\r\nline2", "6c5a0ac5c1d49bb0d8bc3ab41afd40be3e68386f558b94b6d451ce638d760fb1"],
+    ["tab\tbell\b nul\x00", "f1e8c75ffaa7b689a5fb2273938cb73d7c6a84df403210ec59e193400ea3f4f2"],
+    ["  shop  ", "e9021e86b8b30507ce9f7cbacc08f8e60967d2e668e6ca22230eceb07cffc37e"],
+    ["<media:image>", "8da593b66bb41f768cf3c9f92b7ba8cfb2f8beecf2b9df3a9fcf95daaa32e886"],
+    ["[telegram receipt image]", "5d6a464c4edb4f679f4e2e9040f70192bcbdd6f60535e9a10659f9df55243595"],
   ] as const;
   for (const [caption, expected] of vectors) {
     assert.equal(photoIntakeFingerprint(111, 20, caption, "a".repeat(64)), expected);
@@ -221,6 +222,7 @@ function capture(core: FakeCore, options: {
   let retained = false;
   const handoff = {
     pendingReclaims: async () => [],
+    pendingPublicationKeyHash: async () => undefined,
     isReclaimed: async () => !retained,
     prepareRetainedReclaim: async () => retained,
     reclaimVerified: async (_claim: unknown, prove: (claim: never) => Promise<boolean>) => {
@@ -528,6 +530,7 @@ test("startup reclaim caps multiple slow Core proofs and never claims adoption",
       jobPublicId: `fcj_${sha256(`finance-capture-job-v1\0${rawIntakePublicId}`).slice(0, 40)}`,
       canonicalKeyHash: sha256(key), ingressIdentityDigest: "a".repeat(64),
       attachmentContentHash: sha256(jpeg),
+      intakeFingerprint: photoIntakeFingerprint(111, Number(messageId), "receipt", sha256(jpeg)),
     };
   };
   const handoff = {

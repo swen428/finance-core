@@ -8,6 +8,7 @@ import { resolve, join } from "node:path";
 
 import { HandoffPublisher } from "../dist/src/handoff.js";
 import { ReceiptMediaAdapter } from "../dist/src/media.js";
+import { createBridgeRequest } from "../dist/src/protocol.js";
 import { TrustedIngressCapture } from "../dist/src/trusted-ingress.js";
 
 const repositoryRoot = resolve(import.meta.dirname, "../../..");
@@ -197,6 +198,32 @@ try {
   const alteredAfterLoss = { ...lostInput.event, content: "changed after response loss" };
   assert.deepEqual(await bridge().handle(alteredAfterLoss, lostInput.context), { handled: false });
 
+  for (const [index, phase] of [
+    "after-record-fsync", "after-record-publish", "after-payload-fsync",
+  ].entries()) {
+    const messageId = 280 + index;
+    const original = turn(messageId, jpeg(80 + index), "original caption");
+    const crashed = await bridge(new HandoffPublisher(workspace, {
+      hook: (candidate) => { if (candidate === phase) throw new Error("synthetic publish crash"); },
+    })).handle(original.event, original.context);
+    assert.deepEqual(crashed, { handled: false });
+    const pendingPublisher = new HandoffPublisher(workspace);
+    assert.deepEqual(await pendingPublisher.pendingReclaims(), []);
+    await bridge().resumePendingReclaims();
+    const beforeCapture = calls.filter((value) => value === "capture").length;
+    const unrelatedText = textTurn(290 + index, "other lunch 2.00");
+    assert.deepEqual(await bridge().handle(unrelatedText.event, unrelatedText.context), { handled: false });
+    const unrelatedPhoto = turn(300 + index, jpeg(90 + index));
+    assert.deepEqual(await bridge().handle(unrelatedPhoto.event, unrelatedPhoto.context), { handled: false });
+    const otherImage = turn(messageId, png(100 + index), "original caption");
+    assert.deepEqual(await bridge().handle(otherImage.event, otherImage.context), { handled: false });
+    assert.equal(calls.filter((value) => value === "capture").length, beforeCapture);
+    const recovered = await bridge().handle(original.event, original.context);
+    assert.equal(recovered.adoption?.attachmentStatus, "stored", JSON.stringify(recovered));
+    assert.equal(calls.filter((value) => value === "capture").length, beforeCapture + 1);
+    await assertHandoffEmpty();
+  }
+
   const rejected = turn(241, png(41), "完成");
   const refusal = await bridge().handle(rejected.event, rejected.context);
   assert.deepEqual(refusal, { handled: false });
@@ -217,7 +244,15 @@ try {
   const emptyResult = await bridge().handle(emptyCaption.event, emptyCaption.context);
   assert.equal(emptyResult.adoption?.attachmentStatus, "stored");
   assert.equal("caption" in captureArguments.at(-1), false);
-  assert.equal(coreRawInputs()[emptyResult.adoption.intakeId], "[telegram receipt image]");
+  assert.equal(coreRawInputs()[emptyResult.adoption.intakeId], "");
+  const spoofedEmpty = { ...emptyCaption.event, content: "[telegram receipt image]" };
+  assert.deepEqual(await bridge().handle(spoofedEmpty, emptyCaption.context), { handled: false });
+  const literalOldMarker = turn(247, jpeg(47), "[telegram receipt image]");
+  const literalOldResult = await bridge().handle(literalOldMarker.event, literalOldMarker.context);
+  assert.equal(literalOldResult.adoption?.attachmentStatus, "stored");
+  assert.equal(coreRawInputs()[literalOldResult.adoption.intakeId], "[telegram receipt image]");
+  assert.deepEqual(await bridge().handle({ ...literalOldMarker.event, content: "" },
+    literalOldMarker.context), { handled: false });
   const literalMarker = turn(244, png(44), "<media:image>");
   const markerResult = await bridge().handle(literalMarker.event, literalMarker.context);
   assert.equal(markerResult.adoption?.attachmentStatus, "stored");
@@ -257,7 +292,18 @@ try {
   ]);
   assert.equal(calls.filter((command) => command === "capture_interaction").length,
     beforeHistoricalCapture);
-  assert.equal(Object.values(rawInputs).includes("完成"), false);
+  const afterControlRawInputs = coreRawInputs();
+  assert.equal(afterControlRawInputs[controlResult.adoption.intakeId], "完成");
+  const controlRoute = await runner.run(createBridgeRequest("get_interaction_route", {
+    workspace_path: workspace, operator_actor_id: "111", telegram_account_id: "finance",
+    telegram_conversation_id: "111", conversation_binding_id: "bind-1",
+    telegram_message_id: 271,
+  }));
+  assert.equal(controlRoute.status, "ok");
+  assert.equal(controlRoute.result.found, true);
+  assert.equal(controlRoute.result.final_transaction_created, false);
+  assert.equal(controlRoute.result.interaction_route.route_kind, "control_refused");
+  assert.equal(controlRoute.result.interaction_route.raw_text_sha256, sha256("完成"));
 
   const changed = adopted[0].input;
   const forged = {
@@ -309,7 +355,7 @@ try {
 
   const unknown = join(workspace, "handoff", "unknown-residue");
   await writeFile(unknown, "foreign", { mode: 0o600 });
-  await assert.rejects(bridge().resumePendingReclaims(), /unknown reclaim residue/u);
+  await assert.rejects(bridge().resumePendingReclaims(), /unknown (?:reclaim residue|entry)/u);
   await unlink(unknown);
 
   // A torn intent is retained for controlled repair. It cannot authorize

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import {
   copyFile,
+  chmod,
   mkdir,
   mkdtemp,
   readFile,
@@ -46,7 +48,9 @@ import {
 } from "../src/operator-cli-v1.js";
 import type { CompatibilityArtifactEvidenceV1 } from "../src/model-compatibility-operator-v1.js";
 import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.js";
+import { canonicalCaptureKey, captureIdentities } from "../src/protocol.js";
 import { BridgeCliRunner } from "../src/subprocess.js";
+import { photoIntakeFingerprint } from "../src/trusted-ingress.js";
 
 const FINANCE_PLUGIN_ROOT = "/repo/plugins/finance-bridge";
 const CODEX_PLUGIN_ROOT = "/openclaw/node_modules/@openclaw/codex";
@@ -328,6 +332,112 @@ function registrationOk(request: BridgeRequest, result: JsonObject): BridgeRespo
     idempotentReplay: false,
   };
 }
+
+test("registered plugin starts with a pending photo and resumes only its trusted replay", async () => {
+  const temporaryRoot = await realpath(await mkdtemp(join(tmpdir(), "finance-register-pending-")));
+  try {
+    const workspaceRoot = join(temporaryRoot, "workspace");
+    await mkdir(workspaceRoot, { mode: 0o700 });
+    await chmod(workspaceRoot, 0o700);
+    const bytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    const hash = createHash("sha256").update(bytes).digest("hex");
+    const media = {
+      bytes, byteSize: bytes.length, contentHash: hash,
+      detectedMimeType: "image/jpeg" as const, canonicalExtension: ".jpg" as const,
+    };
+    const key = canonicalCaptureKey("111", "881");
+    const intakeId = captureIdentities(key).rawIntakePublicId;
+    await assert.rejects(new HandoffPublisher(workspaceRoot, {
+      hook: (phase) => { if (phase === "after-payload-fsync") throw new Error("crash"); },
+    }).publish(key, intakeId, media), /crash/u);
+    const fixture = fakeApi();
+    const config = {
+      ...(fixture.api as unknown as {pluginConfig: FinanceBridgeConfig}).pluginConfig,
+      workspaceRoot,
+    };
+    const jobId = `fcj_${createHash("sha256").update(`finance-capture-job-v1\0${intakeId}`).digest("hex").slice(0, 40)}`;
+    let storedIngress: JsonObject | undefined;
+    let captureCalls = 0;
+    const runner: BridgeRunner & FinanceDeliveryReceiptRecorder = {
+      async validateFinanceDeliveryReceiptCapability() {},
+      async recordFinanceDeliveryReceipt() {},
+      async run(request) {
+        if (request.command === "health") return registrationOk(request, {
+          workspace_verified: true, database_verified: true, callback_key_status: "present",
+        });
+        if (request.command === "get_capture_job_for_message") {
+          return registrationOk(request, { candidate: storedIngress === undefined ? null : {
+            job_public_id: jobId, telegram_message_id: "881",
+            source_identity_sha256: "c".repeat(64),
+          } });
+        }
+        if (request.command === "capture") {
+          captureCalls += 1;
+          storedIngress = request.arguments.finance_ingress as JsonObject;
+          return registrationOk(request, { intake_public_id: intakeId,
+            capture_job: { public_id: jobId } });
+        }
+        if (request.command === "get_status" && storedIngress !== undefined) {
+          const ingressDigest = createHash("sha256").update(JSON.stringify(Object.fromEntries(
+            Object.entries(storedIngress).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0),
+          ))).digest("hex");
+          return registrationOk(request, {
+            identity_kind: "intake", intake_public_id: intakeId,
+            final_transaction_created: false, capture_attachment_integrity: "verified",
+            capture_job: {
+              public_id: jobId, intake_public_id: intakeId, capture_kind: "receipt_image",
+              ingress_identity_digest: ingressDigest, attachment_content_hash: hash,
+              intake_fingerprint: photoIntakeFingerprint(111, 881, "receipt", hash),
+            },
+          });
+        }
+        throw new Error(`Unexpected registered command: ${request.command}`);
+      },
+    };
+    registerFinanceBridge(fixture.api, {
+      ...dependencies,
+      async validateConfig() { return config; },
+      createRunner() { return runner; },
+      createMediaAdapter() { return { acquireTrustedInbound: async () => media } as unknown as ReceiptMediaAdapter; },
+      createHandoffPublisher() { return new HandoffPublisher(workspaceRoot); },
+    });
+    const claim = fixture.hooks[0]?.handler as (
+      event: PluginHookInboundClaimEvent, context: PluginHookInboundClaimContext,
+    ) => Promise<PluginHookInboundClaimResult>;
+    assert.ok(claim);
+    const ingress = {
+      channel: "telegram", accountId: "finance-account", updateId: 1881,
+      chatId: "111", messageId: "881", senderId: "111", bindingId: "binding-1",
+      payloadSha256: "a".repeat(64), attachmentSha256: hash,
+    };
+    const event = {
+      content: "receipt", timestamp: 1_750_000_000_000,
+      channel: "telegram", accountId: "finance-account", conversationId: "111",
+      parentConversationId: "111", senderId: "111", messageId: "881",
+      isGroup: false, commandAuthorized: true, senderIsOwner: true,
+      financeIngress: ingress, metadata: { mediaUrl: "media://original", mediaType: "image/jpeg" },
+    } as PluginHookInboundClaimEvent;
+    const context = {
+      channelId: "telegram", accountId: "finance-account", conversationId: "111",
+      senderId: "111", messageId: "881",
+      pluginBinding: { bindingId: "binding-1", pluginId: "finance-bridge", pluginRoot: "/plugin",
+        channel: "telegram", accountId: "finance-account", conversationId: "111",
+        parentConversationId: "111", boundAt: 1_750_000_000, data: { senderId: "111" } },
+    } as PluginHookInboundClaimContext;
+    const otherEvent = { ...event, messageId: "882",
+      financeIngress: { ...ingress, messageId: "882" } } as PluginHookInboundClaimEvent;
+    const otherContext = { ...context, messageId: "882" } as PluginHookInboundClaimContext;
+    assert.deepEqual(await claim(otherEvent, otherContext), { handled: false });
+    assert.equal(captureCalls, 0);
+    const result = await claim(event, context);
+    assert.equal(result.handled, true);
+    assert.equal((result as { adoption?: { jobId: string } }).adoption?.jobId, jobId);
+    assert.equal(captureCalls, 1);
+    assert.deepEqual(await new HandoffPublisher(workspaceRoot).pendingReclaims(), []);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
+});
 
 test("plugin registers the public pinned API surfaces and eight optional disabled tools", async () => {
   const fixture = fakeApi();
