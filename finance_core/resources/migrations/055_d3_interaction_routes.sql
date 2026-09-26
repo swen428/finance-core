@@ -88,9 +88,51 @@ BEGIN
     SELECT RAISE(ABORT, 'interaction route collision cannot replace evidence');
 END;
 
+-- The cutover must not strand a Telegram text proposal that was already
+-- bound to its raw source before this migration.  Snapshot only established,
+-- matching source lineage; an old unparsed intake receives no admission.
+CREATE TABLE finance_legacy_text_lineage_admissions (
+    raw_intake_record_id INTEGER PRIMARY KEY REFERENCES raw_intake_records(id),
+    source_public_id TEXT NOT NULL UNIQUE,
+    admitted_parser_output_id INTEGER NOT NULL UNIQUE REFERENCES parser_outputs(id)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO finance_legacy_text_lineage_admissions (
+    raw_intake_record_id, source_public_id, admitted_parser_output_id
+)
+SELECT intake.id, intake.public_id, parent.id
+FROM raw_intake_records AS intake
+JOIN parser_outputs AS parent ON parent.id = intake.parser_output_id
+    AND parent.source_public_id = intake.public_id
+    AND parent.source_type = 'telegram_text'
+WHERE intake.source_type = 'telegram_text'
+  AND intake.source_channel = 'telegram'
+  AND (SELECT COUNT(*) FROM raw_intake_records AS other
+       WHERE other.parser_output_id = parent.id) = 1;
+
+CREATE TRIGGER trg_finance_legacy_text_lineage_no_insert
+BEFORE INSERT ON finance_legacy_text_lineage_admissions
+BEGIN
+    SELECT RAISE(ABORT, 'legacy text admission is migration-only');
+END;
+
+CREATE TRIGGER trg_finance_legacy_text_lineage_no_update
+BEFORE UPDATE ON finance_legacy_text_lineage_admissions
+BEGIN
+    SELECT RAISE(ABORT, 'legacy text admission is immutable');
+END;
+
+CREATE TRIGGER trg_finance_legacy_text_lineage_no_delete
+BEFORE DELETE ON finance_legacy_text_lineage_admissions
+BEGIN
+    SELECT RAISE(ABORT, 'legacy text admission cannot be deleted');
+END;
+
 -- A worker or older API must not reinterpret adopted edit/control source as
 -- a fresh parser proposal or a new AI fallback attempt. An authenticated
 -- ingress job without a route is quarantined rather than assumed ordinary.
+-- Existing admitted lineage may add only a direct child of its current
+-- proposal; it cannot use the admission to start a new unrelated proposal.
 CREATE TRIGGER trg_finance_interaction_no_control_parser
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (
@@ -103,6 +145,13 @@ WHEN EXISTS (
       AND intake.source_channel = 'telegram'
       AND (job.public_id IS NULL OR job.capture_kind != 'text'
            OR route.route_kind IS NULL OR route.route_kind != 'initial_intake')
+      AND NOT EXISTS (
+          SELECT 1 FROM finance_legacy_text_lineage_admissions AS legacy
+          WHERE legacy.raw_intake_record_id = intake.id
+            AND legacy.source_public_id = intake.public_id
+            AND NEW.source_type = 'telegram_text'
+            AND NEW.parent_parser_output_id = intake.parser_output_id
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'Telegram text requires initial intake route before parser');
@@ -120,6 +169,12 @@ WHEN EXISTS (
       AND intake.source_channel = 'telegram'
       AND (job.public_id IS NULL OR job.capture_kind != 'text'
            OR route.route_kind IS NULL OR route.route_kind != 'initial_intake')
+      AND NOT EXISTS (
+          SELECT 1 FROM finance_legacy_text_lineage_admissions AS legacy
+          WHERE legacy.raw_intake_record_id = intake.id
+            AND legacy.source_public_id = intake.public_id
+            AND NEW.parent_parser_output_id = intake.parser_output_id
+      )
 )
 BEGIN
     SELECT RAISE(ABORT, 'Telegram text requires initial intake route before AI fallback');

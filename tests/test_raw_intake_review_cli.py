@@ -29,8 +29,8 @@ def transaction_count(db_path: Path) -> int:
     return count
 
 
-def test_list_pending_records(migrated_temp_db_path: Path) -> None:
-    db_path = migrated_temp_db_path
+def test_list_pending_records(legacy_temp_db_path: Path) -> None:
+    db_path = legacy_temp_db_path
     result = insert_proposal(db_path, "NTUC SGD 28.60 groceries")
 
     output = run_cli("list", "--db", str(db_path))
@@ -43,9 +43,9 @@ def test_list_pending_records(migrated_temp_db_path: Path) -> None:
 
 
 def test_show_one_record_includes_raw_input_and_parser_proposal(
-    migrated_temp_db_path: Path,
+    legacy_temp_db_path: Path,
 ) -> None:
-    db_path = migrated_temp_db_path
+    db_path = legacy_temp_db_path
     result = insert_proposal(db_path, "Lunch SGD 12.50 at ExampleCafe paid by Owner")
 
     output = run_cli("show", "--db", str(db_path), "--id", str(result["intake"]["id"]))
@@ -61,9 +61,9 @@ def test_show_one_record_includes_raw_input_and_parser_proposal(
 
 
 def test_missing_amount_review_includes_missing_fields_and_safety_notice(
-    migrated_temp_db_path: Path,
+    legacy_temp_db_path: Path,
 ) -> None:
-    db_path = migrated_temp_db_path
+    db_path = legacy_temp_db_path
     result = insert_proposal(db_path, "Coffee at Starbucks")
 
     output = run_cli("show", "--db", str(db_path), "--id", str(result["intake"]["id"]))
@@ -76,9 +76,9 @@ def test_missing_amount_review_includes_missing_fields_and_safety_notice(
 
 
 def test_cli_list_and_show_do_not_create_final_transaction_records(
-    migrated_temp_db_path: Path,
+    legacy_temp_db_path: Path,
 ) -> None:
-    db_path = migrated_temp_db_path
+    db_path = legacy_temp_db_path
     result = insert_proposal(db_path, "I paid SGD 9.00 for stationery, shared equally with B")
 
     before = transaction_count(db_path)

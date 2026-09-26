@@ -73,9 +73,9 @@ def test_raw_text_record_writes_source_metadata_and_initial_evidence(
 
 
 def test_process_raw_text_input_writes_source_evidence_without_final_facts(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_temp_db_connection: sqlite3.Connection,
 ) -> None:
-    conn = migrated_temp_db_connection
+    conn = legacy_temp_db_connection
     raw_input = "Coffee SGD 6.40 at Starbucks"
 
     result = process_raw_text_input(
@@ -112,9 +112,9 @@ def test_process_raw_text_input_writes_source_evidence_without_final_facts(
 
 
 def test_duplicate_telegram_message_returns_existing_raw_intake_record(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_temp_db_connection: sqlite3.Connection,
 ) -> None:
-    conn = migrated_temp_db_connection
+    conn = legacy_temp_db_connection
 
     first = process_raw_text_input(
         conn,
@@ -138,9 +138,9 @@ def test_duplicate_telegram_message_returns_existing_raw_intake_record(
 
 
 def test_repeated_generic_text_without_metadata_creates_distinct_raw_intake_records(
-    migrated_temp_db_connection: sqlite3.Connection,
+    legacy_temp_db_connection: sqlite3.Connection,
 ) -> None:
-    conn = migrated_temp_db_connection
+    conn = legacy_temp_db_connection
     raw_input = "Coffee SGD 6.40 at Starbucks"
 
     first = process_raw_text_input(conn, raw_input, received_at="2026-06-04T10:00:00+00:00")

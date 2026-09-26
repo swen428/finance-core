@@ -221,7 +221,7 @@ def test_list_candidates_excludes_ineligible_proposals(
     legacy_pid, legacy_public, _legacy_hash = seed_confirmed_receipt_proposal(conn, tmp_path, "leg")
     forge_legacy_conversion(conn, legacy_pid, "leg")
     # Unsupported type: confirmed simple text proposal (no OCR link).
-    simple_pid = create_confirmed_simple_proposal(conn)
+    simple_pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     simple_public = conn.execute(
         "SELECT public_id FROM parser_outputs WHERE id = ?", (simple_pid,)
     ).fetchone()[0]
@@ -430,7 +430,7 @@ def test_show_candidate_unknown_and_unsupported_and_inconsistent_fail_safely(
     assert "ReviewProposalNotFoundError" in err
     assert "Traceback" not in err
 
-    simple_pid = create_confirmed_simple_proposal(conn)
+    simple_pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     simple_public = conn.execute(
         "SELECT public_id FROM parser_outputs WHERE id = ?", (simple_pid,)
     ).fetchone()[0]

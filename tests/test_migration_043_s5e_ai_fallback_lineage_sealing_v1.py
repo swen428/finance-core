@@ -20,6 +20,7 @@ from tests.test_migration_042_s5e_ai_fallback_provenance_foundation_v1 import (
 )
 
 PATHS_THROUGH_042 = TEMP_DB_MIGRATION_PATHS[:42]
+PATHS_BEFORE_D3_ROUTE = TEMP_DB_MIGRATION_PATHS[:-1]
 HASH = "a" * 64
 
 
@@ -157,8 +158,10 @@ def test_upgrade_from_042_preserves_legacy_rows_and_adds_043_contract() -> None:
 def test_ai_child_evidence_remains_append_only_after_043() -> None:
     conn = _connection()
     try:
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        apply_migration_paths(conn, PATHS_BEFORE_D3_ROUTE)
         parent_id, intake_id = seed_parent(conn, "sealing_043")
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         attempt_id = insert_attempt(conn, parent_id, intake_id, "1")
         claim_id = insert_claim(conn, attempt_id, "2")
         result_id = insert_result(
@@ -344,8 +347,10 @@ def test_ai_child_evidence_remains_append_only_after_043() -> None:
 def test_raw_intake_pointer_collision_is_refused_after_fallback_sealing() -> None:
     conn = _connection()
     try:
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        apply_migration_paths(conn, PATHS_BEFORE_D3_ROUTE)
         parent_id, intake_id = seed_parent(conn, "pointer_collision_043")
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         attempt_id = insert_attempt(conn, parent_id, intake_id, "d")
         claim_id = insert_claim(conn, attempt_id, "e")
         result_id = insert_result(
@@ -424,8 +429,10 @@ def test_raw_intake_pointer_collision_is_refused_after_fallback_sealing() -> Non
 def test_raw_intake_lineage_escape_is_blocked_and_only_trigger_bypass_allows_it() -> None:
     conn = _connection()
     try:
-        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        apply_migration_paths(conn, PATHS_BEFORE_D3_ROUTE)
         parent_id, intake_id = seed_parent(conn, "lineage_escape_043")
+        conn.commit()
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
         attempt_id = insert_attempt(conn, parent_id, intake_id, "7")
         claim_id = insert_claim(conn, attempt_id, "8")
         result_id = insert_result(

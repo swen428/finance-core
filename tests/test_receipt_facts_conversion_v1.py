@@ -741,7 +741,7 @@ def test_unsupported_simple_text_proposal_rejected(
 ) -> None:
     conn = migrated_temp_db_connection
     seed_people(conn)
-    pid = create_confirmed_simple_proposal(conn)
+    pid = create_confirmed_simple_proposal(conn, source_type="manual_entry")
     public_id = conn.execute(
         "SELECT public_id FROM parser_outputs WHERE id = ?", (pid,)
     ).fetchone()["public_id"]

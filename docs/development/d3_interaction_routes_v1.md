@@ -81,8 +81,12 @@ saved. It does not say an edit or economic event succeeded.
 
 Migration 055 rejects direct parser-output and AI-attempt inserts for any new
 Telegram text intake without an `initial_intake` route, including the older
-one-step Python intake API with no capture job. Older pre-055 databases retain
-their historical behavior. Its route table
+one-step Python intake API with no capture job. At upgrade it freezes the set
+of existing Telegram text intakes already bound to a matching parser proposal.
+Only those historical sources may continue their current proposal lineage or
+prepare AI fallback under its existing eligibility rules; old unparsed sources
+remain blocked. The admission set is immutable after migration. Older pre-055
+databases retain their historical behavior. Its route table
 uses `WITHOUT ROWID` so hidden SQLite
 row identifiers cannot replace frozen evidence; primary, message, and operation
 key collisions are also refused before SQLite conflict replacement executes.

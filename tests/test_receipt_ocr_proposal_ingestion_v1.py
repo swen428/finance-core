@@ -83,7 +83,7 @@ def _insert_raw_intake(conn: sqlite3.Connection, suffix: str) -> int:
         """
         INSERT INTO raw_intake_records (
             public_id, source_type, source_channel, raw_input, received_at
-        ) VALUES (?, 'telegram_text', 'telegram', 'receipt image', ?)
+        ) VALUES (?, 'telegram_image', 'telegram', 'receipt image', ?)
         """,
         (f"raw_ocr_{suffix}", "2026-07-19T15:00:00+00:00"),
     )
