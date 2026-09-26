@@ -182,6 +182,10 @@ try {
   assert.deepEqual(replay.adoption, duplicate.receipt);
   assert.equal(downloads, beforeDuplicate.downloads);
   assert.equal(calls.filter((value) => value === "capture").length, beforeDuplicate.captures);
+  const alteredCaption = { ...duplicate.input.event, content: "different receipt caption" };
+  assert.deepEqual(await restart.handle(alteredCaption, duplicate.input.context), { handled: false });
+  assert.equal(downloads, beforeDuplicate.downloads);
+  assert.equal(calls.filter((value) => value === "capture").length, beforeDuplicate.captures);
 
   loseNextCaptureResponse = true;
   const lostInput = turn(240, jpeg(40));
@@ -190,6 +194,8 @@ try {
   await assertHandoffEmpty();
   const lostReplay = await bridge().handle(lostInput.event, lostInput.context);
   assert.equal(lostReplay.adoption?.jobId, lost.adoption.jobId);
+  const alteredAfterLoss = { ...lostInput.event, content: "changed after response loss" };
+  assert.deepEqual(await bridge().handle(alteredAfterLoss, lostInput.context), { handled: false });
 
   const rejected = turn(241, png(41), "完成");
   const refusal = await bridge().handle(rejected.event, rejected.context);

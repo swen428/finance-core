@@ -56,6 +56,11 @@ The Bridge returns `finance-ingress-adoption-v1` only after `get_status` confirm
 the expected intake and deterministic job ID, the independently computed ingress
 identity digest, and the capture kind. For a photo, Core must also reopen and
 verify the linked original and report `capture_attachment_integrity=verified`.
+The Bridge compares Core's saved `raw-intake-v1` fingerprint with the exact
+Telegram image intake material: original caption (or Core's absent-caption
+placeholder), message source, and attachment hash. A prior photo job with the
+same ingress identity and original bytes but a different caption cannot be
+adopted, including on replay or after a lost capture response.
 For text, including control text, the Bridge additionally queries Core's
 authenticated `get_interaction_route` for the same actor, account, conversation,
 binding, and message. Adoption requires the frozen route to match the exact raw

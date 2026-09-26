@@ -115,6 +115,24 @@ function caption(text) {
         throw new Error("Receipt caption is too long.");
     return text;
 }
+/** Mirror Core's raw-intake-v1 canonical_fingerprint for Telegram image intake. */
+export function photoIntakeFingerprint(chatId, messageId, rawCaption, attachmentHash) {
+    // Python json.dumps(sort_keys=True, separators=(',', ':'), ensure_ascii=True).
+    // The fixed object keys below are already in sorted order. Without /u, the
+    // replacement escapes each UTF-16 surrogate separately, as Python does.
+    const canonical = JSON.stringify({
+        fingerprint_schema_version: "raw-intake-v1",
+        material: {
+            attachment_content_hash: attachmentHash,
+            external_source_id: `telegram:${chatId}:${messageId}`,
+            raw_input: rawCaption === "" ? "[telegram receipt image]" : rawCaption,
+            source_channel: "telegram",
+            source_message_id: String(messageId),
+            source_type: "telegram_image",
+        },
+    }).replace(/[\u007f-\uffff]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    return createHash("sha256").update(canonical, "utf8").digest("hex");
+}
 function checkedStatus(result, turn, expectedJobId) {
     const job = result.capture_job;
     const intakeId = result.intake_public_id;
@@ -129,7 +147,7 @@ function checkedStatus(result, turn, expectedJobId) {
         result.final_transaction_created !== false)
         return undefined;
     if (turn.photo && (job.attachment_content_hash !== turn.ingress.attachmentSha256 ||
-        result.capture_attachment_integrity !== "verified"))
+        job.intake_fingerprint !== photoIntakeFingerprint(turn.chatId, turn.messageId, turn.text, turn.ingress.attachmentSha256) || result.capture_attachment_integrity !== "verified"))
         return undefined;
     if (!turn.photo && (job.attachment_content_hash !== null ||
         result.capture_attachment_integrity !== null))

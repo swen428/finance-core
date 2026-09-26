@@ -11,7 +11,7 @@ import type { BridgeRunner } from "../src/controller.js";
 import type { HandoffPublisher } from "../src/handoff.js";
 import type { ReceiptMediaAdapter, ValidatedMedia } from "../src/media.js";
 import { canonicalCaptureKey, captureIdentities, type BridgeRequest, type BridgeResponse, type JsonObject } from "../src/protocol.js";
-import { TrustedIngressCapture, type TrustedFinanceIngress } from "../src/trusted-ingress.js";
+import { photoIntakeFingerprint, TrustedIngressCapture, type TrustedFinanceIngress } from "../src/trusted-ingress.js";
 
 const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
 const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
@@ -77,6 +77,7 @@ class FakeCore implements BridgeRunner {
   routeMissing = false;
   routeMalformed = false;
   routeUnavailable = false;
+  statusRawCaption?: string;
   readonly intakeByMessage = new Map<string, string>();
 
   private jobId(intakeId: string): string {
@@ -131,6 +132,9 @@ class FakeCore implements BridgeRunner {
         capture_job: {
           public_id: jobId, intake_public_id: intakeId, capture_kind: item.kind,
           ingress_identity_digest: digest(item.ingress), attachment_content_hash: item.attachment,
+          intake_fingerprint: item.kind === "receipt_image"
+            ? photoIntakeFingerprint(Number(item.ingress.chatId), Number(item.ingress.messageId),
+              this.statusRawCaption ?? item.text ?? "", item.attachment!) : "unused-for-text",
         },
       });
     }
@@ -173,13 +177,28 @@ class FakeCore implements BridgeRunner {
       ingress, attachment: request.command === "capture" ? ingress.attachmentSha256 as string : null,
       ...(request.command === "capture_interaction" ? {
         text: ((request.arguments.telegram_update as JsonObject).message as JsonObject).text as string,
-      } : {}),
+      } : { text: (request.arguments.caption as string | undefined) ?? "" }),
     });
     this.intakeByMessage.set(String(ingress.messageId), intakeId);
     if (this.loseResponse) throw new Error("response lost after commit");
     return success(request, { intake_public_id: intakeId, capture_job: { public_id: this.jobId(intakeId) } });
   }
 }
+
+test("photo intake fingerprint matches Core Python canonical_fingerprint golden vectors", () => {
+  const vectors = [
+    ["", "cef9fd89382718fe1c637b35c23ebcf4cabb9633a186fba08ca2819182dea2de"],
+    ["收据咖啡", "44312b54def3be26174d833b250b65bcdbfb644e12f61f1bb7a6536939e95f6a"],
+    ["🧾😀", "a223f4c9ee85239ba083ddb1100db1b96ac772edd94461f21a81ac545188f550"],
+    ["line1\r\nline2", "baf309c8ce7cd72d76a00dffae0e11b841bda953ff02de53fda7a44bc7390ebb"],
+    ["tab\tbell\b nul\x00", "18b6cc793dd42111c30e36be1745a1c13ac66f2effb052ab10e64ecbabcdcfe8"],
+    ["  shop  ", "a7602481d54b7b558cf5f704014c672615e3550b02971c4752dec6cb63574a94"],
+    ["<media:image>", "e422fb72cb37731f4ed74e2226e7a5353bdfa42eab10a1e066e1306942602806"],
+  ] as const;
+  for (const [caption, expected] of vectors) {
+    assert.equal(photoIntakeFingerprint(111, 20, caption, "a".repeat(64)), expected);
+  }
+});
 
 function capture(core: FakeCore, options: {
   image?: Buffer; unavailable?: boolean; meter?: { acquire: number; publish: number };
@@ -281,6 +300,28 @@ for (const image of [jpeg, png]) {
     ]);
   });
 }
+
+test("photo replay with same ingress and bytes but changed raw caption cannot adopt", async () => {
+  const core = new FakeCore();
+  const meter = { acquire: 0, publish: 0 };
+  const first = turn({ image: jpeg, text: "original" });
+  assert.equal((await capture(core, { image: jpeg, meter }).handle(first.event, first.context)).handled, true);
+  const changed = turn({ image: jpeg, text: "different" });
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(changed.event, changed.context),
+    { handled: false });
+  assert.deepEqual(meter, { acquire: 1, publish: 1 });
+  assert.equal(core.calls.filter((call) => call.command === "capture").length, 1);
+});
+
+test("photo response loss cannot adopt a mismatched Core intake fingerprint", async () => {
+  const core = new FakeCore();
+  core.loseResponse = true;
+  core.statusRawCaption = "different";
+  const input = turn({ image: jpeg, text: "original" });
+  assert.deepEqual(await capture(core, { image: jpeg }).handle(input.event, input.context),
+    { handled: false });
+  assert.equal(core.calls.filter((call) => call.command === "capture").length, 1);
+});
 
 test("control caption photo is refused by Core without adoption or inline processing", async () => {
   const core = new FakeCore();
