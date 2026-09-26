@@ -23,6 +23,8 @@ from tests.test_parser_human_drafts_v1 import (
     _start,
 )
 
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+
 ACTOR = "111"
 ACCOUNT = "finance-account"
 CONVERSATION = "111"
@@ -34,7 +36,7 @@ def _d1_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    apply_migration_paths(conn, LEGACY_D1_MIGRATION_PATHS)
     return conn
 
 
@@ -481,7 +483,7 @@ def test_d1_issuance_is_atomic_and_reconstructs_across_restart(
         opened.execute("PRAGMA foreign_keys = ON")
         return opened
 
-    conn = create_staging_database(database_path, migration_paths=TEMP_DB_MIGRATION_PATHS)
+    conn = create_staging_database(database_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
     conn.row_factory = sqlite3.Row
     started = _start(conn)
     text, fields = _card_text(started.card_generation_public_id)

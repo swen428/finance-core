@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import openclaw_staging_bridge_support_v1 as support
 import pytest
@@ -22,8 +23,14 @@ from finance_core.openclaw_staging_bridge import (
     identity,
 )
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
+from finance_core.parser_proposals.human_drafts import (
+    HumanDraftCommand,
+    HumanDraftError,
+    apply_human_draft_card,
+)
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from tests.test_openclaw_staging_bridge_guided_edit_v1 import _apply, _begin, _complete
+from tests.test_parser_human_drafts_v1 import _card_text, _start
 
 
 @pytest.fixture()
@@ -181,6 +188,43 @@ def test_initial_text_is_adopted_without_parser_then_worker_parses(
     )
     assert processed.exit_code == errors.EXIT_OK, processed.response
     assert processed.response["result"]["capture_job"]["proposal_public_id"] is not None
+
+
+def test_initial_route_cannot_bind_a_parser_from_another_source(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    captured = support.run_cli(_request(workspace, "lunch 12.50"))
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    intake_id = captured.response["result"]["intake_public_id"]
+    with support.open_database(workspace) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="parser source type mismatch"):
+            conn.execute(
+                "INSERT INTO parser_outputs "
+                "(public_id, source_type, source_public_id, parse_status) "
+                "VALUES ('wrong_type_route', 'manual_entry', ?, "
+                "'parsed_pending_confirmation')",
+                (intake_id,),
+            )
+        conn.execute(
+            "INSERT INTO parser_outputs "
+            "(public_id, source_type, source_public_id, parse_status) "
+            "VALUES ('unrelated_route', 'manual_entry', 'unrelated_source', "
+            "'parsed_pending_confirmation')"
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="pointer source mismatch"):
+            conn.execute(
+                "UPDATE raw_intake_records SET parser_output_id = "
+                "(SELECT id FROM parser_outputs WHERE public_id = 'unrelated_route') "
+                "WHERE public_id = ?",
+                (intake_id,),
+            )
+        assert (
+            conn.execute(
+                "SELECT parser_output_id FROM raw_intake_records WHERE public_id = ?",
+                (intake_id,),
+            ).fetchone()[0]
+            is None
+        )
 
 
 @pytest.mark.parametrize(
@@ -488,6 +532,259 @@ def test_post_cutover_guided_pending_cannot_be_forged_without_route(
             is None
         )
         assert support.count_final_facts(conn)["transactions"] == 0
+
+
+def test_post_cutover_d1_direct_api_cannot_use_old_lineage_for_new_reply(
+    temp_db_connection: sqlite3.Connection,
+) -> None:
+    conn = temp_db_connection
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:-1])
+    started = _start(conn)
+    text, fields = _card_text(started.card_generation_public_id)
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    command = HumanDraftCommand(
+        card_generation_public_id=started.card_generation_public_id,
+        telegram_message_id=101,
+        operation_public_id="d1op_unrouted_101",
+        authenticated_actor_id="111",
+        telegram_account_id="acct",
+        telegram_conversation_id="111",
+        conversation_binding_id="binding",
+        raw_card_text=text,
+        field_values=fields,
+    )
+    before = conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0]
+    for validator in (None, lambda _conn: None):
+        published = False
+
+        def publisher(*_args: object) -> None:
+            nonlocal published
+            published = True
+
+        with pytest.raises(HumanDraftError, match="interaction_route_required"):
+            apply_human_draft_card(conn, command, publish=publisher, authority_validator=validator)
+        assert not published
+    assert (
+        conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0] == before
+    )
+    assert conn.execute("SELECT COUNT(*) FROM parser_human_draft_reply_evidence").fetchone()[0] == 0
+    draft_id = conn.execute("SELECT id FROM parser_human_drafts").fetchone()[0]
+    for verb in ("INSERT", "INSERT OR REPLACE"):
+        with pytest.raises(sqlite3.IntegrityError, match="requires frozen route"):
+            conn.execute(
+                f"{verb} INTO parser_human_draft_reply_evidence "
+                "(evidence_public_id, draft_id, raw_utf8, encoding, format_version, "
+                "byte_length, sha256, authenticated_actor_id, telegram_account_id, "
+                "telegram_conversation_id, conversation_binding_id, telegram_message_id, "
+                "received_at) VALUES (?, ?, ?, 'UTF-8', 'd1-human-reply-v1', ?, ?, "
+                "'111', 'acct', '111', 'binding', 101, 1001)",
+                (
+                    "d1evidence_" + "e" * 32,
+                    draft_id,
+                    text.encode(),
+                    len(text.encode()),
+                    hashlib.sha256(text.encode()).hexdigest(),
+                ),
+            )
+
+
+def test_pre_cutover_d1_operation_replays_exactly_after_upgrade(
+    temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finance_core.parser_proposals import human_drafts
+
+    conn = temp_db_connection
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:-1])
+    started = _start(conn)
+    text, fields = _card_text(started.card_generation_public_id)
+    command = HumanDraftCommand(
+        card_generation_public_id=started.card_generation_public_id,
+        telegram_message_id=101,
+        operation_public_id="d1op_historical_101",
+        authenticated_actor_id="111",
+        telegram_account_id="acct",
+        telegram_conversation_id="111",
+        conversation_binding_id="binding",
+        raw_card_text=text,
+        field_values=fields,
+    )
+
+    def validate(payload: dict[str, object], supplied: dict[str, str], **_kwargs: object) -> object:
+        return SimpleNamespace(
+            canonical_payload={**payload, **supplied},
+            changed_fields=("merchant",),
+            completeness="incomplete",
+            reason_contributors=(),
+            unresolved_flags=("missing_source",),
+            explicit_clears={},
+        )
+
+    monkeypatch.setattr(human_drafts, "_validate_human_draft_adapter", validate)
+    monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
+    first = apply_human_draft_card(conn, command, publish=lambda *_: None)
+    assert first.operation_outcome == "accepted"
+    before = conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0]
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+    replay = apply_human_draft_card(conn, command, publish=lambda *_: None)
+    assert replay.idempotent_replay
+    assert (
+        conn.execute("SELECT COUNT(*) FROM parser_human_draft_operations").fetchone()[0] == before
+    )
+    with pytest.raises(HumanDraftError, match="operation_conflict"):
+        apply_human_draft_card(
+            conn,
+            HumanDraftCommand(**{**command.__dict__, "raw_card_text": text + " "}),
+            publish=lambda *_: None,
+        )
+
+
+def test_pre_cutover_pending_guided_d1_recovers_without_new_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finance_core.parser_proposals import human_drafts
+
+    workspace = support.create_bridge_workspace(
+        tmp_path, migration_paths=TEMP_DB_MIGRATION_PATHS[:-1]
+    )
+    monkeypatch.setattr(guided_edit, "_now_epoch", lambda: 1001)
+    monkeypatch.setattr(human_drafts, "_now_epoch", lambda: 1001)
+    session_id = "gedit_" + "b" * 32
+    with support.open_database(workspace) as conn:
+        _start(
+            conn,
+            source_type="telegram_text",
+            payload={
+                "intent": "personal_expense",
+                "amount": "12.50",
+                "currency": "SGD",
+                "transaction_date": "2026-09-13",
+                "merchant": "Kopitiam",
+                "description": "Lunch",
+                "category": "food",
+            },
+        )
+        conn.execute(
+            "UPDATE raw_intake_records SET source_channel = 'telegram' "
+            "WHERE public_id = 'intake_d1'"
+        )
+        reference = conn.execute(
+            "SELECT id, parser_output_id, proposal_content_hash "
+            "FROM openclaw_human_action_references WHERE action = 'edit'"
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO openclaw_guided_edit_sessions "
+            "(session_public_id, source_reference_id, current_parser_output_id, "
+            "current_proposal_version, current_content_hash, authenticated_actor_id, "
+            "channel_account_id, channel_conversation_id, conversation_binding_id, "
+            "status, expires_at, last_claimed_message_id, created_at, updated_at) "
+            "VALUES (?, ?, ?, 0, ?, '111', 'acct', '111', 'binding', "
+            "'active', 2000, 100, '1970-01-01', '1970-01-01')",
+            (
+                session_id,
+                reference["id"],
+                reference["parser_output_id"],
+                reference["proposal_content_hash"],
+            ),
+        )
+        conn.commit()
+        session = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        guided_edit.request_update(
+            conn,
+            session,
+            message_id=101,
+            operation_key=commands.canonical_edit_key(
+                proposal_public_id="prop_d1_source",
+                version=0,
+                content_hash=str(reference["proposal_content_hash"]),
+            ),
+            field_name="merchant",
+            field_value="Cafe Two",
+        )
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM finance_legacy_guided_pending_admissions"
+            ).fetchone()[0]
+            == 1
+        )
+    request = support.make_request(
+        "apply_guided_edit_update",
+        {
+            "workspace_path": str(workspace.workspace_path),
+            "operator_actor_id": "111",
+            "telegram_account_id": "acct",
+            "telegram_conversation_id": "111",
+            "conversation_binding_id": "binding",
+            "session_public_id": session_id,
+            "telegram_message_id": 101,
+            "field_name": "merchant",
+            "field_value": "Cafe Two",
+        },
+        idempotency_key=f"bridge-guided-edit-update:{session_id}:101",
+    )
+    recovered = support.run_cli(request)
+    assert recovered.exit_code == errors.EXIT_OK, recovered.response
+    assert support.run_cli(request).exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM finance_capture_interaction_routes").fetchone()[0]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM parser_human_draft_operations "
+                "WHERE operation_type IN ('accepted', 'noop', 'refused')"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_guided_route_rejects_noncanonical_execution_key(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    _proposal, session_id, _redemption = _begin(workspace)
+    captured = support.run_cli(
+        _request(
+            workspace,
+            "merchant=Cafe Two",
+            message_id=21,
+            account="finance-account",
+            binding="binding-1",
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK, captured.response
+    assert captured.response["result"]["interaction_route"]["route_kind"] == "guided_update"
+    with support.open_database(workspace) as conn:
+        session = dict(
+            conn.execute(
+                "SELECT * FROM openclaw_guided_edit_sessions WHERE session_public_id = ?",
+                (session_id,),
+            ).fetchone()
+        )
+        with pytest.raises(guided_edit.GuidedEditError, match="interaction_route_required"):
+            guided_edit.request_update(
+                conn,
+                session,
+                message_id=21,
+                operation_key="wrong-execution-key",
+                field_name="merchant",
+                field_value="Cafe Two",
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="requires a frozen route"):
+            conn.execute(
+                "UPDATE openclaw_guided_edit_sessions SET pending_message_id = 21, "
+                "pending_operation_key = 'wrong-execution-key', "
+                "pending_field_name = 'merchant', pending_field_value_json = '\"Cafe Two\"', "
+                "last_claimed_message_id = 21 WHERE session_public_id = ?",
+                (session_id,),
+            )
 
 
 @pytest.mark.parametrize(

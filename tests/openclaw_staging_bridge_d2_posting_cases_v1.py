@@ -11,7 +11,7 @@ from pathlib import Path
 import openclaw_staging_bridge_support_v1 as support
 import pytest
 
-from finance_core.openclaw_staging_bridge import delivery_receipt_cli
+from finance_core.openclaw_staging_bridge import delivery_receipt_cli, workspace_access
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
 from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
     PROOF_VERSION,
@@ -27,12 +27,16 @@ from finance_core.posting_authority import (
     record_posting_review_delivery,
 )
 from finance_core.receipt_staging_runner.workspace import load_delivery_receipt_signing_key
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+from finance_core.staging_guard import open_staging_database
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     record_telegram_source_context,
 )
 from tests.test_parser_human_drafts_v1 import _complete_validator
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
+
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
 
 ACTOR = "111"
 ACCOUNT = "finance-account"
@@ -41,8 +45,17 @@ BINDING = "binding-1"
 
 
 @pytest.fixture()
-def workspace(tmp_path: Path) -> support.BridgeWorkspace:
-    return support.create_bridge_workspace(tmp_path)
+def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> support.BridgeWorkspace:
+    workspace = support.create_bridge_workspace(tmp_path, migration_paths=LEGACY_D1_MIGRATION_PATHS)
+    monkeypatch.setattr(
+        workspace_access,
+        "open_workspace_database",
+        lambda target: open_staging_database(
+            workspace_access.database_path_for(target),
+            migration_paths=LEGACY_D1_MIGRATION_PATHS,
+        ),
+    )
+    return workspace
 
 
 def _published_text_card(
@@ -302,7 +315,9 @@ def test_delivery_receipt_proof_rejects_tamper_rotation_and_workspace_transplant
         receipt_token_sha256=hashlib.sha256(b"real-receipt").hexdigest(),
         source_identity_sha256="f" * 64,
     )
-    other = support.create_bridge_workspace(tmp_path, name="proof-transplant")
+    other = support.create_bridge_workspace(
+        tmp_path, name="proof-transplant", migration_paths=LEGACY_D1_MIGRATION_PATHS
+    )
     invalid_payloads = [
         {**payload, "receipt_proof_sha256": "0" * 64},
         {**payload, "attempt_nonce": "d2nonce_" + "9" * 32},

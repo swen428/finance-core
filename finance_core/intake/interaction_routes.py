@@ -288,9 +288,16 @@ def _historical_guided_route(
         "route_kind": "guided_update",
         "guided_session_public_id": session_id,
         "operation_key": operation_key,
+        "d1_compatibility_operation_public_id": _guided_d1_operation_id(session_id, message_id),
         "field_name": field,
         "field_value_json": json.dumps(value, ensure_ascii=False),
     }
+
+
+def _guided_d1_operation_id(session_id: str, message_id: int) -> str:
+    """Freeze the D1 compatibility operation separately from the route key."""
+    material = "\x00".join(("d1-guided-edit-compatibility-v1", session_id, str(message_id)))
+    return "d1op_" + hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 def classify_interaction(
@@ -361,6 +368,9 @@ def classify_interaction(
                 "route_kind": "guided_update",
                 "guided_session_public_id": session_id,
                 "operation_key": f"bridge-guided-edit-update:{session_id}:{message_id}",
+                "d1_compatibility_operation_public_id": _guided_d1_operation_id(
+                    session_id, message_id
+                ),
                 "field_name": field,
                 "field_value_json": json.dumps(field_value, ensure_ascii=False),
             }
@@ -395,8 +405,9 @@ def freeze_interaction_route(
         "(job_public_id, route_kind, raw_text_sha256, authenticated_actor_id, "
         "telegram_account_id, telegram_conversation_id, conversation_binding_id, "
         "telegram_message_id, card_generation_public_id, guided_session_public_id, "
-        "operation_key, field_name, field_value_json, refusal_code) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "operation_key, d1_compatibility_operation_public_id, "
+        "field_name, field_value_json, refusal_code) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             job_public_id,
             route["route_kind"],
@@ -409,6 +420,7 @@ def freeze_interaction_route(
             route.get("card_generation_public_id"),
             route.get("guided_session_public_id"),
             route.get("operation_key"),
+            route.get("d1_compatibility_operation_public_id"),
             route.get("field_name"),
             route.get("field_value_json"),
             route.get("refusal_code"),

@@ -16,6 +16,7 @@ CREATE TABLE finance_capture_interaction_routes (
     card_generation_public_id TEXT,
     guided_session_public_id TEXT,
     operation_key TEXT,
+    d1_compatibility_operation_public_id TEXT,
     field_name TEXT,
     field_value_json TEXT CHECK (field_value_json IS NULL OR json_valid(field_value_json) = 1),
     refusal_code TEXT,
@@ -31,9 +32,11 @@ CREATE TABLE finance_capture_interaction_routes (
             AND guided_session_public_id IS NULL AND operation_key IS NULL)
         OR route_kind = 'control_refused'),
     CHECK ((route_kind = 'guided_update' AND field_name IS NOT NULL
-            AND field_value_json IS NOT NULL)
+            AND field_value_json IS NOT NULL
+            AND d1_compatibility_operation_public_id IS NOT NULL)
         OR (route_kind != 'guided_update' AND field_name IS NULL
-            AND field_value_json IS NULL)),
+            AND field_value_json IS NULL
+            AND d1_compatibility_operation_public_id IS NULL)),
     CHECK ((route_kind = 'control_refused' AND refusal_code IS NOT NULL)
         OR (route_kind != 'control_refused' AND refusal_code IS NULL))
 ) STRICT, WITHOUT ROWID;
@@ -205,6 +208,7 @@ WHEN NEW.pending_message_id IS NOT NULL
       OR OLD.pending_field_value_json IS NOT NEW.pending_field_value_json)
  AND NOT EXISTS (
     SELECT 1 FROM finance_capture_interaction_routes AS route
+    JOIN parser_outputs AS proposal ON proposal.id = NEW.current_parser_output_id
     WHERE route.route_kind = 'guided_update'
       AND route.guided_session_public_id = NEW.session_public_id
       AND route.telegram_message_id = NEW.pending_message_id
@@ -213,11 +217,24 @@ WHEN NEW.pending_message_id IS NOT NULL
       AND route.telegram_conversation_id = NEW.channel_conversation_id
       AND route.conversation_binding_id = NEW.conversation_binding_id
       AND route.field_name = NEW.pending_field_name
+      AND NEW.pending_operation_key =
+          'bridge-edit:' || proposal.public_id || ':v' ||
+          NEW.current_proposal_version || ':' || NEW.current_content_hash
       AND json_extract(route.field_value_json, '$')
           = json_extract(NEW.pending_field_value_json, '$')
  )
 BEGIN
     SELECT RAISE(ABORT, 'guided pending update requires a frozen route');
+END;
+
+CREATE TRIGGER trg_finance_guided_pending_state_immutable
+BEFORE UPDATE ON openclaw_guided_edit_sessions
+WHEN OLD.pending_message_id IS NOT NULL AND NEW.pending_message_id IS NOT NULL
+ AND (NEW.current_parser_output_id IS NOT OLD.current_parser_output_id
+      OR NEW.current_proposal_version IS NOT OLD.current_proposal_version
+      OR NEW.current_content_hash IS NOT OLD.current_content_hash)
+BEGIN
+    SELECT RAISE(ABORT, 'guided pending proposal state is immutable');
 END;
 
 CREATE TRIGGER trg_finance_guided_request_requires_route
@@ -286,6 +303,140 @@ BEGIN
     SELECT RAISE(ABORT, 'guided completion event requires a frozen route');
 END;
 
+-- D1's Telegram reply evidence is another business-write boundary.  The
+-- guided compatibility card is generated from the original guided message;
+-- its bytes differ from the saved Telegram text.  Keep that exact mapping
+-- queryable for both the Core API and direct SQL guards.
+CREATE VIEW finance_d3_guided_reply_authority AS
+SELECT draft.id AS draft_id,
+       session.pending_message_id AS telegram_message_id,
+       session.authenticated_actor_id,
+       session.channel_account_id AS telegram_account_id,
+       session.channel_conversation_id AS telegram_conversation_id,
+       session.conversation_binding_id,
+       route.d1_compatibility_operation_public_id AS routed_d1_operation_public_id,
+       'Card Ref: ' || draft.current_card_generation_public_id || char(10) ||
+       CASE session.pending_field_name
+           WHEN 'amount' THEN 'Amount'
+           WHEN 'currency' THEN 'Currency'
+           WHEN 'transaction_date' THEN 'Date'
+           WHEN 'merchant' THEN 'Merchant'
+           WHEN 'description' THEN 'Description'
+           WHEN 'category' THEN 'Category'
+       END || ': ' || json_extract(session.pending_field_value_json, '$')
+           AS expected_card_text
+FROM parser_human_drafts AS draft
+JOIN openclaw_guided_edit_sessions AS session
+  ON session.source_reference_id = draft.source_edit_reference_id
+ AND session.status = 'active' AND session.pending_message_id IS NOT NULL
+JOIN openclaw_guided_edit_events AS event
+  ON event.session_id = session.id
+ AND event.event_type = 'update_requested'
+ AND event.telegram_message_id = session.pending_message_id
+ AND event.operation_key = session.pending_operation_key
+ AND event.field_name = session.pending_field_name
+ AND event.field_value_json = session.pending_field_value_json
+LEFT JOIN finance_capture_interaction_routes AS route
+  ON route.route_kind = 'guided_update'
+ AND route.guided_session_public_id = session.session_public_id
+ AND route.telegram_message_id = session.pending_message_id
+ AND route.authenticated_actor_id = session.authenticated_actor_id
+ AND route.telegram_account_id = session.channel_account_id
+ AND route.telegram_conversation_id = session.channel_conversation_id
+ AND route.conversation_binding_id = session.conversation_binding_id
+ AND route.field_name = session.pending_field_name
+ AND json_extract(route.field_value_json, '$')
+     = json_extract(session.pending_field_value_json, '$')
+LEFT JOIN finance_legacy_guided_pending_admissions AS legacy
+  ON legacy.session_id = session.id
+ AND legacy.session_public_id = session.session_public_id
+ AND legacy.request_event_id = event.id
+ AND legacy.telegram_message_id = session.pending_message_id
+ AND legacy.operation_key = session.pending_operation_key
+ AND legacy.field_name = session.pending_field_name
+ AND legacy.field_value_json = session.pending_field_value_json
+ AND legacy.authenticated_actor_id = session.authenticated_actor_id
+ AND legacy.channel_account_id = session.channel_account_id
+ AND legacy.channel_conversation_id = session.channel_conversation_id
+ AND legacy.conversation_binding_id = session.conversation_binding_id
+WHERE route.job_public_id IS NOT NULL OR legacy.session_id IS NOT NULL;
+
+CREATE TRIGGER trg_finance_d1_reply_evidence_requires_route
+BEFORE INSERT ON parser_human_draft_reply_evidence
+WHEN NOT EXISTS (
+    SELECT 1 FROM parser_human_drafts AS draft
+    JOIN finance_capture_interaction_routes AS route
+      ON route.route_kind = 'whole_card'
+     AND route.card_generation_public_id = draft.current_card_generation_public_id
+    JOIN finance_capture_jobs AS job ON job.public_id = route.job_public_id
+    JOIN raw_intake_records AS intake ON intake.id = job.raw_intake_record_id
+    WHERE draft.id = NEW.draft_id
+      AND route.authenticated_actor_id = NEW.authenticated_actor_id
+      AND route.telegram_account_id = NEW.telegram_account_id
+      AND route.telegram_conversation_id = NEW.telegram_conversation_id
+      AND route.conversation_binding_id = NEW.conversation_binding_id
+      AND route.telegram_message_id = NEW.telegram_message_id
+      AND route.raw_text_sha256 = NEW.sha256
+      AND CAST(intake.raw_input AS BLOB) = NEW.raw_utf8
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM finance_d3_guided_reply_authority AS guided
+    WHERE guided.draft_id = NEW.draft_id
+      AND guided.authenticated_actor_id = NEW.authenticated_actor_id
+      AND guided.telegram_account_id = NEW.telegram_account_id
+      AND guided.telegram_conversation_id = NEW.telegram_conversation_id
+      AND guided.conversation_binding_id = NEW.conversation_binding_id
+      AND guided.telegram_message_id = NEW.telegram_message_id
+      AND CAST(guided.expected_card_text AS BLOB) = NEW.raw_utf8
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'D1 Telegram reply requires frozen route or cutover admission');
+END;
+
+CREATE TRIGGER trg_finance_d1_operation_requires_route
+BEFORE INSERT ON parser_human_draft_operations
+WHEN NEW.operation_type IN ('accepted', 'refused', 'noop')
+ AND NOT EXISTS (
+    SELECT 1 FROM parser_human_draft_reply_evidence AS evidence
+    JOIN parser_human_drafts AS draft ON draft.id = evidence.draft_id
+    JOIN finance_capture_interaction_routes AS route
+      ON route.route_kind = 'whole_card'
+     AND route.card_generation_public_id = draft.current_card_generation_public_id
+     AND route.operation_key = NEW.operation_public_id
+    JOIN finance_capture_jobs AS job ON job.public_id = route.job_public_id
+    JOIN raw_intake_records AS intake ON intake.id = job.raw_intake_record_id
+    WHERE evidence.id = NEW.human_reply_evidence_id
+      AND evidence.draft_id = NEW.draft_id
+      AND evidence.telegram_message_id = NEW.telegram_message_id
+      AND route.authenticated_actor_id = evidence.authenticated_actor_id
+      AND route.telegram_account_id = evidence.telegram_account_id
+      AND route.telegram_conversation_id = evidence.telegram_conversation_id
+      AND route.conversation_binding_id = evidence.conversation_binding_id
+      AND route.telegram_message_id = evidence.telegram_message_id
+      AND route.raw_text_sha256 = evidence.sha256
+      AND CAST(intake.raw_input AS BLOB) = evidence.raw_utf8
+ )
+ AND NOT EXISTS (
+    SELECT 1 FROM parser_human_draft_reply_evidence AS evidence
+    JOIN finance_d3_guided_reply_authority AS guided
+      ON guided.draft_id = evidence.draft_id
+     AND guided.telegram_message_id = evidence.telegram_message_id
+    WHERE evidence.id = NEW.human_reply_evidence_id
+      AND evidence.draft_id = NEW.draft_id
+      AND evidence.telegram_message_id = NEW.telegram_message_id
+      AND guided.authenticated_actor_id = evidence.authenticated_actor_id
+      AND guided.telegram_account_id = evidence.telegram_account_id
+      AND guided.telegram_conversation_id = evidence.telegram_conversation_id
+      AND guided.conversation_binding_id = evidence.conversation_binding_id
+      AND CAST(guided.expected_card_text AS BLOB) = evidence.raw_utf8
+      AND (guided.routed_d1_operation_public_id = NEW.operation_public_id
+           OR (guided.routed_d1_operation_public_id IS NULL
+               AND NEW.operation_public_id GLOB 'd1op_[0-9a-f]*'))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'D1 Telegram operation requires frozen route or cutover admission');
+END;
+
 -- Source classification cannot be changed to escape the parser gate before a
 -- capture job exists.  Image and manual sources retain their own contracts.
 CREATE TRIGGER trg_finance_telegram_text_source_identity
@@ -315,6 +466,16 @@ END;
 -- ingress job without a route is quarantined rather than assumed ordinary.
 -- Existing admitted lineage may add only a direct child of its current
 -- proposal; it cannot use the admission to start a new unrelated proposal.
+CREATE TRIGGER trg_finance_telegram_text_parser_type
+BEFORE INSERT ON parser_outputs
+WHEN NEW.source_type != 'telegram_text'
+ AND EXISTS (SELECT 1 FROM raw_intake_records AS intake
+             WHERE intake.public_id = NEW.source_public_id
+               AND intake.source_type = 'telegram_text')
+BEGIN
+    SELECT RAISE(ABORT, 'Telegram text parser source type mismatch');
+END;
+
 CREATE TRIGGER trg_finance_interaction_no_control_parser
 BEFORE INSERT ON parser_outputs
 WHEN EXISTS (
@@ -359,6 +520,30 @@ END;
 
 -- Binding a raw source to a parser is another authority transition.  The
 -- historical admission permits only a direct child of its current pointer.
+CREATE TRIGGER trg_finance_telegram_text_pointer_source
+BEFORE UPDATE OF parser_output_id ON raw_intake_records
+WHEN OLD.source_type = 'telegram_text'
+ AND NEW.parser_output_id IS NOT OLD.parser_output_id
+ AND NEW.parser_output_id IS NOT NULL
+ AND NOT EXISTS (
+     SELECT 1 FROM parser_outputs AS proposal
+     WHERE proposal.id = NEW.parser_output_id
+       AND proposal.source_type = 'telegram_text'
+       AND (proposal.source_public_id = OLD.public_id
+            OR EXISTS (
+                SELECT 1 FROM ai_fallback_proposal_links AS link
+                JOIN ai_fallback_results AS result ON result.id = link.result_id
+                JOIN ai_fallback_attempts AS attempt ON attempt.id = result.attempt_id
+                WHERE link.parser_output_id = proposal.id
+                  AND attempt.raw_intake_record_id = OLD.id
+                  AND attempt.parent_parser_output_id = OLD.parser_output_id
+                  AND proposal.parent_parser_output_id = OLD.parser_output_id
+            ))
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'Telegram text parser pointer source mismatch');
+END;
+
 CREATE TRIGGER trg_finance_telegram_text_parser_pointer
 BEFORE UPDATE OF parser_output_id ON raw_intake_records
 WHEN OLD.source_type = 'telegram_text'

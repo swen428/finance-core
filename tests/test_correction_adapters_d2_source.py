@@ -24,6 +24,7 @@ from finance_core.posting_authority import (
     confirm_and_post,
     prepare_posting_review,
 )
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
 from tests.test_d2_initial_card_delivery_authority_v1 import (
     _file_connection,
     _record_delivery,
@@ -93,8 +94,9 @@ def test_initial_text_replays_source_delivery_confirmation_and_conversion(
         next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
     )
     database.chmod(0o600)
-    provision(database, "111")
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     conn.close()
+    provision(database, "111")
     tick = [int(time.time())]
     authority = LocalApprovalAuthority(clock=lambda: tick[0])
     with open_local_authority_connection() as trusted:
@@ -199,8 +201,9 @@ def test_personal_receipt_replays_conditional_fact_snapshot_and_audit(
         next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
     )
     database.chmod(0o600)
-    provision(database, "111")
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS)
     conn.close()
+    provision(database, "111")
     tick = [int(time.time())]
     authority = LocalApprovalAuthority(clock=lambda: tick[0])
     with open_local_authority_connection() as trusted:

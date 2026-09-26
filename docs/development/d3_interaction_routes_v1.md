@@ -57,7 +57,9 @@ OCR text is never interpreted as a user control command.
 A malformed card or guided control is `control_refused` with a queryable reason;
 it is never sent to the ordinary parser. The immutable route stores original
 text SHA-256, message/context identity, and applicable card, session,
-operation, field and field-value material. `get_interaction_route` retrieves
+operation, field and field-value material. Guided updates also store the
+deterministic D1 compatibility operation separately from the Telegram message
+lookup key. `get_interaction_route` retrieves
 it read-only under the same authenticated context by original message ID or
 operation key, including after a guided session ends. `get_status` also
 returns capture and processing status for a known intake/job, but does not
@@ -106,6 +108,18 @@ An admitted old text source may advance to its direct parser child when the
 child retains the same source identity, or when a sealed AI fallback result
 links that child to the admitted source and current parent. This preserves
 pre-055 fallback recovery without admitting an unrelated proposal.
+Even an `initial_intake` route cannot bind a Telegram text raw record to a
+parser with a different source type or identity.
+
+D1 whole-card writes require the saved card route, original reply bytes,
+message/context, card generation and operation identity. The Core transaction
+checks this even when an internal caller omits its optional extra validator;
+SQLite also rejects direct insertion of unauthorised reply evidence or
+accepted/refused/noop operations. Guided edits that use a D1 card require a
+matching guided route and pending request, or the exact migration-time pending
+admission. The synthetic one-field card is checked against the guided field
+and value rather than compared to the original Telegram text. Existing D1
+operations replay by their original evidence and do not create new writes.
 
 New receipt captions resembling a card, guided command or ambiguous control
 are refused before intake publication with a request to send the instruction as

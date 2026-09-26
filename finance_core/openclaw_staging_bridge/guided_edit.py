@@ -723,6 +723,7 @@ def _require_guided_route(
     session: dict[str, Any],
     message_id: int,
     route_kind: str,
+    operation_key: str | None = None,
     field_name: str | None = None,
     field_value: str | None = None,
 ) -> None:
@@ -734,6 +735,17 @@ def _require_guided_route(
         ).fetchone()
         is None
     ):
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+            ).fetchone()
+            is not None
+            and conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE migration_id = '055'"
+            ).fetchone()
+            is not None
+        ):
+            raise GuidedEditError("interaction_route_required")
         return  # The pre-055 application has no frozen ingress routes.
     rows = conn.execute(
         "SELECT field_name, field_value_json FROM finance_capture_interaction_routes "
@@ -756,6 +768,19 @@ def _require_guided_route(
         and (rows[0][0] != field_name or json.loads(str(rows[0][1])) != field_value)
     ):
         raise GuidedEditError("interaction_route_required")
+    if route_kind == "guided_update":
+        proposal = conn.execute(
+            "SELECT public_id FROM parser_outputs WHERE id = ?",
+            (session["current_parser_output_id"],),
+        ).fetchone()
+        expected = (
+            None
+            if proposal is None
+            else f"bridge-edit:{proposal[0]}:v{session['current_proposal_version']}:"
+            f"{session['current_content_hash']}"
+        )
+        if operation_key != expected:
+            raise GuidedEditError("interaction_route_required")
 
 
 def request_update(
@@ -789,6 +814,7 @@ def request_update(
             session=current,
             message_id=message_id,
             route_kind="guided_update",
+            operation_key=operation_key,
             field_name=field_name,
             field_value=field_value,
         )
