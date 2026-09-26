@@ -69,11 +69,14 @@ function missing(request: BridgeRequest): BridgeResponse {
 
 class FakeCore implements BridgeRunner {
   readonly calls: BridgeRequest[] = [];
-  readonly stored = new Map<string, { kind: string; ingress: JsonObject; attachment: string | null }>();
+  readonly stored = new Map<string, { kind: string; ingress: JsonObject; attachment: string | null; text?: string }>();
   beforeCommit?: () => Promise<void>;
   loseResponse = false;
   available = true;
   originalAvailable = true;
+  routeMissing = false;
+  routeMalformed = false;
+  routeUnavailable = false;
   readonly intakeByMessage = new Map<string, string>();
 
   private jobId(intakeId: string): string {
@@ -90,6 +93,30 @@ class FakeCore implements BridgeRunner {
         job_public_id: this.jobId(intakeId), telegram_message_id: messageId,
         source_identity_sha256: "c".repeat(64),
       } });
+    }
+    if (request.command === "get_interaction_route") {
+      if (this.routeUnavailable) return missing(request);
+      const messageId = String(request.arguments.telegram_message_id);
+      const intakeId = this.intakeByMessage.get(messageId);
+      const item = intakeId === undefined ? undefined : this.stored.get(intakeId);
+      if (intakeId === undefined || item?.kind !== "text" || this.routeMissing) {
+        return success(request, { found: false, final_transaction_created: false });
+      }
+      const jobId = this.jobId(intakeId);
+      return success(request, {
+        found: true, final_transaction_created: false,
+        interaction_route: {
+          job_public_id: jobId, route_kind: item.text === "完成" ? "control_refused" : "initial_intake",
+          raw_text_sha256: this.routeMalformed ? "0".repeat(64) : sha256(item.text ?? ""),
+          authenticated_actor_id: "111", telegram_account_id: "finance-account",
+          telegram_conversation_id: "111", conversation_binding_id: "binding-1",
+          telegram_message_id: Number(messageId),
+        },
+        capture_job: {
+          public_id: jobId, intake_public_id: intakeId, capture_kind: "text",
+          ingress_identity_digest: digest(item.ingress), attachment_content_hash: null,
+        },
+      });
     }
     if (request.command === "get_status") {
       const jobId = request.arguments.job_public_id as string;
@@ -144,6 +171,9 @@ class FakeCore implements BridgeRunner {
     this.stored.set(intakeId, {
       kind: request.command === "capture" ? "receipt_image" : "text",
       ingress, attachment: request.command === "capture" ? ingress.attachmentSha256 as string : null,
+      ...(request.command === "capture_interaction" ? {
+        text: ((request.arguments.telegram_update as JsonObject).message as JsonObject).text as string,
+      } : {}),
     });
     this.intakeByMessage.set(String(ingress.messageId), intakeId);
     if (this.loseResponse) throw new Error("response lost after commit");
@@ -204,7 +234,7 @@ test("host receives adoption only after Core commits; D2 control text never invo
   assert.equal(result.handled, true);
   assert.equal(result.adoption?.schema, "finance-ingress-adoption-v1");
   assert.deepEqual(core.calls.map((call) => call.command), [
-    "get_capture_job_for_message", "capture_interaction", "get_status",
+    "get_capture_job_for_message", "capture_interaction", "get_status", "get_interaction_route",
   ]);
 });
 
@@ -216,7 +246,28 @@ test("duplicate text replay and restart return same durable job", async () => {
   assert.equal(replay.adoption?.jobId, first.adoption?.jobId);
   assert.equal(replay.adoption?.intakeId, first.adoption?.intakeId);
   assert.equal(core.stored.size, 1);
+  assert.equal(core.calls.filter((call) => call.command === "get_interaction_route").length, 2);
 });
+
+test("text response loss can adopt only with frozen route proof", async () => {
+  const core = new FakeCore();
+  core.loseResponse = true;
+  const { event, context } = turn({ text: "完成" });
+  const recovered = await capture(core).handle(event, context);
+  assert.equal(recovered.adoption?.attachmentStatus, "none");
+  assert.ok(core.calls.some((call) => call.command === "get_interaction_route"));
+});
+
+for (const failure of ["routeMissing", "routeMalformed", "routeUnavailable"] as const) {
+  test(`text with ${failure} cannot adopt on capture or replay`, async () => {
+    const core = new FakeCore();
+    core[failure] = true;
+    const { event, context } = turn();
+    assert.deepEqual(await capture(core).handle(event, context), { handled: false });
+    assert.deepEqual(await capture(core).handle(event, context), { handled: false });
+    assert.equal(core.calls.filter((call) => call.command === "capture_interaction").length, 1);
+  });
+}
 
 for (const image of [jpeg, png]) {
   test(`photo ${image === jpeg ? "JPEG" : "PNG"} proves original before adoption`, async () => {
@@ -245,6 +296,7 @@ test("control caption photo is refused by Core without adoption or inline proces
 test("trusted photo preserves empty raw caption separately from literal media marker", async () => {
   for (const [messageId, original, expectedCaption] of [
     ["75", "", undefined], ["76", "<media:image>", "<media:image>"],
+    ["77", "  receipt  ", "  receipt  "],
   ] as const) {
     const core = new FakeCore();
     const { event, context } = turn({ image: jpeg, text: original, messageId });
@@ -254,6 +306,23 @@ test("trusted photo preserves empty raw caption separately from literal media ma
     assert.ok(request);
     assert.equal(request.arguments.caption, expectedCaption);
   }
+});
+
+test("whitespace-only photo caption is refused before discovery even on replay", async () => {
+  const core = new FakeCore();
+  const meter = { acquire: 0, publish: 0 };
+  const valid = turn({ image: jpeg, text: "", messageId: "79" });
+  assert.equal((await capture(core, { image: jpeg, meter }).handle(valid.event, valid.context)).handled, true);
+  const before = core.calls.length;
+  const invalid = turn({ image: jpeg, text: " \t ", messageId: "79" });
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(invalid.event, invalid.context),
+    { handled: false });
+  assert.equal(core.calls.length, before);
+  assert.deepEqual(meter, { acquire: 1, publish: 1 });
+  const fresh = turn({ image: jpeg, text: "\n", messageId: "80" });
+  assert.deepEqual(await capture(core, { image: jpeg, meter }).handle(fresh.event, fresh.context),
+    { handled: false });
+  assert.equal(core.calls.length, before);
 });
 
 for (const [name, value] of [

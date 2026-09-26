@@ -28,7 +28,9 @@ send. Later processing resumes from the Core job.
 
 The pinned Host's Finance hook must set photo `event.content` to the original
 Telegram caption (`''` when absent). The Bridge omits Core `caption` for an
-empty string and preserves a literal user caption such as `<media:image>`.
+empty string, refuses nonempty whitespace-only captions before any Core
+discovery or adoption, and preserves valid captions byte for byte, including
+leading or trailing spaces and a literal `<media:image>`.
 The public repository tests the consumer behavior; the fixed Host's producer
 projection and same-version interoperability remain separate host acceptance.
 
@@ -54,6 +56,12 @@ The Bridge returns `finance-ingress-adoption-v1` only after `get_status` confirm
 the expected intake and deterministic job ID, the independently computed ingress
 identity digest, and the capture kind. For a photo, Core must also reopen and
 verify the linked original and report `capture_attachment_integrity=verified`.
+For text, including control text, the Bridge additionally queries Core's
+authenticated `get_interaction_route` for the same actor, account, conversation,
+binding, and message. Adoption requires the frozen route to match the exact raw
+text hash and the same intake, job, kind, and ingress digest. An old text job
+without a frozen route, an incomplete route, or a failed lookup cannot be adopted,
+including after a lost capture response or on replay.
 For newly captured photos, adoption also requires a durable per-slot reclaim
 intent and completed handoff cleanup. The intent is only a request to check
 Core; it is never proof that Core holds an original. Core `get_status` must match

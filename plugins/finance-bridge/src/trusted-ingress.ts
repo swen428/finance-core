@@ -157,7 +157,8 @@ function ingressDigest(identity: JsonObject): string {
 }
 
 function caption(text: string): string | undefined {
-  if (text.trim().length === 0) return undefined;
+  if (text.length === 0) return undefined;
+  if (text.trim().length === 0) throw new Error("Receipt caption is invalid.");
   let count = 0;
   for (const character of text) {
     const point = character.codePointAt(0)!;
@@ -255,6 +256,12 @@ export class TrustedIngressCapture {
   async handle(event: PluginHookInboundClaimEvent, context: PluginHookInboundClaimContext): Promise<TrustedClaimResult> {
     const turn = validateTurn(event, context);
     if (turn === undefined) return { handled: false };
+    let receiptCaption: string | undefined;
+    try {
+      if (turn.photo) receiptCaption = caption(turn.text);
+    } catch {
+      return { handled: false };
+    }
     const messageKey = `${turn.ingress.accountId}\0${turn.chatId}\0${turn.messageId}`;
     const existingOperation = this.activeByMessage.get(messageKey);
     if (existingOperation !== undefined) {
@@ -286,7 +293,38 @@ export class TrustedIngressCapture {
         }), COMMAND_DEADLINE_MS);
         if (response.status !== "ok") return {};
         const adoption = checkedStatus(response.result, turn, jobId);
-        if (adoption !== undefined) return { adoption };
+        if (adoption !== undefined) {
+          if (!turn.photo) {
+            const routeResponse = await this.runner.run(createBridgeRequest("get_interaction_route", {
+              workspace_path: this.workspaceRoot,
+              operator_actor_id: String(turn.senderId),
+              telegram_account_id: turn.ingress.accountId,
+              telegram_conversation_id: turn.ingress.chatId,
+              conversation_binding_id: turn.ingress.bindingId,
+              telegram_message_id: turn.messageId,
+            }), COMMAND_DEADLINE_MS);
+            if (routeResponse.status !== "ok" || routeResponse.result.found !== true ||
+                routeResponse.result.final_transaction_created !== false) return {};
+            const route = routeResponse.result.interaction_route;
+            const routeJob = routeResponse.result.capture_job;
+            const statusJob = response.result.capture_job;
+            if (!isRecord(route) || !isRecord(routeJob) || !isRecord(statusJob) ||
+                route.job_public_id !== adoption.jobId ||
+                route.raw_text_sha256 !== createHash("sha256").update(turn.text, "utf8").digest("hex") ||
+                route.authenticated_actor_id !== String(turn.senderId) ||
+                route.telegram_account_id !== turn.ingress.accountId ||
+                route.telegram_conversation_id !== turn.ingress.chatId ||
+                route.conversation_binding_id !== turn.ingress.bindingId ||
+                route.telegram_message_id !== turn.messageId ||
+                !["initial_intake", "whole_card", "guided_update", "guided_complete", "control_refused"].includes(String(route.route_kind)) ||
+                routeJob.public_id !== adoption.jobId ||
+                routeJob.intake_public_id !== adoption.intakeId ||
+                routeJob.capture_kind !== "text" ||
+                routeJob.ingress_identity_digest !== statusJob.ingress_identity_digest ||
+                routeJob.attachment_content_hash !== null) return {};
+          }
+          return { adoption };
+        }
         if (turn.photo && response.result.capture_attachment_integrity === "missing" &&
             checkedStatus({ ...response.result, capture_attachment_integrity: "verified" }, turn, jobId)) {
           return { reupload: true };
@@ -362,7 +400,6 @@ export class TrustedIngressCapture {
         }
         if (media.contentHash !== turn.ingress.attachmentSha256) return { handled: false };
         const intakeId = captureIdentities(key).rawIntakePublicId;
-        const receiptCaption = caption(turn.text);
         try {
           capturedJobId = await this.handoff.withPublished(key, intakeId, media, async (published, payloadFd) => {
             const request = createBridgeRequest("capture", {

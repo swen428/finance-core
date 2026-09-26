@@ -36,6 +36,7 @@ let passed = false;
 const calls = [];
 const captureArguments = [];
 let loseNextCaptureResponse = false;
+let loseNextTextResponse = false;
 const runner = {
   async run(request, _deadline, fd) {
     calls.push(request.command);
@@ -50,6 +51,10 @@ const runner = {
     if (request.command === "capture" && loseNextCaptureResponse && response.status === "ok") {
       loseNextCaptureResponse = false;
       throw new Error("synthetic response loss after Core commit");
+    }
+    if (request.command === "capture_interaction" && loseNextTextResponse && response.status === "ok") {
+      loseNextTextResponse = false;
+      throw new Error("synthetic text response loss after Core commit");
     }
     return response;
   },
@@ -96,6 +101,46 @@ function turn(messageId, bytes, content = "receipt") {
       senderId: "111", messageId: String(messageId), pluginBinding: binding,
     },
   };
+}
+function textTurn(messageId, content) {
+  const photo = turn(messageId, jpeg(messageId), content);
+  delete photo.event.financeIngress.attachmentSha256;
+  delete photo.event.metadata;
+  return photo;
+}
+function seedHistoricalText(input) {
+  const script = [
+    "import hashlib, json, sys",
+    "from pathlib import Path",
+    "from openclaw_staging_bridge_support_v1 import BridgeWorkspace, open_database",
+    "from finance_core.intake.capture_jobs import ensure_capture_job",
+    "from finance_core.intake.raw_text_repository import create_raw_intake_record",
+    "from finance_core.intake.telegram_text_adapter import validate_telegram_text_update",
+    "from finance_core.telegram_source_context import TelegramSourceContext, record_telegram_source_context",
+    "workspace_path, database_path, source_json = sys.argv[1:]",
+    "source = json.loads(source_json)",
+    "ingress = source['ingress']",
+    "update = source['update']",
+    "validated = validate_telegram_text_update(update)",
+    "digest = hashlib.sha256(json.dumps(ingress, sort_keys=True, separators=(',', ':')).encode()).hexdigest()",
+    "workspace = BridgeWorkspace(Path(workspace_path), Path(database_path))",
+    "with open_database(workspace) as conn:",
+    "    conn.execute('BEGIN IMMEDIATE')",
+    "    intake = create_raw_intake_record(conn, validated.text, source_channel='telegram', source_metadata=validated.source_metadata)",
+    "    record_telegram_source_context(conn, raw_intake_record_id=int(intake['id']), context=TelegramSourceContext(authenticated_actor_id='111', account_id='finance', conversation_id='111', binding_id='bind-1', message_id=str(ingress['messageId'])), captured_at=str(intake['received_at']))",
+    "    ensure_capture_job(conn, intake_id=int(intake['id']), capture_kind='text', ingress_identity_digest=digest)",
+    "    conn.commit()",
+  ].join("\n");
+  const ingress = { ...input.event.financeIngress, chatId: 111, messageId: Number(input.event.messageId), senderId: 111 };
+  const update = {
+    update_id: ingress.updateId,
+    message: { message_id: ingress.messageId, chat: { id: 111, type: "private" },
+      date: input.event.timestamp / 1_000, from: { id: 111 }, text: input.event.content },
+  };
+  const outcome = spawnSync(python, ["-c", script, workspace,
+    join(workspace, "database", "staging.sqlite"), JSON.stringify({ ingress, update })],
+  { cwd: repositoryRoot, env: environment, encoding: "utf8" });
+  assert.equal(outcome.status, 0, outcome.stderr);
 }
 function bridge(handoff = new HandoffPublisher(workspace)) {
   return new TrustedIngressCapture(workspace, runner, media, handoff);
@@ -173,6 +218,39 @@ try {
   assert.equal(captureArguments.at(-1).caption, "<media:image>");
   const rawInputs = coreRawInputs();
   assert.equal(rawInputs[markerResult.adoption.intakeId], "<media:image>");
+  const beforeWhitespace = calls.length;
+  const downloadsBeforeWhitespace = downloads;
+  const whitespacePhoto = turn(245, jpeg(45), " \t ");
+  assert.deepEqual(await bridge().handle(whitespacePhoto.event, whitespacePhoto.context), { handled: false });
+  assert.equal(calls.length, beforeWhitespace);
+  assert.equal(downloads, downloadsBeforeWhitespace);
+  const validSpaced = turn(246, png(46), "  shop  ");
+  const spacedResult = await bridge().handle(validSpaced.event, validSpaced.context);
+  assert.equal(spacedResult.adoption?.attachmentStatus, "stored");
+  assert.equal(coreRawInputs()[spacedResult.adoption.intakeId], "  shop  ");
+
+  const ordinaryText = textTurn(270, "lunch 12.50");
+  const textResult = await bridge().handle(ordinaryText.event, ordinaryText.context);
+  assert.equal(textResult.adoption?.attachmentStatus, "none");
+  assert.equal((await bridge().handle(ordinaryText.event, ordinaryText.context)).adoption?.jobId,
+    textResult.adoption.jobId);
+  const controlText = textTurn(271, "完成");
+  loseNextTextResponse = true;
+  const controlResult = await bridge().handle(controlText.event, controlText.context);
+  assert.equal(controlResult.adoption?.attachmentStatus, "none");
+  assert.equal((await bridge().handle(controlText.event, controlText.context)).adoption?.jobId,
+    controlResult.adoption.jobId);
+  assert.equal(calls.filter((command) => command === "get_interaction_route").length, 4);
+
+  const historical = textTurn(272, "historical lunch 12.50");
+  seedHistoricalText(historical);
+  const beforeHistoricalCapture = calls.filter((command) => command === "capture_interaction").length;
+  assert.deepEqual(await bridge().handle(historical.event, historical.context), { handled: false });
+  assert.deepEqual(calls.slice(-3), [
+    "get_capture_job_for_message", "get_status", "get_interaction_route",
+  ]);
+  assert.equal(calls.filter((command) => command === "capture_interaction").length,
+    beforeHistoricalCapture);
   assert.equal(Object.values(rawInputs).includes("完成"), false);
 
   const changed = adopted[0].input;
