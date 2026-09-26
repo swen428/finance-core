@@ -5,6 +5,14 @@ private Finance Telegram binding. The public Bridge checks that identity against
 the bound event and context. A malformed or missing identity cannot produce a
 custody receipt.
 
+The Bridge does not reconstruct `payloadSha256` from Telegram's raw update;
+that value and its binding to the original message are a fixed-host trust
+contract. This slice proves that the same host-provided identity is saved by
+Core and compared before a receipt. Without `financeIngress`, the existing
+legacy controller remains registered. The fixed host refuses ordinary Finance
+adoption without a matching receipt, so this source change alone is not a
+runtime activation or a safety claim for an older host.
+
 The pinned host routes `/finance` through its existing command/result authority
 without `financeIngress`; it is outside this raw-message custody path. If the
 host supplies a trusted slash message through this path, the Bridge still sends

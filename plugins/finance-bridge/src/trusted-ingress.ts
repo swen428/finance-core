@@ -118,8 +118,11 @@ function validateTurn(
   if (photo && (typeof candidate.attachmentSha256 !== "string" || !SHA256.test(candidate.attachmentSha256))) return undefined;
   if (!photo && (candidate.attachmentUnavailable !== undefined || event.content.trim().length === 0)) return undefined;
   if (candidate.attachmentUnavailable !== undefined && candidate.attachmentUnavailable !== true) return undefined;
-  if (!photo && event.metadata !== undefined && isRecord(event.metadata) &&
-      ["mediaUrl", "mediaUrls", "mediaPath", "mediaPaths"].some((key) => event.metadata?.[key] !== undefined)) return undefined;
+  if (!photo && event.metadata !== undefined &&
+      (!isRecord(event.metadata) || [
+        "mediaStagingPending", "mediaUrl", "mediaUrls", "mediaPath", "mediaPaths",
+        "mediaType", "mediaTypes", "originalFilename",
+      ].some((key) => event.metadata?.[key] !== undefined))) return undefined;
   return {
     ingress: candidate as unknown as TrustedFinanceIngress,
     chatId,

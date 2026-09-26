@@ -65,8 +65,11 @@ function validateTurn(event, context) {
         return undefined;
     if (candidate.attachmentUnavailable !== undefined && candidate.attachmentUnavailable !== true)
         return undefined;
-    if (!photo && event.metadata !== undefined && isRecord(event.metadata) &&
-        ["mediaUrl", "mediaUrls", "mediaPath", "mediaPaths"].some((key) => event.metadata?.[key] !== undefined))
+    if (!photo && event.metadata !== undefined &&
+        (!isRecord(event.metadata) || [
+            "mediaStagingPending", "mediaUrl", "mediaUrls", "mediaPath", "mediaPaths",
+            "mediaType", "mediaTypes", "originalFilename",
+        ].some((key) => event.metadata?.[key] !== undefined)))
         return undefined;
     return {
         ingress: candidate,
@@ -171,9 +174,8 @@ export class TrustedIngressCapture {
                     workspace_path: this.workspaceRoot,
                     job_public_id: jobId,
                 }), COMMAND_DEADLINE_MS);
-                if (response.status !== "ok") {
-                    return response.error.code === "INTAKE_NOT_FOUND" ? { missing: true } : {};
-                }
+                if (response.status !== "ok")
+                    return {};
                 const adoption = checkedStatus(response.result, turn, jobId);
                 if (adoption !== undefined)
                     return { adoption };
@@ -241,6 +243,7 @@ export class TrustedIngressCapture {
                 if (media.contentHash !== turn.ingress.attachmentSha256)
                     return { handled: false };
                 const intakeId = captureIdentities(key).rawIntakePublicId;
+                const receiptCaption = caption(turn.text);
                 try {
                     capturedJobId = await this.handoff.withPublished(key, intakeId, media, async (published, payloadFd) => {
                         const response = await this.runner.run(createBridgeRequest("capture", {
@@ -259,7 +262,7 @@ export class TrustedIngressCapture {
                             conversation_binding_id: turn.ingress.bindingId,
                             declared_mime_type: media.detectedMimeType,
                             ...(media.originalFilename === undefined ? {} : { original_filename: media.originalFilename }),
-                            ...(caption(turn.text) === undefined ? {} : { caption: caption(turn.text) }),
+                            ...(receiptCaption === undefined ? {} : { caption: receiptCaption }),
                             finance_ingress: coreIdentity(turn.ingress),
                         }, key), COMMAND_DEADLINE_MS, payloadFd);
                         if (response.status !== "ok")

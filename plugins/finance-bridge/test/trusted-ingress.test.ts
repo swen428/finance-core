@@ -116,6 +116,17 @@ class FakeCore implements BridgeRunner {
     } else {
       assert.equal(request.arguments.telegram_update_id, ingress.updateId);
       assert.equal(request.arguments.handoff_content_hash, ingress.attachmentSha256);
+      if (request.arguments.caption === "完成") {
+        return {
+          envelopeVersion: "v1", requestId: request.request_id,
+          operationId: `op_${"a".repeat(32)}`, status: "error",
+          error: {
+            code: "ARGUMENTS_REFUSED",
+            message: "Receipt caption resembles a control message; send the instruction as text.",
+            retryable: false,
+          },
+        };
+      }
     }
     await this.beforeCommit?.();
     const intakeId = this.intakeByMessage.get(String(ingress.messageId)) ??
@@ -199,7 +210,7 @@ test("duplicate text replay and restart return same durable job", async () => {
 for (const image of [jpeg, png]) {
   test(`photo ${image === jpeg ? "JPEG" : "PNG"} proves original before adoption`, async () => {
     const core = new FakeCore();
-    const { event, context, ingress } = turn({ image, text: "完成" });
+    const { event, context, ingress } = turn({ image, text: "receipt" });
     const result = await capture(core, { image }).handle(event, context);
     assert.equal(result.adoption?.attachmentStatus, "stored");
     assert.equal(result.adoption?.attachmentSha256, ingress.attachmentSha256);
@@ -208,6 +219,40 @@ for (const image of [jpeg, png]) {
     ]);
   });
 }
+
+test("control caption photo is refused by Core without adoption or inline processing", async () => {
+  const core = new FakeCore();
+  const { event, context } = turn({ image: jpeg, text: "完成" });
+  const result = await capture(core, { image: jpeg }).handle(event, context);
+  assert.deepEqual(result, { handled: false });
+  assert.equal(core.stored.size, 0);
+  assert.deepEqual(core.calls.map((call) => call.command), [
+    "get_capture_job_for_message", "capture", "get_capture_job_for_message",
+  ]);
+});
+
+for (const [name, value] of [
+  ["mediaStagingPending", false], ["mediaType", "image/jpeg"],
+  ["mediaTypes", []], ["originalFilename", "receipt.jpg"],
+  ["mediaUrl", "media://inbound/x"], ["mediaUrls", []],
+  ["mediaPath", "/tmp/x"], ["mediaPaths", []],
+] as const) {
+  test(`text without attachment digest refuses metadata ${name}`, async () => {
+    const core = new FakeCore();
+    const { event, context } = turn();
+    event.metadata = { [name]: value };
+    assert.deepEqual(await capture(core).handle(event, context), { handled: false });
+    assert.deepEqual(core.calls, []);
+  });
+}
+
+test("text without attachment digest refuses malformed metadata", async () => {
+  const core = new FakeCore();
+  const { event, context } = turn();
+  event.metadata = [] as unknown as Record<string, unknown>;
+  assert.deepEqual(await capture(core).handle(event, context), { handled: false });
+  assert.deepEqual(core.calls, []);
+});
 
 test("missing photo without prior Core custody returns typed reupload refusal", async () => {
   const core = new FakeCore();
