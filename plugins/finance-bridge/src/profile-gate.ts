@@ -256,6 +256,9 @@ export function initializeProfileGate(profileRoot: string): void {
       closeSync(current.fd);
       fsyncSync(fd);
       fsyncSync(root.fd);
+      requireCurrentRoot(profileRoot, root.identity);
+      const afterSync = openValidatedLock(root.fd, created);
+      closeSync(afterSync.fd);
       initialized = true;
     } finally {
       if (!initialized) {
