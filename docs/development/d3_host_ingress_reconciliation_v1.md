@@ -25,6 +25,9 @@ ingress digest. Text requires its original route and exact raw text hash; photos
 require the original attachment hash, exact caption fingerprint, and verified
 stored original. Missing or partial jobs, changed originals, absent text routes,
 unavailable images, Core conflicts, and unresolved handoff residue refuse.
+For a photo, Core recovery recomputes the saved raw caption's content hash and
+versioned fingerprint against the intake and capture job before returning a
+current result. A pre-v2 photo cannot satisfy this reconciliation proof.
 `financialState` comes from authenticated `get_capture_recovery`; the
 `get_status.final_transaction_created` field is not a financial result check.
 The result contains no raw text, attachment bytes, financial amount, or reply

@@ -206,6 +206,10 @@ test("corrected and unknown financial outcomes come only from recovery GET", asy
   const corrected = await reconciler(core).reconcile(original());
   assert.equal(corrected.kind === "matched" && corrected.financialState, "corrected");
   assert.equal(corrected.kind === "matched" && corrected.replyState, "missing");
+  core.replyOutbox = [{ status: "outcome_unknown" }];
+  const mixed = await reconciler(core).reconcile(original());
+  assert.equal(mixed.kind === "matched" && mixed.replyState, "outcome_unknown");
+  core.replyOutbox = [];
   core.financialState = "unposted";
   core.nextAction = "ai_outcome_unknown";
   const unknown = await reconciler(core).reconcile(original());

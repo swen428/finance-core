@@ -80,8 +80,8 @@ function replyState(view: JsonObject): "none" | "missing" | "pending" | "outcome
     }
     states.push(item.status);
   }
-  if (view.next_action === "enqueue_existing_result") return "missing";
   if (states.includes("outcome_unknown")) return "outcome_unknown";
+  if (view.next_action === "enqueue_existing_result") return "missing";
   if (states.includes("pending")) return "pending";
   if (states.includes("sent")) return "sent";
   return "none";

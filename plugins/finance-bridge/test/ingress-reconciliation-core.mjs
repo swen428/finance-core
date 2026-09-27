@@ -103,6 +103,24 @@ function counts() {
   return JSON.parse(query.stdout);
 }
 
+function tamperTemporaryPhoto(intakeId, mode) {
+  assert.ok(mode === "caption" || mode === "fingerprint_version");
+  const database = join(workspace, "database", "staging.sqlite");
+  const tamper = spawnSync(python, ["-c", [
+    "import sqlite3, sys",
+    "database, intake_id, mode = sys.argv[1:]",
+    "with sqlite3.connect(database) as conn:",
+    "    trigger = conn.execute(\"SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'trg_capture_raw_intake_freeze_source'\").fetchone()",
+    "    assert trigger is not None",
+    "    conn.execute('DROP TRIGGER trg_capture_raw_intake_freeze_source')",
+    "    changed = conn.execute('UPDATE raw_intake_records SET raw_input = ? WHERE public_id = ?', ('tampered caption', intake_id)) if mode == 'caption' else conn.execute('UPDATE raw_intake_records SET fingerprint_version = ? WHERE public_id = ?', ('raw-intake-v1', intake_id))",
+    "    assert changed.rowcount == 1",
+    "    conn.execute(trigger[0])",
+  ].join("\n"), database, intakeId, mode],
+  { cwd: repositoryRoot, env: environment, encoding: "utf8" });
+  assert.equal(tamper.status, 0, tamper.stderr);
+}
+
 try {
   const handoff = new HandoffPublisher(workspace);
   const capture = new TrustedIngressCapture(
@@ -149,12 +167,28 @@ try {
     assert.equal((await reconcile.reconcile(changedOriginal)).kind, "refused");
   }
   assert.deepEqual(counts(), before);
+  // Only this disposable staging database is mutated. Status still sees the
+  // saved job fingerprint; authenticated recovery must reject the altered raw caption.
+  tamperTemporaryPhoto(adopted[1].intakeId, "caption");
+  const tampered = await reconcile.reconcile(inputs[1]);
+  assert.deepEqual(tampered, {
+    schema: "finance-ingress-reconciliation-v1", kind: "refused",
+    nonce: inputs[1].nonce, reason: "recovery_unavailable",
+  });
+  tamperTemporaryPhoto(adopted[2].intakeId, "fingerprint_version");
+  const preV2Marker = await reconcile.reconcile(inputs[2]);
+  assert.deepEqual(preV2Marker, {
+    schema: "finance-ingress-reconciliation-v1", kind: "refused",
+    nonce: inputs[2].nonce, reason: "recovery_unavailable",
+  });
+  assert.deepEqual(counts(), before);
   assert.ok(commands.slice(beforeCommands).every((command) => [
     "get_capture_job_for_message", "get_status", "get_interaction_route", "get_capture_recovery",
   ].includes(command)));
   assert.equal(commands.filter((command) => command === "capture").length, 2);
   assert.equal(commands.filter((command) => command === "capture_interaction").length, 1);
   process.stdout.write(JSON.stringify({ verifiedExisting: 3, alteredOriginalsRefused: 5,
+    tamperedStoredCaptionRefused: 1, preV2MarkerRefused: 1,
     extraCapture: 0, finalFacts: 0, modelCalls: 0 }) + "\n");
   passed = true;
 } finally {
