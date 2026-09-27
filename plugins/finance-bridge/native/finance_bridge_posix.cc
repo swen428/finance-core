@@ -315,6 +315,25 @@ napi_value OpenExistingDirectoryAt(napi_env env, napi_callback_info info) {
   return IntResult(env, fd);
 }
 
+napi_value CreateDirectoryExclusiveAt(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value args[3];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  int32_t parent_fd;
+  int32_t mode;
+  std::string name;
+  if (argc != 3 || !GetInt32(env, args[0], &parent_fd) ||
+      !GetString(env, args[1], &name) || !GetInt32(env, args[2], &mode)) return nullptr;
+  if (mkdirat(parent_fd, name.c_str(), static_cast<mode_t>(mode)) < 0) {
+    ThrowErrno(env, "mkdirat exclusive");
+    return nullptr;
+  }
+  const int fd = openat(parent_fd, name.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) { ThrowErrno(env, "openat created directory"); return nullptr; }
+  return IntResult(env, fd);
+}
+
 napi_value OpenFileAt(napi_env env, napi_callback_info info) {
   size_t argc = 4;
   napi_value args[4];
@@ -523,6 +542,8 @@ napi_value Initialize(napi_env env, napi_value exports) {
       {"openDirectoryAt", nullptr, OpenDirectoryAt, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"openExistingDirectoryAt", nullptr, OpenExistingDirectoryAt, nullptr, nullptr, nullptr,
        napi_default, nullptr},
+      {"createDirectoryExclusiveAt", nullptr, CreateDirectoryExclusiveAt, nullptr, nullptr,
+       nullptr, napi_default, nullptr},
       {"openFileAt", nullptr, OpenFileAt, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"descriptorIdentitySync", nullptr, DescriptorIdentitySync, nullptr, nullptr, nullptr,
        napi_default, nullptr},

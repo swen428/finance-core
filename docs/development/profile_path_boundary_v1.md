@@ -114,13 +114,51 @@ child's handoff and its write.
 
 ### Current capability boundary
 
-This gate does not implement a backup or restore exporter and does not prove a
-complete, consistent backup. It also does not admit or activate a real profile,
-wire every runtime writer to the gate, or change a consumer's fixed Core
-version. Only paths that explicitly acquire the gate participate in its
-coordination. Existing staging-guard authorization still applies to every
-database open and write; the gate does not relax it. A future exporter must
-use a validated profile witness, hold the exclusive lease only for the local
-cut, check its cooperative deadline before every transition, and separately
-perform its own descriptor pinning and existing restore/backup authorization
-checks.
+This gate does not by itself produce a complete, consistent backup. The public
+Bridge owner-state exporter described in
+[`bridge_owner_export_v1.md`](bridge_owner_export_v1.md) freezes only the
+Bridge handoff portion of a D4 cut. It does not back up or restore SQLite
+databases, prove that every runtime writer participates in the gate, admit or
+activate a real profile, or change a consumer's fixed Core version. Only paths
+that explicitly acquire the gate participate in its coordination. Existing
+staging-guard authorization still applies to every database open and write;
+the gate does not relax it. A complete D4 cut must combine the Bridge export
+with the other approved, independently validated cut components.
+
+## Bridge owner-state export
+
+`exportBridgeOwnerState({ applicationSupportRoot, profileId, runtimeRoot },
+options?)` is an explicit operation on one already provisioned profile. It
+validates the fixed profile layout, opens the profile's existing gate, and
+freezes the Bridge handoff tree while holding one exclusive lease in the same
+Node process and cut session. It never creates a profile or initializes a
+missing gate. Its wait and cooperative hold limits are bounded; the lease is
+checked at each export transition and is released after protected cleanup.
+
+The exporter is an owner-state boundary, not the whole D4 backup protocol. It
+returns the frozen Bridge handoff description, a manifest entry containing the
+staged file's relative name, byte size and SHA-256, and the private stage path.
+The manifest proves the staged bytes' identity. It does not prove database
+consistency, whole-profile completeness, restore safety, or permission to
+promote or activate the stage.
+
+Pending and reclaim state is part of the evidence. A recognized standalone
+pending record (`.finance-bridge.record.pending`) is copied as found and
+represented as `incomplete`; export does not publish it into a completed slot.
+Reclaim intent and its related files are likewise retained until a separately
+authorized Core custody check proves reclaim is safe. A final handoff record
+whose image is missing is rejected unless a matching reclaim intent explains
+the state. A valid `.finance-bridge.payload.pending` does not change that rule:
+D3 must finish its recovery/replay before owner export can proceed. Export must
+not resolve, discard, or label an incomplete handoff complete.
+
+Unknown handoff entries, malformed records, invalid or mismatched content
+hashes, missing required images, and unsafe file identities fail the export.
+The exporter leaves any created stage available for owner inspection on
+failure and does not return a success result. A successful stage also does not
+auto-promote: a separate complete D4 acceptance step must validate all cut
+components and explicitly decide whether any stage may be finalized.
+
+D4 Bridge tests use only synthetic profiles and temporary files. They verify
+the successful frozen manifest and fail-closed cases without opening live
+profiles, live databases, or real owner data.
