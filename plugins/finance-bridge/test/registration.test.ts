@@ -154,6 +154,7 @@ function fakeApi(
   const cli: unknown[] = [];
   const completions: unknown[] = [];
   const deliveryReceiptConsumers: FinanceDeliveryReceiptConsumerV1[] = [];
+  const ingressReconciliationHandlers: unknown[] = [];
   const currentConfig = runtimeHostConfig();
   const api = {
     id: "finance-bridge",
@@ -161,9 +162,13 @@ function fakeApi(
     rootDir: FINANCE_PLUGIN_ROOT,
     source: `${FINANCE_PLUGIN_ROOT}/dist/src/index.js`,
     registrationMode,
+    financeIngressReconciliationCapabilities: ["telegram.finance-ingress-reconciliation-v1"],
     financeDeliveryCapabilities: ["telegram.finance-delivery-material-v1"],
     registerFinanceDeliveryReceiptConsumerV1(consumer: FinanceDeliveryReceiptConsumerV1) {
       deliveryReceiptConsumers.push(consumer);
+    },
+    registerFinanceIngressReconciliationV1(handler: unknown) {
+      ingressReconciliationHandlers.push(handler);
     },
     config: currentConfig,
     pluginConfig: {
@@ -226,6 +231,7 @@ function fakeApi(
   } as unknown as OpenClawPluginApi;
   return {
     api, tools, hooks, interactive, commands, cli, completions, deliveryReceiptConsumers,
+    ingressReconciliationHandlers,
   };
 }
 
@@ -463,6 +469,7 @@ test("plugin registers the public pinned API surfaces and eight optional disable
   }
   assert.equal(fixture.commands.length, 1);
   assert.equal(fixture.deliveryReceiptConsumers.length, 1);
+  assert.equal(fixture.ingressReconciliationHandlers.length, 1);
   assert.equal(fixture.cli.length, 1);
   assert.deepEqual((fixture.cli[0] as {options: unknown}).options, {
     commands: ["finance-compatibility"],
@@ -715,6 +722,26 @@ test("full registration refuses a host without the terminal Finance delivery cap
   assert.throws(
     () => registerFinanceBridge(fixture.api, dependencies),
     /terminal-delivery capability/u,
+  );
+});
+
+test("full registration refuses a host without the isolated Finance reconciliation capability", () => {
+  const fixture = fakeApi();
+  delete (fixture.api as unknown as { registerFinanceIngressReconciliationV1?: unknown })
+    .registerFinanceIngressReconciliationV1;
+  assert.throws(
+    () => registerFinanceBridge(fixture.api, dependencies),
+    /ingress reconciliation capability/u,
+  );
+});
+
+test("full registration refuses a Host that omits the reconciliation capability version", () => {
+  const fixture = fakeApi();
+  delete (fixture.api as unknown as { financeIngressReconciliationCapabilities?: unknown })
+    .financeIngressReconciliationCapabilities;
+  assert.throws(
+    () => registerFinanceBridge(fixture.api, dependencies),
+    /ingress reconciliation capability/u,
   );
 });
 

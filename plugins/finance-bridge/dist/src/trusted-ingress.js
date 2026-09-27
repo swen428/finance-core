@@ -22,7 +22,7 @@ function ingressFromEvent(event) {
 export function hasTrustedFinanceIngress(event) {
     return ingressFromEvent(event) !== undefined;
 }
-function validateTurn(event, context) {
+export function validateTrustedIngressTurn(event, context) {
     const candidate = ingressFromEvent(event);
     if (!isRecord(candidate) || !isRecord(context.pluginBinding))
         return undefined;
@@ -100,7 +100,7 @@ function ingressDigest(identity) {
     const canonical = JSON.stringify(Object.fromEntries(Object.entries(identity).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)));
     return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
-function caption(text) {
+export function caption(text) {
     if (text.length === 0)
         return undefined;
     if (text.trim().length === 0)
@@ -134,7 +134,7 @@ export function photoIntakeFingerprint(chatId, messageId, rawCaption, attachment
     }).replace(/[\u007f-\uffff]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
     return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
-function checkedStatus(result, turn, expectedJobId) {
+export function checkedStatus(result, turn, expectedJobId, requireLegacyFinalTransactionField = true) {
     const job = result.capture_job;
     const intakeId = result.intake_public_id;
     if (!isRecord(job) || result.identity_kind !== "intake" ||
@@ -145,7 +145,7 @@ function checkedStatus(result, turn, expectedJobId) {
         job.public_id !== `fcj_${createHash("sha256").update(`finance-capture-job-v1\0${intakeId}`).digest("hex").slice(0, 40)}` ||
         job.ingress_identity_digest !== ingressDigest(coreIdentity(turn.ingress)) ||
         job.capture_kind !== (turn.photo ? "receipt_image" : "text") ||
-        result.final_transaction_created !== false)
+        (requireLegacyFinalTransactionField && result.final_transaction_created !== false))
         return undefined;
     if (turn.photo && (job.attachment_content_hash !== turn.ingress.attachmentSha256 ||
         job.intake_fingerprint !== photoIntakeFingerprint(turn.chatId, turn.messageId, turn.text, turn.ingress.attachmentSha256) || result.capture_attachment_integrity !== "verified"))
@@ -219,7 +219,7 @@ export class TrustedIngressCapture {
         }
     }
     async handle(event, context) {
-        const turn = validateTurn(event, context);
+        const turn = validateTrustedIngressTurn(event, context);
         if (turn === undefined)
             return { handled: false };
         let receiptCaption;

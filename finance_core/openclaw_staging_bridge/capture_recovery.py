@@ -16,6 +16,7 @@ from typing import Any, Iterator
 from finance_core.application.corrections import CorrectionService
 from finance_core.intake.capture_jobs import get_capture_job
 from finance_core.intake.interaction_routes import get_interaction_route
+from finance_core.intake.raw_text_repository import TELEGRAM_PHOTO_FINGERPRINT_VERSION
 from finance_core.openclaw_staging_bridge.capture_reply_outbox import ensure_result_reply
 from finance_core.openclaw_staging_bridge.capture_results import (
     CaptureResultUnavailable,
@@ -25,6 +26,7 @@ from finance_core.openclaw_staging_bridge.capture_review import ensure_capture_r
 from finance_core.openclaw_staging_bridge.human_actions import HumanActionContext
 from finance_core.parser_proposals.human_draft_delivery import get_human_draft_card
 from finance_core.parser_proposals.human_drafts import HumanDraftContext, HumanDraftError
+from finance_core.persistence_fingerprint import canonical_fingerprint
 from finance_core.posting_authority import get_status, prepare_posting_review, resume_posting
 from finance_core.staging_guard import require_staging_database
 from finance_core.telegram_source_context import (
@@ -85,7 +87,8 @@ def _source(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     intake = conn.execute(
         "SELECT source_type, source_channel, external_source_id, source_message_id, "
-        "raw_input, parser_output_id FROM raw_intake_records WHERE id = ?",
+        "raw_input, source_content_hash, content_fingerprint, fingerprint_version, "
+        "parser_output_id FROM raw_intake_records WHERE id = ?",
         (job["raw_intake_record_id"],),
     ).fetchone()
     if intake is None:
@@ -98,6 +101,31 @@ def _source(
         or source["external_source_id"] != f"telegram:{context.conversation_id}:{message_id}"
     ):
         raise CaptureRecoveryUnavailable("Captured Telegram source is inconsistent")
+    if job["capture_kind"] == "receipt_image":
+        raw_input = source["raw_input"]
+        attachment_hash = job["attachment_content_hash"]
+        if (
+            source["source_type"] != "telegram_image"
+            or source["fingerprint_version"] != TELEGRAM_PHOTO_FINGERPRINT_VERSION
+            or not isinstance(raw_input, str)
+            or not isinstance(attachment_hash, str)
+            or source["source_content_hash"]
+            != f"sha256:{hashlib.sha256(raw_input.encode('utf-8')).hexdigest()}"
+        ):
+            raise CaptureRecoveryUnavailable("Captured photo original differs from source")
+        fingerprint = canonical_fingerprint(
+            schema_version=TELEGRAM_PHOTO_FINGERPRINT_VERSION,
+            material={
+                "source_type": source["source_type"],
+                "source_channel": source["source_channel"],
+                "external_source_id": source["external_source_id"],
+                "source_message_id": source["source_message_id"],
+                "raw_input": raw_input,
+                "attachment_content_hash": attachment_hash,
+            },
+        )
+        if source["content_fingerprint"] != fingerprint or job["intake_fingerprint"] != fingerprint:
+            raise CaptureRecoveryUnavailable("Captured photo fingerprint differs from source")
     try:
         require_telegram_source_context(
             conn,

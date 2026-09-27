@@ -9,6 +9,12 @@ import {
   type BridgeRunner,
 } from "./controller.js";
 import { HandoffPublisher } from "./handoff.js";
+import {
+  FINANCE_INGRESS_RECONCILIATION_CAPABILITY,
+  FinanceIngressReconciliationV1,
+  type FinanceIngressReconciliationRequestV1,
+  type FinanceIngressReconciliationResultV1,
+} from "./ingress-reconciliation-v1.js";
 import { createHumanActionInteractiveHandler } from "./interactive.js";
 import { ReceiptMediaAdapter } from "./media.js";
 import { registerOperatorCliV1 } from "./operator-cli-v1.js";
@@ -90,6 +96,16 @@ export interface RegistrationDependencies {
   createHandoffPublisher(config: FinanceBridgeConfig, markUnhealthy: () => void): HandoffPublisher;
 }
 
+/** The pinned SDK has not yet published this Host-only recovery capability. */
+export interface FinanceIngressReconciliationHostV1 {
+  readonly financeIngressReconciliationCapabilities?:
+    readonly [typeof FINANCE_INGRESS_RECONCILIATION_CAPABILITY];
+  registerFinanceIngressReconciliationV1(
+    handler: (request: FinanceIngressReconciliationRequestV1) =>
+      Promise<FinanceIngressReconciliationResultV1>,
+  ): void;
+}
+
 const defaultDependencies: RegistrationDependencies = {
   validateConfig: validatePluginConfig,
   createRunner: (config, markUnhealthy) => new BridgeCliRunner(
@@ -117,6 +133,13 @@ export function registerFinanceBridge(
     registerOperatorCliV1(api);
   }
   if (api.registrationMode !== "full") return;
+  const reconciliationHost = api as OpenClawPluginApi & Partial<FinanceIngressReconciliationHostV1>;
+  if (reconciliationHost.financeIngressReconciliationCapabilities?.length !== 1 ||
+      reconciliationHost.financeIngressReconciliationCapabilities[0] !==
+        FINANCE_INGRESS_RECONCILIATION_CAPABILITY ||
+      typeof reconciliationHost.registerFinanceIngressReconciliationV1 !== "function") {
+    throw new Error("Pinned OpenClaw host lacks the Finance ingress reconciliation capability.");
+  }
   requireFinanceDeliveryHost(api);
   validateRetryCapability(api.runtime.llm);
   getLoadedCodexPluginSourceV2(api.runtime);
@@ -128,6 +151,7 @@ export function registerFinanceBridge(
   let healthy = false;
   let controller: FinanceInboundController | undefined;
   let trustedIngress: TrustedIngressCapture | undefined;
+  let ingressReconciliation: FinanceIngressReconciliationV1 | undefined;
   let humanActionRuntime: { workspaceRoot: string; runner: BridgeRunner } | undefined;
   let deliveryReceiptRecorder: FinanceDeliveryReceiptRecorder | undefined;
   const ready = dependencies.validateConfig(api.pluginConfig).then(async (config) => {
@@ -162,6 +186,7 @@ export function registerFinanceBridge(
       hostLlmRuntime(api, config),
     );
     trustedIngress = new TrustedIngressCapture(config.workspaceRoot, runner, media, handoff);
+    ingressReconciliation = new FinanceIngressReconciliationV1(config.workspaceRoot, runner, handoff);
     await trustedIngress.resumePendingReclaims();
     humanActionRuntime = { workspaceRoot: config.workspaceRoot, runner };
     healthy = true;
@@ -179,6 +204,14 @@ export function registerFinanceBridge(
       }
       await deliveryReceiptRecorder.recordFinanceDeliveryReceipt(material, 30_000);
     });
+  });
+
+  reconciliationHost.registerFinanceIngressReconciliationV1(async (request) => {
+    await ready;
+    if (!healthy || ingressReconciliation === undefined) {
+      throw new Error("Finance ingress reconciliation is unavailable.");
+    }
+    return await ingressReconciliation.reconcile(request);
   });
 
   for (const tool of createDisabledTools(() => undefined)) {
