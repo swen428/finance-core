@@ -4,7 +4,9 @@ This module does not open a database or start a backup. Every participating
 writer must hold a shared lease for the whole durable write, and a cut must
 hold an exclusive lease for the whole freeze. A descriptor's metadata cannot
 prove that another process still holds a lock; the owner of a parent lease
-must keep it open until its child has been reaped.
+must keep it open until its child has been reaped. Only leases returned by
+writer_gate, writer_gate_from_parent, or exclusive_cut represent acquisition;
+assert_valid checks identity and deadline, not whether a lock is still held.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ DEFAULT_ACQUIRE_SECONDS = 5.0
 MAX_ACQUIRE_SECONDS = 30.0
 MAX_HOLD_SECONDS = 30.0
 _POLL_SECONDS = 0.02
+_LEASE_CONSTRUCTOR_TOKEN = object()
 
 
 class ProfileGateError(RuntimeError):
@@ -164,13 +167,20 @@ def _try_lock(fd: int, operation: int) -> bool:
 
 
 class GateLease:
-    """A held lock on one independent open file description; release is close only."""
+    """A module-issued lock lease on one independent open; release is close only."""
 
     __slots__ = ("_profile", "_fd", "_hold_deadline")
 
     def __init__(
-        self, profile: ProfilePaths, fd: int, *, hold_deadline: float | None = None
+        self,
+        profile: ProfilePaths,
+        fd: int,
+        *,
+        hold_deadline: float | None = None,
+        _constructor_token: object | None = None,
     ) -> None:
+        if _constructor_token is not _LEASE_CONSTRUCTOR_TOKEN:
+            raise ProfileGateError("GateLease must be issued by a profile gate acquisition API")
         self._profile = profile
         self._fd = fd
         self._hold_deadline = hold_deadline
@@ -183,8 +193,9 @@ class GateLease:
     def assert_valid(self) -> None:
         """Check the held file identity and, for a cut, its monotonic hold bound.
 
-        This is a cooperative deadline check, not asynchronous preemption.
-        Call it at every exporter transition and abort the cut on expiry.
+        This cannot prove the lock is still held. It is a cooperative deadline
+        check, not asynchronous preemption. Call it at every exporter transition
+        and abort the cut on expiry.
         """
         fd = self.fileno()
         if self._hold_deadline is not None and time.monotonic() >= self._hold_deadline:
@@ -236,7 +247,12 @@ def _acquire(
             if _try_lock(fd, operation):
                 _validate_lock_fd(profile, fd)
                 hold_deadline = None if hold is None else time.monotonic() + hold
-                return GateLease(profile, fd, hold_deadline=hold_deadline)
+                return GateLease(
+                    profile,
+                    fd,
+                    hold_deadline=hold_deadline,
+                    _constructor_token=_LEASE_CONSTRUCTOR_TOKEN,
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProfileGateBusy("Fixed profile gate is contended")
@@ -281,7 +297,7 @@ def writer_gate_from_parent(profile: ProfilePaths, inherited_fd: int = 4) -> Gat
         if not _try_lock(fd, fcntl.LOCK_SH):
             raise ProfileGateBusy("Fixed profile gate is contended for child writer")
         _validate_lock_fd(profile, fd)
-        return GateLease(profile, fd)
+        return GateLease(profile, fd, _constructor_token=_LEASE_CONSTRUCTOR_TOKEN)
     except BaseException:
         os.close(fd)
         raise

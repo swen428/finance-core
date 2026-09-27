@@ -235,6 +235,21 @@ def test_inherited_fd_is_identity_only_not_proof_of_parent_lock(profile: Profile
         os.close(witness_fd)
 
 
+def test_unlocked_fd_cannot_be_wrapped_as_a_gate_lease(profile: ProfilePaths) -> None:
+    path = initialize_profile_gate(profile)
+    unlocked_fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(ProfileGateError, match="issued by a profile gate acquisition API"):
+            gate.GateLease(profile, unlocked_fd)
+        with pytest.raises(ProfileGateError, match="issued by a profile gate acquisition API"):
+            gate.GateLease(profile, unlocked_fd, _constructor_token=object())
+        assert os.fstat(unlocked_fd).st_ino == path.stat().st_ino
+        with writer_gate(profile) as issued:
+            issued.assert_valid()
+    finally:
+        os.close(unlocked_fd)
+
+
 def test_exclusive_hold_deadline_requires_cooperative_check(
     profile: ProfilePaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
