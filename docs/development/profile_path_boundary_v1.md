@@ -11,14 +11,23 @@ The expected layout is
 `<Application Support>/Finance-Codex/profiles/<id>/` containing `profile.json`,
 `runtime/database/`, `workspace/database/`, `backups/`, `work/`, and `restore/`.
 All directories *below* Application Support must be owned by the current user
-and mode `0700`. `profile.json` and any existing database files must be regular,
-single-link, owner-owned `0600` files. `profile.json` must bind `profile_id`,
+and mode `0700`. `profile.json` must be a regular, single-link, owner-owned
+`0600` file. `profile.json` must bind `profile_id`,
 the absolute canonical `runtime_root`, and the sibling `workspace_root`. For
 Core Python profile validation and runtime access, `FINANCE_RUNTIME_ROOT` must
 exactly name that runtime directory. The reserved
 live DB path is `runtime/database/finance.db`; the staging path is
 `workspace/database/staging.sqlite`, outside the runtime root. Existing
 staging-guard authorization still applies to every database open/write.
+
+Until native SQLite file admission is implemented, this validator accepts
+**blank profiles only**: both reserved database names must be absent. An
+existing live or staging database, including a symlink, hard link or FIFO at
+either name, fails before the validator opens any regular file. The absence is
+checked again during validation and on each `revalidate()`. A populated profile
+requires a separate native SQLite admission path; this witness cannot authorize
+a writer, backup, or restore. The validator never opens or closes an existing
+database descriptor, which avoids disturbing SQLite's process-level POSIX locks.
 
 `validate_profile_paths(application_support_root, profile_id)` returns a
 context-managed `ProfilePaths` witness and rejects repository roots, symlinks,
@@ -28,8 +37,10 @@ FIFOs and, on macOS, refuses extended ACL allow entries even when mode bits
 look private; deny-only ACLs remain valid. Public path fields are read-only and
 come from the same immutable mapping that `revalidate()` checks. Keep the
 witness open and call `revalidate()` just before each path-based operation. A
-file that appeared after validation needs a new witness. This is a path and
-permission check, not a capability to open or mutate arbitrary data. The
+database that appeared after validation invalidates the witness; getting a new
+witness cannot admit that populated profile. The manifest stays pinned and is
+rechecked by its descriptor and named identity without a fresh open. This is a
+path and permission check, not a capability to open or mutate arbitrary data. The
 eventual backup and restore adapters must pin and recheck their own file
 descriptors around actual I/O and apply the existing staging/restore authority
 checks.

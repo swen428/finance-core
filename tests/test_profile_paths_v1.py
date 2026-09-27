@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -122,7 +123,7 @@ def test_profile_rejects_database_aliases_and_replaced_witness(
         validate_profile_paths(support, "synthetic")
     staging.unlink()
     os.link(outside, staging)
-    with pytest.raises(ProfilePathError, match="hard links"):
+    with pytest.raises(ProfilePathError, match="native SQLite admission"):
         validate_profile_paths(support, "synthetic")
     staging.unlink()
 
@@ -132,6 +133,137 @@ def test_profile_rejects_database_aliases_and_replaced_witness(
         original.mkdir(mode=0o700)
         with pytest.raises(ProfilePathError, match="identity changed"):
             profile.revalidate()
+
+
+@pytest.mark.parametrize(
+    "relative_path", ["runtime/database/finance.db", "workspace/database/staging.sqlite"]
+)
+def test_existing_database_is_refused_before_any_regular_file_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, relative_path: str
+) -> None:
+    support, base = _profile(tmp_path, monkeypatch)
+    database = base / relative_path
+    database.write_bytes(b"synthetic existing database")
+    database.chmod(0o600)
+    import finance_core.profile_paths as module
+
+    original_open = module.os.open
+    regular_opens: list[str] = []
+
+    def tracked_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
+        if not flags & os.O_DIRECTORY:
+            regular_opens.append(os.fspath(path))
+        return original_open(path, flags, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "open", tracked_open)
+        with pytest.raises(ProfilePathError, match="native SQLite admission"):
+            validate_profile_paths(support, "synthetic")
+    assert regular_opens == []
+
+
+def test_revalidation_refuses_new_database_before_file_open_and_keeps_manifest_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    support, base = _profile(tmp_path, monkeypatch)
+    import finance_core.profile_paths as module
+
+    original_open = module.os.open
+    regular_opens: list[str] = []
+
+    def tracked_open(
+        path: str | os.PathLike[str], flags: int, *args: object, **kwargs: object
+    ) -> int:
+        if not flags & os.O_DIRECTORY:
+            regular_opens.append(os.fspath(path))
+        return original_open(path, flags, *args, **kwargs)
+
+    with validate_profile_paths(support, "synthetic") as profile:
+        with monkeypatch.context() as patch:
+            patch.setattr(module.os, "open", tracked_open)
+            profile.revalidate()
+            assert regular_opens == []
+            profile.live_database.write_bytes(b"synthetic appeared database")
+            profile.live_database.chmod(0o600)
+            with pytest.raises(ProfilePathError, match="native SQLite admission"):
+                profile.revalidate()
+            assert regular_opens == []
+    assert (base / "profile.json").is_file()
+
+
+def test_validation_refuses_database_appearing_during_manifest_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    support, base = _profile(tmp_path, monkeypatch)
+    import finance_core.profile_paths as module
+
+    original_validate = module._validate_manifest
+
+    def insert_database(profile: module.ProfilePaths) -> None:
+        original_validate(profile)
+        database = base / "workspace/database/staging.sqlite"
+        database.write_bytes(b"synthetic late database")
+        database.chmod(0o600)
+
+    monkeypatch.setattr(module, "_validate_manifest", insert_database)
+    with pytest.raises(ProfilePathError, match="native SQLite admission"):
+        validate_profile_paths(support, "synthetic")
+
+
+def _assert_other_process_cannot_write(database: Path) -> None:
+    code = (
+        "import sqlite3, sys\n"
+        "try:\n"
+        "    connection = sqlite3.connect(sys.argv[1], timeout=0)\n"
+        "    connection.execute('INSERT INTO synthetic_lock_probe VALUES (1)')\n"
+        "    connection.commit()\n"
+        "except sqlite3.OperationalError as exc:\n"
+        "    sys.exit(0 if 'locked' in str(exc) else 2)\n"
+        "sys.exit(1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(database)],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr or "another process bypassed SQLite's lock"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS POSIX SQLite lock regression")
+@pytest.mark.parametrize("database_preexists", [True, False])
+def test_profile_validation_does_not_cancel_sqlite_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, database_preexists: bool
+) -> None:
+    support, base = _profile(tmp_path, monkeypatch)
+    database = base / "runtime/database/finance.db"
+    if database_preexists:
+        witness = None
+    else:
+        witness = validate_profile_paths(support, "synthetic")
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE synthetic_lock_probe (value INTEGER)")
+        connection.commit()
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            with pytest.raises(ProfilePathError, match="native SQLite admission"):
+                if witness is None:
+                    validate_profile_paths(support, "synthetic")
+                else:
+                    witness.revalidate()
+            if witness is not None:
+                witness.close()
+            _assert_other_process_cannot_write(database)
+        finally:
+            connection.rollback()
+    finally:
+        connection.close()
+        if witness is not None:
+            witness.close()
 
 
 def test_profile_rejects_repository_disguise_and_root_symlink(
@@ -161,7 +293,7 @@ def test_profile_witness_refuses_new_unpinned_database_and_duplicate_manifest_fi
     with validate_profile_paths(support, "synthetic") as profile:
         profile.staging_database.write_bytes(b"synthetic")
         profile.staging_database.chmod(0o600)
-        with pytest.raises(ProfilePathError, match="appeared"):
+        with pytest.raises(ProfilePathError, match="native SQLite admission"):
             profile.revalidate()
     (base / "workspace/database/staging.sqlite").unlink()
     (base / "profile.json").write_text(
