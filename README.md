@@ -37,15 +37,21 @@ identity files with:
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.5 \
+  --core-version 0.1.6 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
-  40e3f64b1582d0a97ef669c18ab61b6594ea14b7c5d32eea95b4d221c674088a
+  53c86dadfc67d57c93d8a08a8e27a240188dcd506642a7829eac8983b866a5c5
 ```
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
+
+Version 0.1.6 adds read-only Host ingress reconciliation for originals already
+captured by Core. It verifies retained text and photo identity, including the
+photo caption and stored image, and returns an existing locator/status or refuses.
+It does not create captures, invoke AI, finalize transactions, send replies,
+or activate a runtime.
 
 Version 0.1.5 adds the D2b controlled correction source for finalized D2
 transactions. It preserves the original transaction and evidence, records an

@@ -79,10 +79,17 @@ recording the cause, followed by a newly approved candidate/validation plan;
 do not manufacture a qualifying result by rerunning an old attempt.
 
 Build and inspect the wheel, source distribution and Bridge from the exact
-clean commit. Bind the annotated tag, commit, API version, complete migration
-ledger and every artifact's name/size/SHA-256 in the release manifest. Obtain
-explicit approval for the new release identity before publication. Preserve all
-published versions and their tags/assets unchanged.
+clean commit. The release manifest binds that commit, API version, complete
+migration ledger and every artifact's name/size/SHA-256. Separately verify that
+the annotated tag points directly to the same protected-main commit. The
+published GitHub release must use that tag and carry exactly the approved
+manifest and artifacts, with matching names, sizes and SHA-256 digests. Retain
+the tag-object and release-asset verification as part of the release proof;
+manifest validation alone does not prove the tag identity. A consumer must
+verify the live tag and release assets against its fixed release identity
+before acceptance. Obtain explicit approval for the new release identity
+before publication. Preserve all published versions and their tags/assets
+unchanged.
 
 ## Protected merge approval
 
