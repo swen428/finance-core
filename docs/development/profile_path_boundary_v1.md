@@ -22,11 +22,15 @@ staging-guard authorization still applies to every database open/write.
 `validate_profile_paths(application_support_root, profile_id)` returns a
 context-managed `ProfilePaths` witness and rejects repository roots, symlinks,
 hard-linked files, unsafe ownership or permissions, mismatched roots and
-unexpected path changes. Keep the witness open and call `revalidate()` just
-before each path-based operation. A file that appeared after validation needs
-a new witness. This is a path and permission check, not a capability to open or
-mutate arbitrary data. The eventual backup and restore adapters must pin and
-recheck their own file descriptors around actual I/O and apply the existing
-staging/restore authority checks.
+unexpected path changes. It also refuses nonregular files without blocking on
+FIFOs and, on macOS, refuses extended ACL allow entries even when mode bits
+look private; deny-only ACLs remain valid. Public path fields are read-only and
+come from the same immutable mapping that `revalidate()` checks. Keep the
+witness open and call `revalidate()` just before each path-based operation. A
+file that appeared after validation needs a new witness. This is a path and
+permission check, not a capability to open or mutate arbitrary data. The
+eventual backup and restore adapters must pin and recheck their own file
+descriptors around actual I/O and apply the existing staging/restore authority
+checks.
 
 D4 tests construct only disposable synthetic trees under temporary paths.

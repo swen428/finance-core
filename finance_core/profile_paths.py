@@ -8,11 +8,16 @@ replacement cannot silently acquire their identity.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import stat
+import sys
+from collections.abc import Mapping
+from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Self
 
 from finance_core.runtime_paths import RUNTIME_ROOT_ENV
@@ -36,6 +41,70 @@ class ProfilePathError(RuntimeError):
     """A profile path, identity, or private permission is unsafe."""
 
 
+@lru_cache(maxsize=1)
+def _darwin_acl_library() -> ctypes.CDLL:
+    """Load the native extended-ACL API; a missing symbol is a hard failure."""
+    library = ctypes.CDLL(None, use_errno=True)
+    library.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    library.acl_get_fd_np.restype = ctypes.c_void_p
+    library.acl_valid.argtypes = [ctypes.c_void_p]
+    library.acl_valid.restype = ctypes.c_int
+    library.acl_get_entry.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    library.acl_get_entry.restype = ctypes.c_int
+    library.acl_get_tag_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+    library.acl_get_tag_type.restype = ctypes.c_int
+    library.acl_free.argtypes = [ctypes.c_void_p]
+    library.acl_free.restype = ctypes.c_int
+    return library
+
+
+def _reject_acl_grants(fd: int, path: Path) -> None:
+    """Reject Darwin extended ACL allow entries, including inherited grants.
+
+    An absent ACL is reported as ENOENT. Deny-only ACLs, including the usual
+    ``everyone deny delete`` ACE on macOS home directories, are acceptable.
+    Other ACL inspection errors are never interpreted as an empty ACL.
+    """
+    if sys.platform != "darwin":
+        return
+    import errno
+
+    try:
+        library = _darwin_acl_library()
+        ctypes.set_errno(0)
+        acl = library.acl_get_fd_np(fd, 0x100)  # ACL_TYPE_EXTENDED
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return
+            raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}")
+        try:
+            if library.acl_valid(acl) != 0:
+                raise ProfilePathError(f"Invalid ACL on profile path: {path}")
+            for index in range(129):  # Darwin ACL_MAX_ENTRIES is 128.
+                entry = ctypes.c_void_p()
+                ctypes.set_errno(0)
+                if library.acl_get_entry(acl, index, ctypes.byref(entry)) != 0:
+                    if ctypes.get_errno() == errno.EINVAL:
+                        return
+                    raise ProfilePathError(f"Cannot enumerate ACL for profile path: {path}")
+                if index == 128:
+                    raise ProfilePathError(f"ACL has too many entries: {path}")
+                tag = ctypes.c_int()
+                if library.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                    raise ProfilePathError(f"Cannot inspect ACL entry for profile path: {path}")
+                if tag.value != 2:  # ACL_EXTENDED_DENY; ALLOW is 1.
+                    raise ProfilePathError(f"ACL grants access to profile path: {path}")
+        finally:
+            if library.acl_free(acl) != 0:
+                raise ProfilePathError(f"Cannot release ACL for profile path: {path}")
+    except (AttributeError, OSError) as exc:
+        raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}") from exc
+
+
 def _identity(info: os.stat_result) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
@@ -53,15 +122,22 @@ def _trusted_ancestor(path: Path) -> None:
             or ((mode & 0o022) and not sticky_root)
         ):
             raise ProfilePathError(f"Unsafe Application Support ancestor: {current}")
+        fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if _identity(os.fstat(fd)) != _identity(info):
+                raise ProfilePathError(f"Application Support ancestor changed: {current}")
+            _reject_acl_grants(fd, current)
+        finally:
+            os.close(fd)
         if current.parent == current:
             break
         current = current.parent
 
 
 def _open_checked(path: Path, *, directory: bool) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     if directory:
-        flags |= getattr(os, "O_DIRECTORY", 0)
+        flags |= os.O_DIRECTORY
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
@@ -79,6 +155,7 @@ def _open_checked(path: Path, *, directory: bool) -> int:
             raise ProfilePathError(f"Profile path must be private to its owner: {path}")
         if not directory and info.st_nlink != 1:
             raise ProfilePathError(f"Profile file has multiple hard links: {path}")
+        _reject_acl_grants(fd, path)
         return fd
     except BaseException:
         os.close(fd)
@@ -88,20 +165,56 @@ def _open_checked(path: Path, *, directory: bool) -> int:
 class ProfilePaths:
     """Pinned, context-managed path identities; never a database authorization."""
 
+    __slots__ = ("_profile_id", "_paths", "_pins")
+
     def __init__(self, profile_id: str, paths: dict[str, Path], pins: dict[str, int]) -> None:
-        self.profile_id = profile_id
-        self.application_support = paths["application_support"]
-        self.profile = paths["profile"]
-        self.profile_json = paths["profile_json"]
-        self.runtime = paths["runtime"]
-        self.live_database = paths["live_database"]
-        self.workspace = paths["workspace"]
-        self.staging_database = paths["staging_database"]
-        self.backups = paths["backups"]
-        self.work = paths["work"]
-        self.restore = paths["restore"]
-        self._paths = paths
+        self._profile_id = profile_id
+        self._paths: Mapping[str, Path] = MappingProxyType(dict(paths))
         self._pins = pins
+
+    @property
+    def profile_id(self) -> str:
+        return self._profile_id
+
+    @property
+    def application_support(self) -> Path:
+        return self._paths["application_support"]
+
+    @property
+    def profile(self) -> Path:
+        return self._paths["profile"]
+
+    @property
+    def profile_json(self) -> Path:
+        return self._paths["profile_json"]
+
+    @property
+    def runtime(self) -> Path:
+        return self._paths["runtime"]
+
+    @property
+    def live_database(self) -> Path:
+        return self._paths["live_database"]
+
+    @property
+    def workspace(self) -> Path:
+        return self._paths["workspace"]
+
+    @property
+    def staging_database(self) -> Path:
+        return self._paths["staging_database"]
+
+    @property
+    def backups(self) -> Path:
+        return self._paths["backups"]
+
+    @property
+    def work(self) -> Path:
+        return self._paths["work"]
+
+    @property
+    def restore(self) -> Path:
+        return self._paths["restore"]
 
     def revalidate(self) -> None:
         """Recheck every pinned inode and permission before path-based use."""
