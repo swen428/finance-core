@@ -134,6 +134,10 @@ freezes the Bridge handoff tree while holding one exclusive lease in the same
 Node process and cut session. It never creates a profile or initializes a
 missing gate. Its wait and cooperative hold limits are bounded; the lease is
 checked at each export transition and is released after protected cleanup.
+The profile owner must separately provision an empty `workspace/handoff/` and
+its fixed handoff lock before backup, even before the first receipt. The path
+validator alone does not require these Bridge-owned entries; missing entries
+make this exporter fail closed until private profile wiring supplies them.
 
 The exporter is an owner-state boundary, not the whole D4 backup protocol. It
 returns the frozen Bridge handoff description, a manifest entry containing the

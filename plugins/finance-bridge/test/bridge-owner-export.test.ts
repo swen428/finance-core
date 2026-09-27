@@ -17,6 +17,7 @@ import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
 import { exportBridgeOwnerState } from "../src/owner-state-export-v1.js";
+import { withExclusiveBridgeCut } from "../src/bridge-export-boundary.js";
 import {
   HANDOFF_PENDING_RECORD,
   HANDOFF_PENDING_PAYLOAD,
@@ -199,6 +200,13 @@ test("owner export stages one verified retained handoff under the fixed profile"
   await assertStageFilesMatch(profile, receipt);
 });
 
+test("owner export refuses a blank profile until its handoff lock is provisioned", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  await assert.rejects(exportProfile(profile), /openat|ENOENT|handoff lock/u);
+  await assertFailedStageIsPreserved(profile);
+  assert.deepEqual(await readdir(profile.handoffRoot), []);
+});
+
 test("owner export preserves a standalone pending record and marks it incomplete", { concurrency: false }, async (t) => {
   const profile = await syntheticProfile(t);
   const { key, rawIntakePublicId } = captureKey("902");
@@ -316,4 +324,24 @@ test("owner export rejects a record whose content hash was changed and keeps its
   await assertFailedStageIsPreserved(profile);
   assert.equal((JSON.parse(await readFile(recordPath, "utf8")) as Record<string, unknown>).content_hash,
     "0".repeat(64));
+});
+
+test("owner export rejects a payload changed after inventory but before freezing", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("908");
+  const published = await new HandoffPublisher(profile.workspaceRoot).publish(
+    key, rawIntakePublicId, MEDIA,
+  );
+  const changed = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02, 0x04]);
+  await assert.rejects(withExclusiveBridgeCut({
+    applicationSupportRoot: profile.applicationSupportRoot,
+    profileId: profile.profileId,
+    runtimeRoot: profile.runtimeRoot,
+  }, async (cut, sink) => await new HandoffPublisher(cut.workspaceRoot, {
+    hook: async (phase) => {
+      if (phase === "after-export-inventory") await writeFile(published.payloadPath, changed);
+    },
+  }).exportFrozen(cut, sink)), /frozen original differs from its record/u);
+  await assertFailedStageIsPreserved(profile);
+  assert.deepEqual(await readFile(published.payloadPath), changed);
 });

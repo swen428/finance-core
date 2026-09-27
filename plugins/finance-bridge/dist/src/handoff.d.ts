@@ -2,7 +2,7 @@ import type { ValidatedMedia } from "./media.js";
 import { type BridgeCutContext, type PrivateBridgeStageSink } from "./bridge-export-boundary.js";
 export declare const HANDOFF_PENDING_RECORD = ".finance-bridge.record.pending";
 export declare const HANDOFF_PENDING_PAYLOAD = ".finance-bridge.payload.pending";
-export type HandoffPhase = "after-lock" | "after-record-fsync" | "after-record-pin" | "after-record-publish" | "after-payload-fsync" | "after-payload-pin" | "after-payload-publish" | "before-callback" | "after-reclaim-payload-unlink" | "after-reclaim-payload-fsync" | "after-reclaim-record-unlink" | "after-reclaim-record-fsync" | "after-reclaim-intent-unlink" | "after-reclaim-intent-fsync";
+export type HandoffPhase = "after-export-inventory" | "after-lock" | "after-record-fsync" | "after-record-pin" | "after-record-publish" | "after-payload-fsync" | "after-payload-pin" | "after-payload-publish" | "before-callback" | "after-reclaim-payload-unlink" | "after-reclaim-payload-fsync" | "after-reclaim-record-unlink" | "after-reclaim-record-fsync" | "after-reclaim-intent-unlink" | "after-reclaim-intent-fsync";
 export type HandoffHook = (phase: HandoffPhase) => void | Promise<void>;
 /** A claim identifies one Core-owned original; it does not itself prove custody. */
 export interface ReclaimClaim {

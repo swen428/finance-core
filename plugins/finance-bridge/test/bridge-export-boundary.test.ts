@@ -78,6 +78,34 @@ test("cut binds handoff directory FD and rejects a changed source identity", asy
   });
 });
 
+test("finalization rejects changed earlier outputs and unexpected stage entries", async (t) => {
+  for (const change of ["mutate", "replace", "extra"] as const) {
+    await t.test(change, async (caseContext) => {
+      const profile = await synthetic(caseContext);
+      let stagePath: string | undefined;
+      await assert.rejects(withExclusiveBridgeCut(profile, async (context, sink) => {
+        stagePath = context.stagePath;
+        await sink.writeValidated("first.bin", Buffer.from("original"));
+        await sink.writeValidated("second.bin", Buffer.from("later"));
+        const first = join(context.stagePath, "first.bin");
+        if (change === "mutate") await writeFile(first, Buffer.from("modified"));
+        else if (change === "replace") {
+          await rm(first);
+          await writeFile(first, Buffer.from("original"), { mode: 0o600 });
+        } else await writeFile(join(context.stagePath, "unlisted.bin"), Buffer.from("extra"), { mode: 0o600 });
+        return "must not be accepted";
+      }), /Bridge stage (output|inventory)/u);
+      assert.ok(stagePath);
+      assert.equal((await readFile(join(stagePath, "second.bin"))).toString(), "later");
+      const gate = openProfileGate(profile.profileRoot);
+      try {
+        const lease = await gate.acquireExclusive(1_000, 1_000);
+        lease.close();
+      } finally { gate.close(); }
+    });
+  }
+});
+
 test("cut rejects unsafe profile manifest, source replacement, and gate replacement", async (t) => {
   const profile = await synthetic(t);
   const manifest = join(profile.profileRoot, "profile.json");
@@ -103,7 +131,7 @@ test("cut rejects unsafe profile manifest, source replacement, and gate replacem
   await assert.rejects(withExclusiveBridgeCut(profile, async () => undefined));
 });
 
-test("a stage descriptor close failure still releases the exclusive gate and rejects success", async (t) => {
+test("a stage output descriptor close failure still releases the exclusive gate and rejects success", async (t) => {
   const profile = await synthetic(t);
   const fsModule = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
   const originalClose = fsModule.closeSync;
@@ -120,7 +148,7 @@ test("a stage descriptor close failure still releases the exclusive gate and rej
         }
       };
       syncBuiltinESMExports();
-    }), /Bridge cut cleanup failed/u);
+    }), /(?:Bridge cut cleanup failed|injected output close failure)/u);
   } finally {
     fsModule.closeSync = originalClose;
     syncBuiltinESMExports();

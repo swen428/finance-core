@@ -601,9 +601,11 @@ export class HandoffPublisher {
                 if (checked.treeBytes > MAX_TREE_BYTES || checked.recordCount > MAX_RECORDS) {
                     throw new Error("Bridge export handoff tree exceeds its bounded size.");
                 }
+                await this.options.hook?.("after-export-inventory");
                 const files = [];
                 const records = new Map();
                 const intents = new Map();
+                const sourceIdentities = new Map();
                 let pendingRecord;
                 let totalBytes = 0;
                 for (const [index, name] of names.entries()) {
@@ -631,6 +633,7 @@ export class HandoffPublisher {
                         if (!sameEntryIdentity(await entryIdentityAtPinned(directoryFd, name), sourceIdentity)) {
                             throw new Error("Bridge export source path identity changed.");
                         }
+                        sourceIdentities.set(name, sourceIdentity);
                         if (role === "record" || role === "pending_record") {
                             const record = parseRecord(bytes);
                             if (role === "record")
@@ -659,6 +662,42 @@ export class HandoffPublisher {
                     }
                     finally {
                         await closeDescriptor(sourceFd);
+                    }
+                }
+                const frozenBySourceName = new Map(files.map((file) => [file.sourceName, file]));
+                for (const [id, record] of records) {
+                    const recordName = `${id}${RECORD_SUFFIX}`;
+                    if (frozenBySourceName.get(recordName)?.role !== "record") {
+                        throw new Error("Bridge export record was not frozen.");
+                    }
+                    const payload = frozenBySourceName.get(record.payload_basename);
+                    if (payload !== undefined &&
+                        (payload.role !== "payload" || payload.byteSize !== record.byte_size ||
+                            payload.sha256 !== record.content_hash)) {
+                        throw new Error("Bridge export frozen original differs from its record.");
+                    }
+                }
+                for (const [id, intent] of intents) {
+                    if (intent.directory_identity.dev !== directoryIdentity.dev.toString() ||
+                        intent.directory_identity.ino !== directoryIdentity.ino.toString()) {
+                        throw new Error("Bridge export reclaim directory identity changed.");
+                    }
+                    const recordName = `${id}${RECORD_SUFFIX}`;
+                    const record = records.get(id);
+                    const frozenRecord = frozenBySourceName.get(recordName);
+                    const frozenPayload = frozenBySourceName.get(intent.payload_basename);
+                    if (record !== undefined &&
+                        (record.canonical_key_hash !== intent.claim.canonicalKeyHash ||
+                            record.content_hash !== intent.claim.attachmentContentHash ||
+                            record.payload_basename !== intent.payload_basename ||
+                            frozenRecord?.sha256 !== intent.record_sha256 ||
+                            !sameEntryIdentity(sourceIdentities.get(recordName), restoreIdentity(intent.record_identity)))) {
+                        throw new Error("Bridge export frozen record conflicts with reclaim intent.");
+                    }
+                    if (frozenPayload !== undefined &&
+                        (frozenPayload.sha256 !== intent.payload_sha256 ||
+                            !sameEntryIdentity(sourceIdentities.get(intent.payload_basename), restoreIdentity(intent.payload_identity)))) {
+                        throw new Error("Bridge export frozen payload conflicts with reclaim intent.");
                     }
                 }
                 const slots = [];

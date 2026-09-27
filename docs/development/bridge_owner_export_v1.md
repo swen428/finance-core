@@ -31,6 +31,13 @@ paths, and the profile ID must select the profile already bound by
 requires the existing fixed profile gate. It does not infer a profile from the
 checkout, current working directory, message, or environment.
 
+The profile owner must initialize the empty `workspace/handoff/` directory and
+its fixed owner lock before the first backup, including profiles that have not
+received a photo. This exporter does not create either entry during a cut: a
+missing entry fails closed. The private profile/runtime wiring must fulfill
+this precondition before a blank profile can be backed up; the current private
+profile adapter does not yet provision it.
+
 The full owner-state read, validation, hash calculation, and stage write run
 within one Bridge exclusive profile-gate lease in one Node process and one cut
 session. The exporter checks the cooperative hold bound at each transition.

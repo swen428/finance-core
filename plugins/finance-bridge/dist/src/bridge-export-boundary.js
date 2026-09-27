@@ -3,7 +3,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, readSync, realpathSync, writeSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { openProfileGate } from "./profile-gate.js";
-import { createDirectoryExclusiveAt, descriptorIdentitySync, openDirectory, openExistingDirectoryAt, openFileAt, rejectAclGrants, } from "./posix.js";
+import { createDirectoryExclusiveAt, descriptorIdentitySync, openDirectory, openExistingDirectoryAt, openFileAt, listAt, rejectAclGrants, } from "./posix.js";
 const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const STAGE_PREFIX = "owner-export-";
 const MAX_MANIFEST_BYTES = 65_536;
@@ -289,6 +289,52 @@ function safeName(name) {
         throw new Error("Stage output needs one safe basename.");
     }
 }
+function verifyStageOutputs(active) {
+    active.lease.assertValid();
+    const expected = new Set(active.verifiedOutputs.map((output) => output.relativeName));
+    const actual = listAt(active.stageFd);
+    if (actual.length !== expected.size || actual.some((name) => !expected.has(name))) {
+        throw new Error("Bridge stage inventory changed before finalization.");
+    }
+    const block = Buffer.allocUnsafe(64 * 1024);
+    for (const output of active.verifiedOutputs) {
+        active.lease.assertValid();
+        const fd = openFileAt(active.stageFd, output.relativeName, constants.O_RDONLY | constants.O_NONBLOCK);
+        try {
+            const named = checkedPin(join(active.stagePath, output.relativeName), fd, false);
+            const pinned = fstatSync(output.fd, { bigint: true });
+            const before = fstatSync(fd, { bigint: true });
+            if (named.dev !== output.dev || named.ino !== output.ino ||
+                pinned.dev !== output.dev || pinned.ino !== output.ino ||
+                before.size !== BigInt(output.byteSize) || pinned.size !== before.size) {
+                throw new Error("Bridge stage output identity or size changed before finalization.");
+            }
+            const hash = createHash("sha256");
+            for (let offset = 0; offset < output.byteSize;) {
+                active.lease.assertValid();
+                const count = readSync(fd, block, 0, Math.min(block.length, output.byteSize - offset), offset);
+                if (count <= 0)
+                    throw new Error("Bridge stage output changed during finalization.");
+                hash.update(block.subarray(0, count));
+                offset += count;
+            }
+            const after = fstatSync(fd, { bigint: true });
+            if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+                after.ctimeNs !== before.ctimeNs || after.mtimeNs !== before.mtimeNs ||
+                hash.digest("hex") !== output.sha256) {
+                throw new Error("Bridge stage output changed before finalization.");
+            }
+        }
+        finally {
+            closeSync(fd);
+        }
+    }
+    active.lease.assertValid();
+    const finalNames = listAt(active.stageFd);
+    if (finalNames.length !== expected.size || finalNames.some((name) => !expected.has(name))) {
+        throw new Error("Bridge stage inventory changed during finalization.");
+    }
+}
 function openProfile(locator) {
     if (typeof locator !== "object" || locator === null || !PROFILE_ID.test(locator.profileId)) {
         throw new Error("Invalid profile locator.");
@@ -375,6 +421,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
             handoffRoot: profile.handoffRoot, stageRelativeName, stagePath,
         });
         const outputFds = [];
+        const verifiedOutputs = [];
         let stagedBytes = 0;
         const sink = Object.freeze({
             stagePath,
@@ -424,8 +471,11 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
                     }
                     assertBridgeCut(context, sink);
                     fsyncSync(stageFd);
-                    return Object.freeze({ relativeName, byteSize: bytes.length,
+                    const entry = Object.freeze({ relativeName, byteSize: bytes.length,
                         sha256: verifiedHash.digest("hex") });
+                    verifiedOutputs.push({ relativeName, fd, dev: after.dev, ino: after.ino,
+                        byteSize: entry.byteSize, sha256: entry.sha256 });
+                    return entry;
                 }
                 catch (error) {
                     throw error;
@@ -433,7 +483,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
             },
         });
         active = { context, sink, pins: profile.pins, absentFiles: profile.absentFiles, stageFd, stagePath, gate, lease,
-            outputFds, locator, active: true };
+            outputFds, verifiedOutputs, locator, active: true };
         activeContexts.set(context, active);
         activeSinks.set(sink, active);
         activeStageIdentity.set(active, { dev: stage.dev, ino: stage.ino });
@@ -445,6 +495,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
         fsyncSync(stageFd);
         fsyncSync(profile.workFd);
         assertBridgeCut(context, sink);
+        verifyStageOutputs(active);
         completed = true;
     }
     catch (error) {
