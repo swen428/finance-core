@@ -109,6 +109,12 @@ export function openPrivateDirectoryAt(parentFd, name) {
 export function openExistingDirectoryAt(parentFd, name) {
     return native.openExistingDirectoryAt(parentFd, name);
 }
+/** Create a genuinely new descriptor-relative directory; EEXIST is fatal. */
+export function createDirectoryExclusiveAt(parentFd, name) {
+    requireFileDescriptor(parentFd);
+    requireEntryBasename(name);
+    return native.createDirectoryExclusiveAt(parentFd, name, 0o700);
+}
 export function openFileAt(directoryFd, name, flags, mode = 0) {
     return native.openFileAt(directoryFd, name, flags, mode);
 }

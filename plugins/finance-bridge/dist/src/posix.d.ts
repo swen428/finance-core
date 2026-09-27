@@ -16,6 +16,8 @@ export declare function descriptorIdentitySync(fd: number): DescriptorIdentity;
 export declare function openDirectory(path: string): number;
 export declare function openPrivateDirectoryAt(parentFd: number, name: string): number;
 export declare function openExistingDirectoryAt(parentFd: number, name: string): number;
+/** Create a genuinely new descriptor-relative directory; EEXIST is fatal. */
+export declare function createDirectoryExclusiveAt(parentFd: number, name: string): number;
 export declare function openFileAt(directoryFd: number, name: string, flags: number, mode?: number): number;
 /** Reject Darwin extended ACL allow entries on a pinned descriptor. */
 export declare function rejectAclGrants(fd: number): void;

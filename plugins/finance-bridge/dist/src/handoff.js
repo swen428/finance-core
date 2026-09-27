@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { fstatSync } from "node:fs";
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { flock } from "fs-ext";
-import { chmodDescriptor, closeDescriptor, constants, descriptorIdentity, descriptorIdentitySync, freeBytes as descriptorFreeBytes, listAt, openDirectory, openExistingDirectoryAt, openFileAt, openPrivateDirectoryAt, readDescriptor, renameNoReplaceAt, syncDescriptor, unlinkAtIfIdentity, writeDescriptor, } from "./posix.js";
+import { assertBridgeCut, } from "./bridge-export-boundary.js";
+import { chmodDescriptor, closeDescriptor, constants, descriptorIdentity, descriptorIdentitySync, freeBytes as descriptorFreeBytes, listAt, openDirectory, openExistingDirectoryAt, openFileAt, openPrivateDirectoryAt, readDescriptor, rejectAclGrants, renameNoReplaceAt, syncDescriptor, unlinkAtIfIdentity, writeDescriptor, } from "./posix.js";
 import { captureIdentities } from "./protocol.js";
 export const HANDOFF_PENDING_RECORD = ".finance-bridge.record.pending";
 export const HANDOFF_PENDING_PAYLOAD = ".finance-bridge.payload.pending";
@@ -15,6 +17,7 @@ const MAX_TREE_BYTES = 321_000_000;
 const FREE_SPACE_RESERVE = 16 * 1024 * 1024;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const PUBLIC_ID = /^raw_intake_bridge_[0-9a-f]{32}$/u;
+const READ_NO_BLOCK = constants.O_RDONLY | constants.O_NONBLOCK;
 /** Core evidence changed while an inbound photo was waiting for the publication flock. */
 export class HandoffPublicationRefused extends Error {
 }
@@ -41,7 +44,7 @@ function sameEntryIdentity(left, right) {
         left.ctimeNs === right.ctimeNs && left.mtimeNs === right.mtimeNs;
 }
 async function entryIdentityAt(directoryFd, name) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return await descriptorIdentity(fd);
     }
@@ -50,7 +53,7 @@ async function entryIdentityAt(directoryFd, name) {
     }
 }
 async function entryIdentityAtPinned(directoryFd, name) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return descriptorIdentitySync(fd);
     }
@@ -238,7 +241,7 @@ function serializedRecord(record) {
     return Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 }
 async function readRegularAt(directoryFd, name, maximum) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return await readDescriptor(fd, maximum);
     }
@@ -345,7 +348,7 @@ async function publishPending(directoryFd, pendingName, finalName, bytes, afterF
     // Pin and snapshot the inode synchronously before any await. A directory
     // fsync is required for durability, but it must not become a window where a
     // same-UID replacement can establish a new callback baseline.
-    const finalFd = openFileAt(directoryFd, finalName, constants.O_RDONLY);
+    const finalFd = openFileAt(directoryFd, finalName, READ_NO_BLOCK);
     try {
         const publishedIdentity = descriptorIdentitySync(finalFd);
         await hook?.(afterPin);
@@ -400,7 +403,7 @@ async function inventory(directoryFd) {
     for (const name of entries) {
         let fd;
         try {
-            fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+            fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
         }
         catch (error) {
             if (error.code === "ELOOP") {
@@ -555,6 +558,244 @@ export class HandoffPublisher {
         this.workspaceRoot = workspaceRoot;
         this.options = options;
     }
+    /** Freeze only Bridge-owned handoff bytes under the caller's live exclusive cut. */
+    async exportFrozen(cut, sink) {
+        if (this.workspaceRoot !== cut.workspaceRoot) {
+            throw new Error("Bridge export workspace does not match its profile cut.");
+        }
+        assertBridgeCut(cut, sink);
+        const workspaceFd = openDirectory(this.workspaceRoot);
+        let directoryFd;
+        try {
+            directoryFd = openExistingDirectoryAt(workspaceFd, "handoff");
+        }
+        finally {
+            await closeDescriptor(workspaceFd);
+        }
+        const directoryIdentity = descriptorIdentitySync(directoryFd);
+        let lockFd;
+        try {
+            assertBridgeCut(cut, sink, { fd: directoryFd, identity: directoryIdentity });
+            if (!directoryIdentity.isDirectory || directoryIdentity.uid !== process.getuid?.() ||
+                (directoryIdentity.mode & 0o777) !== 0o700) {
+                throw new Error("Bridge export handoff directory is not private.");
+            }
+            rejectAclGrants(directoryFd);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NONBLOCK);
+            const lockIdentity = descriptorIdentitySync(lockFd);
+            if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
+                (lockIdentity.mode & 0o777) !== 0o600 ||
+                fstatSync(lockFd, { bigint: true }).nlink !== 1n) {
+                throw new Error("Bridge export handoff lock is invalid.");
+            }
+            rejectAclGrants(lockFd);
+            await acquireExclusiveLock(lockFd, this.options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS);
+            try {
+                assertBridgeCut(cut, sink, { fd: directoryFd, identity: directoryIdentity });
+                await requireDirectoryPathIdentity(cut.handoffRoot, directoryIdentity);
+                await requireLockIdentity(directoryFd, lockFd, lockIdentity);
+                const names = listAt(directoryFd).sort();
+                if (!names.includes(LOCK_BASENAME))
+                    throw new Error("Bridge export lock disappeared.");
+                const checked = await inventory(directoryFd);
+                const pendingKeyHash = await pendingPublication(directoryFd);
+                if (checked.treeBytes > MAX_TREE_BYTES || checked.recordCount > MAX_RECORDS) {
+                    throw new Error("Bridge export handoff tree exceeds its bounded size.");
+                }
+                await this.options.hook?.("after-export-inventory");
+                const files = [];
+                const records = new Map();
+                const intents = new Map();
+                const sourceIdentities = new Map();
+                const frozenPayloadMagic = new Map();
+                let pendingRecord;
+                let totalBytes = 0;
+                for (const [index, name] of names.entries()) {
+                    if (name === LOCK_BASENAME)
+                        continue;
+                    assertBridgeCut(cut, sink, { fd: directoryFd, identity: directoryIdentity });
+                    const role = name === HANDOFF_PENDING_RECORD
+                        ? "pending_record" : name === HANDOFF_PENDING_PAYLOAD
+                        ? "pending_payload" : name.endsWith(RECORD_SUFFIX)
+                        ? "record" : name.endsWith(RECLAIM_SUFFIX)
+                        ? "reclaim_intent" : "payload";
+                    const maximum = role === "payload" || role === "pending_payload" ? 10_000_000 : 4_096;
+                    const sourceFd = openFileAt(directoryFd, name, READ_NO_BLOCK);
+                    try {
+                        const sourceIdentity = descriptorIdentitySync(sourceFd);
+                        if (!sourceIdentity.isFile || sourceIdentity.uid !== process.getuid?.() ||
+                            (sourceIdentity.mode & 0o777) !== 0o600 ||
+                            fstatSync(sourceFd, { bigint: true }).nlink !== 1n) {
+                            throw new Error("Bridge export source is not a private single-link file.");
+                        }
+                        rejectAclGrants(sourceFd);
+                        assertBridgeCut(cut, sink, { fd: sourceFd, identity: sourceIdentity });
+                        const bytes = await readDescriptor(sourceFd, maximum);
+                        assertBridgeCut(cut, sink, { fd: sourceFd, identity: sourceIdentity });
+                        if (!sameEntryIdentity(await entryIdentityAtPinned(directoryFd, name), sourceIdentity)) {
+                            throw new Error("Bridge export source path identity changed.");
+                        }
+                        sourceIdentities.set(name, sourceIdentity);
+                        if (role === "record" || role === "pending_record") {
+                            const record = parseRecord(bytes);
+                            if (role === "record" && name !== `${record.raw_intake_public_id}${RECORD_SUFFIX}`) {
+                                throw new Error("Bridge export frozen record filename mismatch.");
+                            }
+                            if (role === "record")
+                                records.set(record.raw_intake_public_id, record);
+                            else
+                                pendingRecord = record;
+                        }
+                        else if (role === "reclaim_intent") {
+                            const intent = parseIntent(bytes);
+                            if (name !== `${intent.claim.rawIntakePublicId}${RECLAIM_SUFFIX}`) {
+                                throw new Error("Bridge export frozen reclaim filename mismatch.");
+                            }
+                            intents.set(intent.claim.rawIntakePublicId, intent);
+                        }
+                        else if (role === "payload") {
+                            frozenPayloadMagic.set(name, {
+                                jpeg: bytes.length >= 3 && bytes[0] === 0xff &&
+                                    bytes[1] === 0xd8 && bytes[2] === 0xff,
+                                png: bytes.length >= 8 &&
+                                    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+                            });
+                        }
+                        totalBytes += bytes.byteLength;
+                        if (totalBytes > MAX_TREE_BYTES)
+                            throw new Error("Bridge export byte budget exceeded.");
+                        const frozen = await sink.writeValidated(`handoff-${index.toString().padStart(3, "0")}.bin`, bytes);
+                        assertBridgeCut(cut, sink, { fd: sourceFd, identity: sourceIdentity });
+                        files.push({
+                            role,
+                            rawIntakePublicId: role === "record" || role === "payload" || role === "reclaim_intent"
+                                ? name.slice(0, name.indexOf(".")) : pendingRecord?.raw_intake_public_id ?? null,
+                            sourceName: name,
+                            frozenName: frozen.relativeName,
+                            byteSize: frozen.byteSize,
+                            sha256: frozen.sha256,
+                        });
+                    }
+                    finally {
+                        await closeDescriptor(sourceFd);
+                    }
+                }
+                const frozenBySourceName = new Map(files.map((file) => [file.sourceName, file]));
+                if (pendingRecord !== undefined &&
+                    (pendingRecord.canonical_key_hash !== pendingKeyHash ||
+                        records.has(pendingRecord.raw_intake_public_id) ||
+                        intents.has(pendingRecord.raw_intake_public_id) ||
+                        frozenBySourceName.has(pendingRecord.payload_basename))) {
+                    throw new Error("Bridge export frozen pending record conflicts with publication state.");
+                }
+                for (const [id, record] of records) {
+                    const recordName = `${id}${RECORD_SUFFIX}`;
+                    if (frozenBySourceName.get(recordName)?.role !== "record") {
+                        throw new Error("Bridge export record was not frozen.");
+                    }
+                    const payload = frozenBySourceName.get(record.payload_basename);
+                    if (payload !== undefined &&
+                        (payload.role !== "payload" || payload.byteSize !== record.byte_size ||
+                            payload.sha256 !== record.content_hash ||
+                            (record.detected_mime_type === "image/jpeg" &&
+                                (record.canonical_extension !== ".jpg" || !frozenPayloadMagic.get(record.payload_basename)?.jpeg)) ||
+                            (record.detected_mime_type === "image/png" &&
+                                (record.canonical_extension !== ".png" || !frozenPayloadMagic.get(record.payload_basename)?.png)))) {
+                        throw new Error("Bridge export frozen original differs from its record.");
+                    }
+                }
+                for (const [id, intent] of intents) {
+                    if (intent.directory_identity.dev !== directoryIdentity.dev.toString() ||
+                        intent.directory_identity.ino !== directoryIdentity.ino.toString()) {
+                        throw new Error("Bridge export reclaim directory identity changed.");
+                    }
+                    const recordName = `${id}${RECORD_SUFFIX}`;
+                    const record = records.get(id);
+                    const frozenRecord = frozenBySourceName.get(recordName);
+                    const frozenPayload = frozenBySourceName.get(intent.payload_basename);
+                    if (record !== undefined &&
+                        (record.canonical_key_hash !== intent.claim.canonicalKeyHash ||
+                            record.content_hash !== intent.claim.attachmentContentHash ||
+                            record.payload_basename !== intent.payload_basename ||
+                            frozenRecord?.sha256 !== intent.record_sha256 ||
+                            !sameEntryIdentity(sourceIdentities.get(recordName), restoreIdentity(intent.record_identity)))) {
+                        throw new Error("Bridge export frozen record conflicts with reclaim intent.");
+                    }
+                    if (frozenPayload !== undefined &&
+                        (frozenPayload.sha256 !== intent.payload_sha256 ||
+                            !sameEntryIdentity(sourceIdentities.get(intent.payload_basename), restoreIdentity(intent.payload_identity)))) {
+                        throw new Error("Bridge export frozen payload conflicts with reclaim intent.");
+                    }
+                }
+                const slots = [];
+                for (const id of new Set([...records.keys(), ...intents.keys()])) {
+                    const record = records.get(id);
+                    const intent = intents.get(id);
+                    const hasPayload = record !== undefined && names.includes(record.payload_basename);
+                    if (record === undefined && intent === undefined) {
+                        throw new Error("Bridge export found an unbound handoff slot.");
+                    }
+                    if (record !== undefined && !hasPayload && intent === undefined) {
+                        throw new Error("Bridge export original photo is missing.");
+                    }
+                    const payloadName = record?.payload_basename ?? intent.payload_basename;
+                    slots.push({
+                        rawIntakePublicId: id,
+                        canonicalKeyHash: record?.canonical_key_hash ?? intent.claim.canonicalKeyHash,
+                        attachmentSha256: record?.content_hash ?? intent.claim.attachmentContentHash,
+                        byteSize: record?.byte_size ?? intent.payload_identity.size,
+                        mimeType: payloadName.endsWith(".jpg") ? "image/jpeg" : "image/png",
+                        state: intent !== undefined ? "reclaiming" : hasPayload ? "retained" : "incomplete",
+                        coreCustodyRequired: true,
+                    });
+                }
+                if (pendingRecord !== undefined && !records.has(pendingRecord.raw_intake_public_id)) {
+                    slots.push({
+                        rawIntakePublicId: pendingRecord.raw_intake_public_id,
+                        canonicalKeyHash: pendingRecord.canonical_key_hash,
+                        attachmentSha256: pendingRecord.content_hash,
+                        byteSize: pendingRecord.byte_size,
+                        mimeType: pendingRecord.detected_mime_type,
+                        state: "incomplete", coreCustodyRequired: true,
+                    });
+                }
+                const pendingId = pendingRecord?.raw_intake_public_id ??
+                    [...checked.incompleteRecords][0] ?? null;
+                for (const file of files) {
+                    if (file.role === "pending_record" || file.role === "pending_payload") {
+                        file.rawIntakePublicId = pendingId;
+                    }
+                }
+                if (listAt(directoryFd).sort().join("\0") !== names.join("\0")) {
+                    throw new Error("Bridge export handoff inventory changed.");
+                }
+                for (const file of files) {
+                    const original = sourceIdentities.get(file.sourceName);
+                    if (original === undefined ||
+                        !sameEntryIdentity(await entryIdentityAt(directoryFd, file.sourceName), original)) {
+                        throw new Error("Bridge export source changed after freezing.");
+                    }
+                }
+                assertBridgeCut(cut, sink, { fd: directoryFd, identity: directoryIdentity });
+                await requireDirectoryPathIdentity(cut.handoffRoot, directoryIdentity);
+                await requireLockIdentity(directoryFd, lockFd, lockIdentity);
+                return {
+                    contractVersion: "finance-bridge-handoff-export-v1", owner: "finance-bridge",
+                    profileId: cut.profileId, cutId: cut.cutId, files,
+                    slots: slots.sort((left, right) => left.rawIntakePublicId.localeCompare(right.rawIntakePublicId)),
+                    pendingPublicationKeyHash: pendingKeyHash ?? null, totalBytes,
+                };
+            }
+            finally {
+                await lockOperation(lockFd, "un");
+            }
+        }
+        finally {
+            if (lockFd !== undefined)
+                await closeDescriptor(lockFd);
+            await closeDescriptor(directoryFd);
+        }
+    }
     async withReclaimLock(callback, deadlineAt) {
         const handoffPath = join(this.workspaceRoot, "handoff");
         const workspaceFd = openDirectory(this.workspaceRoot);
@@ -581,7 +822,7 @@ export class HandoffPublisher {
                 (directoryIdentity.mode & 0o077) !== 0) {
                 throw new Error("Reclaim handoff directory is not private.");
             }
-            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
             const lockIdentity = await descriptorIdentity(lockFd);
             if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
                 (lockIdentity.mode & 0o077) !== 0) {
@@ -905,7 +1146,7 @@ export class HandoffPublisher {
         }
         let lockFd;
         try {
-            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
             const lockIdentity = await descriptorIdentity(lockFd);
             if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
                 (lockIdentity.mode & 0o077) !== 0) {
@@ -952,7 +1193,7 @@ export class HandoffPublisher {
                     contentHash: record.content_hash,
                 };
                 await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
-                const payloadFd = openFileAt(directoryFd, record.payload_basename, constants.O_RDONLY);
+                const payloadFd = openFileAt(directoryFd, record.payload_basename, READ_NO_BLOCK);
                 try {
                     const payloadIdentity = descriptorIdentitySync(payloadFd);
                     const recordIdentity = await entryIdentityAtPinned(directoryFd, recordName);
@@ -999,7 +1240,7 @@ export class HandoffPublisher {
                 const after = await descriptorIdentity(lockFd);
                 let pathIdentity;
                 try {
-                    const pathFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDONLY);
+                    const pathFd = openFileAt(directoryFd, LOCK_BASENAME, READ_NO_BLOCK);
                     try {
                         pathIdentity = await descriptorIdentity(pathFd);
                     }
@@ -1079,7 +1320,7 @@ export class HandoffPublisher {
                     const { published } = slot;
                     await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
                     await requireDirectoryPathIdentity(handoffPath, directoryStatus);
-                    const payloadFd = openFileAt(directoryFd, published.handoffFilename, constants.O_RDONLY);
+                    const payloadFd = openFileAt(directoryFd, published.handoffFilename, READ_NO_BLOCK);
                     try {
                         const payloadIdentity = await descriptorIdentity(payloadFd);
                         const expectedNames = listAt(directoryFd).sort();
@@ -1125,7 +1366,7 @@ export class HandoffPublisher {
                     const after = await descriptorIdentity(lockFd);
                     let pathIdentity;
                     try {
-                        const pathFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDONLY);
+                        const pathFd = openFileAt(directoryFd, LOCK_BASENAME, READ_NO_BLOCK);
                         try {
                             pathIdentity = await descriptorIdentity(pathFd);
                         }

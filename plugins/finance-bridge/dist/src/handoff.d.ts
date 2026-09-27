@@ -1,7 +1,8 @@
 import type { ValidatedMedia } from "./media.js";
+import { type BridgeCutContext, type PrivateBridgeStageSink } from "./bridge-export-boundary.js";
 export declare const HANDOFF_PENDING_RECORD = ".finance-bridge.record.pending";
 export declare const HANDOFF_PENDING_PAYLOAD = ".finance-bridge.payload.pending";
-export type HandoffPhase = "after-lock" | "after-record-fsync" | "after-record-pin" | "after-record-publish" | "after-payload-fsync" | "after-payload-pin" | "after-payload-publish" | "before-callback" | "after-reclaim-payload-unlink" | "after-reclaim-payload-fsync" | "after-reclaim-record-unlink" | "after-reclaim-record-fsync" | "after-reclaim-intent-unlink" | "after-reclaim-intent-fsync";
+export type HandoffPhase = "after-export-inventory" | "after-lock" | "after-record-fsync" | "after-record-pin" | "after-record-publish" | "after-payload-fsync" | "after-payload-pin" | "after-payload-publish" | "before-callback" | "after-reclaim-payload-unlink" | "after-reclaim-payload-fsync" | "after-reclaim-record-unlink" | "after-reclaim-record-fsync" | "after-reclaim-intent-unlink" | "after-reclaim-intent-fsync";
 export type HandoffHook = (phase: HandoffPhase) => void | Promise<void>;
 /** A claim identifies one Core-owned original; it does not itself prove custody. */
 export interface ReclaimClaim {
@@ -23,6 +24,33 @@ export interface PublishedHandoff {
     rawIntakePublicId: string;
     contentHash: string;
 }
+export interface FrozenBridgeFileV1 {
+    role: "record" | "payload" | "reclaim_intent" | "pending_record" | "pending_payload";
+    rawIntakePublicId: string | null;
+    sourceName: string;
+    frozenName: string;
+    byteSize: number;
+    sha256: string;
+}
+export interface FrozenBridgeSlotV1 {
+    rawIntakePublicId: string;
+    canonicalKeyHash: string;
+    attachmentSha256: string;
+    byteSize: number;
+    mimeType: "image/jpeg" | "image/png";
+    state: "retained" | "reclaiming" | "incomplete";
+    coreCustodyRequired: true;
+}
+export interface FrozenBridgeHandoffV1 {
+    contractVersion: "finance-bridge-handoff-export-v1";
+    owner: "finance-bridge";
+    profileId: string;
+    cutId: string;
+    files: FrozenBridgeFileV1[];
+    slots: FrozenBridgeSlotV1[];
+    pendingPublicationKeyHash: string | null;
+    totalBytes: number;
+}
 interface PublisherOptions {
     hook?: HandoffHook;
     freeBytes?: (directoryFd: number) => Promise<number>;
@@ -33,6 +61,8 @@ export declare class HandoffPublisher {
     private readonly workspaceRoot;
     private readonly options;
     constructor(workspaceRoot: string, options?: PublisherOptions);
+    /** Freeze only Bridge-owned handoff bytes under the caller's live exclusive cut. */
+    exportFrozen(cut: BridgeCutContext, sink: PrivateBridgeStageSink): Promise<FrozenBridgeHandoffV1>;
     private withReclaimLock;
     /** Lists only durable intents. The caller must query Core outside the flock. */
     pendingReclaims(): Promise<ReclaimClaim[]>;

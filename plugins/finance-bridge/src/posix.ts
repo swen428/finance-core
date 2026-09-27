@@ -9,6 +9,7 @@ interface NativePosix {
   openDirectory(path: string): number;
   openDirectoryAt(parentFd: number, name: string, mode: number): number;
   openExistingDirectoryAt(parentFd: number, name: string): number;
+  createDirectoryExclusiveAt(parentFd: number, name: string, mode: number): number;
   openFileAt(directoryFd: number, name: string, flags: number, mode: number): number;
   descriptorIdentitySync(fd: number): DescriptorIdentity;
   renameNoReplaceAt(directoryFd: number, source: string, target: string): void;
@@ -144,6 +145,13 @@ export function openPrivateDirectoryAt(parentFd: number, name: string): number {
 
 export function openExistingDirectoryAt(parentFd: number, name: string): number {
   return native.openExistingDirectoryAt(parentFd, name);
+}
+
+/** Create a genuinely new descriptor-relative directory; EEXIST is fatal. */
+export function createDirectoryExclusiveAt(parentFd: number, name: string): number {
+  requireFileDescriptor(parentFd);
+  requireEntryBasename(name);
+  return native.createDirectoryExclusiveAt(parentFd, name, 0o700);
 }
 
 export function openFileAt(
