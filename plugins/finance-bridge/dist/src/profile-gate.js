@@ -158,25 +158,30 @@ function sharedLease(fd, onClose) {
     liveSharedLeases.add(lease);
     return lease;
 }
-function exclusiveLease(fd, maxHoldMs, validate, onClose) {
+function exclusiveLease(fd, holdDeadline, validate, onClose) {
     let closed = false;
-    const holdDeadline = performance.now() + maxHoldMs;
+    const close = () => {
+        if (closed)
+            return;
+        closeSync(fd);
+        closed = true;
+        onClose();
+    };
+    const checkHoldDeadline = () => {
+        if (performance.now() >= holdDeadline) {
+            close();
+            throw new Error("Exclusive profile gate hold deadline exceeded.");
+        }
+    };
     return Object.freeze({
         assertValid() {
             if (closed)
                 throw new Error("Exclusive profile gate lease is closed.");
-            if (performance.now() >= holdDeadline) {
-                throw new Error("Exclusive profile gate hold deadline exceeded.");
-            }
+            checkHoldDeadline();
             validate();
+            checkHoldDeadline();
         },
-        close() {
-            if (closed)
-                return;
-            closeSync(fd);
-            closed = true;
-            onClose();
-        },
+        close,
     });
 }
 /**
@@ -255,12 +260,10 @@ export function openProfileGate(profileRoot) {
                 if (closed)
                     throw new Error("Profile gate closed during acquisition.");
                 if (await tryLock(opened.fd, operation)) {
+                    const holdDeadline = operation === "exnb" ? performance.now() + maxHoldMs : undefined;
                     if (performance.now() > deadline) {
                         throw new Error("Profile gate wait deadline exceeded.");
                     }
-                    requireCurrentRoot(profileRoot, root.identity);
-                    const current = openValidatedLock(root.fd, lock.identity);
-                    closeSync(current.fd);
                     const onClose = () => { activeLeases -= 1; };
                     const validate = () => {
                         requirePrivateLock(opened.fd);
@@ -268,9 +271,13 @@ export function openProfileGate(profileRoot) {
                         const named = openValidatedLock(root.fd, lock.identity);
                         closeSync(named.fd);
                     };
+                    validate();
+                    if (holdDeadline !== undefined && performance.now() >= holdDeadline) {
+                        throw new Error("Exclusive profile gate hold deadline exceeded.");
+                    }
                     const lease = operation === "shnb"
                         ? sharedLease(opened.fd, onClose)
-                        : exclusiveLease(opened.fd, maxHoldMs, validate, onClose);
+                        : exclusiveLease(opened.fd, holdDeadline, validate, onClose);
                     activeLeases += 1;
                     transferred = true;
                     return lease;

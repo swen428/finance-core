@@ -286,6 +286,55 @@ def test_exclusive_hold_deadline_requires_cooperative_check(
         writer.assert_valid()
 
 
+def test_exclusive_acquisition_counts_post_lock_validation(
+    profile: ProfilePaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_profile_gate(profile)
+    clock = [0.0]
+    original_validate = gate._validate_lock_fd
+    validations = 0
+
+    def delayed_validation(witness: ProfilePaths, fd: int) -> Path:
+        nonlocal validations
+        validations += 1
+        result = original_validate(witness, fd)
+        if validations == 2:  # The second check runs after the exclusive flock succeeds.
+            clock[0] = 0.2
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gate.time, "monotonic", lambda: clock[0])
+        patch.setattr(gate, "_validate_lock_fd", delayed_validation)
+        with pytest.raises(ProfileGateHoldExpired):
+            exclusive_cut(profile, max_hold_seconds=0.1)
+    with writer_gate(profile) as writer:
+        writer.assert_valid()
+
+
+def test_exclusive_assert_valid_counts_validation_time_and_releases_lock(
+    profile: ProfilePaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initialize_profile_gate(profile)
+    clock = [0.0]
+    with monkeypatch.context() as patch:
+        patch.setattr(gate.time, "monotonic", lambda: clock[0])
+        cut = exclusive_cut(profile, max_hold_seconds=0.1)
+        original_validate = gate._validate_lock_fd
+
+        def delayed_validation(witness: ProfilePaths, fd: int) -> Path:
+            result = original_validate(witness, fd)
+            clock[0] = 0.2
+            return result
+
+        patch.setattr(gate, "_validate_lock_fd", delayed_validation)
+        with pytest.raises(ProfileGateHoldExpired):
+            cut.assert_valid()
+        with pytest.raises(ProfileGateError, match="closed"):
+            cut.assert_valid()
+    with writer_gate(profile) as writer:
+        writer.assert_valid()
+
+
 def test_unsafe_lock_identity_is_refused_without_replacement(profile: ProfilePaths) -> None:
     path = initialize_profile_gate(profile)
     other = profile.profile / "other-link"

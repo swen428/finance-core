@@ -208,6 +208,45 @@ test("exclusive profile cut checks its cooperative bounded hold deadline", async
   gate.close();
 });
 
+test("exclusive acquisition counts validation after flock and releases an expired lock", async (t) => {
+  const root = await privateRoot(t);
+  initializeProfileGate(root);
+  const gate = openProfileGate(root);
+  const originalNow = performance.now;
+  let readings = 0;
+  try {
+    // The fourth timestamp is after post-flock validation. Simulate that
+    // validation taking longer than the one-millisecond hold bound.
+    performance.now = () => ++readings >= 4 ? 2 : 0;
+    await assert.rejects(gate.acquireExclusive(1_000, 1), /hold deadline exceeded/u);
+    assert.equal(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), "held");
+  } finally {
+    performance.now = originalNow;
+    gate.close();
+  }
+});
+
+test("exclusive assertValid counts validation time and closes an expired lease", async (t) => {
+  const root = await privateRoot(t);
+  initializeProfileGate(root);
+  const gate = openProfileGate(root);
+  const originalNow = performance.now;
+  let cut: Awaited<ReturnType<typeof gate.acquireExclusive>> | undefined;
+  try {
+    performance.now = () => 0;
+    cut = await gate.acquireExclusive(1_000, 1);
+    let readings = 0;
+    performance.now = () => ++readings === 1 ? 0 : 2;
+    assert.throws(() => cut!.assertValid(), /hold deadline exceeded/u);
+    assert.throws(() => cut!.assertValid(), /closed/u);
+    assert.equal(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), "held");
+  } finally {
+    performance.now = originalNow;
+    cut?.close();
+    gate.close();
+  }
+});
+
 test("caller-owned shared lease cannot close until the child is reaped", async (t) => {
   const root = await privateRoot(t);
   initializeProfileGate(root);

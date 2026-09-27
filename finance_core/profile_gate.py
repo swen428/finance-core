@@ -199,9 +199,14 @@ class GateLease:
         and abort the cut on expiry.
         """
         fd = self.fileno()
-        if self._hold_deadline is not None and time.monotonic() >= self._hold_deadline:
-            raise ProfileGateHoldExpired("Exclusive profile cut exceeded its hold deadline")
+        self._check_hold_deadline()
         _validate_lock_fd(self._profile, fd)
+        self._check_hold_deadline()
+
+    def _check_hold_deadline(self) -> None:
+        if self._hold_deadline is not None and time.monotonic() >= self._hold_deadline:
+            self.close()
+            raise ProfileGateHoldExpired("Exclusive profile cut exceeded its hold deadline")
 
     def close(self) -> None:
         if self._fd >= 0:
@@ -246,8 +251,10 @@ def _acquire(
         deadline = time.monotonic() + timeout
         while True:
             if _try_lock(fd, operation):
-                _validate_lock_fd(profile, fd)
                 hold_deadline = None if hold is None else time.monotonic() + hold
+                _validate_lock_fd(profile, fd)
+                if hold_deadline is not None and time.monotonic() >= hold_deadline:
+                    raise ProfileGateHoldExpired("Exclusive profile cut exceeded its hold deadline")
                 return GateLease(
                     profile,
                     fd,
