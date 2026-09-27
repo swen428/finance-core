@@ -1,7 +1,19 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { constants, openSync, closeSync } from "node:fs";
-import { chmod, link, mkdtemp, realpath, rename, rm, stat, symlink } from "node:fs/promises";
+import {
+  chmod,
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -15,10 +27,50 @@ import {
 } from "../src/profile-gate.js";
 import { rejectAclGrants } from "../src/posix.js";
 
+const REPOSITORY_ROOT = resolve("../..");
+
 async function privateRoot(t: TestContext): Promise<string> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "finance-profile-gate-")));
   t.after(async () => rm(root, { recursive: true, force: true }));
   return root;
+}
+
+async function syntheticProfile(t: TestContext): Promise<{
+  applicationSupport: string;
+  profileId: string;
+  profileRoot: string;
+  runtimeRoot: string;
+}> {
+  const applicationSupport = join(await privateRoot(t), "Application Support");
+  const profileId = "synthetic";
+  const profileRoot = join(applicationSupport, "Finance-Codex", "profiles", profileId);
+  const runtimeRoot = join(profileRoot, "runtime");
+  const workspaceRoot = join(profileRoot, "workspace");
+  for (const directory of [
+    applicationSupport,
+    join(applicationSupport, "Finance-Codex"),
+    join(applicationSupport, "Finance-Codex", "profiles"),
+    profileRoot,
+    runtimeRoot,
+    join(runtimeRoot, "database"),
+    workspaceRoot,
+    join(workspaceRoot, "database"),
+    join(profileRoot, "backups"),
+    join(profileRoot, "work"),
+    join(profileRoot, "restore"),
+  ]) {
+    await mkdir(directory, { mode: 0o700 });
+  }
+  await writeFile(
+    join(profileRoot, "profile.json"),
+    JSON.stringify({
+      profile_id: profileId,
+      runtime_root: runtimeRoot,
+      workspace_root: workspaceRoot,
+    }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  return { applicationSupport, profileId, profileRoot, runtimeRoot };
 }
 
 const CHILD_LOCK_PROBE = [
@@ -169,4 +221,92 @@ test("caller-owned shared lease cannot close until the child is reaped", async (
   lease.close();
   assert.equal(isSharedProfileGateLease(lease), false);
   gate.close();
+});
+
+test("Node shared lease reaches Python through FD4 and remains held through child reap", async (t) => {
+  const { applicationSupport, profileId, profileRoot, runtimeRoot } = await syntheticProfile(t);
+  const python = process.env.PYTHON_EXECUTABLE ?? join(REPOSITORY_ROOT, ".venv", "bin", "python");
+  assert.equal(resolve(python), python, "PYTHON_EXECUTABLE must be normalized");
+  const pythonEnvironment: NodeJS.ProcessEnv = {
+    FINANCE_RUNTIME_ROOT: runtimeRoot,
+    LANG: "C.UTF-8",
+    LC_ALL: "C.UTF-8",
+    PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONNOUSERSITE: "1",
+    PYTHONUTF8: "1",
+  };
+  const pythonVersion = execFileSync(
+    python,
+    ["-B", "-c", "import json,sys; print(json.dumps(list(sys.version_info[:2])))"],
+    { cwd: REPOSITORY_ROOT, encoding: "utf8", env: pythonEnvironment, timeout: 5_000 },
+  );
+  assert.deepEqual(JSON.parse(pythonVersion.trim()), [3, 12]);
+
+  initializeProfileGate(profileRoot);
+  const gate = openProfileGate(profileRoot);
+  const lease = await gate.acquireShared(1_000);
+  let leaseBound = false;
+  let leaseClosed = false;
+  try {
+    lease.bindChild();
+    leaseBound = true;
+    assert.throws(() => lease.close(), /child reap/u);
+
+    const childProgram = `
+import os
+import sys
+from finance_core.profile_gate import writer_gate_from_parent
+from finance_core.profile_paths import validate_profile_paths
+
+with validate_profile_paths(sys.argv[1], sys.argv[2]) as profile:
+    writer = writer_gate_from_parent(profile, inherited_fd=4)
+    try:
+        profile.revalidate()
+        marker = profile.work / "node-fd4-writer.synthetic"
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, b"synthetic FD4 writer gate integration\\n")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        writer.close()
+print("CHILD_WRITER_GATE_OK")
+`;
+    const child = spawnSync(
+      python,
+      ["-B", "-c", childProgram, applicationSupport, profileId],
+      {
+        cwd: REPOSITORY_ROOT,
+        encoding: "utf8",
+        env: pythonEnvironment,
+        stdio: ["ignore", "pipe", "pipe", "ignore", lease.fdForChild()],
+        timeout: 5_000,
+      },
+    );
+    assert.equal(child.error, undefined, child.error?.message ?? child.stderr);
+    assert.equal(child.signal, null, child.stderr);
+    assert.equal(child.status, 0, child.stderr);
+    assert.equal(child.stdout.trim(), "CHILD_WRITER_GATE_OK");
+    assert.equal(
+      await readFile(join(profileRoot, "work", "node-fd4-writer.synthetic"), "utf8"),
+      "synthetic FD4 writer gate integration\n",
+    );
+
+    // spawnSync returns only after the Python child has exited and been reaped.
+    // The parent's bound shared lease must still exclude a cut at that point.
+    await assert.rejects(gate.acquireExclusive(80), /deadline exceeded/u);
+    lease.unbindChild();
+    leaseBound = false;
+    lease.close();
+    leaseClosed = true;
+
+    const cut = await gate.acquireExclusive(1_000);
+    cut.assertValid();
+    cut.close();
+  } finally {
+    if (leaseBound) lease.unbindChild();
+    if (!leaseClosed) lease.close();
+    gate.close();
+  }
 });
