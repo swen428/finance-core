@@ -606,6 +606,7 @@ export class HandoffPublisher {
                 const records = new Map();
                 const intents = new Map();
                 const sourceIdentities = new Map();
+                const frozenPayloadMagic = new Map();
                 let pendingRecord;
                 let totalBytes = 0;
                 for (const [index, name] of names.entries()) {
@@ -636,6 +637,9 @@ export class HandoffPublisher {
                         sourceIdentities.set(name, sourceIdentity);
                         if (role === "record" || role === "pending_record") {
                             const record = parseRecord(bytes);
+                            if (role === "record" && name !== `${record.raw_intake_public_id}${RECORD_SUFFIX}`) {
+                                throw new Error("Bridge export frozen record filename mismatch.");
+                            }
                             if (role === "record")
                                 records.set(record.raw_intake_public_id, record);
                             else
@@ -643,7 +647,18 @@ export class HandoffPublisher {
                         }
                         else if (role === "reclaim_intent") {
                             const intent = parseIntent(bytes);
+                            if (name !== `${intent.claim.rawIntakePublicId}${RECLAIM_SUFFIX}`) {
+                                throw new Error("Bridge export frozen reclaim filename mismatch.");
+                            }
                             intents.set(intent.claim.rawIntakePublicId, intent);
+                        }
+                        else if (role === "payload") {
+                            frozenPayloadMagic.set(name, {
+                                jpeg: bytes.length >= 3 && bytes[0] === 0xff &&
+                                    bytes[1] === 0xd8 && bytes[2] === 0xff,
+                                png: bytes.length >= 8 &&
+                                    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])),
+                            });
                         }
                         totalBytes += bytes.byteLength;
                         if (totalBytes > MAX_TREE_BYTES)
@@ -665,6 +680,12 @@ export class HandoffPublisher {
                     }
                 }
                 const frozenBySourceName = new Map(files.map((file) => [file.sourceName, file]));
+                if (pendingRecord !== undefined &&
+                    (pendingRecord.canonical_key_hash !== pendingKeyHash ||
+                        records.has(pendingRecord.raw_intake_public_id) ||
+                        frozenBySourceName.has(pendingRecord.payload_basename))) {
+                    throw new Error("Bridge export frozen pending record conflicts with publication state.");
+                }
                 for (const [id, record] of records) {
                     const recordName = `${id}${RECORD_SUFFIX}`;
                     if (frozenBySourceName.get(recordName)?.role !== "record") {
@@ -673,7 +694,11 @@ export class HandoffPublisher {
                     const payload = frozenBySourceName.get(record.payload_basename);
                     if (payload !== undefined &&
                         (payload.role !== "payload" || payload.byteSize !== record.byte_size ||
-                            payload.sha256 !== record.content_hash)) {
+                            payload.sha256 !== record.content_hash ||
+                            (record.detected_mime_type === "image/jpeg" &&
+                                (record.canonical_extension !== ".jpg" || !frozenPayloadMagic.get(record.payload_basename)?.jpeg)) ||
+                            (record.detected_mime_type === "image/png" &&
+                                (record.canonical_extension !== ".png" || !frozenPayloadMagic.get(record.payload_basename)?.png)))) {
                         throw new Error("Bridge export frozen original differs from its record.");
                     }
                 }
@@ -741,6 +766,13 @@ export class HandoffPublisher {
                 }
                 if (listAt(directoryFd).sort().join("\0") !== names.join("\0")) {
                     throw new Error("Bridge export handoff inventory changed.");
+                }
+                for (const file of files) {
+                    const original = sourceIdentities.get(file.sourceName);
+                    if (original === undefined ||
+                        !sameEntryIdentity(await entryIdentityAt(directoryFd, file.sourceName), original)) {
+                        throw new Error("Bridge export source changed after freezing.");
+                    }
                 }
                 assertBridgeCut(cut, sink, { fd: directoryFd, identity: directoryIdentity });
                 await requireDirectoryPathIdentity(cut.handoffRoot, directoryIdentity);

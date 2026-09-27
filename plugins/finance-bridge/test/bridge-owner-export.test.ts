@@ -22,6 +22,7 @@ import {
   HANDOFF_PENDING_RECORD,
   HANDOFF_PENDING_PAYLOAD,
   HandoffPublisher,
+  type HandoffHook,
   type ReclaimClaim,
 } from "../src/handoff.js";
 import { initializeProfileGate } from "../src/profile-gate.js";
@@ -131,6 +132,15 @@ async function exportProfile(profile: SyntheticProfile) {
   }, { waitMs: 1_000, maxHoldMs: 10_000 });
 }
 
+async function exportProfileWithHook(profile: SyntheticProfile, hook: HandoffHook) {
+  return await withExclusiveBridgeCut({
+    applicationSupportRoot: profile.applicationSupportRoot,
+    profileId: profile.profileId,
+    runtimeRoot: profile.runtimeRoot,
+  }, async (cut, sink) => await new HandoffPublisher(cut.workspaceRoot, { hook })
+    .exportFrozen(cut, sink), { waitMs: 1_000, maxHoldMs: 10_000 });
+}
+
 async function assertManifestMatchesStage(
   receipt: Awaited<ReturnType<typeof exportProfile>>,
 ): Promise<Buffer> {
@@ -233,6 +243,32 @@ test("owner export preserves a standalone pending record and marks it incomplete
   await assertStageFilesMatch(profile, receipt);
 });
 
+test("owner export rejects a pending record whose canonical key changes after inventory", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("909");
+  const interrupted = new HandoffPublisher(profile.workspaceRoot, {
+    hook: async (phase) => {
+      if (phase === "after-record-fsync") throw new Error("synthetic publication interruption");
+    },
+  });
+  await assert.rejects(interrupted.publish(key, rawIntakePublicId, MEDIA), /synthetic publication interruption/u);
+
+  const pendingPath = join(profile.handoffRoot, HANDOFF_PENDING_RECORD);
+  const originalRecord = JSON.parse(await readFile(pendingPath, "utf8")) as Record<string, unknown>;
+  assert.equal(originalRecord.canonical_key_hash, sha256(key));
+  const replacementHash = "c".repeat(64);
+  await assert.rejects(exportProfileWithHook(profile, async (phase) => {
+    if (phase !== "after-export-inventory") return;
+    const changed = JSON.parse(await readFile(pendingPath, "utf8")) as Record<string, unknown>;
+    changed.canonical_key_hash = replacementHash;
+    await writeFile(pendingPath, `${JSON.stringify(changed)}\n`, { mode: 0o600 });
+  }), /pending|publication|canonical|hash|changed|inventory/u);
+
+  const preserved = JSON.parse(await readFile(pendingPath, "utf8")) as Record<string, unknown>;
+  assert.equal(preserved.canonical_key_hash, replacementHash);
+  await assertFailedStageIsPreserved(profile);
+});
+
 test("owner export preserves reclaim intent without reclaiming the retained original", { concurrency: false }, async (t) => {
   const profile = await syntheticProfile(t);
   const { key, rawIntakePublicId } = captureKey("903");
@@ -261,6 +297,53 @@ test("owner export preserves reclaim intent without reclaiming the retained orig
   assert.equal((await readdir(profile.handoffRoot)).some((name) => name.endsWith(".reclaim.json")), true);
   await assertManifestMatchesStage(receipt);
   await assertStageFilesMatch(profile, receipt);
+});
+
+test("owner export rejects a reclaim intent rebound after inventory while intent-only", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("910");
+  const claim = reclaimClaim(key, rawIntakePublicId);
+  await assert.rejects(new HandoffPublisher(profile.workspaceRoot).withPublished(
+    key,
+    rawIntakePublicId,
+    MEDIA,
+    async () => { throw new Error("synthetic Core response lost"); },
+    30_000,
+    claim,
+  ), /synthetic Core response lost/u);
+
+  const reclaimCrash = new HandoffPublisher(profile.workspaceRoot, {
+    hook: async (phase) => {
+      if (phase === "after-reclaim-record-fsync") throw new Error("synthetic reclaim interruption");
+    },
+  });
+  await assert.rejects(reclaimCrash.reclaimVerified(claim, async () => true), /synthetic reclaim interruption/u);
+  const intentName = `${rawIntakePublicId}.reclaim.json`;
+  const intentPath = join(profile.handoffRoot, intentName);
+  assert.deepEqual((await readdir(profile.handoffRoot)).filter((name) => name.endsWith(".reclaim.json")), [intentName]);
+  await assert.rejects(lstat(join(profile.handoffRoot, `${rawIntakePublicId}.handoff.json`)), { code: "ENOENT" });
+  await assert.rejects(lstat(join(profile.handoffRoot, `${rawIntakePublicId}.jpg`)), { code: "ENOENT" });
+
+  const replacement = captureKey("911");
+  const replacementClaim = reclaimClaim(replacement.key, replacement.rawIntakePublicId);
+  const initialIntent = JSON.parse(await readFile(intentPath, "utf8")) as Record<string, unknown>;
+  const reboundIntent = {
+    ...initialIntent,
+    claim: replacementClaim,
+    record_basename: `${replacement.rawIntakePublicId}.handoff.json`,
+    payload_basename: `${replacement.rawIntakePublicId}.jpg`,
+  };
+  await assert.rejects(exportProfileWithHook(profile, async (phase) => {
+    if (phase !== "after-export-inventory") return;
+    await writeFile(intentPath, `${JSON.stringify(reboundIntent)}\n`, { mode: 0o600 });
+  }), /intent|reclaim|identity|changed|inventory|slot/u);
+
+  const preservedIntent = JSON.parse(await readFile(intentPath, "utf8")) as Record<string, unknown>;
+  assert.equal((preservedIntent.claim as Record<string, unknown>).rawIntakePublicId,
+    replacement.rawIntakePublicId);
+  assert.equal(preservedIntent.record_basename, `${replacement.rawIntakePublicId}.handoff.json`);
+  assert.equal(preservedIntent.payload_basename, `${replacement.rawIntakePublicId}.jpg`);
+  await assertFailedStageIsPreserved(profile);
 });
 
 test("owner export rejects an unexplained missing image and keeps its failed stage", { concurrency: false }, async (t) => {
@@ -344,4 +427,27 @@ test("owner export rejects a payload changed after inventory but before freezing
   }).exportFrozen(cut, sink)), /frozen original differs from its record/u);
   await assertFailedStageIsPreserved(profile);
   assert.deepEqual(await readFile(published.payloadPath), changed);
+});
+
+test("owner export rejects self-consistent record and payload rewrites with invalid image magic", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("912");
+  const published = await new HandoffPublisher(profile.workspaceRoot).publish(
+    key, rawIntakePublicId, MEDIA,
+  );
+  const changed = Buffer.from("not-jpg");
+  await assert.rejects(exportProfileWithHook(profile, async (phase) => {
+    if (phase !== "after-export-inventory") return;
+    const record = JSON.parse(await readFile(published.recordPath, "utf8")) as Record<string, unknown>;
+    record.content_hash = sha256(changed);
+    record.byte_size = changed.byteLength;
+    await writeFile(published.recordPath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    await writeFile(published.payloadPath, changed, { mode: 0o600 });
+  }), /magic|image|mime|payload|changed|record/u);
+
+  const preservedRecord = JSON.parse(await readFile(published.recordPath, "utf8")) as Record<string, unknown>;
+  assert.equal(preservedRecord.content_hash, sha256(changed));
+  assert.equal(preservedRecord.byte_size, changed.byteLength);
+  assert.deepEqual(await readFile(published.payloadPath), changed);
+  await assertFailedStageIsPreserved(profile);
 });
