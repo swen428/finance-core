@@ -84,6 +84,11 @@ abort on a failed check, and close the lease in a `finally` path. Shared writer
 leases do not have an automatic hold deadline, so callers must keep them only
 for the durable write they protect.
 
+An expired check prevents the cut from continuing but does not implicitly
+release an already returned exclusive lease. The exporter closes it after its
+protected cleanup, so writers stay excluded through that unwind. Acquisition
+that expires before lease handoff closes its untransferred descriptor.
+
 Acquire the exclusive cut only after network, OCR, and provider work has
 finished. Do not hold either lease while waiting on those external operations.
 Acquire a shared writer lease only for the local durable-write section. Because

@@ -282,6 +282,8 @@ def test_exclusive_hold_deadline_requires_cooperative_check(
             patch.setattr(gate.time, "monotonic", lambda: float("inf"))
             with pytest.raises(ProfileGateHoldExpired):
                 cut.assert_valid()
+        with pytest.raises(ProfileGateBusy):
+            writer_gate(profile, timeout_seconds=0)
     with writer_gate(profile) as writer:
         writer.assert_valid()
 
@@ -311,7 +313,7 @@ def test_exclusive_acquisition_counts_post_lock_validation(
         writer.assert_valid()
 
 
-def test_exclusive_assert_valid_counts_validation_time_and_releases_lock(
+def test_exclusive_assert_valid_counts_validation_time_until_explicit_close(
     profile: ProfilePaths, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     initialize_profile_gate(profile)
@@ -327,10 +329,15 @@ def test_exclusive_assert_valid_counts_validation_time_and_releases_lock(
             return result
 
         patch.setattr(gate, "_validate_lock_fd", delayed_validation)
-        with pytest.raises(ProfileGateHoldExpired):
-            cut.assert_valid()
-        with pytest.raises(ProfileGateError, match="closed"):
-            cut.assert_valid()
+        try:
+            with pytest.raises(ProfileGateHoldExpired):
+                cut.assert_valid()
+            with pytest.raises(ProfileGateHoldExpired):
+                cut.assert_valid()
+            with pytest.raises(ProfileGateBusy):
+                writer_gate(profile, timeout_seconds=0)
+        finally:
+            cut.close()
     with writer_gate(profile) as writer:
         writer.assert_valid()
 

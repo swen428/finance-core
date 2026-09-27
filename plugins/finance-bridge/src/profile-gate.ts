@@ -222,7 +222,6 @@ function exclusiveLease(
   };
   const checkHoldDeadline = (): void => {
     if (performance.now() >= holdDeadline) {
-      close();
       throw new Error("Exclusive profile gate hold deadline exceeded.");
     }
   };
@@ -317,8 +316,10 @@ export function openProfileGate(profileRoot: string): ProfileGate {
     try {
       for (;;) {
         if (closed) throw new Error("Profile gate closed during acquisition.");
+        // fs-ext may obtain the lock before its callback reaches this task.
+        const attemptStarted = operation === "exnb" ? performance.now() : undefined;
         if (await tryLock(opened.fd, operation)) {
-          const holdDeadline = operation === "exnb" ? performance.now() + maxHoldMs : undefined;
+          const holdDeadline = attemptStarted === undefined ? undefined : attemptStarted + maxHoldMs;
           if (performance.now() > deadline) {
             throw new Error("Profile gate wait deadline exceeded.");
           }

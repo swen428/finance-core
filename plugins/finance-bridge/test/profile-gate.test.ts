@@ -204,7 +204,9 @@ test("exclusive profile cut checks its cooperative bounded hold deadline", async
   const cut = await gate.acquireExclusive(1_000, 1);
   await delay(10);
   assert.throws(() => cut.assertValid(), /hold deadline exceeded/u);
+  assert.match(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), /EAGAIN|EWOULDBLOCK/u);
   cut.close();
+  assert.equal(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), "held");
   gate.close();
 });
 
@@ -226,7 +228,25 @@ test("exclusive acquisition counts validation after flock and releases an expire
   }
 });
 
-test("exclusive assertValid counts validation time and closes an expired lease", async (t) => {
+test("exclusive acquisition counts asynchronous flock callback time", async (t) => {
+  const root = await privateRoot(t);
+  initializeProfileGate(root);
+  const gate = openProfileGate(root);
+  const originalNow = performance.now;
+  let now = 0;
+  try {
+    performance.now = () => now;
+    const pending = gate.acquireExclusive(1_000, 1);
+    queueMicrotask(() => { now = 2; });
+    await assert.rejects(pending, /hold deadline exceeded/u);
+    assert.equal(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), "held");
+  } finally {
+    performance.now = originalNow;
+    gate.close();
+  }
+});
+
+test("exclusive assertValid counts validation time until explicit close", async (t) => {
   const root = await privateRoot(t);
   initializeProfileGate(root);
   const gate = openProfileGate(root);
@@ -238,7 +258,9 @@ test("exclusive assertValid counts validation time and closes an expired lease",
     let readings = 0;
     performance.now = () => ++readings === 1 ? 0 : 2;
     assert.throws(() => cut!.assertValid(), /hold deadline exceeded/u);
-    assert.throws(() => cut!.assertValid(), /closed/u);
+    assert.throws(() => cut!.assertValid(), /hold deadline exceeded/u);
+    assert.match(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), /EAGAIN|EWOULDBLOCK/u);
+    cut.close();
     assert.equal(childTryLock(join(root, PROFILE_GATE_BASENAME), "exnb"), "held");
   } finally {
     performance.now = originalNow;

@@ -205,7 +205,6 @@ class GateLease:
 
     def _check_hold_deadline(self) -> None:
         if self._hold_deadline is not None and time.monotonic() >= self._hold_deadline:
-            self.close()
             raise ProfileGateHoldExpired("Exclusive profile cut exceeded its hold deadline")
 
     def close(self) -> None:
