@@ -2,6 +2,7 @@ import { createFinanceCommand } from "./command.js";
 import { validatePluginConfig } from "./config.js";
 import { FINANCE_FAILURE_REPLY, FinanceInboundController, } from "./controller.js";
 import { HandoffPublisher } from "./handoff.js";
+import { FINANCE_INGRESS_RECONCILIATION_CAPABILITY, FinanceIngressReconciliationV1, } from "./ingress-reconciliation-v1.js";
 import { createHumanActionInteractiveHandler } from "./interactive.js";
 import { ReceiptMediaAdapter } from "./media.js";
 import { registerOperatorCliV1 } from "./operator-cli-v1.js";
@@ -69,6 +70,13 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
     }
     if (api.registrationMode !== "full")
         return;
+    const reconciliationHost = api;
+    if (reconciliationHost.financeIngressReconciliationCapabilities?.length !== 1 ||
+        reconciliationHost.financeIngressReconciliationCapabilities[0] !==
+            FINANCE_INGRESS_RECONCILIATION_CAPABILITY ||
+        typeof reconciliationHost.registerFinanceIngressReconciliationV1 !== "function") {
+        throw new Error("Pinned OpenClaw host lacks the Finance ingress reconciliation capability.");
+    }
     requireFinanceDeliveryHost(api);
     validateRetryCapability(api.runtime.llm);
     getLoadedCodexPluginSourceV2(api.runtime);
@@ -81,6 +89,7 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
     let healthy = false;
     let controller;
     let trustedIngress;
+    let ingressReconciliation;
     let humanActionRuntime;
     let deliveryReceiptRecorder;
     const ready = dependencies.validateConfig(api.pluginConfig).then(async (config) => {
@@ -106,6 +115,7 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
             handoff,
         }, undefined, hostLlmRuntime(api, config));
         trustedIngress = new TrustedIngressCapture(config.workspaceRoot, runner, media, handoff);
+        ingressReconciliation = new FinanceIngressReconciliationV1(config.workspaceRoot, runner, handoff);
         await trustedIngress.resumePendingReclaims();
         humanActionRuntime = { workspaceRoot: config.workspaceRoot, runner };
         healthy = true;
@@ -122,6 +132,13 @@ export function registerFinanceBridge(api, dependencies = defaultDependencies) {
             }
             await deliveryReceiptRecorder.recordFinanceDeliveryReceipt(material, 30_000);
         });
+    });
+    reconciliationHost.registerFinanceIngressReconciliationV1(async (request) => {
+        await ready;
+        if (!healthy || ingressReconciliation === undefined) {
+            throw new Error("Finance ingress reconciliation is unavailable.");
+        }
+        return await ingressReconciliation.reconcile(request);
     });
     for (const tool of createDisabledTools(() => undefined)) {
         api.registerTool(tool, { optional: true });
