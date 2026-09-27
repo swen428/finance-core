@@ -224,9 +224,6 @@ function validatePinned(active) {
     if (manifest === undefined)
         throw new Error("Missing pinned profile.json.");
     checkManifest(manifest.fd, active.locator, active.context.workspaceRoot);
-    if (process.env.FINANCE_RUNTIME_ROOT !== active.locator.runtimeRoot) {
-        throw new Error("FINANCE_RUNTIME_ROOT changed during cut.");
-    }
     const stage = checkedPin(active.stagePath, active.stageFd, true);
     if (stage.dev !== activeStageIdentity.get(active)?.dev || stage.ino !== activeStageIdentity.get(active)?.ino) {
         throw new Error("Bridge stage identity changed.");
@@ -343,8 +340,8 @@ function openProfile(locator) {
     const profileRoot = join(locator.applicationSupportRoot, "Finance-Codex", "profiles", locator.profileId);
     const runtimeRoot = join(profileRoot, "runtime");
     const workspaceRoot = join(profileRoot, "workspace");
-    if (locator.runtimeRoot !== runtimeRoot || process.env.FINANCE_RUNTIME_ROOT !== runtimeRoot) {
-        throw new Error("FINANCE_RUNTIME_ROOT does not match the selected profile.");
+    if (locator.runtimeRoot !== runtimeRoot) {
+        throw new Error("Runtime root does not match the selected profile.");
     }
     const pins = [];
     const absentFiles = [];
@@ -397,7 +394,14 @@ function openProfile(locator) {
 }
 /** Owns the exclusive lock; neither an FD nor a caller flag can supply its authority. */
 export async function withExclusiveBridgeCut(locator, callback, options = {}) {
-    const profile = openProfile(locator);
+    if (typeof locator !== "object" || locator === null)
+        throw new Error("Invalid profile locator.");
+    const selectedLocator = Object.freeze({
+        applicationSupportRoot: locator.applicationSupportRoot,
+        profileId: locator.profileId,
+        runtimeRoot: locator.runtimeRoot,
+    });
+    const profile = openProfile(selectedLocator);
     let gate;
     let lease;
     let stageFd;
@@ -417,7 +421,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
         const stage = checkedPin(stagePath, stageFd, true);
         fsyncSync(profile.workFd);
         const context = Object.freeze({
-            profileId: locator.profileId, cutId, workspaceRoot: profile.workspaceRoot,
+            profileId: selectedLocator.profileId, cutId, workspaceRoot: profile.workspaceRoot,
             handoffRoot: profile.handoffRoot, stageRelativeName, stagePath,
         });
         const outputFds = [];
@@ -483,7 +487,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
             },
         });
         active = { context, sink, pins: profile.pins, absentFiles: profile.absentFiles, stageFd, stagePath, gate, lease,
-            outputFds, verifiedOutputs, locator, active: true };
+            outputFds, verifiedOutputs, locator: selectedLocator, active: true };
         activeContexts.set(context, active);
         activeSinks.set(sink, active);
         activeStageIdentity.set(active, { dev: stage.dev, ino: stage.ino });

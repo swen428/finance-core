@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { constants, openSync, closeSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -32,8 +32,6 @@ async function synthetic(t: TestContext): Promise<{
     profile_id: profileId, runtime_root: runtimeRoot, workspace_root: workspaceRoot,
   }), { mode: 0o600 });
   initializeProfileGate(profileRoot);
-  t.after(() => { delete process.env.FINANCE_RUNTIME_ROOT; });
-  process.env.FINANCE_RUNTIME_ROOT = runtimeRoot;
   return { applicationSupportRoot, profileId, runtimeRoot, profileRoot, handoffRoot };
 }
 
@@ -76,6 +74,71 @@ test("cut binds handoff directory FD and rejects a changed source identity", asy
       assert.throws(() => assertBridgeCut(context, sink, { fd, identity: { ...identity, ino: identity.ino + 1n } }), /source descriptor/u);
     } finally { closeSync(fd); }
   });
+});
+
+test("cut snapshots the explicit locator before waiting, even if the caller selects another profile", async (t) => {
+  const selected = await synthetic(t);
+  const alternate = await synthetic(t);
+  const locator = {
+    applicationSupportRoot: selected.applicationSupportRoot,
+    profileId: selected.profileId,
+    runtimeRoot: selected.runtimeRoot,
+  };
+  const alternateLocator = {
+    applicationSupportRoot: alternate.applicationSupportRoot,
+    profileId: alternate.profileId,
+    runtimeRoot: alternate.runtimeRoot,
+  };
+  const gate = openProfileGate(selected.profileRoot);
+  const held = await gate.acquireExclusive(1_000, 10_000);
+  try {
+    const pendingCut = withExclusiveBridgeCut(locator, async (context, sink) => {
+      assert.equal(context.profileId, selected.profileId);
+      assert.equal(context.handoffRoot, selected.handoffRoot);
+      assert.equal(context.stagePath.startsWith(join(selected.profileRoot, "work") + "/"), true);
+      await sink.writeValidated("selected-profile.bin", Buffer.from("selected"));
+      return { profileId: context.profileId, stagePath: context.stagePath };
+    }, { waitMs: 2_000, maxHoldMs: 10_000 });
+
+    Object.assign(locator, alternateLocator);
+    held.close();
+    const result = await pendingCut;
+    assert.equal(result.profileId, selected.profileId);
+    assert.equal(result.stagePath.startsWith(join(selected.profileRoot, "work") + "/"), true);
+    assert.deepEqual(await readdir(join(alternate.profileRoot, "work")), []);
+  } finally {
+    held.close();
+    gate.close();
+  }
+});
+
+test("cut keeps explicit runtime and profile-manifest bindings authoritative", async (t) => {
+  const profile = await synthetic(t);
+  const previousRuntimeRoot = process.env.FINANCE_RUNTIME_ROOT;
+  process.env.FINANCE_RUNTIME_ROOT = join(profile.profileRoot, "unselected-runtime");
+  try {
+    const validLocator = {
+      applicationSupportRoot: profile.applicationSupportRoot,
+      profileId: profile.profileId,
+      runtimeRoot: profile.runtimeRoot,
+    };
+    await withExclusiveBridgeCut(validLocator, async (context) => context.profileId);
+
+    await assert.rejects(withExclusiveBridgeCut({
+      ...validLocator,
+      runtimeRoot: join(profile.profileRoot, "unselected-runtime"),
+    }, async () => undefined), /Runtime root does not match the selected profile/u);
+
+    await writeFile(join(profile.profileRoot, "profile.json"), JSON.stringify({
+      profile_id: profile.profileId,
+      runtime_root: join(profile.profileRoot, "unselected-runtime"),
+      workspace_root: join(profile.profileRoot, "workspace"),
+    }), { mode: 0o600 });
+    await assert.rejects(withExclusiveBridgeCut(validLocator, async () => undefined), /profile.json does not bind/u);
+  } finally {
+    if (previousRuntimeRoot === undefined) delete process.env.FINANCE_RUNTIME_ROOT;
+    else process.env.FINANCE_RUNTIME_ROOT = previousRuntimeRoot;
+  }
 });
 
 test("finalization rejects changed earlier outputs and unexpected stage entries", async (t) => {

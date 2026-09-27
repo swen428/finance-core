@@ -13,8 +13,9 @@ The expected layout is
 All directories *below* Application Support must be owned by the current user
 and mode `0700`. `profile.json` and any existing database files must be regular,
 single-link, owner-owned `0600` files. `profile.json` must bind `profile_id`,
-the absolute canonical `runtime_root`, and the sibling `workspace_root`.
-`FINANCE_RUNTIME_ROOT` must exactly name that runtime directory. The reserved
+the absolute canonical `runtime_root`, and the sibling `workspace_root`. For
+Core Python profile validation and runtime access, `FINANCE_RUNTIME_ROOT` must
+exactly name that runtime directory. The reserved
 live DB path is `runtime/database/finance.db`; the staging path is
 `workspace/database/staging.sqlite`, outside the runtime root. Existing
 staging-guard authorization still applies to every database open/write.
@@ -131,9 +132,11 @@ with the other approved, independently validated cut components.
 options?)` is an explicit operation on one already provisioned profile. It
 validates the fixed profile layout, opens the profile's existing gate, and
 freezes the Bridge handoff tree while holding one exclusive lease in the same
-Node process and cut session. It never creates a profile or initializes a
-missing gate. Its wait and cooperative hold limits are bounded; the lease is
-checked at each export transition and is released after protected cleanup.
+Node process and cut session. It does not read or require `FINANCE_RUNTIME_ROOT`;
+Core's Python profile/runtime boundary above continues to require that setting.
+It never creates a profile or initializes a missing gate. Its wait and
+cooperative hold limits are bounded; the lease is checked at each export
+transition and is released after protected cleanup.
 The profile owner must separately provision an empty `workspace/handoff/` and
 its fixed handoff lock before backup, even before the first receipt. The path
 validator alone does not require these Bridge-owned entries; missing entries

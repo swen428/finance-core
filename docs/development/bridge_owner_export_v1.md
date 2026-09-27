@@ -28,7 +28,9 @@ exportBridgeOwnerState(
 The application-support root and runtime root must be explicit canonical
 paths, and the profile ID must select the profile already bound by
 `profile.json`. The exporter validates the fixed profile path boundary and
-requires the existing fixed profile gate. It does not infer a profile from the
+requires the existing fixed profile gate. It does not read or require
+`FINANCE_RUNTIME_ROOT`; that environment setting remains part of the Core
+Python profile/runtime boundary. Bridge does not infer a profile from the
 checkout, current working directory, message, or environment.
 
 The profile owner must initialize the empty `workspace/handoff/` directory and

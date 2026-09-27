@@ -26,7 +26,7 @@ import {
   type HandoffHook,
   type ReclaimClaim,
 } from "../src/handoff.js";
-import { initializeProfileGate } from "../src/profile-gate.js";
+import { initializeProfileGate, openProfileGate } from "../src/profile-gate.js";
 import type { ValidatedMedia } from "../src/media.js";
 import { canonicalCaptureKey, captureIdentities } from "../src/protocol.js";
 
@@ -54,12 +54,7 @@ interface SyntheticProfile {
 
 async function syntheticProfile(t: TestContext): Promise<SyntheticProfile> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "finance-owner-export-")));
-  const previousRuntimeRoot = process.env.FINANCE_RUNTIME_ROOT;
-  t.after(async () => {
-    if (previousRuntimeRoot === undefined) delete process.env.FINANCE_RUNTIME_ROOT;
-    else process.env.FINANCE_RUNTIME_ROOT = previousRuntimeRoot;
-    await rm(root, { recursive: true, force: true });
-  });
+  t.after(async () => rm(root, { recursive: true, force: true }));
 
   const applicationSupportRoot = join(root, "Application Support");
   const profileId = "synthetic";
@@ -92,7 +87,6 @@ async function syntheticProfile(t: TestContext): Promise<SyntheticProfile> {
     { encoding: "utf8", mode: 0o600 },
   );
   initializeProfileGate(profileRoot);
-  process.env.FINANCE_RUNTIME_ROOT = runtimeRoot;
   return {
     applicationSupportRoot,
     profileId,
@@ -211,6 +205,43 @@ test("owner export stages one verified retained handoff under the fixed profile"
   await assertStageFilesMatch(profile, receipt);
 });
 
+test("owner export uses the explicit locator when FINANCE_RUNTIME_ROOT is absent, mismatched, or changes while waiting", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("915");
+  await new HandoffPublisher(profile.workspaceRoot).publish(key, rawIntakePublicId, MEDIA);
+  const previousRuntimeRoot = process.env.FINANCE_RUNTIME_ROOT;
+  const mismatchedRuntimeRoot = join(profile.profileRoot, "unselected-runtime");
+  try {
+    delete process.env.FINANCE_RUNTIME_ROOT;
+    const withoutEnvironment = await exportProfile(profile);
+    assert.equal(withoutEnvironment.profileId, profile.profileId);
+    assert.equal(withoutEnvironment.handoff.slots.length, 1);
+
+    process.env.FINANCE_RUNTIME_ROOT = mismatchedRuntimeRoot;
+    const withMismatchedEnvironment = await exportProfile(profile);
+    assert.equal(withMismatchedEnvironment.profileId, profile.profileId);
+    assert.equal(withMismatchedEnvironment.handoff.slots.length, 1);
+
+    const gate = openProfileGate(profile.profileRoot);
+    const held = await gate.acquireExclusive(1_000, 10_000);
+    try {
+      process.env.FINANCE_RUNTIME_ROOT = profile.runtimeRoot;
+      const pendingExport = exportProfile(profile);
+      process.env.FINANCE_RUNTIME_ROOT = mismatchedRuntimeRoot;
+      held.close();
+      const afterEnvironmentChanged = await pendingExport;
+      assert.equal(afterEnvironmentChanged.profileId, profile.profileId);
+      assert.equal(afterEnvironmentChanged.handoff.slots.length, 1);
+    } finally {
+      held.close();
+      gate.close();
+    }
+  } finally {
+    if (previousRuntimeRoot === undefined) delete process.env.FINANCE_RUNTIME_ROOT;
+    else process.env.FINANCE_RUNTIME_ROOT = previousRuntimeRoot;
+  }
+});
+
 test("owner export refuses a blank profile until its handoff lock is provisioned", { concurrency: false }, async (t) => {
   const profile = await syntheticProfile(t);
   await assert.rejects(exportProfile(profile), /openat|ENOENT|handoff lock/u);
@@ -235,7 +266,7 @@ test("owner export rejects a FIFO promptly and releases the handoff EX lock", { 
     "const locator = {",
     "  applicationSupportRoot: process.env.FINANCE_TEST_APPLICATION_SUPPORT_ROOT,",
     "  profileId: process.env.FINANCE_TEST_PROFILE_ID,",
-    "  runtimeRoot: process.env.FINANCE_RUNTIME_ROOT,",
+    "  runtimeRoot: process.env.FINANCE_TEST_RUNTIME_ROOT,",
     "};",
     "try {",
     "  await exportBridgeOwnerState(locator, { waitMs: 1_000, maxHoldMs: 10_000 });",
@@ -261,8 +292,8 @@ test("owner export rejects a FIFO promptly and releases the handoff EX lock", { 
       ...process.env,
       FINANCE_TEST_APPLICATION_SUPPORT_ROOT: profile.applicationSupportRoot,
       FINANCE_TEST_PROFILE_ID: profile.profileId,
+      FINANCE_TEST_RUNTIME_ROOT: profile.runtimeRoot,
       FINANCE_TEST_LOCK_PATH: join(profile.handoffRoot, ".finance-bridge.lock.v1"),
-      FINANCE_RUNTIME_ROOT: profile.runtimeRoot,
     },
     encoding: "utf8",
     killSignal: "SIGKILL",
