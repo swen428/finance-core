@@ -1,6 +1,7 @@
 """Read-only path boundary for an explicitly configured Finance profile.
 
 This module does not create a profile, open SQLite, or grant write authority.
+Only a blank profile is admitted until native SQLite file admission exists.
 Callers retain the returned object and call ``revalidate`` immediately before
 using a path. The pinned descriptors keep the validated inodes alive so a
 replacement cannot silently acquire their identity.
@@ -162,6 +163,41 @@ def _open_checked(path: Path, *, directory: bool) -> int:
         raise
 
 
+def _require_blank_databases(paths: Mapping[str, Path]) -> None:
+    """Never open an existing SQLite database through the path witness."""
+    for name in ("live_database", "staging_database"):
+        path = paths[name]
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ProfilePathError(f"Cannot inspect reserved database path: {path}") from exc
+        raise ProfilePathError(
+            f"Existing profile database requires native SQLite admission: {path}"
+        )
+
+
+def _check_pinned_manifest(path: Path, fd: int) -> None:
+    """Recheck the manifest without closing another descriptor on its inode."""
+    try:
+        info = os.fstat(fd)
+        named = path.lstat()
+    except OSError as exc:
+        raise ProfilePathError(f"Profile path is missing or unsafe: {path}") from exc
+    if not stat.S_ISREG(info.st_mode) or _identity(info) != _identity(named):
+        raise ProfilePathError(f"Profile path identity changed: {path}")
+    if stat.S_ISLNK(named.st_mode):
+        raise ProfilePathError(f"Profile path is a symbolic link: {path}")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ProfilePathError(f"Profile path has the wrong owner: {path}")
+    if stat.S_IMODE(info.st_mode) != 0o600:
+        raise ProfilePathError(f"Profile path must be private to its owner: {path}")
+    if info.st_nlink != 1:
+        raise ProfilePathError(f"Profile file has multiple hard links: {path}")
+    _reject_acl_grants(fd, path)
+
+
 class ProfilePaths:
     """Pinned, context-managed path identities; never a database authorization."""
 
@@ -217,26 +253,24 @@ class ProfilePaths:
         return self._paths["restore"]
 
     def revalidate(self) -> None:
-        """Recheck every pinned inode and permission before path-based use."""
+        """Recheck the blank profile and pinned identities before path-based use."""
         if not self._pins:
             raise ProfilePathError("Closed profile path witness")
         _trusted_ancestor(self.application_support)
         for name, fd in self._pins.items():
+            if name == "profile_json":
+                continue
             path = self._paths[name]
-            fresh = _open_checked(
-                path, directory=name not in {"profile_json", "live_database", "staging_database"}
-            )
+            fresh = _open_checked(path, directory=True)
             try:
                 if _identity(os.fstat(fresh)) != _identity(os.fstat(fd)):
                     raise ProfilePathError(f"Profile path identity changed: {path}")
             finally:
                 os.close(fresh)
-        for name in ("live_database", "staging_database"):
-            if name not in self._pins and os.path.lexists(self._paths[name]):
-                raise ProfilePathError(
-                    f"Profile file appeared after validation: {self._paths[name]}"
-                )
+        _require_blank_databases(self._paths)
+        _check_pinned_manifest(self.profile_json, self._pins["profile_json"])
         _validate_manifest(self)
+        _require_blank_databases(self._paths)
         if os.environ.get(RUNTIME_ROOT_ENV) != str(self.runtime):
             raise ProfilePathError(f"{RUNTIME_ROOT_ENV} does not match the profile runtime")
 
@@ -323,11 +357,10 @@ def validate_profile_paths(application_support_root: str | Path, profile_id: str
         try:
             for name in _DIRECTORIES:
                 pins[name] = _open_checked(paths[name], directory=True)
-            for name in ("profile_json", "live_database", "staging_database"):
-                if os.path.lexists(paths[name]):
-                    pins[name] = _open_checked(paths[name], directory=False)
-            if "profile_json" not in pins:
+            _require_blank_databases(paths)
+            if not os.path.lexists(paths["profile_json"]):
                 raise ProfilePathError("profile.json is missing")
+            pins["profile_json"] = _open_checked(paths["profile_json"], directory=False)
             result = ProfilePaths(profile_id, paths, pins)
             result.revalidate()
             return result
