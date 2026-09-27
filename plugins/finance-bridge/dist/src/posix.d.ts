@@ -17,6 +17,8 @@ export declare function openDirectory(path: string): number;
 export declare function openPrivateDirectoryAt(parentFd: number, name: string): number;
 export declare function openExistingDirectoryAt(parentFd: number, name: string): number;
 export declare function openFileAt(directoryFd: number, name: string, flags: number, mode?: number): number;
+/** Reject Darwin extended ACL allow entries on a pinned descriptor. */
+export declare function rejectAclGrants(fd: number): void;
 export declare function closeDescriptor(fd: number): Promise<void>;
 export declare function chmodDescriptor(fd: number, mode: number): Promise<void>;
 export declare function syncDescriptor(fd: number): Promise<void>;

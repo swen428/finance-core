@@ -47,6 +47,7 @@ import {
   financeDeliveryReceiptProofSha256,
   type FinanceDeliveryReceiptProofProvider,
 } from "../src/delivery-receipt-proof.js";
+import { initializeProfileGate, openProfileGate } from "../src/profile-gate.js";
 
 const execFile = promisify(execFileCallback);
 const CURRENT_REPOSITORY_ROOT = resolve("../..");
@@ -1198,6 +1199,108 @@ test("CLI runner uses absolute fixed argv, no shell, bounded stdin, and minimal 
     blob: "x".repeat(MAX_REQUEST_BYTES),
   }, "raw-intake:telegram:111:20");
   await assert.rejects(runner.run(oversized, 1_000), /256 KiB/u);
+});
+
+test("explicit profile gate lease reaches FD4 in both subprocess routes and stays caller-owned", async (t) => {
+  const profileRoot = await realpath(await mkdtemp(join(tmpdir(), "finance-runner-gate-")));
+  t.after(async () => rm(profileRoot, { recursive: true, force: true }));
+  initializeProfileGate(profileRoot);
+  const gate = openProfileGate(profileRoot);
+  const lease = await gate.acquireShared(100);
+  const config = {
+    repoRoot: "/repo",
+    coreDistributionRoot: "/core-distribution",
+    pythonExecutable: "/repo/.venv/bin/python",
+    workspaceRoot: "/tmp/workspace",
+    agentProfileV2: AGENT_PROFILE_V2,
+  };
+  const request = createBridgeRequest("health", { workspace_path: "/tmp/workspace" });
+  const commandChild = new FakeChild();
+  let commandOptions: Parameters<SpawnProcess>[2] | undefined;
+  let commandSpawned!: () => void;
+  const commandSpawn = new Promise<void>((resolveSpawn) => { commandSpawned = resolveSpawn; });
+  const runner = new BridgeCliRunner(
+    config,
+    (_executable, _args, options) => {
+      commandOptions = options;
+      commandSpawned();
+      return commandChild;
+    },
+    undefined,
+    undefined,
+    ACCEPT_TEST_EXECUTABLE,
+    ACCEPT_TEST_RECEIPT_PROOF,
+  );
+  try {
+    const payloadFd = lease.fdForChild() + 1;
+    const commandResult = runner.run(request, 1_000, payloadFd, lease);
+    await commandSpawn;
+    assert.deepEqual(commandOptions?.stdio, ["pipe", "pipe", "pipe", payloadFd, lease.fdForChild()]);
+    assert.throws(() => lease.close(), /child reap/u);
+    commandChild.stdout.end(`${JSON.stringify({
+      envelope_version: "v1",
+      request_id: request.request_id,
+      operation_id: expectedBridgeOperationId(request),
+      status: "ok",
+      result: { healthy: true },
+      idempotent_replay: false,
+    })}\n`);
+    commandChild.stderr.end();
+    commandChild.emit("close", 0, null);
+    assert.equal((await commandResult).status, "ok");
+
+    const receiptChild = new FakeChild();
+    let receiptOptions: Parameters<SpawnProcess>[2] | undefined;
+    let receiptSpawned!: () => void;
+    const receiptSpawn = new Promise<void>((resolveSpawn) => { receiptSpawned = resolveSpawn; });
+    const receiptRunner = new BridgeCliRunner(
+      config,
+      (_executable, _args, options) => {
+        receiptOptions = options;
+        receiptSpawned();
+        return receiptChild;
+      },
+      undefined,
+      undefined,
+      ACCEPT_TEST_EXECUTABLE,
+      ACCEPT_TEST_RECEIPT_PROOF,
+    );
+    const receiptResult = receiptRunner.recordFinanceDeliveryReceipt(
+      deliveryReceiptMaterial(),
+      1_000,
+      lease,
+    );
+    await receiptSpawn;
+    assert.deepEqual(receiptOptions?.stdio, ["pipe", "pipe", "pipe", "ignore", lease.fdForChild()]);
+    assert.throws(() => lease.close(), /child reap/u);
+    receiptChild.stdout.end(JSON.stringify({
+      observation_public_id: `d2dobs_${"9".repeat(32)}`,
+      status: "ok",
+    }));
+    receiptChild.stderr.end();
+    receiptChild.emit("close", 0, null);
+    await receiptResult;
+
+    const spawnFailure = new BridgeCliRunner(
+      config,
+      () => { throw new Error("synthetic spawn failure"); },
+      undefined,
+      undefined,
+      ACCEPT_TEST_EXECUTABLE,
+      ACCEPT_TEST_RECEIPT_PROOF,
+    );
+    await assert.rejects(spawnFailure.run(request, 1_000, undefined, lease), /synthetic spawn failure/u);
+    assert.ok(lease.fdForChild() >= 0);
+    await assert.rejects(
+      spawnFailure.recordFinanceDeliveryReceipt(deliveryReceiptMaterial(), 1_000, lease),
+      /synthetic spawn failure/u,
+    );
+    assert.ok(lease.fdForChild() >= 0);
+    assert.throws(() => gate.close(), /active leases/u);
+  } finally {
+    lease.close();
+    gate.close();
+  }
 });
 
 test("CLI runner ignores a hostile runtime checkout that shadows finance_core", async () => {
