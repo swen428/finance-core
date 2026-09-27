@@ -112,6 +112,10 @@ export function openExistingDirectoryAt(parentFd, name) {
 export function openFileAt(directoryFd, name, flags, mode = 0) {
     return native.openFileAt(directoryFd, name, flags, mode);
 }
+/** Reject Darwin extended ACL allow entries on a pinned descriptor. */
+export function rejectAclGrants(fd) {
+    native.rejectAclGrants(fd);
+}
 export async function closeDescriptor(fd) {
     await closeAsync(fd);
 }

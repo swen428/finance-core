@@ -24,6 +24,7 @@ import {
   financeDeliveryReceiptProofProvider,
   type FinanceDeliveryReceiptProofProvider,
 } from "./delivery-receipt-proof.js";
+import { isSharedProfileGateLease, type SharedProfileGateLease } from "./profile-gate.js";
 
 const DEFAULT_REAP_GRACE_MS = 1_000;
 const CORE_CLI_BOOTSTRAP = [
@@ -241,6 +242,7 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
   async recordFinanceDeliveryReceipt(
     material: FinanceDeliveryMaterialV1,
     deadlineMs: number,
+    gateLease?: SharedProfileGateLease,
   ): Promise<void> {
     if (this.poisoned) throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
     if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > 30_000) {
@@ -273,24 +275,38 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     }));
     if (input.byteLength > 16_384) throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
     if (performance.now() >= expiresAt) throw processFailure("BRIDGE_PROCESS_TIMEOUT");
-    const child = this.spawn(
-      this.config.pythonExecutable,
-      ["-I", "-B", "-c", DELIVERY_RECEIPT_CLI_BOOTSTRAP, this.config.coreDistributionRoot],
-      {
-        cwd: this.config.coreDistributionRoot,
-        detached: false,
-        env: {
-          FINANCE_RUNTIME_ROOT: this.config.repoRoot,
-          LANG: "C.UTF-8",
-          LC_ALL: "C.UTF-8",
-          PYTHONDONTWRITEBYTECODE: "1",
-          PYTHONNOUSERSITE: "1",
-          PYTHONUTF8: "1",
+    if (gateLease !== undefined && !isSharedProfileGateLease(gateLease)) {
+      throw new Error("Delivery receipt profile gate lease is untrusted.");
+    }
+    const gateFd = gateLease?.fdForChild();
+    gateLease?.bindChild();
+    let child: ChildProcessLike;
+    try {
+      child = this.spawn(
+        this.config.pythonExecutable,
+        ["-I", "-B", "-c", DELIVERY_RECEIPT_CLI_BOOTSTRAP, this.config.coreDistributionRoot],
+        {
+          cwd: this.config.coreDistributionRoot,
+          detached: false,
+          env: {
+            FINANCE_RUNTIME_ROOT: this.config.repoRoot,
+            LANG: "C.UTF-8",
+            LC_ALL: "C.UTF-8",
+            PYTHONDONTWRITEBYTECODE: "1",
+            PYTHONNOUSERSITE: "1",
+            PYTHONUTF8: "1",
+          },
+          shell: false,
+          stdio: gateFd === undefined
+            ? ["pipe", "pipe", "pipe"]
+            : ["pipe", "pipe", "pipe", "ignore", gateFd],
         },
-        shell: false,
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
+      );
+    } catch (error) {
+      gateLease?.unbindChild();
+      throw error;
+    }
+    child.once("close", () => gateLease?.unbindChild());
     await new Promise<void>((resolve, reject) => {
       const stdout: Buffer[] = [];
       let stdoutBytes = 0;
@@ -373,7 +389,12 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     });
   }
 
-  async run(request: BridgeRequest, deadlineMs: number, inheritedFd?: number): Promise<BridgeResponse> {
+  async run(
+    request: BridgeRequest,
+    deadlineMs: number,
+    inheritedFd?: number,
+    gateLease?: SharedProfileGateLease,
+  ): Promise<BridgeResponse> {
     if (this.poisoned) {
       throw processFailure("BRIDGE_PROCESS_RESOURCE_LIMIT");
     }
@@ -382,6 +403,9 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     }
     if (inheritedFd !== undefined && (!Number.isSafeInteger(inheritedFd) || inheritedFd < 0)) {
       throw new Error("Bridge inherited descriptor is invalid.");
+    }
+    if (gateLease !== undefined && !isSharedProfileGateLease(gateLease)) {
+      throw new Error("Bridge profile gate lease is untrusted.");
     }
     if (!Number.isSafeInteger(this.reapGraceMs) || this.reapGraceMs <= 0 ||
         this.reapGraceMs > DEFAULT_REAP_GRACE_MS) {
@@ -412,26 +436,40 @@ export class BridgeCliRunner implements FinanceDeliveryReceiptRecorder {
     if (performance.now() >= expiresAt) {
       throw processFailure("BRIDGE_PROCESS_TIMEOUT");
     }
-    const child = this.spawn(
-      this.config.pythonExecutable,
-      ["-I", "-B", "-c", CORE_CLI_BOOTSTRAP, this.config.coreDistributionRoot],
-      {
-        cwd: this.config.coreDistributionRoot,
-        detached: false,
-        env: {
-          FINANCE_RUNTIME_ROOT: this.config.repoRoot,
-          LANG: "C.UTF-8",
-          LC_ALL: "C.UTF-8",
-          PYTHONDONTWRITEBYTECODE: "1",
-          PYTHONNOUSERSITE: "1",
-          PYTHONUTF8: "1",
+    const gateFd = gateLease?.fdForChild();
+    if (inheritedFd !== undefined && inheritedFd === gateFd) {
+      throw new Error("Bridge payload and profile gate descriptors must differ.");
+    }
+    gateLease?.bindChild();
+    let child: ChildProcessLike;
+    try {
+      child = this.spawn(
+        this.config.pythonExecutable,
+        ["-I", "-B", "-c", CORE_CLI_BOOTSTRAP, this.config.coreDistributionRoot],
+        {
+          cwd: this.config.coreDistributionRoot,
+          detached: false,
+          env: {
+            FINANCE_RUNTIME_ROOT: this.config.repoRoot,
+            LANG: "C.UTF-8",
+            LC_ALL: "C.UTF-8",
+            PYTHONDONTWRITEBYTECODE: "1",
+            PYTHONNOUSERSITE: "1",
+            PYTHONUTF8: "1",
+          },
+          shell: false,
+          stdio: gateFd === undefined
+            ? inheritedFd === undefined
+              ? ["pipe", "pipe", "pipe"]
+              : ["pipe", "pipe", "pipe", inheritedFd]
+            : ["pipe", "pipe", "pipe", inheritedFd ?? "ignore", gateFd],
         },
-        shell: false,
-        stdio: inheritedFd === undefined
-          ? ["pipe", "pipe", "pipe"]
-          : ["pipe", "pipe", "pipe", inheritedFd],
-      },
-    );
+      );
+    } catch (error) {
+      gateLease?.unbindChild();
+      throw error;
+    }
+    child.once("close", () => gateLease?.unbindChild());
 
     return await new Promise<BridgeResponse>((resolve, reject) => {
       const stdout: Buffer[] = [];

@@ -15,6 +15,7 @@ interface NativePosix {
   unlinkAtIfIdentity(directoryFd: number, name: string, expectedIdentity: EntryIdentity): unknown;
   listAt(directoryFd: number): string[];
   freeBytes(directoryFd: number): number;
+  rejectAclGrants(fd: number): void;
 }
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
@@ -152,6 +153,11 @@ export function openFileAt(
   mode = 0,
 ): number {
   return native.openFileAt(directoryFd, name, flags, mode);
+}
+
+/** Reject Darwin extended ACL allow entries on a pinned descriptor. */
+export function rejectAclGrants(fd: number): void {
+  native.rejectAclGrants(fd);
 }
 
 export async function closeDescriptor(fd: number): Promise<void> {

@@ -14,6 +14,10 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <sys/acl.h>
+#endif
+
 #if defined(__linux__)
 #include <linux/fs.h>
 #include <sys/syscall.h>
@@ -458,6 +462,61 @@ napi_value FreeBytes(napi_env env, napi_callback_info info) {
   return result;
 }
 
+napi_value RejectAclGrants(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  int32_t fd;
+  if (argc != 1 || !GetInt32(env, args[0], &fd)) return nullptr;
+#if defined(__APPLE__)
+  errno = 0;
+  acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+  if (acl == nullptr) {
+    if (errno != ENOENT) {
+      napi_throw_error(env, nullptr, "Cannot inspect extended ACL on profile gate entry.");
+      return nullptr;
+    }
+  } else {
+    const bool valid = acl_valid(acl) == 0;
+    bool safe = valid;
+    if (valid) {
+      for (int index = 0; index <= ACL_MAX_ENTRIES; ++index) {
+        acl_entry_t entry;
+        errno = 0;
+        if (acl_get_entry(acl, index, &entry) != 0) {
+          if (errno != EINVAL) safe = false;
+          break;
+        }
+        if (index == ACL_MAX_ENTRIES) {
+          safe = false;
+          break;
+        }
+        acl_tag_t tag;
+        if (acl_get_tag_type(entry, &tag) != 0 || tag != ACL_EXTENDED_DENY) {
+          safe = false;
+          break;
+        }
+      }
+    }
+    if (acl_free(acl) != 0) safe = false;
+    if (!safe) {
+      napi_throw_error(env, nullptr, "Profile gate entry has an ACL grant or an unreadable ACL.");
+      return nullptr;
+    }
+  }
+#else
+  // Linux has no Darwin extended ACL. The trusted profile boundary still
+  // validates ancestors and ownership before supplying this descriptor.
+  if (fcntl(fd, F_GETFD) < 0) {
+    ThrowErrno(env, "fcntl");
+    return nullptr;
+  }
+#endif
+  napi_value result;
+  napi_get_undefined(env, &result);
+  return result;
+}
+
 napi_value Initialize(napi_env env, napi_value exports) {
   const napi_property_descriptor properties[] = {
       {"openDirectory", nullptr, OpenDirectory, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -473,6 +532,8 @@ napi_value Initialize(napi_env env, napi_value exports) {
        nullptr},
       {"listAt", nullptr, ListAt, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"freeBytes", nullptr, FreeBytes, nullptr, nullptr, nullptr, napi_default, nullptr},
+      {"rejectAclGrants", nullptr, RejectAclGrants, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
   };
   napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties);
   return exports;
