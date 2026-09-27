@@ -67,7 +67,7 @@ import os
 import sys
 from finance_core.profile_paths import validate_profile_paths
 from finance_core.profile_gate import (
-    ProfileGateBusy, exclusive_cut, writer_gate, writer_gate_from_parent,
+    ProfileGateBusy, ProfileGateError, exclusive_cut, writer_gate, writer_gate_from_parent,
 )
 support, profile_id, mode = sys.argv[1:4]
 if mode == 'from_parent':
@@ -84,6 +84,8 @@ with validate_profile_paths(support, profile_id) as profile:
             print('ACQUIRED')
     except ProfileGateBusy:
         print('BUSY')
+    except ProfileGateError:
+        print('REFUSED')
 """
 
 
@@ -136,6 +138,27 @@ def test_init_is_explicit_exclusive_and_fsyncs_file_and_directory(
     assert info.st_nlink == 1 and info.st_size == 0
     with pytest.raises(ProfileGateError):
         initialize_profile_gate(profile)
+
+
+def test_writer_cannot_enter_new_gate_before_initializer_takes_exclusive_lock(
+    profile: ProfilePaths, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_try_lock = gate._try_lock
+    checked = False
+
+    def pause_before_exclusive(fd: int, operation: int) -> bool:
+        nonlocal checked
+        assert operation == gate.fcntl.LOCK_EX
+        assert stat.S_IMODE(os.fstat(fd).st_mode) == 0
+        assert _child(profile, "writer") == "REFUSED"
+        checked = True
+        return original_try_lock(fd, operation)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(gate, "_try_lock", pause_before_exclusive)
+        initialize_profile_gate(profile)
+    assert checked
+    assert _child(profile, "writer") == "ACQUIRED"
 
 
 def test_directory_fsync_failure_leaves_refused_gate(

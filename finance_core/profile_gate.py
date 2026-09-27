@@ -82,11 +82,12 @@ def _validate_lock_fd(profile: ProfilePaths, fd: int) -> Path:
 
 
 def initialize_profile_gate(profile: ProfilePaths) -> Path:
-    """Explicitly create one empty 0600 gate, then fsync its file and directory.
+    """Create one unusable gate, lock it, then publish 0600 and sync it.
 
     An existing name, including a symlink, is never opened or replaced. A
     failed initialization leaves its file as evidence rather than unlinking a
-    potentially replaced path. Normal gate opens never create the file.
+    potentially replaced path. Normal gate opens never create the file. Until
+    the exclusive lock is held, ordinary openers must reject the 0000 mode.
     """
     path = _require_profile(profile)
     directory_fd = -1
@@ -100,7 +101,7 @@ def initialize_profile_gate(profile: ProfilePaths) -> Path:
         fd = os.open(
             LOCK_FILENAME,
             os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o600,
+            0o000,
             dir_fd=directory_fd,
         )
         if not _try_lock(fd, fcntl.LOCK_EX):
