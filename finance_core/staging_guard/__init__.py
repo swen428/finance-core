@@ -157,6 +157,40 @@ def _col(row: sqlite3.Row | tuple, name: str, col_idx: int) -> object:
 # ---------------------------------------------------------------------------
 
 
+def _reject_attached_databases(conn: sqlite3.Connection) -> None:
+    """Require a complete, unambiguous database layout before trusting main."""
+    cursor = conn.execute("PRAGMA database_list")
+    cursor.row_factory = None
+    rows = cursor.fetchall()
+    if not rows:
+        raise StagingDatabaseError("Cannot verify database layout: database_list is empty.")
+
+    names: set[str] = set()
+    sequences: set[int] = set()
+    for row in rows:
+        if (
+            not isinstance(row, tuple)
+            or len(row) != 3
+            or not isinstance(row[0], int)
+            or not isinstance(row[1], str)
+            or not isinstance(row[2], str)
+            or row[0] < 0
+            or row[0] in sequences
+            or row[1] in names
+        ):
+            raise StagingDatabaseError("Cannot verify database layout: malformed database_list.")
+        sequence, name, _file = row
+        if name not in {"main", "temp"}:
+            raise StagingDatabaseError(
+                f"High-risk writes are forbidden with an attached database ('{name}')."
+            )
+        sequences.add(sequence)
+        names.add(name)
+
+    if "main" not in names:
+        raise StagingDatabaseError("Cannot verify database layout: main database is missing.")
+
+
 def _get_db_file_path(conn: sqlite3.Connection) -> str:
     rows = conn.execute("PRAGMA database_list").fetchall()
     for row in rows:
@@ -446,20 +480,24 @@ def require_staging_database(
 
     Verification steps:
 
-    1. Genuine ``:memory:`` databases (verified via journal mode) are
+    1. Require an unambiguous ``database_list`` with one ``main`` and only
+       optional SQLite ``temp``; main's authorization cannot cover attachments.
+    2. Genuine ``:memory:`` databases (verified via journal mode) are
        accepted unconditionally.
-    2. Unidentified connections (empty file path that is not in-memory)
+    3. Unidentified connections (empty file path that is not in-memory)
        are rejected.
-    3. The resolved filesystem path is compared against the live database
+    4. The resolved filesystem path is compared against the live database
        path; a match is rejected unconditionally.
-    4. The ``_staging_authorization`` table schema, row count, token
+    5. The ``_staging_authorization`` table schema, row count, token
        format, version, and identity binding are validated.
-    5. The stored ``db_identity`` must match the connection's resolved
+    6. The stored ``db_identity`` must match the connection's resolved
        path; copied or renamed databases are rejected.
 
     This function is **read-only**: it performs no writes, commits, or
     rollbacks, and preserves any caller-owned pending transaction.
     """
+    _reject_attached_databases(conn)
+
     if _is_in_memory(conn):
         return
 
