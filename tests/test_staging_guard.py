@@ -39,6 +39,7 @@ Covers:
  36. Failed initialization remains unauthorised.
  37. Migration failure leaves an unauthorised file.
  38. Attached databases cannot inherit main database staging authorization.
+ 39. Suppressed database layout fails closed without changing caller transaction.
 """
 
 from __future__ import annotations
@@ -108,6 +109,63 @@ def test_memory_main_rejects_separate_memory_attachment() -> None:
             require_staging_database(conn)
     finally:
         conn.close()
+
+
+def test_suppressed_database_list_rejects_attached_file_without_mutation(
+    tmp_path: Path,
+) -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE pending_write (id INTEGER)")
+        conn.execute("ATTACH DATABASE ? AS ordinary", (str(tmp_path / "ordinary.sqlite"),))
+        conn.execute("CREATE TABLE ordinary.target (id INTEGER)")
+        conn.commit()
+        conn.execute("INSERT INTO pending_write VALUES (1)")
+        assert conn.in_transaction
+
+        def hide_database_list(
+            action: int,
+            arg1: str | None,
+            _arg2: str | None,
+            _db_name: str | None,
+            _source: str | None,
+        ) -> int:
+            if action == sqlite3.SQLITE_PRAGMA and arg1 == "database_list":
+                return sqlite3.SQLITE_IGNORE
+            return sqlite3.SQLITE_OK
+
+        conn.set_authorizer(hide_database_list)
+        with pytest.raises(StagingDatabaseError, match="database layout"):
+            require_staging_database(conn)
+            conn.execute("INSERT INTO ordinary.target VALUES (1)")
+
+        assert conn.in_transaction
+        conn.set_authorizer(None)
+        conn.rollback()
+        assert conn.execute("SELECT COUNT(*) FROM pending_write").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM ordinary.target").fetchone()[0] == 0
+    finally:
+        conn.set_authorizer(None)
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [(0, "temp", "")],
+        [(0, "main", ""), (1, "main", "")],
+        [(0, "main")],
+        [(0, "main", None)],
+    ],
+)
+def test_unverifiable_database_layout_is_rejected(rows: list[tuple[object, ...]]) -> None:
+    cursor = mock.Mock()
+    cursor.fetchall.return_value = rows
+    conn = mock.Mock()
+    conn.execute.return_value = cursor
+
+    with pytest.raises(StagingDatabaseError, match="database layout"):
+        _guard._reject_attached_databases(conn)
 
 
 def test_staging_main_rejects_attached_file_without_changing_transaction(
