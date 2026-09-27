@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -217,6 +218,72 @@ test("owner export refuses a blank profile until its handoff lock is provisioned
   assert.deepEqual(await readdir(profile.handoffRoot), []);
 });
 
+test("owner export rejects a FIFO promptly and releases the handoff EX lock", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("913");
+  await new HandoffPublisher(profile.workspaceRoot).publish(key, rawIntakePublicId, MEDIA);
+
+  const fifoPath = join(profile.handoffRoot, "operator-note.fifo");
+  execFileSync("mkfifo", [fifoPath]);
+  await chmod(fifoPath, 0o600);
+
+  const exportModuleUrl = new URL("../src/owner-state-export-v1.js", import.meta.url).href;
+  const childProgram = [
+    'import { openSync, closeSync } from "node:fs";',
+    'import { flock } from "fs-ext";',
+    `const { exportBridgeOwnerState } = await import(${JSON.stringify(exportModuleUrl)});`,
+    "const locator = {",
+    "  applicationSupportRoot: process.env.FINANCE_TEST_APPLICATION_SUPPORT_ROOT,",
+    "  profileId: process.env.FINANCE_TEST_PROFILE_ID,",
+    "  runtimeRoot: process.env.FINANCE_RUNTIME_ROOT,",
+    "};",
+    "try {",
+    "  await exportBridgeOwnerState(locator, { waitMs: 1_000, maxHoldMs: 10_000 });",
+    '  process.stdout.write(JSON.stringify({ ok: true }));',
+    "  process.exitCode = 2;",
+    "} catch (error) {",
+    '  const lockFd = openSync(process.env.FINANCE_TEST_LOCK_PATH, "r+");',
+    '  const lockError = await new Promise((resolve) => flock(lockFd, "exnb", (cause) => resolve(cause?.code ?? null)));',
+    '  if (lockError === null) await new Promise((resolve, reject) => flock(lockFd, "un", (cause) => cause ? reject(cause) : resolve()));',
+    "  closeSync(lockFd);",
+    "  process.stdout.write(JSON.stringify({",
+    "    ok: false,",
+    '    error: error instanceof Error ? error.message : String(error),',
+    "    lockReleased: lockError === null,",
+    "  }));",
+    "  if (lockError !== null) process.exitCode = 3;",
+    "}",
+  ].join("\n");
+  const startedAt = performance.now();
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", childProgram], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      FINANCE_TEST_APPLICATION_SUPPORT_ROOT: profile.applicationSupportRoot,
+      FINANCE_TEST_PROFILE_ID: profile.profileId,
+      FINANCE_TEST_LOCK_PATH: join(profile.handoffRoot, ".finance-bridge.lock.v1"),
+      FINANCE_RUNTIME_ROOT: profile.runtimeRoot,
+    },
+    encoding: "utf8",
+    killSignal: "SIGKILL",
+    timeout: 2_000,
+  });
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(child.error, undefined, child.error?.message ?? "");
+  assert.equal(child.signal, null, child.stderr);
+  assert.equal(child.status, 0, child.stderr);
+  assert.ok(elapsedMs < 1_500, `FIFO refusal took ${elapsedMs.toFixed(0)} ms`);
+  const result = JSON.parse(child.stdout) as {
+    ok: boolean;
+    error?: string;
+    lockReleased?: boolean;
+  };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /unknown|non-file|FIFO|pipe|regular/u);
+  assert.equal(result.lockReleased, true);
+  await assertFailedStageIsPreserved(profile);
+});
+
 test("owner export preserves a standalone pending record and marks it incomplete", { concurrency: false }, async (t) => {
   const profile = await syntheticProfile(t);
   const { key, rawIntakePublicId } = captureKey("902");
@@ -344,6 +411,57 @@ test("owner export rejects a reclaim intent rebound after inventory while intent
   assert.equal(preservedIntent.record_basename, `${replacement.rawIntakePublicId}.handoff.json`);
   assert.equal(preservedIntent.payload_basename, `${replacement.rawIntakePublicId}.jpg`);
   await assertFailedStageIsPreserved(profile);
+});
+
+test("owner export rejects a pending record that duplicates an intent-only reclaim slot", { concurrency: false }, async (t) => {
+  const profile = await syntheticProfile(t);
+  const { key, rawIntakePublicId } = captureKey("914");
+  const claim = reclaimClaim(key, rawIntakePublicId);
+  const publisher = new HandoffPublisher(profile.workspaceRoot);
+  await assert.rejects(
+    publisher.withPublished(
+      key,
+      rawIntakePublicId,
+      MEDIA,
+      async () => { throw new Error("synthetic Core response lost"); },
+      30_000,
+      claim,
+    ),
+    /synthetic Core response lost/u,
+  );
+
+  const reclaimCrash = new HandoffPublisher(profile.workspaceRoot, {
+    hook: async (phase) => {
+      if (phase === "after-reclaim-record-fsync") throw new Error("synthetic reclaim interruption");
+    },
+  });
+  await assert.rejects(reclaimCrash.reclaimVerified(claim, async () => true), /synthetic reclaim interruption/u);
+  const intentPath = join(profile.handoffRoot, `${rawIntakePublicId}.reclaim.json`);
+  const intentBefore = await readFile(intentPath);
+  await assert.rejects(lstat(join(profile.handoffRoot, `${rawIntakePublicId}.handoff.json`)), { code: "ENOENT" });
+  await assert.rejects(lstat(join(profile.handoffRoot, `${rawIntakePublicId}.jpg`)), { code: "ENOENT" });
+
+  const pendingCrash = new HandoffPublisher(profile.workspaceRoot, {
+    hook: async (phase) => {
+      if (phase === "after-record-fsync") throw new Error("synthetic pending publication interruption");
+    },
+  });
+  await assert.rejects(
+    pendingCrash.publish(key, rawIntakePublicId, MEDIA),
+    /synthetic pending publication interruption/u,
+  );
+  const pendingPath = join(profile.handoffRoot, HANDOFF_PENDING_RECORD);
+  const pendingBefore = await readFile(pendingPath);
+  assert.equal(
+    (JSON.parse(pendingBefore.toString("utf8")) as Record<string, unknown>).raw_intake_public_id,
+    rawIntakePublicId,
+  );
+  assert.deepEqual(await readFile(intentPath), intentBefore);
+
+  await assert.rejects(exportProfile(profile), /pending|slot|reclaim|duplicate|conflict|identity/u);
+  await assertFailedStageIsPreserved(profile);
+  assert.deepEqual(await readFile(pendingPath), pendingBefore);
+  assert.deepEqual(await readFile(intentPath), intentBefore);
 });
 
 test("owner export rejects an unexplained missing image and keeps its failed stage", { concurrency: false }, async (t) => {

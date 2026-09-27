@@ -17,6 +17,7 @@ const MAX_TREE_BYTES = 321_000_000;
 const FREE_SPACE_RESERVE = 16 * 1024 * 1024;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const PUBLIC_ID = /^raw_intake_bridge_[0-9a-f]{32}$/u;
+const READ_NO_BLOCK = constants.O_RDONLY | constants.O_NONBLOCK;
 /** Core evidence changed while an inbound photo was waiting for the publication flock. */
 export class HandoffPublicationRefused extends Error {
 }
@@ -43,7 +44,7 @@ function sameEntryIdentity(left, right) {
         left.ctimeNs === right.ctimeNs && left.mtimeNs === right.mtimeNs;
 }
 async function entryIdentityAt(directoryFd, name) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return await descriptorIdentity(fd);
     }
@@ -52,7 +53,7 @@ async function entryIdentityAt(directoryFd, name) {
     }
 }
 async function entryIdentityAtPinned(directoryFd, name) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return descriptorIdentitySync(fd);
     }
@@ -240,7 +241,7 @@ function serializedRecord(record) {
     return Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
 }
 async function readRegularAt(directoryFd, name, maximum) {
-    const fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+    const fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
     try {
         return await readDescriptor(fd, maximum);
     }
@@ -347,7 +348,7 @@ async function publishPending(directoryFd, pendingName, finalName, bytes, afterF
     // Pin and snapshot the inode synchronously before any await. A directory
     // fsync is required for durability, but it must not become a window where a
     // same-UID replacement can establish a new callback baseline.
-    const finalFd = openFileAt(directoryFd, finalName, constants.O_RDONLY);
+    const finalFd = openFileAt(directoryFd, finalName, READ_NO_BLOCK);
     try {
         const publishedIdentity = descriptorIdentitySync(finalFd);
         await hook?.(afterPin);
@@ -402,7 +403,7 @@ async function inventory(directoryFd) {
     for (const name of entries) {
         let fd;
         try {
-            fd = openFileAt(directoryFd, name, constants.O_RDONLY);
+            fd = openFileAt(directoryFd, name, READ_NO_BLOCK);
         }
         catch (error) {
             if (error.code === "ELOOP") {
@@ -580,7 +581,7 @@ export class HandoffPublisher {
                 throw new Error("Bridge export handoff directory is not private.");
             }
             rejectAclGrants(directoryFd);
-            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NONBLOCK);
             const lockIdentity = descriptorIdentitySync(lockFd);
             if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
                 (lockIdentity.mode & 0o777) !== 0o600 ||
@@ -619,7 +620,7 @@ export class HandoffPublisher {
                         ? "record" : name.endsWith(RECLAIM_SUFFIX)
                         ? "reclaim_intent" : "payload";
                     const maximum = role === "payload" || role === "pending_payload" ? 10_000_000 : 4_096;
-                    const sourceFd = openFileAt(directoryFd, name, constants.O_RDONLY);
+                    const sourceFd = openFileAt(directoryFd, name, READ_NO_BLOCK);
                     try {
                         const sourceIdentity = descriptorIdentitySync(sourceFd);
                         if (!sourceIdentity.isFile || sourceIdentity.uid !== process.getuid?.() ||
@@ -683,6 +684,7 @@ export class HandoffPublisher {
                 if (pendingRecord !== undefined &&
                     (pendingRecord.canonical_key_hash !== pendingKeyHash ||
                         records.has(pendingRecord.raw_intake_public_id) ||
+                        intents.has(pendingRecord.raw_intake_public_id) ||
                         frozenBySourceName.has(pendingRecord.payload_basename))) {
                     throw new Error("Bridge export frozen pending record conflicts with publication state.");
                 }
@@ -820,7 +822,7 @@ export class HandoffPublisher {
                 (directoryIdentity.mode & 0o077) !== 0) {
                 throw new Error("Reclaim handoff directory is not private.");
             }
-            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
             const lockIdentity = await descriptorIdentity(lockFd);
             if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
                 (lockIdentity.mode & 0o077) !== 0) {
@@ -1144,7 +1146,7 @@ export class HandoffPublisher {
         }
         let lockFd;
         try {
-            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW);
+            lockFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK);
             const lockIdentity = await descriptorIdentity(lockFd);
             if (!lockIdentity.isFile || lockIdentity.uid !== process.getuid?.() ||
                 (lockIdentity.mode & 0o077) !== 0) {
@@ -1191,7 +1193,7 @@ export class HandoffPublisher {
                     contentHash: record.content_hash,
                 };
                 await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
-                const payloadFd = openFileAt(directoryFd, record.payload_basename, constants.O_RDONLY);
+                const payloadFd = openFileAt(directoryFd, record.payload_basename, READ_NO_BLOCK);
                 try {
                     const payloadIdentity = descriptorIdentitySync(payloadFd);
                     const recordIdentity = await entryIdentityAtPinned(directoryFd, recordName);
@@ -1238,7 +1240,7 @@ export class HandoffPublisher {
                 const after = await descriptorIdentity(lockFd);
                 let pathIdentity;
                 try {
-                    const pathFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDONLY);
+                    const pathFd = openFileAt(directoryFd, LOCK_BASENAME, READ_NO_BLOCK);
                     try {
                         pathIdentity = await descriptorIdentity(pathFd);
                     }
@@ -1318,7 +1320,7 @@ export class HandoffPublisher {
                     const { published } = slot;
                     await verifyPublishedHandoff(directoryFd, published, media, canonicalKey);
                     await requireDirectoryPathIdentity(handoffPath, directoryStatus);
-                    const payloadFd = openFileAt(directoryFd, published.handoffFilename, constants.O_RDONLY);
+                    const payloadFd = openFileAt(directoryFd, published.handoffFilename, READ_NO_BLOCK);
                     try {
                         const payloadIdentity = await descriptorIdentity(payloadFd);
                         const expectedNames = listAt(directoryFd).sort();
@@ -1364,7 +1366,7 @@ export class HandoffPublisher {
                     const after = await descriptorIdentity(lockFd);
                     let pathIdentity;
                     try {
-                        const pathFd = openFileAt(directoryFd, LOCK_BASENAME, constants.O_RDONLY);
+                        const pathFd = openFileAt(directoryFd, LOCK_BASENAME, READ_NO_BLOCK);
                         try {
                             pathIdentity = await descriptorIdentity(pathFd);
                         }
