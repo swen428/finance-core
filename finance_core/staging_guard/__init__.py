@@ -157,6 +157,16 @@ def _col(row: sqlite3.Row | tuple, name: str, col_idx: int) -> object:
 # ---------------------------------------------------------------------------
 
 
+def _reject_attached_databases(conn: sqlite3.Connection) -> None:
+    """Do not let main's authorization cover another attached database."""
+    for row in conn.execute("PRAGMA database_list"):
+        name = str(_col(row, "name", 1))
+        if name not in {"main", "temp"}:
+            raise StagingDatabaseError(
+                f"High-risk writes are forbidden with an attached database ('{name}')."
+            )
+
+
 def _get_db_file_path(conn: sqlite3.Connection) -> str:
     rows = conn.execute("PRAGMA database_list").fetchall()
     for row in rows:
@@ -446,20 +456,24 @@ def require_staging_database(
 
     Verification steps:
 
-    1. Genuine ``:memory:`` databases (verified via journal mode) are
+    1. Reject any attached database other than SQLite's built-in ``temp``
+       schema; main's authorization cannot cover another database.
+    2. Genuine ``:memory:`` databases (verified via journal mode) are
        accepted unconditionally.
-    2. Unidentified connections (empty file path that is not in-memory)
+    3. Unidentified connections (empty file path that is not in-memory)
        are rejected.
-    3. The resolved filesystem path is compared against the live database
+    4. The resolved filesystem path is compared against the live database
        path; a match is rejected unconditionally.
-    4. The ``_staging_authorization`` table schema, row count, token
+    5. The ``_staging_authorization`` table schema, row count, token
        format, version, and identity binding are validated.
-    5. The stored ``db_identity`` must match the connection's resolved
+    6. The stored ``db_identity`` must match the connection's resolved
        path; copied or renamed databases are rejected.
 
     This function is **read-only**: it performs no writes, commits, or
     rollbacks, and preserves any caller-owned pending transaction.
     """
+    _reject_attached_databases(conn)
+
     if _is_in_memory(conn):
         return
 

@@ -38,6 +38,7 @@ Covers:
  35. Failed initialization does not delete an attacker-replaced file.
  36. Failed initialization remains unauthorised.
  37. Migration failure leaves an unauthorised file.
+ 38. Attached databases cannot inherit main database staging authorization.
 """
 
 from __future__ import annotations
@@ -83,6 +84,57 @@ def test_staging_database_is_accepted(tmp_path: Path) -> None:
     db_path = tmp_path / "test_staging.sqlite"
     conn = create_staging_database(db_path)
     try:
+        require_staging_database(conn)
+    finally:
+        conn.close()
+
+
+def test_memory_main_rejects_attached_file(tmp_path: Path) -> None:
+    attached_path = tmp_path / "ordinary.sqlite"
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("ATTACH DATABASE ? AS ordinary", (str(attached_path),))
+        with pytest.raises(StagingDatabaseError, match="attached database"):
+            require_staging_database(conn)
+    finally:
+        conn.close()
+
+
+def test_memory_main_rejects_separate_memory_attachment() -> None:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("ATTACH DATABASE ':memory:' AS separate")
+        with pytest.raises(StagingDatabaseError, match="attached database"):
+            require_staging_database(conn)
+    finally:
+        conn.close()
+
+
+def test_staging_main_rejects_attached_file_without_changing_transaction(
+    tmp_path: Path,
+) -> None:
+    conn = create_staging_database(tmp_path / "staging.sqlite")
+    try:
+        conn.execute("CREATE TABLE pending_write (id INTEGER)")
+        conn.commit()
+        conn.execute("ATTACH DATABASE ? AS ordinary", (str(tmp_path / "ordinary.sqlite"),))
+        conn.execute("INSERT INTO pending_write VALUES (1)")
+        assert conn.in_transaction
+
+        with pytest.raises(StagingDatabaseError, match="attached database"):
+            require_staging_database(conn)
+
+        assert conn.in_transaction
+        conn.rollback()
+        assert conn.execute("SELECT COUNT(*) FROM pending_write").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_staging_main_allows_builtin_temp_schema(tmp_path: Path) -> None:
+    conn = create_staging_database(tmp_path / "staging.sqlite")
+    try:
+        conn.execute("CREATE TEMP TABLE scratch (id INTEGER)")
         require_staging_database(conn)
     finally:
         conn.close()
