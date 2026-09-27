@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { read } from "node:fs";
 import { realpath } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 import { closeDescriptor, constants, descriptorIdentity, openDirectory, openFileAt, readDescriptor, } from "./posix.js";
 export const MAX_RECEIPT_BYTES = 10_000_000;
 const DEFAULT_MEDIA_READ_TIMEOUT_MS = 30_000;
@@ -99,6 +100,87 @@ function opaqueMediaId(url) {
     }
     return decoded;
 }
+function trustedHostMedia(value) {
+    if (value.mediaStagingPending !== undefined &&
+        typeof value.mediaStagingPending !== "boolean") {
+        throw new Error("Trusted receipt media staging state is invalid.");
+    }
+    if (value.mediaStagingPending === true)
+        throw new Error("Trusted receipt media is still pending.");
+    const { mediaPath, mediaUrl, mediaPaths, mediaUrls, mediaType, mediaTypes } = value;
+    if (typeof mediaPath !== "string" || typeof mediaUrl !== "string" ||
+        !Array.isArray(mediaPaths) || !Array.isArray(mediaUrls) ||
+        mediaPaths.length !== 1 || mediaUrls.length !== 1 ||
+        typeof mediaPaths[0] !== "string" || typeof mediaUrls[0] !== "string" ||
+        mediaPath !== mediaUrl || mediaPath !== mediaPaths[0] ||
+        mediaPath !== mediaUrls[0] || typeof mediaType !== "string" ||
+        !Array.isArray(mediaTypes) || mediaTypes.length !== 1 ||
+        mediaTypes[0] !== mediaType) {
+        throw new Error("Trusted receipt media fields do not identify one identical original.");
+    }
+    if (value.originalFilename !== undefined && typeof value.originalFilename !== "string") {
+        throw new Error("Trusted receipt original filename has an invalid type.");
+    }
+    return {
+        path: mediaPath, mime: mediaType,
+        ...(typeof value.originalFilename === "string" ? { filename: value.originalFilename } : {}),
+    };
+}
+function varAlias(path) {
+    if (path === "/var" || path.startsWith("/var/"))
+        return `/private${path}`;
+    if (path === "/private/var" || path.startsWith("/private/var/")) {
+        return path.slice("/private".length);
+    }
+    return undefined;
+}
+function trustedDirectChild(path, requestedInbound) {
+    if (!isAbsolute(path) || path.includes("\0")) {
+        throw new Error("Trusted receipt media path is not an absolute local path.");
+    }
+    const parent = dirname(path);
+    const id = basename(path);
+    if (path !== join(parent, id) ||
+        ![requestedInbound, varAlias(requestedInbound)].includes(parent) ||
+        !/^[A-Za-z0-9._-]{1,200}$/u.test(id) || id === "." || id === "..") {
+        throw new Error("Trusted receipt media is not a direct inbound child.");
+    }
+    return id;
+}
+function readChunk(fd, buffer, offset, length) {
+    return new Promise((resolvePromise, reject) => {
+        read(fd, buffer, offset, length, null, (error, bytesRead) => {
+            if (error)
+                reject(error);
+            else
+                resolvePromise(bytesRead);
+        });
+    });
+}
+async function readTrustedHostOriginal(fd) {
+    const before = await descriptorIdentity(fd);
+    if (!before.isFile || before.uid !== process.getuid?.() ||
+        ![0o600, 0o644].includes(before.mode & 0o7777) ||
+        before.size <= 0 || before.size > MAX_RECEIPT_BYTES) {
+        throw new Error("Trusted receipt original is not an owner-controlled bounded regular file.");
+    }
+    const bytes = Buffer.allocUnsafe(before.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+        const count = await readChunk(fd, bytes, offset, bytes.length - offset);
+        if (count === 0)
+            break;
+        offset += count;
+    }
+    const after = await descriptorIdentity(fd);
+    if (!after.isFile || before.dev !== after.dev || before.ino !== after.ino ||
+        before.uid !== after.uid || before.mode !== after.mode ||
+        before.size !== after.size || before.ctimeNs !== after.ctimeNs ||
+        before.mtimeNs !== after.mtimeNs || offset !== before.size) {
+        throw new Error("Trusted receipt original changed during read.");
+    }
+    return bytes;
+}
 function detectedType(bytes) {
     if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
         return { detectedMimeType: "image/jpeg", canonicalExtension: ".jpg" };
@@ -115,6 +197,111 @@ export class ReceiptMediaAdapter {
     constructor(getMediaDirectory, readTimeoutMs = DEFAULT_MEDIA_READ_TIMEOUT_MS) {
         this.getMediaDirectory = getMediaDirectory;
         this.readTimeoutMs = readTimeoutMs;
+    }
+    /** Only the pinned trusted Finance ingress path may call this host-path reader. */
+    async acquireTrustedInbound(value, timeoutMs = this.readTimeoutMs) {
+        if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 ||
+            timeoutMs > DEFAULT_MEDIA_READ_TIMEOUT_MS) {
+            throw new Error("Trusted receipt media read timeout is invalid.");
+        }
+        if (!isRecord(value))
+            throw new Error("Trusted receipt attachment metadata is invalid.");
+        const descriptor = trustedHostMedia(value);
+        const originalFilename = boundedOriginalFilename(descriptor.filename);
+        const requestedInbound = join(this.getMediaDirectory(), "inbound");
+        const id = trustedDirectChild(descriptor.path, requestedInbound);
+        const startedAt = performance.now();
+        let canonicalInbound;
+        let inboundFd;
+        try {
+            canonicalInbound = await realpath(requestedInbound);
+            if (await realpath(dirname(descriptor.path)) !== canonicalInbound) {
+                throw new Error("Trusted receipt media parent is not the configured inbound directory.");
+            }
+            inboundFd = openDirectory(canonicalInbound);
+        }
+        catch (error) {
+            if (error.code === "ENOENT") {
+                throw new ReceiptMediaUnavailableError("Trusted receipt media is no longer available.", originalFilename, descriptor.mime, { cause: error });
+            }
+            throw error;
+        }
+        let mediaFd;
+        let bytes;
+        try {
+            const inboundIdentity = await descriptorIdentity(inboundFd);
+            if (!inboundIdentity.isDirectory || inboundIdentity.uid !== process.getuid?.() ||
+                (inboundIdentity.mode & 0o7777) !== 0o700) {
+                throw new Error("Trusted media inbound directory is not private owner-controlled 0700.");
+            }
+            const currentInbound = await realpath(requestedInbound);
+            if (currentInbound !== canonicalInbound) {
+                throw new Error("Trusted media inbound directory identity changed.");
+            }
+            const pathFd = openDirectory(currentInbound);
+            try {
+                const pathIdentity = await descriptorIdentity(pathFd);
+                if (pathIdentity.dev !== inboundIdentity.dev || pathIdentity.ino !== inboundIdentity.ino ||
+                    pathIdentity.uid !== inboundIdentity.uid || pathIdentity.mode !== inboundIdentity.mode) {
+                    throw new Error("Trusted media inbound directory identity changed.");
+                }
+            }
+            finally {
+                await closeDescriptor(pathFd);
+            }
+            try {
+                mediaFd = openFileAt(inboundFd, id, constants.O_RDONLY);
+            }
+            catch (error) {
+                if (error.code === "ENOENT") {
+                    throw new ReceiptMediaUnavailableError("Trusted receipt media is no longer available.", originalFilename, descriptor.mime, { cause: error });
+                }
+                throw error;
+            }
+            bytes = await readTrustedHostOriginal(mediaFd);
+            const afterInbound = await descriptorIdentity(inboundFd);
+            if (afterInbound.dev !== inboundIdentity.dev || afterInbound.ino !== inboundIdentity.ino ||
+                afterInbound.uid !== inboundIdentity.uid || afterInbound.mode !== inboundIdentity.mode ||
+                await realpath(requestedInbound) !== canonicalInbound) {
+                throw new Error("Trusted media inbound directory changed during acquisition.");
+            }
+            const afterPathFd = openDirectory(canonicalInbound);
+            try {
+                const afterPath = await descriptorIdentity(afterPathFd);
+                if (afterPath.dev !== inboundIdentity.dev || afterPath.ino !== inboundIdentity.ino ||
+                    afterPath.uid !== inboundIdentity.uid || afterPath.mode !== inboundIdentity.mode) {
+                    throw new Error("Trusted media inbound directory was replaced during acquisition.");
+                }
+            }
+            finally {
+                await closeDescriptor(afterPathFd);
+            }
+        }
+        finally {
+            if (mediaFd !== undefined)
+                await closeDescriptor(mediaFd);
+            await closeDescriptor(inboundFd);
+        }
+        if (performance.now() - startedAt > timeoutMs) {
+            throw new Error("Trusted receipt media read deadline exceeded after descriptor cleanup.");
+        }
+        const detected = detectedType(bytes);
+        if (descriptor.mime !== detected.detectedMimeType) {
+            throw new Error("Trusted declared receipt MIME does not match magic bytes.");
+        }
+        if (descriptor.filename !== undefined) {
+            const extension = extname(descriptor.filename).toLowerCase();
+            if (extension !== detected.canonicalExtension &&
+                !(detected.canonicalExtension === ".jpg" && extension === ".jpeg")) {
+                throw new Error("Trusted declared receipt extension does not match magic bytes.");
+            }
+        }
+        return {
+            bytes, byteSize: bytes.byteLength,
+            contentHash: createHash("sha256").update(bytes).digest("hex"),
+            ...detected,
+            ...(originalFilename === undefined ? {} : { originalFilename }),
+        };
     }
     async acquire(value, timeoutMs = this.readTimeoutMs) {
         if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 ||

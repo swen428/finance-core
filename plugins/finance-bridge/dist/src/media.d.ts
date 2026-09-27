@@ -17,5 +17,7 @@ export declare class ReceiptMediaAdapter {
     private readonly getMediaDirectory;
     private readonly readTimeoutMs;
     constructor(getMediaDirectory: GetMediaDirectory, readTimeoutMs?: number);
+    /** Only the pinned trusted Finance ingress path may call this host-path reader. */
+    acquireTrustedInbound(value: unknown, timeoutMs?: number): Promise<ValidatedMedia>;
     acquire(value: unknown, timeoutMs?: number): Promise<ValidatedMedia>;
 }

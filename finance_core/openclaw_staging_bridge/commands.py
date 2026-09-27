@@ -61,6 +61,7 @@ from finance_core.intake.interaction_routes import (
     require_replayed_interaction_route,
 )
 from finance_core.intake.raw_text_repository import (
+    TELEGRAM_PHOTO_FINGERPRINT_VERSION,
     TELEGRAM_TEXT,
     RawIntakeIdempotencyConflictError,
     create_raw_intake_record,
@@ -1814,6 +1815,12 @@ def _require_replay_content_matches(
     Returns the handoff bytes when the check read them, so publication can
     reuse the exact bound content instead of re-reading the file.
     """
+    if intake.get("fingerprint_version") != TELEGRAM_PHOTO_FINGERPRINT_VERSION:
+        raise errors.bridge_error(
+            errors.IDEMPOTENCY_CONFLICT,
+            "Receipt replay requires the exact-caption fingerprint version.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
     evidence_row = get_telegram_source_evidence_for_raw_intake(conn, int(intake["id"]))
     if evidence_row is not None:
         if provided_content is None:
@@ -1847,7 +1854,7 @@ def _require_replay_content_matches(
     else:
         content = provided_content
     expected_fingerprint = canonical_fingerprint(
-        schema_version="raw-intake-v1",
+        schema_version=TELEGRAM_PHOTO_FINGERPRINT_VERSION,
         material={
             "source_type": intake["source_type"],
             "source_channel": intake["source_channel"],
@@ -1867,7 +1874,10 @@ def _require_replay_content_matches(
 
 
 def _require_replay_caption_matches(intake: dict[str, Any], caption: str) -> None:
-    if intake["raw_input"] != (caption or "[telegram receipt image]"):
+    if (
+        intake.get("fingerprint_version") != TELEGRAM_PHOTO_FINGERPRINT_VERSION
+        or intake["raw_input"] != caption
+    ):
         raise errors.bridge_error(
             errors.IDEMPOTENCY_CONFLICT,
             "Capture idempotency key is already bound to a different receipt caption.",
@@ -2067,7 +2077,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 declared_mime_type=declared_mime_type,
             )
             deadline.check("receipt intake persistence")
-            raw_input = caption or "[telegram receipt image]"
+            raw_input = caption
             source_metadata: dict[str, Any] = {
                 "chat_id": str(chat_id),
                 "message_id": str(message_id),
@@ -2093,6 +2103,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                         source_channel="telegram",
                         source_metadata=source_metadata,
                         public_id=identities["raw_intake_public_id"],
+                        fingerprint_version=TELEGRAM_PHOTO_FINGERPRINT_VERSION,
                     )
                     persistence_effect = _capture_context_effect(source_context)
                     if persistence_effect is not None:

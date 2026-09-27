@@ -21,6 +21,7 @@ MANUAL_ENTRY = "manual_entry"
 MANUAL_CHANNEL = "manual"
 PARSER_NAME = "text_expense_parser"
 PARSER_VERSION = "v2"
+TELEGRAM_PHOTO_FINGERPRINT_VERSION = "raw-intake-telegram-photo-v2"
 
 
 class RawIntakeIdempotencyConflictError(ValueError):
@@ -44,6 +45,7 @@ def create_raw_intake_record(
     source_metadata: Mapping[str, Any] | None = None,
     received_at: datetime | str | None = None,
     public_id: str | None = None,
+    fingerprint_version: str = "raw-intake-v1",
 ) -> dict[str, Any]:
     """Persist a raw intake record before parser interpretation."""
     require_staging_database(conn)
@@ -54,6 +56,7 @@ def create_raw_intake_record(
         source_channel=source_channel,
         raw_input=raw_input,
         source_metadata=source_metadata,
+        fingerprint_version=fingerprint_version,
     )
 
     try:
@@ -369,7 +372,14 @@ def _source_details(
     source_channel: str | None,
     raw_input: str,
     source_metadata: Mapping[str, Any] | None,
+    fingerprint_version: str = "raw-intake-v1",
 ) -> dict[str, str | None]:
+    if fingerprint_version != "raw-intake-v1" and not (
+        fingerprint_version == TELEGRAM_PHOTO_FINGERPRINT_VERSION
+        and source_type == "telegram_image"
+        and source_channel == TELEGRAM_CHANNEL
+    ):
+        raise ValueError("Unsupported raw intake fingerprint version for source")
     resolved_channel = source_channel or _default_source_channel(source_type)
     metadata = dict(source_metadata or {})
     source_message_id = _metadata_text(metadata, "source_message_id") or _metadata_text(
@@ -397,7 +407,7 @@ def _source_details(
         "idempotency_key": idempotency_key,
         "source_content_hash": _source_content_hash(raw_input),
         "content_fingerprint": canonical_fingerprint(
-            schema_version="raw-intake-v1",
+            schema_version=fingerprint_version,
             material={
                 "source_type": source_type,
                 "source_channel": resolved_channel,
@@ -409,7 +419,7 @@ def _source_details(
                 or _metadata_text(metadata, "source_file_hash"),
             },
         ),
-        "fingerprint_version": "raw-intake-v1",
+        "fingerprint_version": fingerprint_version,
         "source_payload": _json_dumps(metadata) if metadata else None,
     }
 

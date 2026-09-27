@@ -12,6 +12,7 @@ interface NativePosix {
   openFileAt(directoryFd: number, name: string, flags: number, mode: number): number;
   descriptorIdentitySync(fd: number): DescriptorIdentity;
   renameNoReplaceAt(directoryFd: number, source: string, target: string): void;
+  unlinkAtIfIdentity(directoryFd: number, name: string, expectedIdentity: EntryIdentity): unknown;
   listAt(directoryFd: number): string[];
   freeBytes(directoryFd: number): number;
 }
@@ -57,6 +58,54 @@ export interface DescriptorIdentity {
   mtimeNs: bigint;
   isDirectory: boolean;
   isFile: boolean;
+}
+
+export type EntryIdentity = Pick<
+  DescriptorIdentity,
+  "dev" | "ino" | "uid" | "mode" | "size" | "ctimeNs" | "mtimeNs"
+>;
+
+const UINT32_MAX = 0xffff_ffff;
+const UINT64_MAX = 0xffff_ffff_ffff_ffffn;
+const INT64_MIN = -0x8000_0000_0000_0000n;
+const INT64_MAX = 0x7fff_ffff_ffff_ffffn;
+const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+
+function requireFileDescriptor(value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fff_ffff) {
+    throw new TypeError("Expected a valid non-negative integer directory descriptor.");
+  }
+}
+
+function requireEntryBasename(value: string): void {
+  if (typeof value !== "string" || value.length === 0 || Buffer.byteLength(value, "utf8") > 255 ||
+      value === "." || value === ".." || value.includes("/") || value.includes("\0")) {
+    throw new TypeError("Expected one safe directory-entry basename.");
+  }
+}
+
+function validatedEntryIdentity(value: EntryIdentity): EntryIdentity {
+  if (typeof value !== "object" || value === null || Array.isArray(value) ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new TypeError("Expected a plain complete file identity object.");
+  }
+  const fields = ["dev", "ino", "uid", "mode", "size", "ctimeNs", "mtimeNs"] as const;
+  for (const field of fields) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) {
+      throw new TypeError(`File identity is missing ${field}.`);
+    }
+  }
+  const { dev, ino, uid, mode, size, ctimeNs, mtimeNs } = value;
+  if (typeof dev !== "bigint" || dev < 0n || dev > UINT64_MAX ||
+      typeof ino !== "bigint" || ino < 0n || ino > UINT64_MAX ||
+      !Number.isSafeInteger(uid) || uid < 0 || uid > UINT32_MAX ||
+      !Number.isSafeInteger(mode) || mode < 0 || mode > UINT32_MAX ||
+      !Number.isSafeInteger(size) || size < 0 || size > MAX_SAFE_INTEGER ||
+      typeof ctimeNs !== "bigint" || ctimeNs < INT64_MIN || ctimeNs > INT64_MAX ||
+      typeof mtimeNs !== "bigint" || mtimeNs < INT64_MIN || mtimeNs > INT64_MAX) {
+    throw new TypeError("File identity fields have invalid types or ranges.");
+  }
+  return { dev, ino, uid, mode, size, ctimeNs, mtimeNs };
 }
 
 export async function descriptorIdentity(fd: number): Promise<DescriptorIdentity> {
@@ -155,6 +204,26 @@ export async function writeDescriptor(fd: number, bytes: Buffer): Promise<void> 
 
 export function renameNoReplaceAt(directoryFd: number, source: string, target: string): void {
   native.renameNoReplaceAt(directoryFd, source, target);
+}
+
+/**
+ * Remove a regular file only when its descriptor-relative identity still matches.
+ * The caller must hold the handoff flock. A same-UID process that ignores it
+ * can race between the native identity check and unlinkat.
+ */
+export function unlinkAtIfIdentity(
+  directoryFd: number,
+  name: string,
+  expectedIdentity: EntryIdentity,
+): void {
+  if (arguments.length !== 3) throw new TypeError("Expected exactly three unlink arguments.");
+  requireFileDescriptor(directoryFd);
+  requireEntryBasename(name);
+  const identity = validatedEntryIdentity(expectedIdentity);
+  const result = native.unlinkAtIfIdentity(directoryFd, name, identity);
+  if (result !== undefined) {
+    throw new Error("Native unlink boundary returned an invalid result.");
+  }
 }
 
 export function listAt(directoryFd: number): string[] {

@@ -217,11 +217,11 @@ def test_receipt_replay_rejects_changed_caption_even_without_handoff(
     assert refusal.response["error"]["code"] == errors.IDEMPOTENCY_CONFLICT
     with support.open_database(workspace) as conn:
         assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 1
-        expected = first_caption or "[telegram receipt image]"
+        expected = first_caption or ""
         assert conn.execute("SELECT raw_input FROM raw_intake_records").fetchone()[0] == expected
 
 
-def test_receipt_replay_same_canonical_caption_succeeds_without_handoff(
+def test_receipt_replay_literal_old_placeholder_conflicts_with_empty_caption(
     workspace: support.BridgeWorkspace,
 ) -> None:
     handoff = support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
@@ -229,7 +229,94 @@ def test_receipt_replay_same_canonical_caption_succeeds_without_handoff(
     handoff.unlink()
     replay = _receipt_request(workspace)
     replay["arguments"]["caption"] = "[telegram receipt image]"
-    assert support.run_cli(replay).exit_code == errors.EXIT_OK
+    refusal = support.run_cli(replay)
+    assert refusal.exit_code == errors.EXIT_AUTHORITY_REFUSED
+    assert refusal.response["error"]["code"] == errors.IDEMPOTENCY_CONFLICT
+
+
+def test_receipt_replay_same_empty_caption_succeeds_without_handoff(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    handoff = support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    assert support.run_cli(_receipt_request(workspace)).exit_code == errors.EXIT_OK
+    handoff.unlink()
+    assert support.run_cli(_receipt_request(workspace)).exit_code == errors.EXIT_OK
+
+
+@pytest.mark.parametrize("caption", ["", "[telegram receipt image]", "收据🧾\r\nnext"])
+def test_receipt_capture_saves_exact_caption_with_distinct_v2_fingerprint(
+    workspace: support.BridgeWorkspace, caption: str
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    request = _receipt_request(workspace)
+    if caption:
+        request["arguments"]["caption"] = caption
+    assert support.run_cli(request).exit_code == errors.EXIT_OK
+    with support.open_database(workspace) as conn:
+        row = conn.execute(
+            "SELECT raw_input, content_fingerprint, fingerprint_version FROM raw_intake_records"
+        ).fetchone()
+        assert row["raw_input"] == caption
+        assert row["fingerprint_version"] == "raw-intake-telegram-photo-v2"
+        assert len(row["content_fingerprint"]) == 64
+
+
+def test_empty_and_literal_placeholder_have_distinct_fingerprints_and_conflict_both_ways(
+    tmp_path: Path,
+) -> None:
+    fingerprints: list[str] = []
+    for name, original, replay_caption in [
+        ("empty", "", "[telegram receipt image]"),
+        ("literal", "[telegram receipt image]", ""),
+    ]:
+        workspace = support.create_bridge_workspace(tmp_path, name=name)
+        support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+        first = _receipt_request(workspace)
+        if original:
+            first["arguments"]["caption"] = original
+        assert support.run_cli(first).exit_code == errors.EXIT_OK
+        with support.open_database(workspace) as conn:
+            row = conn.execute(
+                "SELECT raw_input, content_fingerprint, fingerprint_version FROM raw_intake_records"
+            ).fetchone()
+            assert row["raw_input"] == original
+            assert row["fingerprint_version"] == "raw-intake-telegram-photo-v2"
+            fingerprints.append(row["content_fingerprint"])
+        replay = _receipt_request(workspace)
+        if replay_caption:
+            replay["arguments"]["caption"] = replay_caption
+        refusal = support.run_cli(replay)
+        assert refusal.exit_code == errors.EXIT_AUTHORITY_REFUSED
+        assert refusal.response["error"]["code"] == errors.IDEMPOTENCY_CONFLICT
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_historical_v1_photo_intake_cannot_replay_as_exact_caption(
+    workspace: support.BridgeWorkspace,
+) -> None:
+    support.write_handoff_file(workspace, "d3.jpg", support.JPEG_BYTES)
+    identities = identity.capture_identities(support.canonical_capture_key(message_id=20))
+    with support.open_database(workspace) as conn:
+        legacy = create_raw_intake_record(
+            conn,
+            "[telegram receipt image]",
+            source_type="telegram_image",
+            source_channel="telegram",
+            source_metadata={
+                "chat_id": "111",
+                "message_id": "20",
+                "attachment_hash": support.sha256_hex(support.JPEG_BYTES),
+            },
+            public_id=identities["raw_intake_public_id"],
+        )
+        assert legacy["fingerprint_version"] == "raw-intake-v1"
+    replay = _receipt_request(workspace)
+    replay["arguments"]["caption"] = "[telegram receipt image]"
+    refusal = support.run_cli(replay)
+    assert refusal.exit_code == errors.EXIT_AUTHORITY_REFUSED
+    assert refusal.response["error"]["code"] == errors.IDEMPOTENCY_CONFLICT
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT count(*) FROM finance_capture_jobs").fetchone()[0] == 0
 
 
 def test_receipt_lost_capture_reply_recovers_by_stable_intake_without_handoff(

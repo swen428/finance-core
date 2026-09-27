@@ -230,6 +230,12 @@ jobs:
           PYTHON_EXECUTABLE: ${{ github.workspace }}/.venv/bin/python
         run: npm test
 
+      - name: Test trusted Bridge capture and reclaim against temporary Core
+        working-directory: plugins/finance-bridge
+        env:
+          FINANCE_TEST_PYTHON: ${{ github.workspace }}/.venv/bin/python
+        run: node test/trusted-ingress-core.mjs
+
   pytest-report:
     needs: pytest
     if: ${{ always() }}

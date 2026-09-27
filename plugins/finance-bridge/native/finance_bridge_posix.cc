@@ -2,9 +2,12 @@
 
 #include <cerrno>
 #include <climits>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits>
 #include <string>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
@@ -72,6 +75,116 @@ bool GetString(napi_env env, napi_value value, std::string* output) {
     return false;
   }
   return true;
+}
+
+bool GetExpectedBigInt(napi_env env, napi_value object, const char* property,
+                       bool unsigned_value, uint64_t* unsigned_output,
+                       int64_t* signed_output) {
+  napi_value value;
+  napi_valuetype type;
+  if (napi_get_named_property(env, object, property, &value) != napi_ok ||
+      napi_typeof(env, value, &type) != napi_ok || type != napi_bigint) {
+    napi_throw_type_error(env, nullptr, "Expected complete bigint file identity fields.");
+    return false;
+  }
+  bool lossless = false;
+  const napi_status status = unsigned_value
+      ? napi_get_value_bigint_uint64(env, value, unsigned_output, &lossless)
+      : napi_get_value_bigint_int64(env, value, signed_output, &lossless);
+  if (status != napi_ok || !lossless) {
+    napi_throw_type_error(env, nullptr, "File identity bigint is outside the native range.");
+    return false;
+  }
+  return true;
+}
+
+bool GetExpectedUint32(napi_env env, napi_value object, const char* property,
+                       uint32_t* output) {
+  napi_value value;
+  napi_valuetype type;
+  double number = 0;
+  if (napi_get_named_property(env, object, property, &value) != napi_ok ||
+      napi_typeof(env, value, &type) != napi_ok || type != napi_number ||
+      napi_get_value_double(env, value, &number) != napi_ok || !std::isfinite(number) ||
+      std::trunc(number) != number || number < 0 ||
+      number > static_cast<double>(std::numeric_limits<uint32_t>::max())) {
+    napi_throw_type_error(env, nullptr, "Expected a complete unsigned integer file identity field.");
+    return false;
+  }
+  *output = static_cast<uint32_t>(number);
+  return true;
+}
+
+bool GetExpectedSize(napi_env env, napi_value object, int64_t* output) {
+  napi_value value;
+  napi_valuetype type;
+  double number = 0;
+  if (napi_get_named_property(env, object, "size", &value) != napi_ok ||
+      napi_typeof(env, value, &type) != napi_ok || type != napi_number ||
+      napi_get_value_double(env, value, &number) != napi_ok || !std::isfinite(number) ||
+      std::trunc(number) != number || number < 0 || number > 9007199254740991.0) {
+    napi_throw_type_error(env, nullptr, "Expected a safe non-negative integer file size.");
+    return false;
+  }
+  *output = static_cast<int64_t>(number);
+  return true;
+}
+
+struct ExpectedEntryIdentity {
+  uint64_t dev;
+  uint64_t ino;
+  uint32_t uid;
+  uint32_t mode;
+  int64_t size;
+  int64_t ctime_ns;
+  int64_t mtime_ns;
+};
+
+bool GetExpectedEntryIdentity(napi_env env, napi_value value, ExpectedEntryIdentity* output) {
+  napi_valuetype type;
+  bool is_array = false;
+  if (napi_typeof(env, value, &type) != napi_ok || type != napi_object ||
+      napi_is_array(env, value, &is_array) != napi_ok || is_array) {
+    napi_throw_type_error(env, nullptr, "Expected a complete file identity object.");
+    return false;
+  }
+  return GetExpectedBigInt(env, value, "dev", true, &output->dev, nullptr) &&
+      GetExpectedBigInt(env, value, "ino", true, &output->ino, nullptr) &&
+      GetExpectedUint32(env, value, "uid", &output->uid) &&
+      GetExpectedUint32(env, value, "mode", &output->mode) &&
+      GetExpectedSize(env, value, &output->size) &&
+      GetExpectedBigInt(env, value, "ctimeNs", false, nullptr, &output->ctime_ns) &&
+      GetExpectedBigInt(env, value, "mtimeNs", false, nullptr, &output->mtime_ns);
+}
+
+bool StatTimeNanoseconds(const struct timespec& time, int64_t* output) {
+  const __int128 nanoseconds = static_cast<__int128>(time.tv_sec) * 1000000000LL +
+      static_cast<__int128>(time.tv_nsec);
+  if (nanoseconds < std::numeric_limits<int64_t>::min() ||
+      nanoseconds > std::numeric_limits<int64_t>::max()) {
+    return false;
+  }
+  *output = static_cast<int64_t>(nanoseconds);
+  return true;
+}
+
+bool MatchesIdentity(const struct stat& status, const ExpectedEntryIdentity& expected) {
+#if defined(__APPLE__)
+  const struct timespec ctime = status.st_ctimespec;
+  const struct timespec mtime = status.st_mtimespec;
+#else
+  const struct timespec ctime = status.st_ctim;
+  const struct timespec mtime = status.st_mtim;
+#endif
+  int64_t ctime_ns = 0;
+  int64_t mtime_ns = 0;
+  return StatTimeNanoseconds(ctime, &ctime_ns) && StatTimeNanoseconds(mtime, &mtime_ns) &&
+      static_cast<uint64_t>(status.st_dev) == expected.dev &&
+      static_cast<uint64_t>(status.st_ino) == expected.ino &&
+      static_cast<uint32_t>(status.st_uid) == expected.uid &&
+      static_cast<uint32_t>(status.st_mode) == expected.mode &&
+      status.st_size >= 0 && static_cast<int64_t>(status.st_size) == expected.size &&
+      ctime_ns == expected.ctime_ns && mtime_ns == expected.mtime_ns;
 }
 
 bool GetPath(napi_env env, napi_value value, std::string* output) {
@@ -253,6 +366,46 @@ napi_value RenameNoReplaceAt(napi_env env, napi_callback_info info) {
   return Undefined(env);
 }
 
+napi_value UnlinkAtIfIdentity(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value args[3];
+  napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+  int32_t directory_fd;
+  std::string name;
+  ExpectedEntryIdentity expected {};
+  if (argc != 3 || !GetInt32(env, args[0], &directory_fd) ||
+      !GetString(env, args[1], &name) || !GetExpectedEntryIdentity(env, args[2], &expected)) {
+    return nullptr;
+  }
+
+  struct stat status {};
+  if (fstatat(directory_fd, name.c_str(), &status, AT_SYMLINK_NOFOLLOW) < 0) {
+    ThrowErrno(env, "fstatat entry before unlink");
+    return nullptr;
+  }
+  if (S_ISLNK(status.st_mode)) {
+    errno = ELOOP;
+    ThrowErrno(env, "refuse to unlink symlink");
+    return nullptr;
+  }
+  if (!S_ISREG(status.st_mode)) {
+    napi_throw_error(env, nullptr, "Expected a regular file entry; refusing unlink.");
+    return nullptr;
+  }
+  if (!MatchesIdentity(status, expected)) {
+    napi_throw_error(env, nullptr, "Directory entry identity changed; refusing unlink.");
+    return nullptr;
+  }
+
+  // Callers hold the handoff flock. fstatat plus unlinkat cannot eliminate the
+  // race with a same-UID process that ignores that lock.
+  if (unlinkat(directory_fd, name.c_str(), 0) < 0) {
+    ThrowErrno(env, "unlinkat entry");
+    return nullptr;
+  }
+  return Undefined(env);
+}
+
 napi_value ListAt(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value args[1];
@@ -315,6 +468,8 @@ napi_value Initialize(napi_env env, napi_value exports) {
       {"descriptorIdentitySync", nullptr, DescriptorIdentitySync, nullptr, nullptr, nullptr,
        napi_default, nullptr},
       {"renameNoReplaceAt", nullptr, RenameNoReplaceAt, nullptr, nullptr, nullptr, napi_default,
+       nullptr},
+      {"unlinkAtIfIdentity", nullptr, UnlinkAtIfIdentity, nullptr, nullptr, nullptr, napi_default,
        nullptr},
       {"listAt", nullptr, ListAt, nullptr, nullptr, nullptr, napi_default, nullptr},
       {"freeBytes", nullptr, FreeBytes, nullptr, nullptr, nullptr, napi_default, nullptr},

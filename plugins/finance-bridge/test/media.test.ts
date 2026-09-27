@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, stat, symlink, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -8,6 +8,79 @@ import { temporaryDirectory } from "./support.js";
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x01, 0x02]);
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01]);
+
+function hostFields(path: string, type: string) {
+  return {
+    mediaPath: path, mediaUrl: path, mediaPaths: [path], mediaUrls: [path],
+    mediaType: type, mediaTypes: [type],
+  };
+}
+
+test("trusted host six-field 0644 JPEG/PNG path reads originals without changing permissions", async () => {
+  await using fixture = await mediaFixture();
+  const adapter = new ReceiptMediaAdapter(() => fixture.root);
+  for (const [name, bytes, type] of [
+    ["host-photo.jpg", JPEG, "image/jpeg"], ["host-photo.png", PNG, "image/png"],
+  ] as const) {
+    const path = join(fixture.inbound, name);
+    await writeFile(path, bytes, { mode: 0o644 });
+    await chmod(path, 0o644);
+    const media = await adapter.acquireTrustedInbound(hostFields(path, type));
+    assert.equal(media.detectedMimeType, type);
+    assert.equal(media.bytes.equals(bytes), true);
+    assert.equal((await stat(path)).mode & 0o777, 0o644);
+    await assert.rejects(adapter.acquire(hostFields(path, type)), /Direct media paths/u);
+    if (path.startsWith("/var/")) {
+      const alias = `/private${path}`;
+      assert.equal((await adapter.acquireTrustedInbound(hostFields(alias, type))).bytes.equals(bytes), true);
+    } else if (path.startsWith("/private/var/")) {
+      const alias = path.slice("/private".length);
+      assert.equal((await adapter.acquireTrustedInbound(hostFields(alias, type))).bytes.equals(bytes), true);
+    }
+  }
+});
+
+test("trusted host path reader rejects external, alias-conflicting, plural, and pending media", async () => {
+  await using fixture = await mediaFixture();
+  const adapter = new ReceiptMediaAdapter(() => fixture.root);
+  const path = join(fixture.inbound, "host-photo.jpg");
+  await writeFile(path, JPEG, { mode: 0o644 });
+  await chmod(path, 0o644);
+  const outside = join(fixture.root, "outside.jpg");
+  await writeFile(outside, JPEG, { mode: 0o644 });
+  for (const metadata of [
+    hostFields(outside, "image/jpeg"),
+    hostFields(`${fixture.inbound}/../outside.jpg`, "image/jpeg"),
+    { ...hostFields(path, "image/jpeg"), mediaUrl: outside },
+    { ...hostFields(path, "image/jpeg"), mediaPaths: [path, path] },
+    { ...hostFields(path, "image/jpeg"), mediaUrls: [] },
+    { ...hostFields(path, "image/jpeg"), mediaTypes: ["image/png"] },
+    { ...hostFields(path, "image/jpeg"), mediaStagingPending: true },
+    { ...hostFields(path, "image/jpeg"), mediaPath: undefined },
+  ]) {
+    await assert.rejects(adapter.acquireTrustedInbound(metadata), /trusted receipt|Trusted receipt/iu);
+  }
+});
+
+test("trusted host reader rejects leaf symlink, unsafe mode, directory drift, and MIME magic mismatch", async () => {
+  await using fixture = await mediaFixture();
+  const adapter = new ReceiptMediaAdapter(() => fixture.root);
+  const valid = join(fixture.inbound, "valid.jpg");
+  await writeFile(valid, JPEG, { mode: 0o644 });
+  await chmod(valid, 0o644);
+  const link = join(fixture.inbound, "link.jpg");
+  await symlink("valid.jpg", link);
+  await assert.rejects(adapter.acquireTrustedInbound(hostFields(link, "image/jpeg")), /openat|symbolic/iu);
+  for (const mode of [0o664, 0o755, 0o640]) {
+    await chmod(valid, mode);
+    await assert.rejects(adapter.acquireTrustedInbound(hostFields(valid, "image/jpeg")), /owner-controlled/u);
+  }
+  await chmod(valid, 0o644);
+  await chmod(fixture.inbound, 0o755);
+  await assert.rejects(adapter.acquireTrustedInbound(hostFields(valid, "image/jpeg")), /0700/u);
+  await chmod(fixture.inbound, 0o700);
+  await assert.rejects(adapter.acquireTrustedInbound(hostFields(valid, "image/png")), /MIME/u);
+});
 
 async function mediaFixture(): Promise<AsyncDisposable & {root: string; inbound: string}> {
   const fixture = await temporaryDirectory();
