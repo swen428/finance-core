@@ -192,7 +192,7 @@ def test_p6_fresh_external_failure_preserves_unenrolled_bytes(
 @pytest.mark.skipif(
     sys.platform != "darwin", reason="positive filesystem proof requires Darwin ACL checks"
 )
-def test_p6_fresh_nonempty_authority_collision_refuses_before_add_or_readback() -> None:
+def test_p6_fresh_006_nonempty_authority_collision_refuses_before_add_or_readback() -> None:
     temporary, root = _new_root()
     try:
         collision = root / "authority"
@@ -939,6 +939,8 @@ def _archive_source(
         copied[role] = bounded_read(archive_path)
 
     cut_id = uuid.uuid4().hex
+    # These fake-port declarations exercise cut-field binding only; the test
+    # does not derive them from a real owner inventory or sentinel artifact.
     closure_digest = hashlib.sha256(b"synthetic-closed-owner-inventory").hexdigest()
     sentinel_digest = hashlib.sha256(b"synthetic-archive-sentinel").hexdigest()
     cut_key = os.urandom(32)

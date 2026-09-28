@@ -12,6 +12,7 @@ import base64
 import fcntl
 import json
 import os
+import stat
 import sys
 import uuid
 from dataclasses import asdict
@@ -108,6 +109,84 @@ def _write_fd(fd: int, payload: bytes) -> None:
         if count <= 0:
             raise OSError("private test response made no progress")
         view = view[count:]
+
+
+class LeaseCheckingIssuer(InMemoryIssuer):
+    """Fake enrollment port that probes the actual gate and lifecycle leases."""
+
+    def __init__(self, root: Path, event_fd: int | None = None) -> None:
+        super().__init__()
+        self.root = root
+        self.event_fd = event_fd
+
+    def _assert_port_outside_leases(self, *, require_lifecycle: bool = False) -> None:
+        gate = self.root / "profile-gate.lock"
+        lifecycle = self.root / "authority" / "core-lifecycle.lock"
+        paths = [(gate, True)]
+        if require_lifecycle or lifecycle.exists():
+            paths.append((lifecycle, require_lifecycle))
+        for path, required in paths:
+            if not path.exists():
+                if required:
+                    raise FileNotFoundError(path)
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise RuntimeError(f"invalid lease witness: {path.name}")
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def prepare_fresh(self, root: Path) -> FreshTestGrant:
+        self._assert_port_outside_leases()
+        grant = super().prepare_fresh(root)
+        if self.event_fd is not None:
+            prepared = (
+                json.dumps(
+                    {
+                        "kind": "prepared",
+                        "key": base64.b64encode(grant.key).decode("ascii"),
+                        "grant": {
+                            field: getattr(grant, field)
+                            for field in (
+                                "installation_id",
+                                "profile_id",
+                                "instance_id",
+                                "issuer_epoch",
+                                "registry_id",
+                                "key_id",
+                                "enrollment_id",
+                            )
+                        },
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                + b"\n"
+            )
+            _write_fd(self.event_fd, prepared)
+        return grant
+
+    def add_only(self, anchor: TestAnchor, key: bytes) -> None:
+        self._assert_port_outside_leases(require_lifecycle=True)
+        super().add_only(anchor, key)
+        if self.event_fd is not None:
+            issued = (
+                json.dumps(
+                    {"kind": "issued", "anchor": _anchor_wire(anchor)},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("ascii")
+                + b"\n"
+            )
+            _write_fd(self.event_fd, issued)
+
+    def readback(self, enrollment_id: str) -> tuple[TestAnchor, bytes]:
+        self._assert_port_outside_leases(require_lifecycle=True)
+        return super().readback(enrollment_id)
 
 
 def _snapshot_wire(store: SyntheticAuthorityStore) -> dict[str, Any]:
@@ -283,68 +362,10 @@ def _crash_enrollment(
     target_role: str | None,
     short_chunk: int | None,
 ) -> None:
-    class NotifyingIssuer(InMemoryIssuer):
-        def _assert_port_outside_leases(self) -> None:
-            for path in (root / "profile-gate.lock", root / "authority" / "lifecycle.lock"):
-                if not path.exists():
-                    continue
-                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(fd)
-
-        def prepare_fresh(self, target: Path) -> FreshTestGrant:
-            self._assert_port_outside_leases()
-            grant = super().prepare_fresh(target)
-            prepared = (
-                json.dumps(
-                    {
-                        "kind": "prepared",
-                        "key": base64.b64encode(grant.key).decode("ascii"),
-                        "grant": {
-                            field: getattr(grant, field)
-                            for field in (
-                                "installation_id",
-                                "profile_id",
-                                "instance_id",
-                                "issuer_epoch",
-                                "registry_id",
-                                "key_id",
-                                "enrollment_id",
-                            )
-                        },
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("ascii")
-                + b"\n"
-            )
-            _write_fd(event_fd, prepared)
-            return grant
-
-        def add_only(self, anchor: TestAnchor, key: bytes) -> None:
-            self._assert_port_outside_leases()
-            super().add_only(anchor, key)
-            issued = (
-                json.dumps(
-                    {"kind": "issued", "anchor": _anchor_wire(anchor)},
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("ascii")
-                + b"\n"
-            )
-            _write_fd(event_fd, issued)
-
-        def readback(self, enrollment_id: str) -> tuple[TestAnchor, bytes]:
-            self._assert_port_outside_leases()
-            return super().readback(enrollment_id)
-
     _install_short_writes(short_chunk)
     SyntheticAuthorityStore.enroll_fresh_test(
         root,
-        NotifyingIssuer(),
+        LeaseCheckingIssuer(root, event_fd),
         hook=_make_hook(
             event_fd,
             continue_fd,

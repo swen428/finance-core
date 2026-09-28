@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -30,7 +31,11 @@ from finance_core.synthetic_native_authority.store import (
 HELPERS = Path(__file__).parent / "helpers"
 if str(HELPERS) not in sys.path:
     sys.path.insert(0, str(HELPERS))
-from synthetic_native_authority_worker import InMemoryIssuer, prepare_root  # noqa: E402
+from synthetic_native_authority_worker import (  # noqa: E402
+    InMemoryIssuer,
+    LeaseCheckingIssuer,
+    prepare_root,
+)
 
 WORKER = Path(__file__).parent / "helpers" / "synthetic_native_authority_worker.py"
 
@@ -62,7 +67,7 @@ def _observe(root: Path) -> dict[str, tuple[int, str] | None]:
     paths = {
         "gate": root / "profile-gate.lock",
         "descriptor": root / "authority" / "capabilities.frame",
-        "lifecycle": root / "authority" / "lifecycle.lock",
+        "lifecycle": root / "authority" / "core-lifecycle.lock",
         "registry": root / "authority" / "registry.log",
         "head": root / "authority" / "committed-head.log",
         "receipt": root / "authority" / "enrollment.receipt",
@@ -216,6 +221,11 @@ def _run_kill(
             with pytest.raises(ProcessLookupError):
                 os.kill(process.pid, 0)
             after = _observe(root)
+            lifecycle_created = not (
+                mode == "crash-enrollment"
+                and event in ("before_first_gate_lock", "after_first_gate_lock")
+            )
+            assert (after["lifecycle"] is not None) is lifecycle_created
             if event in ("before_first_gate_lock", "after_first_gate_lock"):
                 assert after["main"] is None
             else:
@@ -375,6 +385,60 @@ def _assert_p6_enrollment_cold_outcome(result: dict[str, object]) -> None:
         assert json.loads(stdout)["seq"] == 1
     else:
         assert status == 2 and "QuarantinedError" in stderr
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="positive ACL/lease proof is Darwin only")
+@pytest.mark.parametrize(
+    "stage",
+    (
+        pytest.param("add_only", id="P1-PORT-001-add-only"),
+        pytest.param("readback", id="P1-PORT-002-readback"),
+    ),
+)
+def test_p1_fake_issuer_refuses_add_and_readback_while_core_lifecycle_is_held(
+    stage: str,
+) -> None:
+    with tempfile.TemporaryDirectory(dir="/private/tmp", prefix="fna-issuer-lock-") as location:
+        parent = Path(location)
+        parent.chmod(0o700)
+        root = prepare_root(parent / "profile")
+        seed_issuer = InMemoryIssuer()
+        store = SyntheticAuthorityStore.enroll_fresh_test(root, seed_issuer)
+        assert seed_issuer.grant is not None
+        anchor, key = seed_issuer.readback(seed_issuer.grant.enrollment_id)
+        store.close()
+
+        issuer = LeaseCheckingIssuer(root)
+        if stage == "readback":
+            InMemoryIssuer.add_only(issuer, anchor, key)
+
+        gate_path = root / "profile-gate.lock"
+        lifecycle_path = root / "authority" / "core-lifecycle.lock"
+        gate_fd = os.open(gate_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        lifecycle_fd = os.open(lifecycle_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(lifecycle_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Prove the gate is free while the lifecycle lease remains held.
+            fcntl.flock(gate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(gate_fd, fcntl.LOCK_UN)
+
+            with pytest.raises(BlockingIOError):
+                if stage == "add_only":
+                    issuer.add_only(anchor, key)
+                else:
+                    issuer.readback(anchor.enrollment_id)
+
+            if stage == "add_only":
+                assert issuer._item is None
+            else:
+                assert issuer._item == (anchor, key)
+            # The failed external-port probe must not leave the gate held.
+            fcntl.flock(gate_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(gate_fd, fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(lifecycle_fd, fcntl.LOCK_UN)
+            os.close(lifecycle_fd)
+            os.close(gate_fd)
 
 
 _GATE_AND_ISSUER_BOUNDARIES = (
