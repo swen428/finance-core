@@ -1575,6 +1575,8 @@ def test_p6_restore_001_replays_copied_old_bytes_and_issues_only_new_epoch() -> 
         pytest.param("P6-RESTORE-002-cut-binding", id="P6-RESTORE-002-cut-binding"),
         pytest.param("P6-RESTORE-003-copied-log-tamper", id="P6-RESTORE-003-log-tamper"),
         pytest.param("P6-RESTORE-004-old-key", id="P6-RESTORE-004-old-key"),
+        pytest.param("P6-RESTORE-012-closure-declaration", id="P6-RESTORE-012-closure"),
+        pytest.param("P6-RESTORE-013-sentinel-declaration", id="P6-RESTORE-013-sentinel"),
     ],
 )
 def test_inconsistent_copied_archive_refuses_before_target_or_add_only(
@@ -1589,9 +1591,14 @@ def test_inconsistent_copied_archive_refuses_before_target_or_add_only(
         target_parent.chmod(0o700)
         target_root = prepare_root(target_parent / "profile")
 
-        if case_id == "P6-RESTORE-002-cut-binding":
+        cut_fields = {
+            "P6-RESTORE-002-cut-binding": "head_file_digest",
+            "P6-RESTORE-012-closure-declaration": "closed_owner_inventory_digest",
+            "P6-RESTORE-013-sentinel-declaration": "snapshot_sentinel_digest",
+        }
+        if case_id in cut_fields:
             bad_cut = dict(evidence["cut_payload"])
-            bad_cut["head_file_digest"] = "f" * 64
+            bad_cut[cut_fields[case_id]] = "f" * 64
             issuer.cut_frame = encode_independent_frame("test-cut", bad_cut, issuer.cut_key)
         elif case_id == "P6-RESTORE-003-copied-log-tamper":
             damaged = bytearray(issuer.source_material["registry"])
