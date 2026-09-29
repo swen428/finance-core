@@ -499,6 +499,7 @@ def test_exclusive_cut_can_validate_while_managed_writer_waits_for_gate(
     managed = managed_staging.bootstrap_registered_staging(blank) if operation == "reopen" else None
     profile = managed if managed is not None else blank
     shared_waiting = threading.Event()
+    shared_acquired = threading.Event()
     completed = threading.Event()
     errors: list[BaseException] = []
     sqlite_opens: list[str] = []
@@ -507,8 +508,11 @@ def test_exclusive_cut_can_validate_while_managed_writer_waits_for_gate(
 
     def observe_try_lock(fd: int, mode: int) -> bool:
         acquired = real_try_lock(fd, mode)
-        if mode == fcntl.LOCK_SH and not acquired:
-            shared_waiting.set()
+        if mode == fcntl.LOCK_SH:
+            if acquired:
+                shared_acquired.set()
+            else:
+                shared_waiting.set()
         return acquired
 
     def observe_connect(database: object, *args: object, **kwargs: object) -> object:
@@ -542,7 +546,12 @@ def test_exclusive_cut_can_validate_while_managed_writer_waits_for_gate(
                 cut.assert_valid()
             assert sqlite_opens == []
             assert not completed.is_set()
-        assert completed.wait(timeout=5)
+        assert shared_acquired.wait(timeout=5), (
+            f"shared writer did not acquire the released gate: errors={errors!r}"
+        )
+        assert completed.wait(timeout=20), (
+            f"shared writer did not finish after acquiring the gate: errors={errors!r}"
+        )
         worker.join(timeout=5)
         assert not worker.is_alive()
         assert errors == []
