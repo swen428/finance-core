@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from finance_core.profile_gate import (
+    DEFAULT_ACQUIRE_SECONDS,
     GateLease,
     initialize_profile_gate,
     writer_gate,
@@ -216,11 +218,12 @@ def _managed_staging_connection(
     profile: ManagedStagingProfile,
     *,
     purpose: Literal["reopen"] = "reopen",
+    gate_timeout_seconds: float = DEFAULT_ACQUIRE_SECONDS,
 ) -> Iterator[sqlite3.Connection]:
     """Hold a shared gate from before SQLite recovery until close completes."""
     if type(profile) is not ManagedStagingProfile or purpose != "reopen":
         raise ProfilePathError("A registered fixed staging profile is required")
-    lease = writer_gate(profile)
+    lease = writer_gate(profile, timeout_seconds=gate_timeout_seconds)
     try:
         with _MANAGED_SQLITE_LIFETIME_LOCK:
             with _managed_staging_connection_locked(profile, lease) as conn:
@@ -263,6 +266,29 @@ def _managed_staging_connection_locked(
                     retained is lease for _, retained in _UNCERTAIN_CLOSES
                 ):
                     _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                    # Full role/ACL inspection belongs after the last SQLite
+                    # handle has actually closed, while the gate is still held.
+                    profile.revalidate()
+
+
+@contextmanager
+def managed_staging_operation(
+    profile: ManagedStagingProfile,
+    *,
+    operation_id: str,
+    gate_timeout_seconds: float = DEFAULT_ACQUIRE_SECONDS,
+) -> Iterator[sqlite3.Connection]:
+    """One local operation on an enrolled profile, with no escaped connection.
+
+    The trusted adapter supplies the bounded operation identity. It cannot be
+    selected by an untrusted envelope to create a managed profile witness.
+    """
+    if not isinstance(operation_id, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9:_-]{0,199}", operation_id
+    ):
+        raise ProfilePathError("A bounded managed operation ID is required")
+    with _managed_staging_connection(profile, gate_timeout_seconds=gate_timeout_seconds) as conn:
+        yield conn
 
 
 def verify_registered_staging(
@@ -283,4 +309,8 @@ def verify_registered_staging(
         raise
 
 
-__all__ = ["bootstrap_registered_staging", "verify_registered_staging"]
+__all__ = [
+    "bootstrap_registered_staging",
+    "managed_staging_operation",
+    "verify_registered_staging",
+]
