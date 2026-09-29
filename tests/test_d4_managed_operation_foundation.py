@@ -54,7 +54,6 @@ _MANAGED_READ_COMMANDS = frozenset(
         envelope.COMMAND_GET_INTERACTION_ROUTE,
         envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES,
         envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
-        envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2,
         envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
         envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
     }
@@ -150,14 +149,13 @@ def test_managed_health_and_status_are_available_through_the_public_cli(
 
 
 def _read_arguments(command: str, workspace: Path) -> dict[str, object]:
-    arguments: dict[str, object] = {"workspace_path": str(workspace)}
-    if command != envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2:
-        arguments.update(
-            operator_actor_id="111",
-            telegram_account_id="finance-account",
-            telegram_conversation_id="111",
-            conversation_binding_id="binding-1",
-        )
+    arguments: dict[str, object] = {
+        "workspace_path": str(workspace),
+        "operator_actor_id": "111",
+        "telegram_account_id": "finance-account",
+        "telegram_conversation_id": "111",
+        "conversation_binding_id": "binding-1",
+    }
     if command in {
         envelope.COMMAND_GET_INTERACTION_ROUTE,
         envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
@@ -165,8 +163,6 @@ def _read_arguments(command: str, workspace: Path) -> dict[str, object]:
         arguments["telegram_message_id"] = 177
     elif command == envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES:
         arguments["limit"] = 5
-    elif command == envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2:
-        arguments["intake_public_id"] = "synthetic-missing-intake"
     elif command == envelope.COMMAND_GET_HUMAN_DRAFT_CARD:
         arguments["operation_public_id"] = "synthetic-missing-operation"
     return arguments

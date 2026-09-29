@@ -3029,13 +3029,16 @@ def handle_get_ai_processing_status_v2(request: BridgeRequest, deadline: Deadlin
     intake_public_id = _require_string(
         request.arguments["intake_public_id"], "intake_public_id", max_length=200
     )
-    with _read_workspace_session(request, deadline) as conn:
+    _workspace, conn = _open_context(request.arguments, deadline)
+    try:
         deadline.check("AI processing status v2")
         try:
             result = get_ai_processing_status_v2(conn, intake_public_id=intake_public_id)
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, False
+    finally:
+        conn.close()
 
 
 def handle_prepare_ai_fallback(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -7079,7 +7082,6 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_GET_INTERACTION_ROUTE,
             envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES,
             envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
-            envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2,
             envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
             envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
         }:
