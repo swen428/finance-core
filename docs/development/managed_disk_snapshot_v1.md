@@ -9,15 +9,19 @@ does not prove those conditions. This module does not acquire a profile gate,
 publish a backup, or return a complete-cut verification result.
 
 The primitive creates only `core.sqlite` in the empty stage, refusing an
-existing output. It uses SQLite's online backup API in bounded page steps.
+existing output. Before writing sensitive bytes, it rejects extended ACL allow
+grants on the stage and newly created file even when their mode bits appear
+private; the file must be owner-held with one link. It uses SQLite's online
+backup API in bounded page steps.
 After backup, it closes the destination, reopens that private file, checkpoints
 WAL when present, and requires the actual journal mode to become `DELETE`.
 It never removes a SQLite sidecar by hand. With all destination handles closed,
 it checks the file identity and size, hashes it, then uses a fresh Python
 process with ordinary read-only SQLite access to check journal mode, database
 integrity, foreign keys, and schema readability. The source remains owned by
-the caller. A second closed-file hash and sidecar check must match, followed
-by file and stage-directory synchronization. Only then is a component receipt
+the caller. A second closed-file hash, sidecar check, and private-file role
+check must match, followed by file and stage-directory synchronization. Only
+then is a component receipt
 returned with the fixed output path, size, hash, page count, and schema count.
 
 Any collision, limit or deadline breach, SQLite error, incomplete checkpoint,

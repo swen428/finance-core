@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from finance_core.profile_paths import ProfilePathError, _reject_acl_grants
+
 _OUTPUT = "core.sqlite"
 _SIDECARS = ("-wal", "-shm", "-journal")
 _READBACK = r"""
@@ -88,6 +90,31 @@ def _sidecars_absent(output: Path) -> None:
         raise DiskSnapshotError("Disk snapshot has a SQLite sidecar")
 
 
+def _check_private_acl(fd: int, path: Path) -> None:
+    try:
+        _reject_acl_grants(fd, path)
+    except ProfilePathError as exc:
+        raise DiskSnapshotError(f"Disk snapshot path has an unsafe ACL: {path}") from exc
+
+
+def _check_output_role(fd: int, output: Path, expected: os.stat_result) -> os.stat_result:
+    info = os.fstat(fd)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_uid != os.getuid()
+        or info.st_nlink != 1
+    ):
+        raise DiskSnapshotError("Disk snapshot is not a private regular file")
+    if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
+        raise DiskSnapshotError("Disk snapshot identity changed")
+    _check_private_acl(fd, output)
+    named = os.stat(output, follow_symlinks=False)
+    if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+        raise DiskSnapshotError("Disk snapshot path changed during role inspection")
+    return info
+
+
 def _hash_closed_file(output: Path, expected: os.stat_result, deadline: float) -> str:
     digest = hashlib.sha256()
     fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW)
@@ -108,11 +135,11 @@ def _hash_closed_file(output: Path, expected: os.stat_result, deadline: float) -
 
 
 def _closed_output_info(output: Path, expected: os.stat_result, limit: int) -> os.stat_result:
-    info = os.stat(output, follow_symlinks=False)
-    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o777 != 0o600:
-        raise DiskSnapshotError("Disk snapshot is not a private regular file")
-    if (info.st_dev, info.st_ino) != (expected.st_dev, expected.st_ino):
-        raise DiskSnapshotError("Disk snapshot identity changed")
+    fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = _check_output_role(fd, output, expected)
+    finally:
+        os.close(fd)
     if info.st_size <= 0 or info.st_size > limit:
         raise DiskSnapshotError("Disk snapshot exceeds size limit")
     return info
@@ -174,8 +201,9 @@ def create_disk_snapshot(
     stage_fd = os.open(private_stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         stage_info = os.fstat(stage_fd)
-        if stage_info.st_uid != os.getuid() or stage_info.st_mode & 0o777 != 0o700:
+        if stage_info.st_uid != os.getuid() or stat.S_IMODE(stage_info.st_mode) != 0o700:
             raise DiskSnapshotError("Stage must be owner-only 0700")
+        _check_private_acl(stage_fd, private_stage)
         path_info = os.stat(private_stage, follow_symlinks=False)
         if (path_info.st_dev, path_info.st_ino) != (stage_info.st_dev, stage_info.st_ino):
             raise DiskSnapshotError("Stage path changed")
@@ -200,6 +228,7 @@ def create_disk_snapshot(
         )
         try:
             created_info = os.fstat(file_fd)
+            _check_output_role(file_fd, private_stage / _OUTPUT, created_info)
         finally:
             os.close(file_fd)
         output = private_stage / _OUTPUT
@@ -289,9 +318,16 @@ def create_disk_snapshot(
         finally:
             os.close(sync_fd)
         os.fsync(stage_fd)
-        final_stage = os.stat(private_stage, follow_symlinks=False)
+        final_stage = os.fstat(stage_fd)
+        if final_stage.st_uid != os.getuid() or stat.S_IMODE(final_stage.st_mode) != 0o700:
+            raise DiskSnapshotError("Stage must be owner-only 0700")
+        _check_private_acl(stage_fd, private_stage)
+        final_path = os.stat(private_stage, follow_symlinks=False)
         if (final_stage.st_dev, final_stage.st_ino) != (stage_info.st_dev, stage_info.st_ino):
             raise DiskSnapshotError("Stage path changed during snapshot")
+        if (final_path.st_dev, final_path.st_ino) != (final_stage.st_dev, final_stage.st_ino):
+            raise DiskSnapshotError("Stage path changed during snapshot")
+        _closed_output_info(output, created_info, limits.max_core_db_bytes)
         _check_deadline(deadline_monotonic)
         return DiskSnapshotReceipt(
             output=output,

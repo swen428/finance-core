@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
 import stat
+import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import closing
@@ -12,11 +15,13 @@ from pathlib import Path
 
 import pytest
 
+import finance_core.managed_disk_snapshot as disk_snapshot
 from finance_core.managed_disk_snapshot import (
     DiskSnapshotError,
     DiskSnapshotLimits,
     create_disk_snapshot,
 )
+from finance_core.profile_paths import ProfilePathError
 
 _LIMITS = DiskSnapshotLimits(
     max_core_db_bytes=1_048_576,
@@ -152,3 +157,90 @@ def test_expired_and_unbounded_deadlines_are_refused_before_stage_write(
                 deadline_monotonic=deadline,
             )
         assert list(stage.iterdir()) == []
+
+
+def test_synthetic_darwin_allow_acl_on_stage_is_refused_before_output(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path)
+
+    def synthetic_allow_acl(_fd: int, path: Path) -> None:
+        raise ProfilePathError(f"ACL grants access to profile path: {path}")
+
+    monkeypatch.setattr(disk_snapshot, "_reject_acl_grants", synthetic_allow_acl)
+    with pytest.raises(DiskSnapshotError, match="unsafe ACL"):
+        create_disk_snapshot(
+            source,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert list(stage.iterdir()) == []
+    assert not (stage / "core.sqlite").exists()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL only")
+def test_darwin_stage_allow_acl_is_refused_before_output_even_with_mode_0700(
+    wal_source: tuple[sqlite3.Connection, Path], tmp_path: Path
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path)
+    initial_mode = stat.S_IMODE(stage.stat().st_mode)
+
+    subprocess.run(["chmod", "+a", "everyone allow read", str(stage)], check=True)
+
+    assert initial_mode == 0o700
+    assert stat.S_IMODE(stage.stat().st_mode) == 0o700
+    with pytest.raises(DiskSnapshotError, match="unsafe ACL"):
+        create_disk_snapshot(
+            source,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert list(stage.iterdir()) == []
+    assert not (stage / "core.sqlite").exists()
+
+
+def test_synthetic_allow_acl_on_output_role_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "synthetic-output.sqlite"
+    output.write_bytes(b"synthetic output bytes")
+    output.chmod(0o600)
+    fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW)
+    expected = os.fstat(fd)
+
+    def synthetic_allow_acl(_fd: int, path: Path) -> None:
+        raise ProfilePathError(f"ACL grants access to profile path: {path}")
+
+    monkeypatch.setattr(disk_snapshot, "_reject_acl_grants", synthetic_allow_acl)
+    try:
+        with pytest.raises(DiskSnapshotError, match="unsafe ACL"):
+            disk_snapshot._check_output_role(fd, output, expected)
+    finally:
+        os.close(fd)
+
+    assert output.read_bytes() == b"synthetic output bytes"
+
+
+def test_complete_output_role_check_rejects_hardlink_alias(tmp_path: Path) -> None:
+    output = tmp_path / "core.sqlite"
+    alias = tmp_path / "core-alias.sqlite"
+    output.write_bytes(b"synthetic standalone database")
+    output.chmod(0o600)
+    os.link(output, alias)
+    fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW)
+    expected = os.fstat(fd)
+    try:
+        assert expected.st_nlink == 2
+        with pytest.raises(DiskSnapshotError, match="private regular file"):
+            disk_snapshot._check_output_role(fd, output, expected)
+    finally:
+        os.close(fd)
