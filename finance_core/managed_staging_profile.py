@@ -157,20 +157,30 @@ def bootstrap_registered_staging(blank_profile: ProfilePaths) -> ManagedStagingP
     Failure preserves the database and registration bytes for explicit
     disposition. It never adopts an unregistered existing SQLite database.
     """
-    with _MANAGED_SQLITE_LIFETIME_LOCK:
-        return _bootstrap_registered_staging_locked(blank_profile)
-
-
-def _bootstrap_registered_staging_locked(blank_profile: ProfilePaths) -> ManagedStagingProfile:
     if type(blank_profile) is not ProfilePaths:
         raise ProfilePathError("Bootstrap requires the original blank profile witness")
-    from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
-
     _require_fresh_names(blank_profile)
     gate_path = blank_profile.profile / ".profile-gate.v1.lock"
     if not os.path.lexists(gate_path):
         initialize_profile_gate(blank_profile)
     lease = writer_gate(blank_profile)
+    try:
+        with _MANAGED_SQLITE_LIFETIME_LOCK:
+            _bootstrap_registered_staging_locked(blank_profile, lease)
+    finally:
+        if not any(retained is lease for _, retained in _UNCERTAIN_CLOSES):
+            lease.close()
+    # Verification opens its own managed connection. Do not acquire its second
+    # shared gate while the first gate and process lifetime lock are held.
+    return verify_registered_staging(blank_profile.application_support, blank_profile.profile_id)
+
+
+def _bootstrap_registered_staging_locked(blank_profile: ProfilePaths, lease: GateLease) -> None:
+    from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+
+    # The pre-gate check cannot authorize the SQLite open: another process may
+    # have changed the reserved names while the shared gate was pending.
+    _require_fresh_names(blank_profile)
     conn: sqlite3.Connection | None = None
     sqlite_started = False
     try:
@@ -186,9 +196,6 @@ def _bootstrap_registered_staging_locked(blank_profile: ProfilePaths) -> Managed
         sqlite_started = False
         _sync_created_main_name(blank_profile)
         _publish_registration(blank_profile)
-        return verify_registered_staging(
-            blank_profile.application_support, blank_profile.profile_id
-        )
     except _StagingCloseUncertain as exc:
         _UNCERTAIN_CLOSES.append((exc.connection, lease))
         _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
@@ -200,7 +207,6 @@ def _bootstrap_registered_staging_locked(blank_profile: ProfilePaths) -> Managed
         raise
     finally:
         if not any(retained is lease for _, retained in _UNCERTAIN_CLOSES):
-            lease.close()
             if sqlite_started:
                 _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
 
@@ -214,18 +220,23 @@ def _managed_staging_connection(
     """Hold a shared gate from before SQLite recovery until close completes."""
     if type(profile) is not ManagedStagingProfile or purpose != "reopen":
         raise ProfilePathError("A registered fixed staging profile is required")
-    with _MANAGED_SQLITE_LIFETIME_LOCK:
-        with _managed_staging_connection_locked(profile) as conn:
-            yield conn
+    lease = writer_gate(profile)
+    try:
+        with _MANAGED_SQLITE_LIFETIME_LOCK:
+            with _managed_staging_connection_locked(profile, lease) as conn:
+                yield conn
+    finally:
+        if not any(retained is lease for _, retained in _UNCERTAIN_CLOSES):
+            lease.close()
 
 
 @contextmanager
 def _managed_staging_connection_locked(
     profile: ManagedStagingProfile,
+    lease: GateLease,
 ) -> Iterator[sqlite3.Connection]:
     from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
 
-    lease = writer_gate(profile)
     conn: sqlite3.Connection | None = None
     sqlite_started = False
     try:
@@ -246,7 +257,7 @@ def _managed_staging_connection_locked(
     finally:
         if not any(retained is lease for _, retained in _UNCERTAIN_CLOSES):
             try:
-                _close_sqlite_then_gate(conn, lease)
+                _close_sqlite_then_gate(conn, lease, release=False)
             finally:
                 if sqlite_started and not any(
                     retained is lease for _, retained in _UNCERTAIN_CLOSES

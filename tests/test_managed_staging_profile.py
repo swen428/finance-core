@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
@@ -14,6 +15,7 @@ from pathlib import Path
 import pytest
 
 import finance_core.managed_staging_profile as managed_staging
+import finance_core.profile_gate as profile_gate
 import finance_core.profile_paths as profile_paths
 import finance_core.staging_guard as staging_guard
 from finance_core.profile_gate import (
@@ -119,6 +121,30 @@ def test_bootstrap_commit_reopen_and_legacy_blank_guard(
     # The original path witness keeps its old blank-only contract after P1.
     with pytest.raises(ProfilePathError, match="native SQLite admission"):
         validate_profile_paths(support, _PROFILE_ID)
+
+
+def test_bootstrap_releases_its_shared_gate_before_final_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    support, _base, blank = _blank_profile(tmp_path, monkeypatch)
+    real_verify = managed_staging.verify_registered_staging
+
+    def verify_after_release(root: str | Path, profile_id: str) -> object:
+        witness = profile_paths.validate_registered_staging_profile(root, profile_id)
+        try:
+            with exclusive_cut(witness, timeout_seconds=0):
+                pass
+        finally:
+            witness.close()
+        return real_verify(root, profile_id)
+
+    monkeypatch.setattr(managed_staging, "verify_registered_staging", verify_after_release)
+    managed = managed_staging.bootstrap_registered_staging(blank)
+    try:
+        assert managed.registration.exists()
+    finally:
+        managed.close()
+        blank.close()
 
 
 def test_legacy_reopen_factory_cannot_bypass_managed_profile_gate(
@@ -463,6 +489,70 @@ def test_other_thread_revalidation_waits_for_managed_connection_close(
     worker.join(timeout=5)
     assert not worker.is_alive()
     assert errors == []
+
+
+@pytest.mark.parametrize("operation", ["reopen", "bootstrap"])
+def test_exclusive_cut_can_validate_while_managed_writer_waits_for_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    _support, _base, blank = _blank_profile(tmp_path, monkeypatch)
+    managed = managed_staging.bootstrap_registered_staging(blank) if operation == "reopen" else None
+    profile = managed if managed is not None else blank
+    shared_waiting = threading.Event()
+    completed = threading.Event()
+    errors: list[BaseException] = []
+    sqlite_opens: list[str] = []
+    real_try_lock = profile_gate._try_lock
+    real_connect = staging_guard.sqlite3.connect
+
+    def observe_try_lock(fd: int, mode: int) -> bool:
+        acquired = real_try_lock(fd, mode)
+        if mode == fcntl.LOCK_SH and not acquired:
+            shared_waiting.set()
+        return acquired
+
+    def observe_connect(database: object, *args: object, **kwargs: object) -> object:
+        sqlite_opens.append(str(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(profile_gate, "_try_lock", observe_try_lock)
+    monkeypatch.setattr(staging_guard.sqlite3, "connect", observe_connect)
+
+    def shared_writer() -> None:
+        try:
+            if operation == "reopen":
+                assert managed is not None
+                with managed_staging._managed_staging_connection(managed, purpose="reopen"):
+                    pass
+            else:
+                enrolled = managed_staging.bootstrap_registered_staging(blank)
+                enrolled.close()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    worker = threading.Thread(target=shared_writer)
+    try:
+        with exclusive_cut(profile, max_hold_seconds=4) as cut:
+            worker.start()
+            assert shared_waiting.wait(timeout=2), "shared writer did not reach the held gate"
+            assert sqlite_opens == []
+            with profile_paths._MANAGED_SQLITE_LIFETIME_LOCK:
+                cut.assert_valid()
+            assert sqlite_opens == []
+            assert not completed.is_set()
+        assert completed.wait(timeout=5)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert errors == []
+        assert sqlite_opens != []
+    finally:
+        if worker.is_alive():
+            worker.join(timeout=5)
+        if managed is not None:
+            managed.close()
+        blank.close()
 
 
 def test_configuration_failure_with_successful_close_releases_gate(
