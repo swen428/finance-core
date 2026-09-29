@@ -14,17 +14,31 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import TracebackType
 from typing import Iterator, cast
 
 import openclaw_staging_bridge_support_v1 as support
 import pytest
 
+from finance_core.intake.capture_jobs import ensure_capture_job
+from finance_core.intake.interaction_routes import freeze_interaction_route
+from finance_core.intake.raw_text_repository import create_raw_intake_record
+from finance_core.intake.telegram_text_adapter import validate_telegram_text_update
 from finance_core.managed_staging_profile import bootstrap_registered_staging
-from finance_core.openclaw_staging_bridge import delivery_receipt_cli, envelope, workspace_access
+from finance_core.openclaw_staging_bridge import (
+    delivery_receipt_cli,
+    envelope,
+    human_actions,
+    workspace_access,
+)
 from finance_core.openclaw_staging_bridge import errors as bridge_errors
 from finance_core.openclaw_staging_bridge.delivery_receipt_proof import PROOF_VERSION
 from finance_core.profile_gate import exclusive_cut
 from finance_core.profile_paths import ManagedStagingProfile, ProfilePaths
+from finance_core.telegram_source_context import (
+    TelegramSourceContext,
+    record_telegram_source_context,
+)
 from tests.test_managed_staging_profile import _blank_profile
 
 
@@ -33,6 +47,17 @@ class ManagedWorkspace:
     profile_base: Path
     workspace_path: Path
     witness: ManagedStagingProfile
+
+
+_MANAGED_READ_COMMANDS = frozenset(
+    {
+        envelope.COMMAND_GET_INTERACTION_ROUTE,
+        envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES,
+        envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
+        envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
+        envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
+    }
+)
 
 
 @pytest.fixture()
@@ -123,13 +148,183 @@ def test_managed_health_and_status_are_available_through_the_public_cli(
     assert status.response["result"]["intake_public_id"] == "d4-managed-status"
 
 
+def _read_arguments(command: str, workspace: Path) -> dict[str, object]:
+    arguments: dict[str, object] = {
+        "workspace_path": str(workspace),
+        "operator_actor_id": "111",
+        "telegram_account_id": "finance-account",
+        "telegram_conversation_id": "111",
+        "conversation_binding_id": "binding-1",
+    }
+    if command in {
+        envelope.COMMAND_GET_INTERACTION_ROUTE,
+        envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
+    }:
+        arguments["telegram_message_id"] = 177
+    elif command == envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES:
+        arguments["limit"] = 5
+    elif command == envelope.COMMAND_GET_HUMAN_DRAFT_CARD:
+        arguments["operation_public_id"] = "synthetic-missing-operation"
+    return arguments
+
+
+@pytest.mark.parametrize("command", sorted(_MANAGED_READ_COMMANDS))
+def test_managed_read_commands_match_ordinary_missing_state_and_close_session(
+    managed_workspace: ManagedWorkspace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    ordinary_root = tmp_path / "ordinary-read"
+    ordinary_root.mkdir()
+    ordinary = support.create_bridge_workspace(ordinary_root, name="ordinary-read")
+    ordinary_outcome = support.run_cli(
+        support.make_request(command, _read_arguments(command, ordinary.workspace_path))
+    )
+
+    connections: list[sqlite3.Connection] = []
+    operations: list[str] = []
+    real_session = workspace_access.workspace_database_session
+
+    class ObservedSession:
+        def __init__(
+            self,
+            workspace: Path,
+            *,
+            operation_id: str,
+            deadline: workspace_access.SessionDeadline | None = None,
+        ) -> None:
+            operations.append(operation_id)
+            self.inner = real_session(workspace, operation_id=operation_id, deadline=deadline)
+            self.conn: sqlite3.Connection | None = None
+
+        def __enter__(self) -> sqlite3.Connection:
+            self.conn = self.inner.__enter__()
+            connections.append(self.conn)
+            return self.conn
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc_value: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            assert self.conn is not None
+            assert self.conn.total_changes == 0, "read handler changed business rows"
+            self.inner.__exit__(exc_type, exc_value, traceback)
+
+    monkeypatch.setattr(workspace_access, "workspace_database_session", ObservedSession)
+    managed_outcome = support.run_cli(
+        support.make_request(command, _read_arguments(command, managed_workspace.workspace_path))
+    )
+
+    assert managed_outcome.exit_code == ordinary_outcome.exit_code, (
+        command,
+        managed_outcome.response,
+        ordinary_outcome.response,
+    )
+    if managed_outcome.exit_code == bridge_errors.EXIT_OK:
+        assert managed_outcome.response["result"] == ordinary_outcome.response["result"]
+    else:
+        assert (
+            managed_outcome.response["error"]["code"] == ordinary_outcome.response["error"]["code"]
+        )
+    assert len(operations) == len(connections) == 1
+    assert operations[0].startswith("bridge:")
+    with pytest.raises(sqlite3.ProgrammingError):
+        connections[0].execute("SELECT 1")
+
+
+def test_managed_capture_reads_preserve_authenticated_source_isolation(
+    managed_workspace: ManagedWorkspace,
+) -> None:
+    workspace = managed_workspace.workspace_path
+    update = support.telegram_text_update("synthetic lunch 12.50", message_id=177)
+    validated = validate_telegram_text_update(update)
+    source_context = TelegramSourceContext(
+        authenticated_actor_id="111",
+        account_id="finance-account",
+        conversation_id="111",
+        binding_id="binding-1",
+        message_id="177",
+    )
+    with workspace_access.workspace_database_session(
+        workspace, operation_id="test-seed-authenticated-capture"
+    ) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        intake = create_raw_intake_record(
+            conn,
+            validated.text,
+            source_channel="telegram",
+            source_metadata=validated.source_metadata,
+        )
+        record_telegram_source_context(
+            conn,
+            raw_intake_record_id=int(intake["id"]),
+            context=source_context,
+            captured_at=str(intake["received_at"]),
+        )
+        job = ensure_capture_job(conn, intake_id=int(intake["id"]), capture_kind="text")
+        freeze_interaction_route(
+            conn,
+            job_public_id=str(job["public_id"]),
+            text=validated.text,
+            context=human_actions.HumanActionContext(
+                actor_id="111",
+                account_id="finance-account",
+                conversation_id="111",
+                binding_id="binding-1",
+            ),
+            message_id=177,
+        )
+        conn.commit()
+
+    for binding, visible in (("binding-1", True), ("other-binding", False)):
+        context = {
+            "workspace_path": str(workspace),
+            "operator_actor_id": "111",
+            "telegram_account_id": "finance-account",
+            "telegram_conversation_id": "111",
+            "conversation_binding_id": binding,
+        }
+        route = support.run_cli(
+            support.make_request("get_interaction_route", {**context, "telegram_message_id": 177})
+        )
+        assert route.exit_code == bridge_errors.EXIT_OK, route.response
+        assert route.response["result"]["found"] is visible
+        if visible:
+            assert route.response["result"]["interaction_route"]["route_kind"] == "initial_intake"
+
+        discovered = support.run_cli(
+            support.make_request("list_capture_recovery_candidates", {**context, "limit": 5})
+        )
+        assert discovered.exit_code == bridge_errors.EXIT_OK, discovered.response
+        candidates = discovered.response["result"]["candidates"]
+        assert [item["job_public_id"] for item in candidates] == (
+            [job["public_id"]] if visible else []
+        )
+
+        located = support.run_cli(
+            support.make_request(
+                "get_capture_job_for_message", {**context, "telegram_message_id": 177}
+            )
+        )
+        assert located.exit_code == bridge_errors.EXIT_OK, located.response
+        candidate = located.response["result"]["candidate"]
+        assert (candidate is not None) is visible
+        if visible:
+            assert candidate["job_public_id"] == job["public_id"]
+
+
 def test_every_other_bridge_command_is_refused_before_managed_effects(
     managed_workspace: ManagedWorkspace,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unsupported = sorted(
-        envelope.ALLOWED_COMMANDS - {envelope.COMMAND_HEALTH, envelope.COMMAND_GET_STATUS}
+        envelope.ALLOWED_COMMANDS
+        - {envelope.COMMAND_HEALTH, envelope.COMMAND_GET_STATUS}
+        - _MANAGED_READ_COMMANDS
     )
     before = _snapshot_tree(managed_workspace.profile_base)
     database_open_attempts: list[str] = []
@@ -353,8 +548,9 @@ finally:
         witness.close()
 
 
-def test_managed_health_obeys_bridge_deadline_while_child_holds_exclusive_gate(
-    managed_workspace: ManagedWorkspace,
+@pytest.mark.parametrize("command", ["health", "get_interaction_route"])
+def test_managed_read_obeys_bridge_deadline_while_child_holds_exclusive_gate(
+    managed_workspace: ManagedWorkspace, command: str
 ) -> None:
     ready_path = managed_workspace.profile_base.parent / "exclusive-gate-ready"
     probe = """
@@ -399,8 +595,12 @@ finally:
         started = time.monotonic()
         outcome = support.run_cli(
             support.make_request(
-                "health",
-                {"workspace_path": str(managed_workspace.workspace_path)},
+                command,
+                (
+                    {"workspace_path": str(managed_workspace.workspace_path)}
+                    if command == "health"
+                    else _read_arguments(command, managed_workspace.workspace_path)
+                ),
             ),
             deadline_seconds=0.2,
         )
