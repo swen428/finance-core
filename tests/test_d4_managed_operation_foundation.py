@@ -552,8 +552,9 @@ finally:
         witness.close()
 
 
-def test_managed_health_obeys_bridge_deadline_while_child_holds_exclusive_gate(
-    managed_workspace: ManagedWorkspace,
+@pytest.mark.parametrize("command", ["health", "get_interaction_route"])
+def test_managed_read_obeys_bridge_deadline_while_child_holds_exclusive_gate(
+    managed_workspace: ManagedWorkspace, command: str
 ) -> None:
     ready_path = managed_workspace.profile_base.parent / "exclusive-gate-ready"
     probe = """
@@ -598,8 +599,12 @@ finally:
         started = time.monotonic()
         outcome = support.run_cli(
             support.make_request(
-                "health",
-                {"workspace_path": str(managed_workspace.workspace_path)},
+                command,
+                (
+                    {"workspace_path": str(managed_workspace.workspace_path)}
+                    if command == "health"
+                    else _read_arguments(command, managed_workspace.workspace_path)
+                ),
             ),
             deadline_seconds=0.2,
         )
