@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from finance_core.profile_gate import (
+    DEFAULT_ACQUIRE_SECONDS,
     GateLease,
     initialize_profile_gate,
     writer_gate,
@@ -217,11 +218,12 @@ def _managed_staging_connection(
     profile: ManagedStagingProfile,
     *,
     purpose: Literal["reopen"] = "reopen",
+    gate_timeout_seconds: float = DEFAULT_ACQUIRE_SECONDS,
 ) -> Iterator[sqlite3.Connection]:
     """Hold a shared gate from before SQLite recovery until close completes."""
     if type(profile) is not ManagedStagingProfile or purpose != "reopen":
         raise ProfilePathError("A registered fixed staging profile is required")
-    lease = writer_gate(profile)
+    lease = writer_gate(profile, timeout_seconds=gate_timeout_seconds)
     try:
         with _MANAGED_SQLITE_LIFETIME_LOCK:
             with _managed_staging_connection_locked(profile, lease) as conn:
@@ -274,6 +276,7 @@ def managed_staging_operation(
     profile: ManagedStagingProfile,
     *,
     operation_id: str,
+    gate_timeout_seconds: float = DEFAULT_ACQUIRE_SECONDS,
 ) -> Iterator[sqlite3.Connection]:
     """One local operation on an enrolled profile, with no escaped connection.
 
@@ -284,7 +287,7 @@ def managed_staging_operation(
         r"[a-z0-9][a-z0-9:_-]{0,199}", operation_id
     ):
         raise ProfilePathError("A bounded managed operation ID is required")
-    with _managed_staging_connection(profile) as conn:
+    with _managed_staging_connection(profile, gate_timeout_seconds=gate_timeout_seconds) as conn:
         yield conn
 
 

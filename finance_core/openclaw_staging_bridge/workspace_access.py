@@ -14,10 +14,11 @@ import sqlite3
 from contextlib import AbstractContextManager
 from pathlib import Path
 from types import TracebackType
+from typing import Protocol
 
 from finance_core.managed_staging_profile import managed_staging_operation
 from finance_core.openclaw_staging_bridge import errors
-from finance_core.profile_gate import ProfileGateError
+from finance_core.profile_gate import DEFAULT_ACQUIRE_SECONDS, MAX_ACQUIRE_SECONDS, ProfileGateError
 from finance_core.profile_paths import (
     ManagedStagingProfile,
     ProfilePathError,
@@ -170,12 +171,23 @@ def _managed_operation_refusal(exc: Exception) -> errors.BridgeError:
     )
 
 
+class SessionDeadline(Protocol):
+    """The Bridge's remaining budget, without coupling this module to commands."""
+
+    def remaining_seconds(self) -> float: ...
+
+    def check(self, phase: str) -> None: ...
+
+
 class _WorkspaceDatabaseSession:
     """Close managed resources without injecting frozen BridgeError into a generator."""
 
-    def __init__(self, workspace: Path, operation_id: str) -> None:
+    def __init__(
+        self, workspace: Path, operation_id: str, deadline: SessionDeadline | None = None
+    ) -> None:
         self.workspace = workspace
         self.operation_id = operation_id
+        self.deadline = deadline
         self.profile: ManagedStagingProfile | None = None
         self.managed_context: AbstractContextManager[sqlite3.Connection] | None = None
         self.conn: sqlite3.Connection | None = None
@@ -186,13 +198,24 @@ class _WorkspaceDatabaseSession:
             self.conn = open_workspace_database(self.workspace)
             return self.conn
         try:
+            if self.deadline is not None:
+                self.deadline.check("managed session gate acquisition")
+            gate_timeout = (
+                min(MAX_ACQUIRE_SECONDS, self.deadline.remaining_seconds())
+                if self.deadline is not None
+                else DEFAULT_ACQUIRE_SECONDS
+            )
             self.managed_context = managed_staging_operation(
-                self.profile, operation_id=self.operation_id
+                self.profile,
+                operation_id=self.operation_id,
+                gate_timeout_seconds=gate_timeout,
             )
             self.conn = self.managed_context.__enter__()
             return self.conn
         except (ProfilePathError, StagingDatabaseError, ProfileGateError) as exc:
             self.profile.close()
+            if self.deadline is not None:
+                self.deadline.check("managed session gate acquisition")
             raise _managed_operation_refusal(exc) from exc
         except BaseException:
             self.profile.close()
@@ -217,11 +240,15 @@ class _WorkspaceDatabaseSession:
         finally:
             if self.profile is not None:
                 self.profile.close()
+        if exc_type is None and self.managed_context is not None and self.deadline is not None:
+            self.deadline.check("database session close")
 
 
-def workspace_database_session(workspace: Path, *, operation_id: str) -> _WorkspaceDatabaseSession:
+def workspace_database_session(
+    workspace: Path, *, operation_id: str, deadline: SessionDeadline | None = None
+) -> _WorkspaceDatabaseSession:
     """Own one managed operation or the ordinary staging connection lifetime."""
-    return _WorkspaceDatabaseSession(workspace, operation_id)
+    return _WorkspaceDatabaseSession(workspace, operation_id, deadline)
 
 
 def verify_workspace_structure(workspace: Path, *, require_handoff: bool = False) -> None:

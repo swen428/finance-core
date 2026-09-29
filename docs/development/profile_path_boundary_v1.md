@@ -95,6 +95,10 @@ fixed workspace layout and the configured `FINANCE_RUNTIME_ROOT`, not from a
 request flag or arbitrary database path. Every other Bridge command targeting
 the managed layout refuses before its handler can open the database or perform
 an external effect. Ordinary staging workspaces retain their existing route.
+The Bridge commands include gate acquisition and session close in their
+cooperative command deadline. A receipt consumer error after the existing
+posting authority commits is an unverified outcome; its caller must inspect or
+replay the receipt token, not infer that no observation was written.
 This partial integration does not admit capture, OCR, correction, migration, or
 any full backup cut.
 
@@ -105,6 +109,10 @@ The admitted `get_status` path may also read a canonical receipt original to
 report its existing integrity state; it does not acquire, publish, or back up
 attachments. This slice has no cut-worker protocol or Host state. Synthetic
 tests use child processes for crash/reopen and gate-overlap fixtures.
+The managed receipt test proves session routing with a synthetic authority
+stub; the existing D2 authority tests cover authenticated commit directly.
+An end-to-end managed receipt commit/replay fixture is not established by this
+slice.
 `receipt_staging_runner`, the
 remaining Bridge commands, correction adapters, and migration or
 restored-profile entry points are not integrated with this managed API. Those

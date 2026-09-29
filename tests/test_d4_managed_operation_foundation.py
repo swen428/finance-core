@@ -10,6 +10,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -350,3 +351,66 @@ finally:
             pass
     finally:
         witness.close()
+
+
+def test_managed_health_obeys_bridge_deadline_while_child_holds_exclusive_gate(
+    managed_workspace: ManagedWorkspace,
+) -> None:
+    ready_path = managed_workspace.profile_base.parent / "exclusive-gate-ready"
+    probe = """
+import sys
+import time
+from pathlib import Path
+from finance_core.profile_gate import exclusive_cut
+from finance_core.profile_paths import validate_registered_staging_profile
+support, profile_id, ready_path = sys.argv[1:4]
+profile = validate_registered_staging_profile(support, profile_id)
+try:
+    with exclusive_cut(profile, timeout_seconds=0):
+        Path(ready_path).write_text("locked\\n", encoding="utf-8")
+        time.sleep(5)
+finally:
+    profile.close()
+"""
+    support_root = managed_workspace.profile_base.parent.parent.parent
+    locker = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            probe,
+            str(support_root),
+            managed_workspace.profile_base.name,
+            str(ready_path),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready_deadline = time.monotonic() + 5
+        while not ready_path.exists() and time.monotonic() < ready_deadline:
+            if locker.poll() is not None:
+                stdout, stderr = locker.communicate()
+                pytest.fail(f"exclusive gate child exited early: {stderr or stdout}")
+            time.sleep(0.01)
+        assert ready_path.exists(), "child did not acquire the exclusive profile gate"
+
+        started = time.monotonic()
+        outcome = support.run_cli(
+            support.make_request(
+                "health",
+                {"workspace_path": str(managed_workspace.workspace_path)},
+            ),
+            deadline_seconds=0.2,
+        )
+        elapsed = time.monotonic() - started
+
+        assert outcome.exit_code == bridge_errors.EXIT_DEADLINE_EXCEEDED, outcome.response
+        assert outcome.response["error"]["code"] == bridge_errors.DEADLINE_EXCEEDED
+        assert elapsed < 1.0, f"Bridge exceeded its short deadline: {elapsed:.3f}s"
+    finally:
+        if locker.poll() is None:
+            locker.terminate()
+        stdout, stderr = locker.communicate(timeout=5)
+        assert locker.returncode == 0 or locker.returncode == -15, stderr or stdout

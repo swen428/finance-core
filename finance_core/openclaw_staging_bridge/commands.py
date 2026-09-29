@@ -462,6 +462,9 @@ class Deadline:
         self._deadline = clock() + deadline_seconds
         self._clock = clock
 
+    def remaining_seconds(self) -> float:
+        return max(0.0, self._deadline - self._clock())
+
     def check(self, phase: str) -> None:
         if self._deadline - self._clock() <= 0:
             raise errors.bridge_error(
@@ -950,8 +953,9 @@ def handle_health(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     workspace_access.verify_workspace_structure(workspace)
     deadline.check("database open")
     with workspace_access.workspace_database_session(
-        workspace, operation_id=f"bridge:{request.request_id}"
+        workspace, operation_id=f"bridge:{request.request_id}", deadline=deadline
     ) as conn:
+        deadline.check("health read")
         from finance_core.reconciliation.migrations import migration_ledger_rows
 
         ledger = migration_ledger_rows(conn)
@@ -1033,7 +1037,7 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
     workspace_access.verify_workspace_structure(workspace)
     deadline.check("database open")
     with workspace_access.workspace_database_session(
-        workspace, operation_id=f"bridge:{request.request_id}"
+        workspace, operation_id=f"bridge:{request.request_id}", deadline=deadline
     ) as conn:
         deadline.check("status read")
         if posting_lookup:
