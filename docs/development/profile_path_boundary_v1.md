@@ -1,11 +1,14 @@
 # D4 profile path boundary (public Core)
 
-This public component validates an **existing** profile layout. It does not
+The original `validate_profile_paths()` boundary validates an **existing**
+profile layout and permits only blank reserved database paths. It does not
 create or activate a real profile, open a database, authorize a restored file,
-or produce a backup. The private macOS owner is responsible for provisioning
-the profile tree and selecting the user's Application Support directory. Core
-receives that directory and a bounded profile ID explicitly; it never infers
-them from the checkout or an inbound message.
+or produce a backup. A separate P1 managed synthetic-staging component is
+described below; it does not change the original witness contract. The private
+macOS owner is responsible for provisioning the profile tree and selecting the
+user's Application Support directory. Core receives that directory and a
+bounded profile ID explicitly; it never infers them from the checkout or an
+inbound message.
 
 The expected layout is
 `<Application Support>/Finance-Codex/profiles/<id>/` containing `profile.json`,
@@ -20,14 +23,15 @@ live DB path is `runtime/database/finance.db`; the staging path is
 `workspace/database/staging.sqlite`, outside the runtime root. Existing
 staging-guard authorization still applies to every database open/write.
 
-Until native SQLite file admission is implemented, this validator accepts
-**blank profiles only**: both reserved database names must be absent. An
-existing live or staging database, including a symlink, hard link or FIFO at
-either name, fails before the validator opens any regular file. The absence is
-checked again during validation and on each `revalidate()`. A populated profile
-requires a separate native SQLite admission path; this witness cannot authorize
-a writer, backup, or restore. The validator never opens or closes an existing
-database descriptor, which avoids disturbing SQLite's process-level POSIX locks.
+This validator accepts **blank profiles only**: both reserved database names
+must be absent. An existing live or staging database, including a symlink,
+hard link or FIFO at either name, fails before the validator opens any regular
+file. The absence is checked again during validation and on each
+`revalidate()`. This witness cannot authorize a writer, backup, or restore. A
+separately registered managed staging witness is required for the narrow P1
+staging component below. The validator never opens or closes an existing
+database descriptor, which avoids disturbing SQLite's process-level POSIX
+locks.
 
 `validate_profile_paths(application_support_root, profile_id)` returns a
 context-managed `ProfilePaths` witness and rejects repository roots, symlinks,
@@ -46,6 +50,54 @@ descriptors around actual I/O and apply the existing staging/restore authority
 checks.
 
 D4 tests construct only disposable synthetic trees under temporary paths.
+
+## Managed synthetic staging component (D4-3 P1)
+
+P1 adds a separate, fixed-path witness for an enrolled **synthetic staging
+database**. The supported operations are `bootstrap_registered_staging()` on
+an existing blank `ProfilePaths` witness and `verify_registered_staging()` for
+the same explicit Application Support root and profile ID. Bootstrap uses the
+existing staging factory and complete temporary-database migration manifest;
+it never accepts a caller-selected database path or authorizes
+`runtime/database/finance.db`. If the fixed profile gate is missing, bootstrap
+initializes that single fixed gate. It does not create profile directories or
+adopt a pre-existing database.
+
+The managed registration is `.managed-staging.v1.json`. It binds the profile
+ID, runtime/workspace roots, fixed staging path, migration-contract digest,
+staging main-file device/inode, and a new instance ID. Registration publishes
+through `.managed-staging.v1.pending`; a leftover pending name marks an
+incomplete publication and remains evidence. Missing, malformed, copied, or
+mismatched registration; an unregistered main database; an unexpected fixed
+sidecar; or an unsafe file role fails closed without deleting or rewriting the
+observed database or registration. Registration is cooperative custody
+evidence for the fixed staging instance, not a profile issuer or defense
+against the excluded same-user offline-mutation threat.
+
+Every managed SQLite open acquires the profile's shared gate before SQLite can
+recover or create a sidecar, then keeps the lease until rollback and actual
+connection close finish. The fixed main and its `-wal`, `-journal`, and `-shm`
+roles are checked against the enrolled profile and owner-only file rules;
+stock SQLite remains responsible for ordinary hot-journal and WAL recovery.
+If connection close is uncertain, the component retains both the connection
+and shared lease until that process exits. A waiting exclusive cut must not
+pass before the process has exited and been reaped.
+
+The generic public `open_staging_database()` refuses the fixed profile staging
+path regardless of enrollment state. Reopening that fixed path is available
+only through the scoped managed connection while its shared gate is held;
+ordinary temporary staging paths retain the existing generic factory behavior.
+
+This component's resource inventory is `profile.json`, the fixed profile gate,
+the managed registration and pending name, `workspace/database/staging.sqlite`,
+and its three fixed SQLite sidecar roles. It includes no attachment store,
+product child-worker protocol, or Host state. Synthetic tests use child
+processes only to create crash/reopen fixtures. `receipt_staging_runner`,
+Bridge commands, correction adapters, and migration or restored-profile entry
+points are not integrated with this managed API. Those entries remain outside
+this component's proof. A passing component test is evidence for only the
+enumerated Core slice; it does not close all D4-C01–C04 acceptance or establish
+D4-3 completion, a complete backup cut, a restore, or production readiness.
 
 ## Fixed profile gate (v1)
 
