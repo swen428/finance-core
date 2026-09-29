@@ -9,9 +9,10 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -46,6 +47,29 @@ _LIMITS = DiskSnapshotLimits(
     backup_pages_per_step=8,
 )
 _SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+
+class _ProgressObservedConnection(sqlite3.Connection):
+    active_backup_remaining: int | None = None
+
+    def backup(
+        self,
+        target: sqlite3.Connection,
+        *,
+        pages: int = -1,
+        progress: Callable[[int, int, int], object] | None = None,
+        name: str = "main",
+        sleep: float = 0.250,
+    ) -> None:
+        def observe(status: int, remaining: int, total: int) -> None:
+            self.active_backup_remaining = remaining
+            try:
+                if progress is not None:
+                    progress(status, remaining, total)
+            finally:
+                self.active_backup_remaining = None
+
+        super().backup(target, pages=pages, progress=observe, name=name, sleep=sleep)
 
 
 @pytest.fixture()
@@ -98,6 +122,19 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
             "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name, tbl_name"
         ).fetchall()
     )
+
+
+def _add_multistep_backup_payload(
+    source: sqlite3.Connection,
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    source.execute("CREATE TABLE backup_payload (id INTEGER PRIMARY KEY, body BLOB NOT NULL)")
+    source.executemany(
+        "INSERT INTO backup_payload (id, body) VALUES (?, ?)",
+        ((row_id, bytes([row_id % 251]) * 4096) for row_id in range(1, 49)),
+    )
+    source.commit()
+    assert source.execute("PRAGMA page_count").fetchone()[0] > 1
+    return _table_contents(source)
 
 
 def test_wal_snapshot_preserves_rowid_and_returns_closed_delete_file(
@@ -164,6 +201,138 @@ def test_existing_stage_output_collision_is_refused_and_preserved(
         )
 
     assert output.read_bytes() == b"synthetic pre-existing evidence"
+
+
+def test_deadline_during_incomplete_backup_preserves_stage_placeholder_and_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_source = sqlite3.connect(tmp_path / "deadline-fixture.sqlite")
+    source = sqlite3.connect(
+        tmp_path / "deadline-source.sqlite", factory=_ProgressObservedConnection
+    )
+    try:
+        fixture_source.execute(
+            "CREATE TABLE snapshot_rows (id INTEGER PRIMARY KEY, label TEXT NOT NULL)"
+        )
+        fixture_source.execute("INSERT INTO snapshot_rows (id, label) VALUES (37, 'synthetic')")
+        fixture_source.commit()
+        fixture_source.backup(source)
+        source_before = _add_multistep_backup_payload(source)
+        stage = _private_stage(tmp_path, name="deadline-partial")
+        output = stage / "core.sqlite"
+        original_check_deadline = disk_snapshot._check_deadline
+        observed_remaining: int | None = None
+
+        def expire_from_progress(deadline: float) -> None:
+            nonlocal observed_remaining
+            remaining = source.active_backup_remaining
+            if remaining is not None and remaining > 0:
+                observed_remaining = remaining
+                raise DiskSnapshotError("Disk snapshot deadline expired")
+            original_check_deadline(deadline)
+
+        monkeypatch.setattr(disk_snapshot, "_check_deadline", expire_from_progress)
+        limits = DiskSnapshotLimits(
+            max_core_db_bytes=1_048_576,
+            max_stage_bytes=2_097_152,
+            min_free_bytes=1,
+            backup_pages_per_step=1,
+        )
+        with pytest.raises(DiskSnapshotError, match="deadline expired"):
+            create_disk_snapshot(
+                source,
+                private_stage=stage,
+                limits=limits,
+                deadline_monotonic=time.monotonic() + 30.0,
+            )
+
+        assert observed_remaining is not None and observed_remaining > 0
+        failed_stage_bytes = output.read_bytes()
+        assert output.is_file()
+        # SQLite rolls the incomplete backup back when the destination closes;
+        # preserve the empty placeholder rather than silently resetting stage.
+        assert failed_stage_bytes == b""
+        assert list(stage.iterdir()) == [output]
+        assert _table_contents(source) == source_before
+        with pytest.raises(DiskSnapshotError, match="Stage is not fresh and empty"):
+            create_disk_snapshot(
+                source,
+                private_stage=stage,
+                limits=limits,
+                deadline_monotonic=time.monotonic() + 30.0,
+            )
+        assert output.read_bytes() == failed_stage_bytes
+    finally:
+        source.close()
+        fixture_source.close()
+
+
+def test_output_fsync_failure_preserves_completed_stage_and_source(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _database = wal_source
+    source_before = _add_multistep_backup_payload(source)
+    stage = _private_stage(tmp_path, name="sync-failure")
+    output = stage / "core.sqlite"
+    actual_run = subprocess.run
+    readback_completed = False
+
+    def record_readback(
+        command: list[str],
+        *,
+        capture_output: Literal[True],
+        text: Literal[True],
+        check: Literal[True],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal readback_completed
+        completed = actual_run(
+            command,
+            capture_output=capture_output,
+            text=text,
+            check=check,
+            timeout=timeout,
+        )
+        readback_completed = True
+        return completed
+
+    actual_fsync = os.fsync
+
+    def fail_output_sync(fd: int) -> None:
+        assert readback_completed
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("synthetic output fsync failure")
+        actual_fsync(fd)
+
+    monkeypatch.setattr(disk_snapshot.subprocess, "run", record_readback)
+    monkeypatch.setattr(disk_snapshot.os, "fsync", fail_output_sync)
+
+    with pytest.raises(OSError, match="synthetic output fsync failure"):
+        create_disk_snapshot(
+            source,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert readback_completed
+    completed_bytes = output.read_bytes()
+    assert completed_bytes
+    assert _table_contents(source) == source_before
+    with closing(sqlite3.connect(output.as_uri() + "?mode=ro", uri=True)) as copied:
+        assert copied.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert _table_contents(copied) == source_before
+    with pytest.raises(DiskSnapshotError, match="Stage is not fresh and empty"):
+        create_disk_snapshot(
+            source,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+    assert output.read_bytes() == completed_bytes
 
 
 def test_nonprivate_stage_permissions_are_refused_without_creating_output(

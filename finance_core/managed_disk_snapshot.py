@@ -117,14 +117,10 @@ def _check_output_role(fd: int, output: Path, expected: os.stat_result) -> os.st
 
 def _hash_closed_file(output: Path, expected: os.stat_result, deadline: float) -> str:
     digest = hashlib.sha256()
-    fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if (info.st_dev, info.st_ino, info.st_size) != (
-            expected.st_dev,
-            expected.st_ino,
-            expected.st_size,
-        ):
+        info = _check_output_role(fd, output, expected)
+        if info.st_size != expected.st_size:
             raise DiskSnapshotError("Disk snapshot identity changed")
         while chunk := os.read(fd, 1024 * 1024):
             _check_deadline(deadline)
@@ -305,14 +301,10 @@ def create_disk_snapshot(
         after_hash = _hash_closed_file(output, after_info, deadline_monotonic)
         if before_hash != after_hash or closed_info.st_size != after_info.st_size:
             raise DiskSnapshotError("Snapshot changed during independent readback")
-        sync_fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW)
+        sync_fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
-            sync_info = os.fstat(sync_fd)
-            if (sync_info.st_dev, sync_info.st_ino, sync_info.st_size) != (
-                created_info.st_dev,
-                created_info.st_ino,
-                after_info.st_size,
-            ):
+            sync_info = _check_output_role(sync_fd, output, created_info)
+            if sync_info.st_size != after_info.st_size:
                 raise DiskSnapshotError("Disk snapshot identity changed before sync")
             os.fsync(sync_fd)
         finally:
