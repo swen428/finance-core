@@ -533,29 +533,77 @@ def test_legacy_migration_refuses_managed_profile_before_sqlite_open(
     assert not backup.exists()
 
 
-@pytest.mark.parametrize("destination_kind", ["path", "directory"])
+@pytest.mark.parametrize("destination_kind", ["path", "directory", "path_alias", "directory_alias"])
 def test_legacy_migration_refuses_managed_backup_namespace_before_sqlite_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination_kind: str
 ) -> None:
     ordinary = _target(tmp_path, migration_paths=None)
     managed = _managed_staging_path(tmp_path)
-    backup_directory = managed.parents[2] / "backups"
-    backup_directory.mkdir()
+    managed_backup_directory = managed.parents[2] / "backups"
+    if destination_kind.endswith("_alias"):
+        profile_alias = tmp_path / "ordinary-looking-profile"
+        profile_alias.symlink_to(managed.parents[2], target_is_directory=True)
+        assert profile_alias.resolve() == managed.parents[2].resolve()
+        backup_directory = profile_alias / "backups"
+    else:
+        managed_backup_directory.mkdir()
+        backup_directory = managed_backup_directory
     before = ordinary.read_bytes()
 
     def unexpected_open(*_args: object, **_kwargs: object) -> None:
         pytest.fail("managed backup destination reached SQLite open")
 
     monkeypatch.setattr(migration_safety, "connect_sqlite", unexpected_open)
-    kwargs = (
-        {"backup_path": backup_directory / "candidate.sqlite"}
-        if destination_kind == "path"
-        else {"backup_directory": backup_directory}
-    )
+    is_path = destination_kind in {"path", "path_alias"}
+    backup_path = backup_directory / "candidate.sqlite"
+    kwargs = {"backup_path": backup_path} if is_path else {"backup_directory": backup_directory}
     with pytest.raises(MigrationBackupError, match="managed"):
         migrate_database_safely(ordinary, **kwargs)
     assert ordinary.read_bytes() == before
-    assert list(backup_directory.iterdir()) == []
+    assert not backup_path.exists()
+    assert not Path(f"{backup_path}.metadata.json").exists()
+    if destination_kind.endswith("_alias"):
+        assert not managed_backup_directory.exists()
+    else:
+        assert list(managed_backup_directory.iterdir()) == []
+
+
+def test_direct_backup_refuses_managed_metadata_alias_before_output_and_preserves_transaction(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "ordinary.sqlite"
+    source = sqlite3.connect(source_path)
+    source.execute("CREATE TABLE evidence (value TEXT NOT NULL)")
+    source.commit()
+    source.execute("BEGIN")
+    source.execute("INSERT INTO evidence (value) VALUES ('pending')")
+
+    managed = _managed_staging_path(tmp_path)
+    managed_backup_directory = managed.parents[2] / "backups"
+    profile_alias = tmp_path / "ordinary-looking-profile"
+    profile_alias.symlink_to(managed.parents[2], target_is_directory=True)
+    assert profile_alias.resolve() == managed.parents[2].resolve()
+
+    destination = tmp_path / "must-not-exist.sqlite"
+    metadata_path = profile_alias / "backups" / "must-not-exist.metadata.json"
+    try:
+        with pytest.raises(MigrationBackupError, match="managed"):
+            migration_safety.create_verified_backup(
+                source,
+                source_path,
+                destination,
+                metadata_path,
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert source.in_transaction
+        assert source.execute("SELECT value FROM evidence").fetchone()[0] == "pending"
+        assert not destination.exists()
+        assert not metadata_path.exists()
+        assert not managed_backup_directory.exists()
+    finally:
+        source.rollback()
+        source.close()
 
 
 def test_direct_backup_refuses_actual_managed_source_even_with_ordinary_path_lie(
