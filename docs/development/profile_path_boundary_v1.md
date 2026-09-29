@@ -54,9 +54,9 @@ D4 tests construct only disposable synthetic trees under temporary paths.
 ## Managed synthetic staging component (D4-3 P1)
 
 P1 adds a separate, fixed-path witness for an enrolled **synthetic staging
-database**. The supported operations are `bootstrap_registered_staging()` on
-an existing blank `ProfilePaths` witness and `verify_registered_staging()` for
-the same explicit Application Support root and profile ID. Bootstrap uses the
+database**. Enrollment uses `bootstrap_registered_staging()` on an existing
+blank `ProfilePaths` witness; `verify_registered_staging()` checks the same
+explicit Application Support root and profile ID. Bootstrap uses the
 existing staging factory and complete temporary-database migration manifest;
 it never accepts a caller-selected database path or authorizes
 `runtime/database/finance.db`. If the fixed profile gate is missing, bootstrap
@@ -85,17 +85,31 @@ pass before the process has exited and been reaped.
 
 The generic public `open_staging_database()` refuses the fixed profile staging
 path regardless of enrollment state. Reopening that fixed path is available
-only through the scoped managed connection while its shared gate is held;
+only through the scoped managed operation while its shared gate is held;
 ordinary temporary staging paths retain the existing generic factory behavior.
 
-This component's resource inventory is `profile.json`, the fixed profile gate,
-the managed registration and pending name, `workspace/database/staging.sqlite`,
-and its three fixed SQLite sidecar roles. It includes no attachment store,
-product child-worker protocol, or Host state. Synthetic tests use child
-processes only to create crash/reopen fixtures. `receipt_staging_runner`,
-Bridge commands, correction adapters, and migration or restored-profile entry
-points are not integrated with this managed API. Those entries remain outside
-this component's proof. A passing component test is evidence for only the
+The first caller integration is deliberately narrow: the Bridge `health` and
+`get_status` commands and its separate delivery-receipt consumer use short
+managed database sessions. The caller derives the enrolled profile from the
+fixed workspace layout and the configured `FINANCE_RUNTIME_ROOT`, not from a
+request flag or arbitrary database path. Every other Bridge command targeting
+the managed layout refuses before its handler can open the database or perform
+an external effect. Ordinary staging workspaces retain their existing route.
+This partial integration does not admit capture, OCR, correction, migration, or
+any full backup cut.
+
+The enrolled database component's resource inventory is `profile.json`, the
+fixed profile gate, the managed registration and pending name,
+`workspace/database/staging.sqlite`, and its three fixed SQLite sidecar roles.
+The admitted `get_status` path may also read a canonical receipt original to
+report its existing integrity state; it does not acquire, publish, or back up
+attachments. This slice has no cut-worker protocol or Host state. Synthetic
+tests use child processes for crash/reopen and gate-overlap fixtures.
+`receipt_staging_runner`, the
+remaining Bridge commands, correction adapters, and migration or
+restored-profile entry points are not integrated with this managed API. Those
+entries remain outside this component's proof. A passing component test is
+evidence for only the
 enumerated Core slice; it does not close all D4-C01–C04 acceptance or establish
 D4-3 completion, a complete backup cut, a restore, or production readiness.
 

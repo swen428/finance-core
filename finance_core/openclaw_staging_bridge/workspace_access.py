@@ -11,10 +11,23 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import AbstractContextManager
 from pathlib import Path
+from types import TracebackType
 
+from finance_core.managed_staging_profile import managed_staging_operation
 from finance_core.openclaw_staging_bridge import errors
-from finance_core.runtime_paths import RuntimePathConfigurationError, live_database_path
+from finance_core.profile_gate import ProfileGateError
+from finance_core.profile_paths import (
+    ManagedStagingProfile,
+    ProfilePathError,
+    validate_registered_staging_profile,
+)
+from finance_core.runtime_paths import (
+    RuntimePathConfigurationError,
+    live_database_path,
+    require_runtime_root,
+)
 from finance_core.staging_guard import StagingDatabaseError, open_staging_database
 
 HANDOFF_DIRNAME = "handoff"
@@ -55,7 +68,20 @@ def validate_workspace_path(raw_path: object) -> Path:
             "workspace_path must not be a symlink.",
             errors.EXIT_VALIDATION_REFUSED,
         )
-    resolved = path.resolve()
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise errors.bridge_error(
+            errors.WORKSPACE_REFUSED,
+            "workspace_path cannot be resolved safely.",
+            errors.EXIT_VALIDATION_REFUSED,
+        ) from exc
+    if is_fixed_profile_workspace_path(resolved) and path != resolved:
+        raise errors.bridge_error(
+            errors.WORKSPACE_REFUSED,
+            "Managed workspace_path must be the exact canonical profile workspace.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
     try:
         live_db_path = live_database_path()
         runtime_root = live_db_path.parents[1]
@@ -97,6 +123,105 @@ def validate_workspace_path(raw_path: object) -> Path:
 
 def database_path_for(workspace: Path) -> Path:
     return workspace / "database" / _DATABASE_FILENAME
+
+
+def is_fixed_profile_workspace_path(path: Path) -> bool:
+    """Recognize the reserved profile layout without trusting a caller flag."""
+    parents = path.parents
+    return (
+        len(parents) >= 4
+        and path.name == "workspace"
+        and parents[1].name == "profiles"
+        and parents[2].name == "Finance-Codex"
+        and parents[3].name == "Application Support"
+    )
+
+
+def managed_profile_for_workspace(workspace: Path) -> ManagedStagingProfile | None:
+    """Bind the exact workspace and configured runtime to enrolled authority."""
+    if not is_fixed_profile_workspace_path(workspace):
+        return None
+    profile_base = workspace.parent
+    support = profile_base.parent.parent.parent
+    try:
+        runtime = require_runtime_root()
+        if workspace != workspace.resolve(strict=True) or runtime != profile_base / "runtime":
+            raise ProfilePathError("Managed workspace or configured runtime does not match")
+        profile = validate_registered_staging_profile(support, profile_base.name)
+        if profile.workspace != workspace or profile.runtime != runtime:
+            profile.close()
+            raise ProfilePathError("Managed workspace witness does not match")
+        return profile
+    except (OSError, RuntimeError, ProfilePathError, RuntimePathConfigurationError) as exc:
+        raise errors.bridge_error(
+            errors.STAGING_REFUSED,
+            f"Managed staging profile refused: {exc}",
+            errors.EXIT_AUTHORITY_REFUSED,
+            retryable=False,
+        ) from exc
+
+
+def _managed_operation_refusal(exc: Exception) -> errors.BridgeError:
+    return errors.bridge_error(
+        errors.STAGING_REFUSED,
+        f"Managed staging operation refused: {exc}",
+        errors.EXIT_AUTHORITY_REFUSED,
+        retryable=False,
+    )
+
+
+class _WorkspaceDatabaseSession:
+    """Close managed resources without injecting frozen BridgeError into a generator."""
+
+    def __init__(self, workspace: Path, operation_id: str) -> None:
+        self.workspace = workspace
+        self.operation_id = operation_id
+        self.profile: ManagedStagingProfile | None = None
+        self.managed_context: AbstractContextManager[sqlite3.Connection] | None = None
+        self.conn: sqlite3.Connection | None = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        self.profile = managed_profile_for_workspace(self.workspace)
+        if self.profile is None:
+            self.conn = open_workspace_database(self.workspace)
+            return self.conn
+        try:
+            self.managed_context = managed_staging_operation(
+                self.profile, operation_id=self.operation_id
+            )
+            self.conn = self.managed_context.__enter__()
+            return self.conn
+        except (ProfilePathError, StagingDatabaseError, ProfileGateError) as exc:
+            self.profile.close()
+            raise _managed_operation_refusal(exc) from exc
+        except BaseException:
+            self.profile.close()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        try:
+            if self.managed_context is None:
+                if self.conn is not None:
+                    self.conn.close()
+            else:
+                # Rollback and real close happen in the managed context. Its
+                # generator must not receive frozen BridgeError via throw().
+                self.managed_context.__exit__(None, None, None)
+        except (ProfilePathError, StagingDatabaseError, ProfileGateError) as exc:
+            raise _managed_operation_refusal(exc) from exc
+        finally:
+            if self.profile is not None:
+                self.profile.close()
+
+
+def workspace_database_session(workspace: Path, *, operation_id: str) -> _WorkspaceDatabaseSession:
+    """Own one managed operation or the ordinary staging connection lifetime."""
+    return _WorkspaceDatabaseSession(workspace, operation_id)
 
 
 def verify_workspace_structure(workspace: Path, *, require_handoff: bool = False) -> None:
@@ -324,10 +449,13 @@ __all__ = [
     "MAX_WORKSPACE_PATH_LENGTH",
     "database_path_for",
     "ensure_handoff_directory",
+    "is_fixed_profile_workspace_path",
+    "managed_profile_for_workspace",
     "open_workspace_database",
     "read_command_file",
     "validate_command_filename",
     "validate_handoff_filename",
     "validate_workspace_path",
     "verify_workspace_structure",
+    "workspace_database_session",
 ]

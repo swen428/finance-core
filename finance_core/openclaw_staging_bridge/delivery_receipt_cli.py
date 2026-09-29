@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from typing import BinaryIO, TextIO
 
 from finance_core import posting_authority
-from finance_core.openclaw_staging_bridge import workspace_access
+from finance_core.openclaw_staging_bridge import errors, workspace_access
 from finance_core.openclaw_staging_bridge.delivery_receipt_proof import (
     PROOF_VERSION,
     authenticate_delivery_receipt,
@@ -82,14 +83,13 @@ def execute_stream(stdin: BinaryIO, stdout: TextIO, stderr: TextIO) -> int:
             receipt_proof_sha256_value=payload["receipt_proof_sha256"],
             **proof_fields,
         )
-        conn = workspace_access.open_workspace_database(workspace)
-        try:
+        with workspace_access.workspace_database_session(
+            workspace, operation_id=f"delivery-receipt:{uuid.uuid4().hex}"
+        ) as conn:
             observation_public_id = posting_authority.record_posting_review_delivery(
                 conn,
                 receipt=receipt,
             )
-        finally:
-            conn.close()
         return _emit(
             stdout,
             {"observation_public_id": observation_public_id, "status": "ok"},
@@ -104,6 +104,9 @@ def execute_stream(stdin: BinaryIO, stdout: TextIO, stderr: TextIO) -> int:
         stderr.write("delivery receipt request refused\n")
         return 6
     except posting_authority.PostingAuthorityError:
+        stderr.write("delivery receipt authority refused\n")
+        return 6
+    except errors.BridgeError:
         stderr.write("delivery receipt authority refused\n")
         return 6
     except Exception:

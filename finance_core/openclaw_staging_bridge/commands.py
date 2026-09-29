@@ -945,8 +945,13 @@ def _finalization_view(
 
 def handle_health(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(request.arguments, required=frozenset({"workspace_path"}))
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    deadline.check("workspace validation")
+    workspace = workspace_access.validate_workspace_path(request.arguments["workspace_path"])
+    workspace_access.verify_workspace_structure(workspace)
+    deadline.check("database open")
+    with workspace_access.workspace_database_session(
+        workspace, operation_id=f"bridge:{request.request_id}"
+    ) as conn:
         from finance_core.reconciliation.migrations import migration_ledger_rows
 
         ledger = migration_ledger_rows(conn)
@@ -960,8 +965,6 @@ def handle_health(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             "callback_key_status": key_status,
         }
         return result, False
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1025,8 +1028,13 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "Posting status requires the complete authenticated Telegram context.",
             errors.EXIT_VALIDATION_REFUSED,
         )
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    deadline.check("workspace validation")
+    workspace = workspace_access.validate_workspace_path(request.arguments["workspace_path"])
+    workspace_access.verify_workspace_structure(workspace)
+    deadline.check("database open")
+    with workspace_access.workspace_database_session(
+        workspace, operation_id=f"bridge:{request.request_id}"
+    ) as conn:
         deadline.check("status read")
         if posting_lookup:
             from finance_core import posting_authority
@@ -1141,8 +1149,6 @@ def handle_get_status(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             "capture_job": capture_job,
             "capture_attachment_integrity": capture_attachment_integrity,
         }, False
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7050,6 +7056,33 @@ def _require_personal_fact_set_bindings(
 
 def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     from finance_core.openclaw_staging_bridge import envelope
+
+    # The reserved profile layout is never allowed through a legacy handler.
+    # Classify before any handler can open SQLite, create files, or call out.
+    raw_workspace = request.arguments.get("workspace_path")
+    if isinstance(raw_workspace, str) and raw_workspace:
+        candidate = Path(raw_workspace)
+        try:
+            fixed_workspace = candidate.is_absolute() and (
+                workspace_access.is_fixed_profile_workspace_path(candidate)
+                or workspace_access.is_fixed_profile_workspace_path(candidate.resolve())
+            )
+        except (OSError, RuntimeError) as exc:
+            raise errors.bridge_error(
+                errors.WORKSPACE_REFUSED,
+                "workspace_path cannot be resolved safely.",
+                errors.EXIT_VALIDATION_REFUSED,
+            ) from exc
+        if fixed_workspace and request.command not in {
+            envelope.COMMAND_HEALTH,
+            envelope.COMMAND_GET_STATUS,
+        }:
+            raise errors.bridge_error(
+                errors.STAGING_REFUSED,
+                "Managed staging does not support this Bridge command.",
+                errors.EXIT_AUTHORITY_REFUSED,
+                retryable=False,
+            )
 
     handlers: dict[str, Callable[[BridgeRequest, Deadline], HandlerResult]] = {
         envelope.COMMAND_HEALTH: handle_health,

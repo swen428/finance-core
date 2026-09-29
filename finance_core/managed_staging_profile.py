@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterator
@@ -263,6 +264,28 @@ def _managed_staging_connection_locked(
                     retained is lease for _, retained in _UNCERTAIN_CLOSES
                 ):
                     _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                    # Full role/ACL inspection belongs after the last SQLite
+                    # handle has actually closed, while the gate is still held.
+                    profile.revalidate()
+
+
+@contextmanager
+def managed_staging_operation(
+    profile: ManagedStagingProfile,
+    *,
+    operation_id: str,
+) -> Iterator[sqlite3.Connection]:
+    """One local operation on an enrolled profile, with no escaped connection.
+
+    The trusted adapter supplies the bounded operation identity. It cannot be
+    selected by an untrusted envelope to create a managed profile witness.
+    """
+    if not isinstance(operation_id, str) or not re.fullmatch(
+        r"[a-z0-9][a-z0-9:_-]{0,199}", operation_id
+    ):
+        raise ProfilePathError("A bounded managed operation ID is required")
+    with _managed_staging_connection(profile) as conn:
+        yield conn
 
 
 def verify_registered_staging(
@@ -283,4 +306,8 @@ def verify_registered_staging(
         raise
 
 
-__all__ = ["bootstrap_registered_staging", "verify_registered_staging"]
+__all__ = [
+    "bootstrap_registered_staging",
+    "managed_staging_operation",
+    "verify_registered_staging",
+]
