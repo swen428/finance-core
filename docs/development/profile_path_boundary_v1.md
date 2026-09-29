@@ -130,6 +130,18 @@ evidence for only the
 enumerated Core slice; it does not close all D4-C01–C04 acceptance or establish
 D4-3 completion, a complete backup cut, a restore, or production readiness.
 
+The legacy path-taking `migrate_database_safely()` and
+`create_verified_backup()` entries refuse the fixed managed profile namespace,
+including backup output there. The direct backup entry also checks the caller's
+actual SQLite main path, rejects attached, memory, temporary, closed or
+mismatched connections, binds the preflight target to that main path, and
+refuses a copied or renamed staging authorization before producing output.
+For a staging database copied alone to an ordinary
+path, the legacy migration entry can inspect its existing authorization only
+after its normal SQLite open; that check precedes backup creation and schema
+mutation, but is not a pre-open, sidecar-free guarantee. These refusals grant no
+managed migration, backup publication, or restored-profile authority.
+
 ## Fixed profile gate (v1)
 
 The profile gate is an opt-in interprocess coordination primitive for

@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -16,6 +19,7 @@ from finance_core.reconciliation.migration_safety import (
     MigrationPhaseError,
     MigrationPostflightError,
     MigrationPreflightError,
+    MigrationPreflightReport,
     MigrationTargetError,
     migrate_database_safely,
     validate_migration_target,
@@ -493,3 +497,292 @@ def test_protected_database_path_is_rejected_without_opening_or_migration(
         validate_migration_target(protected)
     after = protected.stat()
     assert (after.st_size, after.st_mtime_ns) == (before.st_size, before.st_mtime_ns)
+
+
+def _managed_staging_path(tmp_path: Path, *, profile_id: str = "synthetic") -> Path:
+    database = (
+        tmp_path
+        / "Application Support"
+        / "Finance-Codex"
+        / "profiles"
+        / profile_id
+        / "workspace"
+        / "database"
+    )
+    database.mkdir(parents=True)
+    return database / "staging.sqlite"
+
+
+@pytest.mark.parametrize("profile_id", ["synthetic", "copied-profile"])
+def test_legacy_migration_refuses_managed_profile_before_sqlite_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile_id: str
+) -> None:
+    managed = _managed_staging_path(tmp_path, profile_id=profile_id)
+    conn = create_staging_database(managed)
+    conn.close()
+    before = managed.read_bytes()
+    backup = tmp_path / "outside-backup.sqlite"
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("managed migration reached SQLite open")
+
+    monkeypatch.setattr(migration_safety, "connect_sqlite", unexpected_open)
+    with pytest.raises(MigrationTargetError, match="managed"):
+        migrate_database_safely(managed, backup_path=backup)
+    assert managed.read_bytes() == before
+    assert not backup.exists()
+
+
+@pytest.mark.parametrize("destination_kind", ["path", "directory"])
+def test_legacy_migration_refuses_managed_backup_namespace_before_sqlite_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, destination_kind: str
+) -> None:
+    ordinary = _target(tmp_path, migration_paths=None)
+    managed = _managed_staging_path(tmp_path)
+    backup_directory = managed.parents[2] / "backups"
+    backup_directory.mkdir()
+    before = ordinary.read_bytes()
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("managed backup destination reached SQLite open")
+
+    monkeypatch.setattr(migration_safety, "connect_sqlite", unexpected_open)
+    kwargs = (
+        {"backup_path": backup_directory / "candidate.sqlite"}
+        if destination_kind == "path"
+        else {"backup_directory": backup_directory}
+    )
+    with pytest.raises(MigrationBackupError, match="managed"):
+        migrate_database_safely(ordinary, **kwargs)
+    assert ordinary.read_bytes() == before
+    assert list(backup_directory.iterdir()) == []
+
+
+def test_direct_backup_refuses_actual_managed_source_even_with_ordinary_path_lie(
+    tmp_path: Path,
+) -> None:
+    managed = _managed_staging_path(tmp_path)
+    source = create_staging_database(managed)
+    ordinary_lie = tmp_path / "ordinary.sqlite"
+    destination = tmp_path / "must-not-exist.sqlite"
+    try:
+        with pytest.raises(MigrationBackupError, match="managed|match"):
+            migration_safety.create_verified_backup(
+                source,
+                ordinary_lie,
+                destination,
+                Path(f"{destination}.metadata.json"),
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert source.execute("SELECT 1").fetchone()[0] == 1
+        assert not source.in_transaction
+        assert not destination.exists()
+    finally:
+        source.close()
+
+
+def test_direct_backup_refusal_preserves_caller_transaction(tmp_path: Path) -> None:
+    ordinary = tmp_path / "ordinary.sqlite"
+    source = sqlite3.connect(ordinary)
+    source.execute("CREATE TABLE evidence (value TEXT NOT NULL)")
+    source.commit()
+    source.execute("BEGIN")
+    source.execute("INSERT INTO evidence (value) VALUES ('pending')")
+    wrong_source = tmp_path / "wrong-source.sqlite"
+    other = sqlite3.connect(wrong_source)
+    other.close()
+    destination = tmp_path / "no-backup.sqlite"
+    try:
+        with pytest.raises(MigrationBackupError, match="do not match"):
+            migration_safety.create_verified_backup(
+                source,
+                wrong_source,
+                destination,
+                Path(f"{destination}.metadata.json"),
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert source.in_transaction
+        assert source.execute("SELECT value FROM evidence").fetchone()[0] == "pending"
+        assert not destination.exists()
+    finally:
+        source.rollback()
+        source.close()
+
+
+def test_direct_backup_refuses_preflight_for_another_database_without_output(
+    tmp_path: Path,
+) -> None:
+    actual = _target(tmp_path, name="actual.sqlite", migration_paths=None)
+    other = _target(tmp_path, name="other.sqlite", migration_paths=None)
+    source = connect_sqlite(actual, mode=ConnectionMode.MIGRATION)
+    destination = tmp_path / "no-backup.sqlite"
+    try:
+        preflight = migration_safety.inspect_migration_preflight(
+            source,
+            actual,
+            migration_paths=TEMP_DB_MIGRATION_PATHS,
+            expected_application_id=FINANCE_APPLICATION_ID,
+            allow_legacy_application_id=True,
+        )
+        source.execute("BEGIN")
+        with pytest.raises(MigrationBackupError, match="preflight target"):
+            migration_safety.create_verified_backup(
+                source,
+                actual,
+                destination,
+                Path(f"{destination}.metadata.json"),
+                preflight=replace(preflight, target_path=str(other)),
+                created_at=FROZEN_TIME,
+            )
+        assert source.in_transaction
+        assert source.execute("SELECT 1").fetchone()[0] == 1
+        assert not destination.exists()
+    finally:
+        source.rollback()
+        source.close()
+
+
+def test_direct_backup_refuses_copied_staging_binding_outside_profile(tmp_path: Path) -> None:
+    managed = _managed_staging_path(tmp_path)
+    source = create_staging_database(managed)
+    source.close()
+    copied = tmp_path / "ordinary-copied.sqlite"
+    shutil.copyfile(managed, copied)
+    destination = tmp_path / "must-not-exist.sqlite"
+    connection = sqlite3.connect(copied)
+    try:
+        with pytest.raises(MigrationBackupError, match="binding|copied|refused"):
+            migration_safety.create_verified_backup(
+                connection,
+                copied,
+                destination,
+                Path(f"{destination}.metadata.json"),
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert not destination.exists()
+    finally:
+        connection.close()
+
+
+def test_legacy_migration_refuses_copied_staging_binding_before_backup_or_schema(
+    tmp_path: Path,
+) -> None:
+    managed = _managed_staging_path(tmp_path)
+    source = create_staging_database(managed)
+    source.close()
+    copied = tmp_path / "ordinary-copied.sqlite"
+    shutil.copyfile(managed, copied)
+    before = copied.read_bytes()
+    destination = tmp_path / "no-backup.sqlite"
+
+    with pytest.raises(MigrationPreflightError, match="Staging source binding refused"):
+        migrate_database_safely(copied, backup_path=destination)
+    assert copied.read_bytes() == before
+    assert not destination.exists()
+
+
+def test_legacy_migration_refuses_renamed_profile_tree_with_registration_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    moved_profile = tmp_path / "moved-profile"
+    database = moved_profile / "workspace" / "database"
+    database.mkdir(parents=True)
+    target = database / "staging.sqlite"
+    connection = create_staging_database(target)
+    connection.close()
+    (moved_profile / ".managed-staging.v1.json").write_text("synthetic copied marker\n")
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("renamed profile reached SQLite open")
+
+    monkeypatch.setattr(migration_safety, "connect_sqlite", unexpected_open)
+    with pytest.raises(MigrationTargetError, match="managed"):
+        migrate_database_safely(target, backup_path=tmp_path / "no-backup.sqlite")
+    assert not (tmp_path / "no-backup.sqlite").exists()
+
+
+def test_legacy_migration_refuses_symlink_alias_into_managed_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed = _managed_staging_path(tmp_path)
+    source = create_staging_database(managed)
+    source.close()
+    alias = tmp_path / "ordinary-looking-directory"
+    alias.symlink_to(managed.parent, target_is_directory=True)
+
+    def unexpected_open(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("managed alias reached SQLite open")
+
+    monkeypatch.setattr(migration_safety, "connect_sqlite", unexpected_open)
+    with pytest.raises(MigrationTargetError, match="managed"):
+        migrate_database_safely(alias / managed.name, backup_path=tmp_path / "no-backup.sqlite")
+    assert not (tmp_path / "no-backup.sqlite").exists()
+
+
+@pytest.mark.parametrize("case", ["memory", "closed", "attached", "mismatch"])
+def test_direct_backup_refuses_ambiguous_connection_without_changing_it(
+    tmp_path: Path, case: str
+) -> None:
+    source_path = tmp_path / "source.sqlite"
+    connection = sqlite3.connect(":memory:" if case == "memory" else source_path)
+    if case == "attached":
+        connection.execute("ATTACH DATABASE ':memory:' AS extra")
+    if case == "closed":
+        connection.close()
+    destination = tmp_path / "no-backup.sqlite"
+    try:
+        with pytest.raises(MigrationBackupError, match="source|main|connection"):
+            migration_safety.create_verified_backup(
+                connection,
+                tmp_path / "different.sqlite" if case == "mismatch" else source_path,
+                destination,
+                Path(f"{destination}.metadata.json"),
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert not destination.exists()
+        if case != "closed":
+            assert connection.execute("SELECT 1").fetchone()[0] == 1
+            assert not connection.in_transaction
+    finally:
+        if case != "closed":
+            connection.close()
+
+
+@pytest.mark.parametrize("case", ["destination", "metadata", "supplied_source"])
+def test_direct_backup_refuses_any_supplied_managed_namespace_before_output(
+    tmp_path: Path, case: str
+) -> None:
+    ordinary = tmp_path / "ordinary.sqlite"
+    connection = sqlite3.connect(ordinary)
+    managed = _managed_staging_path(tmp_path)
+    profile_backups = managed.parents[2] / "backups"
+    profile_backups.mkdir()
+    destination = tmp_path / "no-backup.sqlite"
+    metadata = Path(f"{destination}.metadata.json")
+    supplied_source = ordinary
+    if case == "destination":
+        destination = profile_backups / "no-backup.sqlite"
+    elif case == "metadata":
+        metadata = profile_backups / "no-backup.metadata.json"
+    else:
+        supplied_source = managed
+    try:
+        with pytest.raises(MigrationBackupError, match="managed"):
+            migration_safety.create_verified_backup(
+                connection,
+                supplied_source,
+                destination,
+                metadata,
+                preflight=cast(MigrationPreflightReport, None),
+                created_at=FROZEN_TIME,
+            )
+        assert connection.execute("SELECT 1").fetchone()[0] == 1
+        assert not destination.exists()
+        assert not metadata.exists()
+    finally:
+        connection.close()

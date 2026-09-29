@@ -24,6 +24,7 @@ from finance_core.reconciliation.migrations import (
     verify_migration_history,
 )
 from finance_core.sqlite_connection import ConnectionMode, SQLiteConnectionError, connect_sqlite
+from finance_core.staging_guard import StagingDatabaseError
 
 SQLITE_HEADER = b"SQLite format 3\x00"
 MIGRATION_SAFETY_VERSION = "finance-migration-safety-v1"
@@ -146,6 +147,12 @@ def migrate_database_safely(
     except SQLiteConnectionError as exc:
         raise MigrationPreflightError("Unable to open the SQLite target safely") from exc
     try:
+        try:
+            _verify_optional_staging_binding(conn)
+        except StagingDatabaseError as exc:
+            raise MigrationPreflightError("Staging source binding refused") from exc
+        except sqlite3.Error as exc:
+            raise MigrationPreflightError("SQLite source preflight failed") from exc
         preflight = inspect_migration_preflight(
             conn,
             target,
@@ -197,12 +204,16 @@ def migrate_database_safely(
 
 def validate_migration_target(target_path: str | Path) -> Path:
     raw = Path(target_path).expanduser()
+    if _is_managed_profile_namespace(raw):
+        raise MigrationTargetError("Legacy migration refuses a managed profile namespace")
     if _has_symlink_component(raw.absolute()):
         raise MigrationTargetError("Migration target path must not contain symbolic links")
     try:
         target = raw.resolve(strict=True)
     except OSError as exc:
         raise MigrationTargetError("Migration target does not exist") from exc
+    if _is_managed_profile_namespace(target):
+        raise MigrationTargetError("Legacy migration refuses a managed profile namespace")
     if not target.is_file():
         raise MigrationTargetError("Migration target must be a regular SQLite file")
     if _same_file_if_available(target, LIVE_DB_PATH):
@@ -295,6 +306,7 @@ def create_verified_backup(
     preflight: MigrationPreflightReport,
     created_at: str,
 ) -> MigrationBackupMetadata:
+    _require_legacy_backup_source(source, source_path, destination, metadata_path, preflight)
     try:
         destination.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -440,12 +452,18 @@ def _resolve_backup_destination(
         )
         safe_timestamp = timestamp.replace(":", "-").replace("+", "_")
         destination = directory / f"{target.stem}.{safe_timestamp}.backup.sqlite"
+    if _is_managed_profile_namespace(destination) or _is_managed_profile_namespace(
+        Path(f"{destination}.metadata.json")
+    ):
+        raise MigrationBackupError("Legacy backup refuses a managed profile namespace")
     if destination.resolve(strict=False) == target:
         raise MigrationTargetError("Backup destination must differ from migration target")
     return destination
 
 
 def _require_unused_backup_paths(destination: Path, metadata_path: Path) -> None:
+    if _is_managed_profile_namespace(destination) or _is_managed_profile_namespace(metadata_path):
+        raise MigrationBackupError("Legacy backup refuses a managed profile namespace")
     if _has_symlink_component(destination.absolute()) or _has_symlink_component(
         metadata_path.absolute()
     ):
@@ -491,6 +509,82 @@ def _same_file_if_available(first: Path, second: Path) -> bool:
         return first.resolve() == second.resolve() or os.path.samefile(first, second)
     except OSError:
         return first.resolve() == second.resolve()
+
+
+def _is_managed_profile_namespace(path: Path) -> bool:
+    """Recognize reserved and copied profile trees without trusting enrollment state."""
+    raw = path.expanduser().absolute()
+    try:
+        candidates = (raw, raw.resolve(strict=False))
+    except (OSError, RuntimeError):
+        return True
+    for candidate in candidates:
+        parts = candidate.parts
+        if any(
+            parts[index : index + 3] == ("Application Support", "Finance-Codex", "profiles")
+            for index in range(len(parts) - 2)
+        ):
+            return True
+        try:
+            if any(
+                (parent / marker).exists() or (parent / marker).is_symlink()
+                for parent in candidate.parents
+                for marker in (".managed-staging.v1.json", ".managed-staging.v1.pending")
+            ):
+                return True
+        except (OSError, RuntimeError):
+            return True
+    return False
+
+
+def _require_legacy_backup_source(
+    source: sqlite3.Connection,
+    source_path: Path,
+    destination: Path,
+    metadata_path: Path,
+    preflight: MigrationPreflightReport,
+) -> None:
+    """Refuse managed or ambiguous source/output before creating backup bytes."""
+    paths = (source_path, destination, metadata_path)
+    if any(_is_managed_profile_namespace(path) for path in paths):
+        raise MigrationBackupError("Legacy backup refuses a managed profile namespace")
+    try:
+        databases = source.execute("PRAGMA database_list").fetchall()
+        if (
+            not databases
+            or databases[0][1] != "main"
+            or not isinstance(databases[0][2], str)
+            or not databases[0][2]
+            or any(row[1] != "temp" or row[2] for row in databases[1:])
+        ):
+            raise MigrationBackupError("Backup requires one file-backed main without attachments")
+        actual = Path(databases[0][2])
+        if _is_managed_profile_namespace(actual):
+            raise MigrationBackupError("Legacy backup refuses a managed profile namespace")
+        if actual.resolve(strict=True) != source_path.expanduser().resolve(strict=True):
+            raise MigrationBackupError("Backup source connection and path do not match")
+        try:
+            _verify_optional_staging_binding(source)
+        except StagingDatabaseError as exc:
+            raise MigrationBackupError("Staging source binding refused") from exc
+        if not isinstance(preflight, MigrationPreflightReport):
+            raise MigrationBackupError("Backup preflight target does not match source connection")
+        preflight_target = Path(preflight.target_path).expanduser().resolve(strict=True)
+        if preflight_target != actual.resolve(strict=True):
+            raise MigrationBackupError("Backup preflight target does not match source connection")
+    except (OSError, sqlite3.Error) as exc:
+        raise MigrationBackupError("Backup source connection could not be verified") from exc
+
+
+def _verify_optional_staging_binding(conn: sqlite3.Connection) -> None:
+    """Keep copied/renamed staging bytes under their original guard contract."""
+    from finance_core.staging_guard import require_staging_database
+
+    authorization = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_staging_authorization'"
+    ).fetchone()
+    if authorization is not None:
+        require_staging_database(conn)
 
 
 def _has_symlink_component(path: Path) -> bool:
