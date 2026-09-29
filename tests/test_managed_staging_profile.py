@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 import subprocess
 import sys
 import threading
@@ -141,6 +143,138 @@ def test_legacy_reopen_factory_cannot_bypass_managed_profile_gate(
 
     with managed_staging._managed_staging_connection(managed, purpose="reopen") as conn:
         assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize("version", [True, 1.0], ids=["boolean-one", "float-one"])
+def test_registration_version_requires_exact_integer_and_preserves_bytes(
+    registered_profile: tuple[Path, Path, object, object],
+    monkeypatch: pytest.MonkeyPatch,
+    version: bool | float,
+) -> None:
+    support, _base, _blank, managed = registered_profile
+    registration = managed.registration
+    payload = json.loads(registration.read_text(encoding="utf-8"))
+    payload["version"] = version
+    invalid_bytes = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    registration.write_bytes(invalid_bytes)
+    registration.chmod(0o600)
+
+    connect_attempts: list[str] = []
+
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> object:
+        connect_attempts.append(str(database))
+        raise AssertionError("malformed registration reached SQLite")
+
+    monkeypatch.setattr(staging_guard.sqlite3, "connect", tracked_connect)
+    with pytest.raises(ProfilePathError):
+        managed_staging.verify_registered_staging(support, _PROFILE_ID)
+
+    assert connect_attempts == []
+    assert registration.read_bytes() == invalid_bytes
+
+
+@pytest.mark.parametrize(
+    ("role", "fault"),
+    [
+        ("main", "mode"),
+        ("main", "symlink"),
+        ("main", "hardlink"),
+        ("sidecar", "mode"),
+        ("sidecar", "fifo"),
+        ("sidecar", "hardlink"),
+    ],
+    ids=[
+        "main-mode",
+        "main-symlink",
+        "main-hardlink",
+        "sidecar-mode",
+        "sidecar-fifo",
+        "sidecar-hardlink",
+    ],
+)
+def test_untrusted_managed_main_and_sidecar_roles_fail_before_sqlite_open(
+    registered_profile: tuple[Path, Path, object, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+    fault: str,
+) -> None:
+    support, _base, _blank, managed = registered_profile
+    main = managed.staging_database
+    main_bytes = main.read_bytes()
+    role_path = main if role == "main" else Path(f"{main}-wal")
+    if role == "sidecar":
+        role_path.write_bytes(b"synthetic enrolled sidecar")
+        role_path.chmod(0o600)
+    role_bytes = role_path.read_bytes() if role_path.is_file() else b""
+    preserved_path: Path | None = None
+    linked_path: Path | None = None
+
+    if fault == "mode":
+        role_path.chmod(0o644)
+    elif fault == "symlink":
+        preserved_path = tmp_path / "preserved-managed-main.sqlite"
+        role_path.rename(preserved_path)
+        role_path.symlink_to(preserved_path)
+    elif fault == "fifo":
+        role_path.unlink()
+        os.mkfifo(role_path, 0o600)
+    elif fault == "hardlink":
+        linked_path = tmp_path / f"preserved-{role}-hardlink"
+        os.link(role_path, linked_path)
+    else:
+        raise AssertionError(f"unknown role fault: {fault}")
+
+    connect_attempts: list[str] = []
+
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> object:
+        connect_attempts.append(str(database))
+        raise AssertionError("unsafe managed role reached SQLite")
+
+    monkeypatch.setattr(staging_guard.sqlite3, "connect", tracked_connect)
+    with pytest.raises(ProfilePathError):
+        managed_staging.verify_registered_staging(support, _PROFILE_ID)
+
+    assert connect_attempts == []
+    assert main_bytes == (preserved_path.read_bytes() if preserved_path else main.read_bytes())
+    if fault == "fifo":
+        assert stat.S_ISFIFO(role_path.lstat().st_mode)
+    elif role_path.is_symlink():
+        assert preserved_path is not None and preserved_path.read_bytes() == role_bytes
+    else:
+        assert role_path.read_bytes() == role_bytes
+    if linked_path is not None:
+        assert linked_path.read_bytes() == role_bytes
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin extended ACL only")
+@pytest.mark.parametrize("role", ["main", "sidecar"])
+def test_managed_main_and_sidecar_acl_allow_fail_before_sqlite_open(
+    registered_profile: tuple[Path, Path, object, object],
+    monkeypatch: pytest.MonkeyPatch,
+    role: str,
+) -> None:
+    support, _base, _blank, managed = registered_profile
+    main = managed.staging_database
+    target = main if role == "main" else Path(f"{main}-wal")
+    if role == "sidecar":
+        target.write_bytes(b"synthetic ACL sidecar")
+        target.chmod(0o600)
+    before = target.read_bytes()
+    subprocess.run(["chmod", "+a", "everyone allow read", str(target)], check=True)
+
+    connect_attempts: list[str] = []
+
+    def tracked_connect(database: object, *args: object, **kwargs: object) -> object:
+        connect_attempts.append(str(database))
+        raise AssertionError("ACL-protected managed role reached SQLite")
+
+    monkeypatch.setattr(staging_guard.sqlite3, "connect", tracked_connect)
+    with pytest.raises(ProfilePathError):
+        managed_staging.verify_registered_staging(support, _PROFILE_ID)
+
+    assert connect_attempts == []
+    assert target.read_bytes() == before
 
 
 def test_existing_unregistered_database_is_not_adopted_or_changed(
@@ -349,6 +483,24 @@ def test_configuration_failure_with_successful_close_releases_gate(
         cut.assert_valid()
 
 
+def test_keyboard_interrupt_during_configuration_releases_gate_after_close(
+    registered_profile: tuple[Path, Path, object, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _support, _base, _blank, managed = registered_profile
+
+    def interrupt_configuration(_conn: object) -> None:
+        raise KeyboardInterrupt("synthetic configuration interrupt")
+
+    monkeypatch.setattr(staging_guard, "configure_sqlite_connection", interrupt_configuration)
+    with pytest.raises(KeyboardInterrupt, match="synthetic configuration interrupt"):
+        with managed_staging._managed_staging_connection(managed, purpose="reopen"):
+            pytest.fail("open must not yield after KeyboardInterrupt")
+
+    with exclusive_cut(managed, timeout_seconds=0) as cut:
+        cut.assert_valid()
+
+
 _CRASH_WORKER = r"""
 import os
 import sys
@@ -489,20 +641,25 @@ class CloseFailingConnection:
     def __getattr__(self, name):
         return getattr(self.inner, name)
     def close(self):
-        raise RuntimeError("synthetic close failure")
+        raise CloseAbort("synthetic close BaseException")
+
+class CloseAbort(BaseException):
+    pass
 
 guard.sqlite3.connect = lambda *args, **kwargs: CloseFailingConnection(
     real_connect(*args, **kwargs)
 )
 def fail_configuration(_conn):
-    raise RuntimeError("synthetic configuration failure")
+    raise KeyboardInterrupt("synthetic configuration interrupt")
 guard.configure_sqlite_connection = fail_configuration
 
 try:
     with managed._managed_staging_connection(profile, purpose="reopen"):
         raise AssertionError("open must fail before yielding")
 except guard._StagingCloseUncertain as exc:
-    assert str(exc.operation_error) == "synthetic configuration failure"
+    assert isinstance(exc.operation_error, KeyboardInterrupt)
+    assert str(exc.operation_error) == "synthetic configuration interrupt"
+    assert isinstance(exc.__cause__, CloseAbort)
     Path(ready).write_text("close-uncertain", encoding="ascii")
 else:
     raise AssertionError("uncertain close must not be reported as a normal failure")

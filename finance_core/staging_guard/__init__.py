@@ -59,7 +59,7 @@ class StagingDatabaseError(RuntimeError):
 class _StagingCloseUncertain(StagingDatabaseError):
     """A failed factory cannot prove its SQLite handle was closed."""
 
-    def __init__(self, conn: sqlite3.Connection, operation_error: Exception) -> None:
+    def __init__(self, conn: sqlite3.Connection, operation_error: BaseException) -> None:
         super().__init__("Staging database factory failed and SQLite close is uncertain")
         self.connection = conn
         self.operation_error = operation_error
@@ -462,11 +462,11 @@ def create_staging_database(
         conn.commit()
 
         return conn
-    except Exception as operation_error:
+    except BaseException as operation_error:
         if conn is not None:
             try:
                 conn.close()
-            except Exception as close_error:
+            except BaseException as close_error:
                 raise _StagingCloseUncertain(conn, operation_error) from close_error
         raise
     finally:
@@ -676,11 +676,11 @@ def _open_staging_database(
             verify_migration_history(conn, migration_paths)
 
         return conn
-    except Exception as operation_error:
+    except BaseException as operation_error:
         if conn is not None:
             try:
                 conn.close()
-            except Exception as close_error:
+            except BaseException as close_error:
                 raise _StagingCloseUncertain(conn, operation_error) from close_error
         raise
 

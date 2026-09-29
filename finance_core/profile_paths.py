@@ -491,7 +491,11 @@ class ManagedStagingProfile(ProfilePaths):
             "staging_database": str(self.staging_database),
             "migration_contract_sha256": _migration_contract_digest(),
         }
-        if not isinstance(data, dict) or any(data.get(k) != v for k, v in expected.items()):
+        if (
+            not isinstance(data, dict)
+            or type(data.get("version")) is not int
+            or any(data.get(k) != v for k, v in expected.items())
+        ):
             raise ProfilePathError("Managed staging registration does not match this profile")
         if set(data) != set(expected) | {"main_device", "main_inode", "instance_id"}:
             raise ProfilePathError("Managed staging registration has unexpected fields")
