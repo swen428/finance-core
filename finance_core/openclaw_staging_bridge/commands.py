@@ -19,7 +19,7 @@ import json
 import sqlite3
 import time
 import unicodedata
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -581,6 +581,20 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
     deadline.check("database open")
     conn = workspace_access.open_workspace_database(workspace)
     return workspace, conn
+
+
+def _read_workspace_session(
+    request: BridgeRequest, deadline: Deadline
+) -> AbstractContextManager[sqlite3.Connection]:
+    """Open an admitted local read through the workspace-owned connection lifetime."""
+    deadline.check("workspace validation")
+    workspace = workspace_access.validate_workspace_path(request.arguments["workspace_path"])
+    deadline.check("workspace structure verification")
+    workspace_access.verify_workspace_structure(workspace)
+    deadline.check("database open")
+    return workspace_access.workspace_database_session(
+        workspace, operation_id=f"bridge:{request.request_id}", deadline=deadline
+    )
 
 
 @contextmanager
@@ -1778,8 +1792,7 @@ def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> 
         if by_operation
         else None
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("frozen interaction route lookup")
         try:
             job_id = find_interaction_route_job(
@@ -1810,8 +1823,6 @@ def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> 
             "capture_job": job,
             "final_transaction_created": False,
         }, False
-    finally:
-        conn.close()
 
 
 def _require_replay_content_matches(
@@ -2536,8 +2547,7 @@ def handle_list_capture_recovery_candidates(
     if after is not None:
         after = _require_string(after, "after_job_public_id", max_length=200)
         through = _require_string(through, "through_job_public_id", max_length=200)
-    _, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("capture discovery")
         try:
             return (
@@ -2556,8 +2566,6 @@ def handle_list_capture_recovery_candidates(
                 "Capture discovery evidence needs local attention.",
                 errors.EXIT_AUTHORITY_REFUSED,
             ) from exc
-    finally:
-        conn.close()
 
 
 def handle_get_capture_job_for_message(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -2584,8 +2592,7 @@ def handle_get_capture_job_for_message(request: BridgeRequest, deadline: Deadlin
     message_id = _require_positive_int(
         request.arguments["telegram_message_id"], "telegram_message_id", maximum=2**63 - 1
     )
-    _, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("original message lookup")
         try:
             return {
@@ -2599,8 +2606,6 @@ def handle_get_capture_job_for_message(request: BridgeRequest, deadline: Deadlin
                 "Original capture evidence needs local attention.",
                 errors.EXIT_AUTHORITY_REFUSED,
             ) from exc
-    finally:
-        conn.close()
 
 
 def handle_get_capture_recovery(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3024,16 +3029,13 @@ def handle_get_ai_processing_status_v2(request: BridgeRequest, deadline: Deadlin
     intake_public_id = _require_string(
         request.arguments["intake_public_id"], "intake_public_id", max_length=200
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("AI processing status v2")
         try:
             result = get_ai_processing_status_v2(conn, intake_public_id=intake_public_id)
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, False
-    finally:
-        conn.close()
 
 
 def handle_prepare_ai_fallback(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -4984,8 +4986,7 @@ def handle_get_guided_edit_session(request: BridgeRequest, deadline: Deadline) -
             maximum=2**63 - 1,
         )
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("guided edit session read")
         try:
             session = guided_edit.get_context_session(conn, context, message_id=message_id)
@@ -4998,8 +4999,6 @@ def handle_get_guided_edit_session(request: BridgeRequest, deadline: Deadline) -
                 "final_transaction_created": False,
             }, False
         return _guided_session_payload(session), False
-    finally:
-        conn.close()
 
 
 def _pending_guided_update(
@@ -5709,8 +5708,7 @@ def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> H
         else:
             identities[name] = _require_string(request.arguments[name], name, max_length=200)
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _read_workspace_session(request, deadline) as conn:
         deadline.check("human draft card query")
         try:
             result = get_human_draft_card(
@@ -5729,8 +5727,6 @@ def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> H
         except HumanDraftError as exc:
             _raise_human_draft_error(exc)
         return _human_draft_result_payload(conn, result), False
-    finally:
-        conn.close()
 
 
 def _human_draft_context(context: human_actions.HumanActionContext) -> HumanDraftContext:
@@ -7080,6 +7076,12 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         if fixed_workspace and request.command not in {
             envelope.COMMAND_HEALTH,
             envelope.COMMAND_GET_STATUS,
+            envelope.COMMAND_GET_INTERACTION_ROUTE,
+            envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES,
+            envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
+            envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2,
+            envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
+            envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
         }:
             raise errors.bridge_error(
                 errors.STAGING_REFUSED,

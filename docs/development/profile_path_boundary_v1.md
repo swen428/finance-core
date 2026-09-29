@@ -90,11 +90,17 @@ ordinary temporary staging paths retain the existing generic factory behavior.
 
 The first caller integration is deliberately narrow: the Bridge `health` and
 `get_status` commands and its separate delivery-receipt consumer use short
-managed database sessions. The caller derives the enrolled profile from the
-fixed workspace layout and the configured `FINANCE_RUNTIME_ROOT`, not from a
-request flag or arbitrary database path. Every other Bridge command targeting
-the managed layout refuses before its handler can open the database or perform
-an external effect. Ordinary staging workspaces retain their existing route.
+managed database sessions. A later read-only group also admits
+`get_interaction_route`, `list_capture_recovery_candidates`,
+`get_capture_job_for_message`, `get_ai_processing_status_v2`,
+`get_guided_edit_session`, and `get_human_draft_card`. Each uses one managed
+session through query completion and actual connection close; its existing
+identity checks and ordinary staging result semantics remain in force. The
+caller derives the enrolled profile from the fixed workspace layout and the
+configured `FINANCE_RUNTIME_ROOT`, not from a request flag or arbitrary
+database path. Every remaining Bridge command targeting the managed layout
+refuses before its handler can open the database or perform an external effect.
+Ordinary staging workspaces retain their existing route.
 The Bridge commands include gate acquisition and session close in their
 cooperative command deadline. A receipt consumer error after the existing
 posting authority commits is an unverified outcome; its caller must inspect or
