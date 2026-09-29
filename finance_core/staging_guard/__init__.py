@@ -56,6 +56,15 @@ class StagingDatabaseError(RuntimeError):
     """
 
 
+class _StagingCloseUncertain(StagingDatabaseError):
+    """A failed factory cannot prove its SQLite handle was closed."""
+
+    def __init__(self, conn: sqlite3.Connection, operation_error: Exception) -> None:
+        super().__init__("Staging database factory failed and SQLite close is uncertain")
+        self.connection = conn
+        self.operation_error = operation_error
+
+
 def _configured_live_database_path() -> Path:
     try:
         return live_database_path()
@@ -389,7 +398,7 @@ def create_staging_database(
         flags |= os.O_NOFOLLOW  # type: ignore[attr-defined]
 
     try:
-        fd = os.open(str(db_path), flags)
+        fd = os.open(str(db_path), flags, 0o600)
     except FileExistsError:
         raise StagingDatabaseError(f"Path '{db_path}' already exists (race detected).") from None
     except OSError as exc:
@@ -453,12 +462,12 @@ def create_staging_database(
         conn.commit()
 
         return conn
-    except Exception:
+    except Exception as operation_error:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as close_error:
+                raise _StagingCloseUncertain(conn, operation_error) from close_error
         raise
     finally:
         os.close(fd)
@@ -553,10 +562,45 @@ def _apply_migrations(
 # ---------------------------------------------------------------------------
 
 
+def _is_fixed_profile_staging_path(path: Path) -> bool:
+    """Recognize the reserved managed layout without reading a profile file."""
+    parents = path.parents
+    return (
+        len(parents) >= 5
+        and path.name == "staging.sqlite"
+        and parents[0].name == "database"
+        and parents[1].name == "workspace"
+        and parents[3].name == "profiles"
+        and parents[4].name == "Finance-Codex"
+        and parents[4].parent.name == "Application Support"
+    )
+
+
 def open_staging_database(
     path: str | Path,
     *,
     migration_paths: Sequence[Path] | None = None,
+) -> sqlite3.Connection:
+    """Open ordinary temporary staging only; fixed profiles use their gate."""
+    return _open_staging_database(path, migration_paths=migration_paths, managed=False)
+
+
+def _open_managed_staging_database(
+    path: str | Path,
+    *,
+    migration_paths: Sequence[Path],
+) -> sqlite3.Connection:
+    """Trusted managed owner entry after profile enrollment and shared gate."""
+    if not _is_fixed_profile_staging_path(Path(path)):
+        raise StagingDatabaseError("Managed reopen requires a fixed profile staging path")
+    return _open_staging_database(path, migration_paths=migration_paths, managed=True)
+
+
+def _open_staging_database(
+    path: str | Path,
+    *,
+    migration_paths: Sequence[Path] | None = None,
+    managed: bool,
 ) -> sqlite3.Connection:
     """Reopen an existing trusted staging database and verify its identity.
 
@@ -597,6 +641,11 @@ def open_staging_database(
     db_path = Path(path).resolve()
     configured_live_database = _configured_live_database_path()
 
+    if _is_fixed_profile_staging_path(db_path) and not managed:
+        raise StagingDatabaseError(
+            "Fixed profile staging requires the managed profile gate and enrollment"
+        )
+
     if _is_live_database_file(db_path, configured_live_database):
         raise StagingDatabaseError(
             "Refusing to open the live database as a staging database: "
@@ -627,12 +676,12 @@ def open_staging_database(
             verify_migration_history(conn, migration_paths)
 
         return conn
-    except Exception:
+    except Exception as operation_error:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as close_error:
+                raise _StagingCloseUncertain(conn, operation_error) from close_error
         raise
 
 
