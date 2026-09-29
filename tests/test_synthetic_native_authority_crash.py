@@ -21,21 +21,24 @@ from unittest.mock import patch
 
 import pytest
 
-import finance_core.synthetic_native_authority.store as store_module
-from finance_core.synthetic_native_authority.store import (
-    PoisonedError,
-    QuarantinedError,
-    SyntheticAuthorityStore,
-)
+if sys.platform == "darwin":
+    # Every test in this module is Darwin-only. Keep its import-time fork hook
+    # and helper-path insertion out of unrelated Linux shard tests.
+    import finance_core.synthetic_native_authority.store as store_module
+    from finance_core.synthetic_native_authority.store import (
+        PoisonedError,
+        QuarantinedError,
+        SyntheticAuthorityStore,
+    )
 
-HELPERS = Path(__file__).parent / "helpers"
-if str(HELPERS) not in sys.path:
-    sys.path.insert(0, str(HELPERS))
-from synthetic_native_authority_worker import (  # noqa: E402
-    InMemoryIssuer,
-    LeaseCheckingIssuer,
-    prepare_root,
-)
+    HELPERS = Path(__file__).parent / "helpers"
+    if str(HELPERS) not in sys.path:
+        sys.path.insert(0, str(HELPERS))
+    from synthetic_native_authority_worker import (  # noqa: E402
+        InMemoryIssuer,
+        LeaseCheckingIssuer,
+        prepare_root,
+    )
 
 WORKER = Path(__file__).parent / "helpers" / "synthetic_native_authority_worker.py"
 
