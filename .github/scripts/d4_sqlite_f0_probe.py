@@ -105,6 +105,8 @@ def main() -> None:
     run(
         sys.executable,
         str(Path(__file__).with_name("d4_sqlite_callsite_inventory.py")),
+        "--sqlite-source",
+        str(source_path),
         "--preprocessed",
         str(preprocessed),
         "--ast",
@@ -115,6 +117,27 @@ def main() -> None:
     )
 
     mount = optional_run("findmnt", "-T", str(out), "-no", "SOURCE,FSTYPE,OPTIONS")
+    filesystem_type = mount.split()[1] if mount and len(mount.split()) >= 2 else None
+    stat_fs_label = optional_run("stat", "-f", "-c", "%T", str(out))
+    if sys.platform == "darwin":
+        df = optional_run("df", "-P", str(out))
+        mounted_at = df.splitlines()[-1].split()[-1] if df else None
+        mounted = optional_run("mount")
+        if mounted_at and mounted:
+            mount = next(
+                (line for line in mounted.splitlines() if f" on {mounted_at} (" in line),
+                None,
+            )
+            if mount:
+                filesystem_type = mount.partition(" (")[2].partition(",")[0]
+        stat_fs_label = None
+    inventory_data = json.loads(inventory.read_text())
+    if inventory_data["sqlite3_c_sha256"] != sha256(source):
+        raise RuntimeError("inventory original-source digest disagrees with probe")
+    if inventory_data["preprocessed_sha256"] != sha256(preprocessed.read_bytes()):
+        raise RuntimeError("inventory preprocessed digest disagrees with probe")
+    if inventory_data["ast_sha256"] != sha256(ast.read_bytes()):
+        raise RuntimeError("inventory AST digest disagrees with probe")
     info = {
         "status": "UPSTREAM_BASELINE_ONLY_NOT_F0_PASS",
         "source_origin": source_origin,
@@ -131,8 +154,16 @@ def main() -> None:
         "libc": platform.libc_ver(),
         "kernel": os.uname().release,
         "mount": mount,
-        "filesystem_type": optional_run("stat", "-f", "-c", "%T", str(out)),
-        "inventory": json.loads(inventory.read_text()),
+        "filesystem_type": filesystem_type,
+        "stat_filesystem_label": stat_fs_label,
+        "macos_build": optional_run("sw_vers", "-buildVersion")
+        if sys.platform == "darwin"
+        else None,
+        "runner_image": {
+            "os": os.environ.get("ImageOS"),
+            "version": os.environ.get("ImageVersion"),
+        },
+        "inventory": inventory_data,
     }
     # The AST is reproducible but large; retain its digest, not the 600 MB file.
     ast.unlink()

@@ -9,17 +9,23 @@ restore, or F0/G1 pass. It contains no Finance database or user data.
 checks its ZIP and `sqlite3.c` SHA-256 values, preprocesses the source with a
 fixed set of diagnostic flags, obtains a Clang JSON AST, and runs
 `d4_sqlite_callsite_inventory.py`. The latter records Unix VFS calls with both
-preprocessed and original source lines, the `aSyscall` slot table, and upper
-SQLite `sqlite3Os*` call sites. The probe records the host, compiler, Python,
-libc and output-directory filesystem. Its large AST is discarded after hashing;
+preprocessed and original source lines, the original/preprocessed source
+hashes, the `aSyscall` slot table, and upper SQLite `sqlite3Os*` call sites.
+Direct calls whose effects have not been classified remain explicitly
+`unclassified_direct_call`; indirect method/function-pointer calls remain
+`indirect_dispatch_candidate`. Neither category is safe by default. The probe
+records the host, compiler, Python, libc and output-directory filesystem. Its
+large AST is discarded after hashing;
 the preprocessed source, inventory and probe metadata remain available for
 inspection.
 
 On a non-production branch, the manual `validate` workflow input
-`d4_sqlite_f0_probe=true` adds one Ubuntu diagnostic job. Other validation jobs
-retain their ordinary behavior. The diagnostic artifact is tied to the exact
-checkout identity. A green diagnostic job means the inventory was collected,
-**not** that its calls are safe or that D4-3 is complete.
+`d4_sqlite_f0_probe=true` enables a conditional diagnostic step inside the
+existing Ubuntu `quality` job. PR and push runs keep the same job inventory
+and required validation behavior. A failed manual diagnostic fails that run's
+`quality` job. The artifact contains the exact checkout identity even if the
+probe fails after starting. A green diagnostic step means the inventory was
+collected, **not** that its calls are safe or that D4-3 is complete.
 
 The remaining proof must connect every supported entry to actual native file
 effects and classify each reachable branch as admitted FD use, controlled
