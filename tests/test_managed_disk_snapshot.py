@@ -16,12 +16,28 @@ from pathlib import Path
 import pytest
 
 import finance_core.managed_disk_snapshot as disk_snapshot
+from finance_core.financial_audit import verify_financial_audit_chain
+from finance_core.intake.raw_text_repository import create_raw_intake_record
 from finance_core.managed_disk_snapshot import (
     DiskSnapshotError,
     DiskSnapshotLimits,
     create_disk_snapshot,
 )
+from finance_core.parser_proposals.receipt_item_allocation_facts import (
+    supersede_receipt_item_allocation_facts,
+)
 from finance_core.profile_paths import ProfilePathError
+from finance_core.receipt_finalization import (
+    authorize_receipt_finalization,
+    finalize_prepared_receipt,
+    prepare_receipt_calculation,
+)
+from finance_core.reconciliation.migrations import migration_ledger_rows
+from tests.test_receipt_b5_staging_e2e_v1 import _run_b5_pipeline
+from tests.test_receipt_item_allocation_facts_supersession_v1 import (
+    correction_command,
+    replacement_items,
+)
 
 _LIMITS = DiskSnapshotLimits(
     max_core_db_bytes=1_048_576,
@@ -56,6 +72,32 @@ def _private_stage(root: Path, name: str = "stage") -> Path:
     stage.mkdir(mode=0o700)
     stage.chmod(0o700)
     return stage
+
+
+def _table_contents(conn: sqlite3.Connection) -> dict[str, tuple[tuple[object, ...], ...]]:
+    table_names = [
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    ]
+    contents: dict[str, tuple[tuple[object, ...], ...]] = {}
+    for table_name in table_names:
+        quoted_name = '"' + table_name.replace('"', '""') + '"'
+        rows = [tuple(row) for row in conn.execute(f"SELECT * FROM {quoted_name}").fetchall()]
+        contents[table_name] = tuple(sorted(rows, key=repr))
+    return contents
+
+
+def _schema_objects(conn: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name, tbl_name"
+        ).fetchall()
+    )
 
 
 def test_wal_snapshot_preserves_rowid_and_returns_closed_delete_file(
@@ -244,3 +286,139 @@ def test_complete_output_role_check_rejects_hardlink_alias(tmp_path: Path) -> No
             disk_snapshot._check_output_role(fd, output, expected)
     finally:
         os.close(fd)
+
+
+def test_migrated_core_snapshot_preserves_financial_source_corrections_and_audit(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+) -> None:
+    source = migrated_temp_db_connection
+
+    # Leave a committed rowid gap in the actual Core source table while keeping
+    # its surviving synthetic source/evidence rows available for comparison.
+    scratch_ids: list[int] = []
+    with source:
+        for suffix in ("before", "hole", "after"):
+            raw = create_raw_intake_record(
+                source,
+                f"C06 synthetic rowid fixture {suffix}",
+                source_type="manual_entry",
+                source_channel="manual",
+                received_at="2026-09-01T00:00:00+00:00",
+                public_id=f"raw_c06_rowid_{suffix}",
+            )
+            scratch_ids.append(int(raw["id"]))
+        source.execute(
+            "DELETE FROM raw_intake_evidence WHERE raw_intake_record_id = ?",
+            (scratch_ids[1],),
+        )
+        source.execute("DELETE FROM raw_intake_records WHERE id = ?", (scratch_ids[1],))
+
+    pipeline = _run_b5_pipeline(source, tmp_path, "c06_snapshot")
+    v2 = supersede_receipt_item_allocation_facts(
+        source,
+        correction_command(pipeline.suffix, pipeline.ctx, pipeline.iaf_result),
+    )
+    v3 = supersede_receipt_item_allocation_facts(
+        source,
+        correction_command(
+            f"{pipeline.suffix}_v3",
+            pipeline.ctx,
+            v2,
+            items=replacement_items("C06 reviewed correction"),
+        ),
+    )
+    source.commit()
+
+    fact_sets = source.execute(
+        "SELECT version, fact_set_public_id, supersedes_fact_set_public_id, "
+        "superseded_by_fact_set_public_id FROM receipt_item_allocation_fact_sets "
+        "WHERE receipt_id = ? ORDER BY version",
+        (pipeline.ctx.receipt_id,),
+    ).fetchall()
+    assert [row["version"] for row in fact_sets] == [1, 2, 3]
+    assert fact_sets[0]["superseded_by_fact_set_public_id"] == v2.fact_set_public_id
+    assert fact_sets[1]["supersedes_fact_set_public_id"] == pipeline.iaf_result.fact_set_public_id
+    assert fact_sets[1]["superseded_by_fact_set_public_id"] == v3.fact_set_public_id
+    assert fact_sets[2]["supersedes_fact_set_public_id"] == v2.fact_set_public_id
+    assert fact_sets[2]["superseded_by_fact_set_public_id"] is None
+
+    prepared = prepare_receipt_calculation(source, pipeline.conversion.receipt_public_id)
+    authorization = authorize_receipt_finalization(source, prepared, actor_id="owner")
+    finalized = finalize_prepared_receipt(source, authorization)
+    assert finalized.status == "finalized"
+
+    authorization_row = source.execute(
+        "SELECT authorization_state FROM receipt_finalization_authorizations "
+        "WHERE authorization_id = ?",
+        (prepared.authorization_id,),
+    ).fetchone()
+    assert authorization_row is not None
+    assert authorization_row["authorization_state"] == "consumed"
+    assert source.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+    assert source.execute("SELECT COUNT(*) FROM raw_intake_evidence").fetchone()[0] > 0
+    assert source.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
+    assert source.execute("SELECT COUNT(*) FROM receipt_ocr_blocks").fetchone()[0] > 0
+    assert (
+        source.execute("SELECT COUNT(*) FROM authoritative_calculation_snapshots").fetchone()[0] > 0
+    )
+    assert source.execute("SELECT COUNT(*) FROM financial_audit_events").fetchone()[0] > 0
+    assert source.execute("SELECT COUNT(*) FROM receipt_finalization_audit").fetchone()[0] == 1
+
+    source_rowids = [
+        int(row[0])
+        for row in source.execute("SELECT id FROM raw_intake_records ORDER BY id").fetchall()
+    ]
+    assert scratch_ids[0] in source_rowids
+    assert scratch_ids[1] not in source_rowids
+    assert scratch_ids[2] in source_rowids
+    assert any(right - left > 1 for left, right in zip(source_rowids, source_rowids[1:]))
+
+    aggregate_keys = source.execute(
+        "SELECT DISTINCT aggregate_type, aggregate_public_id FROM financial_audit_events"
+    ).fetchall()
+    assert aggregate_keys
+    for aggregate in aggregate_keys:
+        verification = verify_financial_audit_chain(
+            source,
+            aggregate_type=str(aggregate["aggregate_type"]),
+            aggregate_public_id=str(aggregate["aggregate_public_id"]),
+        )
+        assert verification.valid, verification.reason
+
+    source_schema = _schema_objects(source)
+    source_ledger = migration_ledger_rows(source)
+    source_contents = _table_contents(source)
+    stage = _private_stage(tmp_path, name="c06-financial-snapshot")
+    receipt = create_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=DiskSnapshotLimits(
+            max_core_db_bytes=16 * 1024 * 1024,
+            max_stage_bytes=32 * 1024 * 1024,
+            min_free_bytes=1,
+            backup_pages_per_step=32,
+        ),
+        deadline_monotonic=time.monotonic() + 60.0,
+    )
+
+    with closing(sqlite3.connect(receipt.output.as_uri() + "?mode=ro", uri=True)) as copied:
+        copied.row_factory = sqlite3.Row
+        assert copied.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
+        assert copied.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert migration_ledger_rows(copied) == source_ledger
+        assert _schema_objects(copied) == source_schema
+        assert _table_contents(copied) == source_contents
+        copied_rowids = [
+            int(row[0])
+            for row in copied.execute("SELECT id FROM raw_intake_records ORDER BY id").fetchall()
+        ]
+        assert copied_rowids == source_rowids
+
+        for aggregate in aggregate_keys:
+            verification = verify_financial_audit_chain(
+                copied,
+                aggregate_type=str(aggregate["aggregate_type"]),
+                aggregate_public_id=str(aggregate["aggregate_public_id"]),
+            )
+            assert verification.valid, verification.reason
