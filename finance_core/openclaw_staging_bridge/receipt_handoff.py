@@ -30,6 +30,10 @@ from finance_core.intake.attachment_evidence import (
     persist_attachment_evidence,
 )
 from finance_core.openclaw_staging_bridge import errors
+from finance_core.sqlite_connection import (
+    DEFAULT_BUSY_TIMEOUT_MILLISECONDS,
+    configure_sqlite_connection,
+)
 
 MAX_HANDOFF_BYTES = 10_000_000
 _HANDOFF_READ_CHUNK = 1_048_576
@@ -212,6 +216,7 @@ def publish_receipt_handoff(
     declared_mime_type: str | None,
     preloaded_content: bytes | None = None,
     persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
+    owner_deadline_monotonic: float | None = None,
 ) -> HandoffResult:
     """Validate, durably publish, and persist one receipt handoff file.
 
@@ -226,13 +231,20 @@ def publish_receipt_handoff(
     so the bound hash and the published bytes always come from one read.
     """
     storage_root = workspace / "attachments"
-    deadline = time.monotonic() + _PUBLICATION_DEADLINE_SECONDS
     clock = time.monotonic
+    deadline = clock() + _PUBLICATION_DEADLINE_SECONDS
+    if owner_deadline_monotonic is not None:
+        deadline = min(deadline, owner_deadline_monotonic)
+
+    def check_owner_deadline(phase: str) -> None:
+        if owner_deadline_monotonic is not None and clock() >= deadline:
+            raise _deadline_error(phase)
 
     root: publication.StorageRootHandle | None = None
     root_locked = False
     temp_name: str | None = None
     try:
+        check_owner_deadline("storage-root open")
         root = publication.open_storage_root(storage_root)
         publication.acquire_storage_root_lock(
             root,
@@ -241,6 +253,7 @@ def publish_receipt_handoff(
             deadline_error_factory=_deadline_error,
         )
         root_locked = True
+        check_owner_deadline("handoff verification")
 
         # Replay path first: an already-persisted evidence row replays from
         # durable truth and never requires the handoff file again.
@@ -261,7 +274,9 @@ def publish_receipt_handoff(
             content = preloaded_content
             observed_size = len(content)
         else:
+            check_owner_deadline("handoff read")
             content, observed_size = read_handoff_file(handoff_path)
+            check_owner_deadline("handoff read")
         content_hash = hashlib.sha256(content).hexdigest()
 
         detected = validate_receipt_handoff_metadata(
@@ -270,19 +285,28 @@ def publish_receipt_handoff(
             declared_mime_type=declared_mime_type,
         )
 
+        check_owner_deadline("temporary publication")
         temp_name, temp_fd = publication.create_private_temp(root)
         try:
             offset = 0
             while offset < len(content):
-                written = os.write(temp_fd, content[offset:])
+                check_owner_deadline("temporary publication")
+                chunk_end = (
+                    min(offset + 1_048_576, len(content))
+                    if owner_deadline_monotonic is not None
+                    else len(content)
+                )
+                written = os.write(temp_fd, content[offset:chunk_end])
                 if written <= 0:
                     raise publication.TemporaryFileError(
                         "Handoff temporary write returned no progress."
                     )
                 offset += written
+            check_owner_deadline("temporary sync")
             os.fsync(temp_fd)
             os.fchmod(temp_fd, 0o400)
             os.fsync(temp_fd)
+            check_owner_deadline("durable publication")
         except OSError as exc:
             raise publication.TemporaryFileError(f"Handoff temporary write failed: {exc}") from exc
         finally:
@@ -314,7 +338,16 @@ def publish_receipt_handoff(
                 publication.release_storage_root_lock(root)
             root.close()
 
+    busy_budget_capped = False
     try:
+        check_owner_deadline("attachment evidence persistence")
+        if owner_deadline_monotonic is not None:
+            remaining_ms = int((deadline - clock()) * 1_000)
+            if remaining_ms < 1:
+                raise _deadline_error("attachment evidence persistence")
+            budget_ms = min(DEFAULT_BUSY_TIMEOUT_MILLISECONDS, remaining_ms)
+            configure_sqlite_connection(conn, timeout_seconds=budget_ms / 1_000)
+            busy_budget_capped = budget_ms < DEFAULT_BUSY_TIMEOUT_MILLISECONDS
         persistence_result = persist_attachment_evidence(
             conn,
             final_path,
@@ -338,6 +371,13 @@ def publish_receipt_handoff(
             f"Attachment evidence persistence failed: {exc}",
             errors.EXIT_INTERNAL,
         ) from exc
+    except sqlite3.OperationalError as exc:
+        if busy_budget_capped and getattr(exc, "sqlite_errorcode", None) in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+        }:
+            raise _deadline_error("attachment evidence persistence") from exc
+        raise
 
     return HandoffResult(
         final_path=final_path,

@@ -576,6 +576,18 @@ def _is_fixed_profile_staging_path(path: Path) -> bool:
     )
 
 
+def require_unmanaged_staging_database(conn: sqlite3.Connection) -> None:
+    """Require ordinary staging for legacy operations that cannot own a profile gate.
+
+    This is a refusal-only refinement of the staging guard. It cannot turn an
+    untrusted connection into managed authority or open another SQLite handle.
+    """
+    require_staging_database(conn)
+    db_file = _get_db_file_path(conn)
+    if db_file and _is_fixed_profile_staging_path(Path(db_file).resolve()):
+        raise StagingDatabaseError("A managed staging profile requires its fixed operation owner.")
+
+
 def open_staging_database(
     path: str | Path,
     *,
@@ -690,4 +702,5 @@ __all__ = [
     "create_staging_database",
     "open_staging_database",
     "require_staging_database",
+    "require_unmanaged_staging_database",
 ]

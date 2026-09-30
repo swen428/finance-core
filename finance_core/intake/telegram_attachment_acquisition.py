@@ -36,7 +36,10 @@ from finance_core.intake.attachment_evidence import (
     get_attachment_evidence,
     persist_attachment_evidence,
 )
-from finance_core.staging_guard import StagingDatabaseError, require_staging_database
+from finance_core.staging_guard import (
+    StagingDatabaseError,
+    require_unmanaged_staging_database,
+)
 
 _PUBLIC_ID_PREFIX = "tgae_"
 _PUBLIC_ID_MAX_LENGTH = 200
@@ -386,7 +389,7 @@ def acquire_and_persist_telegram_attachment(
         clock=_clock,
     )
     try:
-        require_staging_database(conn)
+        require_unmanaged_staging_database(conn)
     except StagingDatabaseError as exc:
         raise StagingDatabaseRejectedError(
             "Attachment acquisition requires an authorised staging database."

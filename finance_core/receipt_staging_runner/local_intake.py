@@ -41,7 +41,10 @@ from finance_core.parser_proposals.receipt_item_allocation_facts import (
     ReceiptItemAllocationFactsCommand,
 )
 from finance_core.receipt_staging_runner.models import RunnerInputManifest, RunnerWorkspace
-from finance_core.staging_guard import require_staging_database
+from finance_core.staging_guard import (
+    require_staging_database,
+    require_unmanaged_staging_database,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -674,7 +677,7 @@ def run_local_receipt_intake(
     ocr_limits:
         Optional OCR resource limits override.
     """
-    require_staging_database(conn)
+    require_unmanaged_staging_database(conn)
     _validate_public_id_prefix(public_id_prefix)
 
     operator_actor_id = manifest.operator_actor_id

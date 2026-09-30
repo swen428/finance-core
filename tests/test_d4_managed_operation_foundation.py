@@ -121,6 +121,7 @@ _MANAGED_DATABASE_COMMANDS = frozenset(
         *_S1C_B_COMMANDS,
         *_S1C_C_COMMANDS,
         *_S1D_COMMANDS,
+        envelope.COMMAND_CAPTURE,
     }
 )
 
@@ -391,9 +392,8 @@ def test_every_other_bridge_command_is_refused_before_managed_effects(
         - _MANAGED_DATABASE_COMMANDS
         - {envelope.COMMAND_VERIFY_AI_MODEL_COMPATIBILITY_CASE_V2}
     )
-    assert len(_MANAGED_DATABASE_COMMANDS) == 39
+    assert len(_MANAGED_DATABASE_COMMANDS) == 40
     assert set(unsupported) == {
-        envelope.COMMAND_CAPTURE,
         envelope.COMMAND_PROPOSE,
         envelope.COMMAND_PROCESS_CAPTURE_JOB,
     }
