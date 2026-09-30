@@ -20,6 +20,7 @@ import test, { type TestContext } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  isExclusiveProfileGateLease,
   initializeProfileGate,
   isSharedProfileGateLease,
   openProfileGate,
@@ -370,4 +371,76 @@ print("CHILD_WRITER_GATE_OK")
     if (!leaseClosed) lease.close();
     gate.close();
   }
+});
+
+test("exclusive lease is live-branded and its reserved child inherits EX through FD4", async (t) => {
+  const root = await privateRoot(t);
+  initializeProfileGate(root);
+  const gate = openProfileGate(root);
+  const lockPath = join(root, PROFILE_GATE_BASENAME);
+  const lease = await gate.acquireExclusive(1_000, 5_000);
+  let childReserved = false;
+  let childMayStillBeLive = false;
+  try {
+    assert.equal(isExclusiveProfileGateLease(lease), true);
+    assert.equal(isExclusiveProfileGateLease({ ...lease }), false);
+    assert.equal(isExclusiveProfileGateLease(null), false);
+    lease.assertValid();
+
+    const childProgram = [
+      "const fs=require('node:fs');",
+      "const {flockSync}=require('fs-ext');",
+      "const inherited=fs.fstatSync(4,{bigint:true});",
+      "const probe=fs.openSync(process.argv[1],'r+');",
+      "try { flockSync(probe,'shnb'); process.exitCode=2; }",
+      "catch(error) { if(!['EAGAIN','EWOULDBLOCK'].includes(error.code)) throw error;",
+      "process.stdout.write(JSON.stringify({dev:String(inherited.dev),ino:String(inherited.ino),blocked:true})); }",
+      "finally { fs.closeSync(probe); }",
+    ].join("");
+    lease.reserveChild();
+    childReserved = true;
+    childMayStillBeLive = true;
+    assert.throws(() => lease.reserveChild(), /cannot reserve another child/u);
+    assert.throws(() => lease.close(), /child reap/u);
+    const child = spawnSync(
+      process.execPath,
+      ["--input-type=commonjs", "-e", childProgram, lockPath],
+      {
+        cwd: resolve("."),
+        encoding: "utf8",
+        timeout: 3_000,
+        stdio: ["ignore", "pipe", "pipe", "ignore", lease.fdForChild()],
+      },
+    );
+    const spawnError = child.error as NodeJS.ErrnoException | undefined;
+    if (child.status !== null || child.signal !== null || spawnError?.code !== "ETIMEDOUT") {
+      childMayStillBeLive = false;
+      lease.unbindChild();
+      childReserved = false;
+    }
+    assert.equal(child.error, undefined, child.error?.message ?? child.stderr);
+    assert.equal(child.signal, null, child.stderr);
+    assert.equal(child.status, 0, child.stderr);
+    const inherited = JSON.parse(child.stdout) as { dev: string; ino: string; blocked: boolean };
+    const named = await stat(lockPath, { bigint: true });
+    assert.deepEqual(inherited, {
+      dev: String(named.dev),
+      ino: String(named.ino),
+      blocked: true,
+    });
+
+    // The lease itself still owns EX after the child closes and is reaped.
+    assert.match(childTryLock(lockPath, "shnb"), /EAGAIN|EWOULDBLOCK/u);
+    lease.assertValid();
+  } finally {
+    if (!childMayStillBeLive) {
+      if (childReserved) {
+        lease.unbindChild();
+      }
+      lease.close();
+      gate.close();
+    }
+  }
+  assert.equal(isExclusiveProfileGateLease(lease), false);
+  assert.equal(childTryLock(lockPath, "shnb"), "held");
 });

@@ -291,6 +291,64 @@ def managed_staging_operation(
         yield conn
 
 
+@contextmanager
+def _delegated_cut_source(profile: ManagedStagingProfile) -> Iterator[sqlite3.Connection]:
+    """Internal fixed-worker source lifecycle under its inherited EX description.
+
+    The worker validates its one-use control handshake and FD4 role before
+    reaching this function. This context never takes or releases a gate lock.
+    It holds the local lifetime exclusion through actual SQLite close, then
+    performs the full main/sidecar revalidation before the child can succeed.
+    """
+    from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+
+    if type(profile) is not ManagedStagingProfile:
+        raise ProfilePathError("A registered managed cut profile is required")
+    with _MANAGED_SQLITE_LIFETIME_LOCK:
+        profile.revalidate()
+        conn: sqlite3.Connection | None = None
+        started = False
+        closed = False
+        try:
+            _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
+            started = True
+            conn = _open_managed_staging_database(
+                profile.staging_database, migration_paths=TEMP_DB_MIGRATION_PATHS
+            )
+            yield conn
+            if conn.in_transaction:
+                conn.rollback()
+            conn.close()
+            closed = True
+            conn = None
+            _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+            started = False
+            profile.revalidate()
+        except _StagingCloseUncertain as exc:
+            _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+            _UNCERTAIN_CUT_CLOSES.append(exc.connection)
+            raise
+        finally:
+            if conn is not None and not closed:
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    conn.close()
+                except BaseException:
+                    _UNCERTAIN_CUT_CLOSES.append(conn)
+                    _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+                    raise
+            if started and not _MANAGED_SQLITE_LIFETIME_LOCK.sqlite_active:
+                raise ProfilePathError("Managed cut SQLite lifetime became inconsistent")
+            if started:
+                _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                profile.revalidate()
+
+
+# Retain any connection whose close outcome is uncertain until worker process exit.
+_UNCERTAIN_CUT_CLOSES: list[sqlite3.Connection] = []
+
+
 def verify_registered_staging(
     application_support_root: str | Path,
     profile_id: str,

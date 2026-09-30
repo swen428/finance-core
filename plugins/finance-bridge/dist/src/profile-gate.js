@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 export const PROFILE_GATE_BASENAME = ".profile-gate.v1.lock";
 const MAX_LOCK_WAIT_MS = 30_000;
 const SHARED_LEASE_BRAND = Symbol("shared-profile-gate-lease");
+const EXCLUSIVE_LEASE_BRAND = Symbol("exclusive-profile-gate-lease");
 const liveSharedLeases = new WeakSet();
+const liveExclusiveLeases = new WeakSet();
 const requireFromModule = createRequire(import.meta.url);
 let nativeGateFs;
 let nativeFlock;
@@ -39,6 +41,9 @@ function lockInitialization(fd) {
 }
 export function isSharedProfileGateLease(value) {
     return typeof value === "object" && value !== null && liveSharedLeases.has(value);
+}
+export function isExclusiveProfileGateLease(value) {
+    return typeof value === "object" && value !== null && liveExclusiveLeases.has(value);
 }
 function currentUid() {
     if (typeof process.getuid !== "function") {
@@ -160,11 +165,15 @@ function sharedLease(fd, onClose) {
 }
 function exclusiveLease(fd, holdDeadline, validate, onClose) {
     let closed = false;
+    let bound = false;
     const close = () => {
         if (closed)
             return;
+        if (bound)
+            throw new Error("Exclusive profile gate remains bound until child reap.");
         closeSync(fd);
         closed = true;
+        liveExclusiveLeases.delete(lease);
         onClose();
     };
     const checkHoldDeadline = () => {
@@ -172,7 +181,8 @@ function exclusiveLease(fd, holdDeadline, validate, onClose) {
             throw new Error("Exclusive profile gate hold deadline exceeded.");
         }
     };
-    return Object.freeze({
+    const lease = Object.freeze({
+        [EXCLUSIVE_LEASE_BRAND]: true,
         assertValid() {
             if (closed)
                 throw new Error("Exclusive profile gate lease is closed.");
@@ -180,8 +190,28 @@ function exclusiveLease(fd, holdDeadline, validate, onClose) {
             validate();
             checkHoldDeadline();
         },
+        fdForChild() {
+            if (closed || !bound)
+                throw new Error("Exclusive profile gate has no reserved child.");
+            return fd;
+        },
+        reserveChild() {
+            if (closed || bound)
+                throw new Error("Exclusive profile gate cannot reserve another child.");
+            checkHoldDeadline();
+            validate();
+            checkHoldDeadline();
+            bound = true;
+        },
+        unbindChild() {
+            if (closed || !bound)
+                throw new Error("Exclusive profile gate has no reserved child.");
+            bound = false;
+        },
         close,
     });
+    liveExclusiveLeases.add(lease);
+    return lease;
 }
 /**
  * The caller must first validate and pin the full profile/ancestor path boundary.

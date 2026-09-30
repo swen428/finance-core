@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from finance_core.profile_paths import ProfilePathError, _reject_acl_grants
 
@@ -185,6 +186,27 @@ def _check_stage_bytes(stage_fd: int, maximum: int) -> None:
             raise DiskSnapshotError("Snapshot stage exceeded byte limit")
 
 
+def _direct_readback(output: Path) -> dict[str, Any]:
+    """Fixed reader process checks SQLite directly, without descendants."""
+    connection = sqlite3.connect(output.as_uri() + "?mode=ro", uri=True, timeout=0)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        integrity = [list(row) for row in connection.execute("PRAGMA integrity_check").fetchmany(2)]
+        fk_problem = connection.execute("PRAGMA foreign_key_check").fetchone()
+        schema_count = connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()[0]
+        page_count = connection.execute("PRAGMA page_count").fetchone()[0]
+        return {
+            "mode": mode,
+            "integrity": integrity,
+            "fk_problem": fk_problem,
+            "schema_count": schema_count,
+            "page_count": page_count,
+        }
+    finally:
+        connection.close()
+
+
 def stage_disk_snapshot(
     source: sqlite3.Connection,
     *,
@@ -322,6 +344,7 @@ def verify_staged_disk_snapshot(
     private_stage: Path,
     limits: DiskSnapshotLimits,
     deadline_monotonic: float,
+    _direct_reader: bool = False,
 ) -> DiskSnapshotReceipt:
     """Independently read back a staged file after its worker has been reaped.
 
@@ -395,22 +418,28 @@ def verify_staged_disk_snapshot(
         if before_hash != staged.sha256:
             raise DiskSnapshotError("Staged disk snapshot content changed")
         _check_deadline(deadline_monotonic)
-        try:
-            run = subprocess.run(
-                [sys.executable, "-I", "-c", _READBACK, str(output)],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=max(0.001, deadline_monotonic - time.monotonic()),
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise DiskSnapshotError("Fresh-process snapshot readback failed") from exc
-        if len(run.stdout) > 4096 or run.stderr:
-            raise DiskSnapshotError("Fresh-process readback was malformed")
-        try:
-            readback = json.loads(run.stdout)
-        except (ValueError, TypeError) as exc:
-            raise DiskSnapshotError("Fresh-process readback was malformed") from exc
+        if _direct_reader:
+            try:
+                readback = _direct_readback(output)
+            except (OSError, sqlite3.Error) as exc:
+                raise DiskSnapshotError("Fresh-process snapshot readback failed") from exc
+        else:
+            try:
+                run = subprocess.run(
+                    [sys.executable, "-I", "-c", _READBACK, str(output)],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=max(0.001, deadline_monotonic - time.monotonic()),
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                raise DiskSnapshotError("Fresh-process snapshot readback failed") from exc
+            if len(run.stdout) > 4096 or run.stderr:
+                raise DiskSnapshotError("Fresh-process readback was malformed")
+            try:
+                readback = json.loads(run.stdout)
+            except (ValueError, TypeError) as exc:
+                raise DiskSnapshotError("Fresh-process readback was malformed") from exc
         if not isinstance(readback, dict) or (
             readback.get("mode") != "delete"
             or readback.get("integrity") != [["ok"]]
