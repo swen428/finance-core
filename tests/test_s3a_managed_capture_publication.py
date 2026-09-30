@@ -211,6 +211,37 @@ def _attachment_files(workspace: s1ca.ManagedBridgeWorkspace) -> tuple[tuple[str
     )
 
 
+def _persisted_receipt_rows(
+    workspace: s1ca.ManagedBridgeWorkspace,
+    *,
+    evidence_public_id: str,
+    capture_job_public_id: str,
+) -> tuple[tuple[Any, ...], ...]:
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-s3a-replay-row-snapshot"
+    ) as conn:
+        evidence = conn.execute(
+            "SELECT * FROM telegram_attachment_source WHERE public_id = ?",
+            (evidence_public_id,),
+        ).fetchone()
+        assert evidence is not None
+        attachment = conn.execute(
+            "SELECT * FROM attachments WHERE id = ?", (int(evidence["attachment_id"]),)
+        ).fetchone()
+        raw_intake = conn.execute(
+            "SELECT * FROM raw_intake_records WHERE id = ?",
+            (int(evidence["raw_intake_record_id"]),),
+        ).fetchone()
+        capture_job = conn.execute(
+            "SELECT * FROM finance_capture_jobs WHERE public_id = ?",
+            (capture_job_public_id,),
+        ).fetchone()
+        assert attachment is not None
+        assert raw_intake is not None
+        assert capture_job is not None
+        return tuple(tuple(row) for row in (raw_intake, attachment, evidence, capture_job))
+
+
 def _assert_generic_refusal(
     outcome: support.CliOutcome,
     *,
@@ -718,6 +749,141 @@ def test_managed_receipt_sqlite_busy_wait_uses_remaining_bridge_budget(
     assert replay.response["result"]["durable_file_reused"] is True
     assert _row_counts(managed_workspace)["telegram_attachment_source"] == 1
     assert _row_counts(managed_workspace)["finance_capture_jobs"] == 1
+    assert_exclusive_gate_released(managed_workspace)
+
+
+def test_managed_reclaimed_receipt_replay_uses_remaining_bridge_budget(
+    managed_workspace: s1ca.ManagedBridgeWorkspace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handoff = _write_managed_handoff(managed_workspace, "reclaimed-writer.jpg", support.JPEG_BYTES)
+    request = _receipt_request(managed_workspace, message_id=311, filename=handoff.name)
+    original = s1ca._run(managed_workspace, request, expected_sessions=1)
+    assert original.exit_code == errors.EXIT_OK, original.response
+    original_result = original.response["result"]
+    evidence_public_id = original_result["attachment_evidence_public_id"]
+    capture_job = original_result["capture_job"]
+    assert isinstance(capture_job, dict)
+    capture_job_public_id = capture_job["public_id"]
+
+    canonical = (
+        managed_workspace.workspace_path
+        / "attachments"
+        / support.sha256_hex(support.JPEG_BYTES)[:2]
+        / f"{support.sha256_hex(support.JPEG_BYTES)}.jpg"
+    )
+    baseline_counts = _row_counts(managed_workspace)
+    baseline_rows = _persisted_receipt_rows(
+        managed_workspace,
+        evidence_public_id=evidence_public_id,
+        capture_job_public_id=capture_job_public_id,
+    )
+    baseline_files = _attachment_files(managed_workspace)
+    assert baseline_counts["telegram_attachment_source"] == 1
+    assert baseline_counts["attachments"] == 1
+    assert baseline_counts["finance_capture_jobs"] == 1
+    assert baseline_counts["final_facts"] == 0
+    assert canonical.read_bytes() == support.JPEG_BYTES
+
+    # The synthetic local reclaimer may remove the handoff after completed
+    # durable capture; the capture boundary itself never deletes it.
+    handoff.unlink()
+    assert not handoff.exists()
+
+    db_path = workspace_access.database_path_for(managed_workspace.workspace_path)
+    storage_root = managed_workspace.workspace_path / "attachments"
+    ready_path = tmp_path / "sqlite-replay-writer-ready"
+    real_persist = receipt_handoff.persist_attachment_evidence
+    real_configure = receipt_handoff.configure_sqlite_connection
+    configured_timeouts: list[float] = []
+    writers: list[subprocess.Popen[str]] = []
+    storage_lock_available_before_persist: list[bool] = []
+
+    def configure_with_observation(conn: sqlite3.Connection, *, timeout_seconds: float) -> None:
+        configured_timeouts.append(timeout_seconds)
+        real_configure(conn, timeout_seconds=timeout_seconds)
+
+    def persist_while_separate_process_holds_writer(*args: object, **kwargs: object) -> object:
+        root = attachment_publication.open_storage_root(storage_root)
+        acquired_storage_lock = False
+        try:
+            attachment_publication.acquire_storage_root_lock(
+                root,
+                deadline=time.monotonic(),
+                clock=time.monotonic,
+            )
+            acquired_storage_lock = True
+            storage_lock_available_before_persist.append(True)
+        finally:
+            if acquired_storage_lock:
+                attachment_publication.release_storage_root_lock(root)
+            root.close()
+
+        writer = _spawn_sqlite_writer(db_path, ready_path)
+        writers.append(writer)
+        try:
+            _wait_for_child_ready(writer, ready_path)
+            return real_persist(*args, **kwargs)  # type: ignore[arg-type]
+        finally:
+            _stop_child(writer)
+
+    before_sessions = len(managed_workspace.sessions)
+    started = time.monotonic()
+    with monkeypatch.context() as patch:
+        patch.setattr(receipt_handoff, "configure_sqlite_connection", configure_with_observation)
+        patch.setattr(
+            receipt_handoff,
+            "persist_attachment_evidence",
+            persist_while_separate_process_holds_writer,
+        )
+        outcome = support.run_cli(request, deadline_seconds=0.9)
+    elapsed = time.monotonic() - started
+
+    assert outcome.exit_code == errors.EXIT_DEADLINE_EXCEEDED, outcome.response
+    assert outcome.response["error"]["code"] == errors.DEADLINE_EXCEEDED
+    assert storage_lock_available_before_persist == [True]
+    assert configured_timeouts and 0 < configured_timeouts[0] < 0.9
+    assert len(writers) == 1
+    assert writers[0].poll() is not None
+    assert elapsed < 3.0, f"completed replay exceeded its short Bridge deadline: {elapsed:.3f}s"
+
+    opened = managed_workspace.sessions[before_sessions:]
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].connection.execute("SELECT 1")
+    assert_exclusive_gate_released(managed_workspace)
+    assert _row_counts(managed_workspace) == baseline_counts
+    assert (
+        _persisted_receipt_rows(
+            managed_workspace,
+            evidence_public_id=evidence_public_id,
+            capture_job_public_id=capture_job_public_id,
+        )
+        == baseline_rows
+    )
+    assert _attachment_files(managed_workspace) == baseline_files
+    assert canonical.read_bytes() == support.JPEG_BYTES
+    assert not handoff.exists()
+
+    retry = s1ca._run(managed_workspace, request, expected_sessions=1)
+    assert retry.exit_code == errors.EXIT_OK, retry.response
+    assert retry.response["idempotent_replay"] is True
+    assert retry.response["result"]["intake_public_id"] == original_result["intake_public_id"]
+    assert retry.response["result"]["attachment_evidence_public_id"] == evidence_public_id
+    assert retry.response["result"]["capture_job"]["public_id"] == capture_job_public_id
+    assert _row_counts(managed_workspace) == baseline_counts
+    assert (
+        _persisted_receipt_rows(
+            managed_workspace,
+            evidence_public_id=evidence_public_id,
+            capture_job_public_id=capture_job_public_id,
+        )
+        == baseline_rows
+    )
+    assert _attachment_files(managed_workspace) == baseline_files
+    assert canonical.read_bytes() == support.JPEG_BYTES
+    assert not handoff.exists()
     assert_exclusive_gate_released(managed_workspace)
 
 
