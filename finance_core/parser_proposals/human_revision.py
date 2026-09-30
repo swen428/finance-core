@@ -1533,6 +1533,16 @@ def _verify_complete_receipt_relational_evidence(
         raise HumanRevisionLineageError("receipt revision relational evidence is invalid")
 
 
+def verify_receipt_relational_evidence(
+    conn: sqlite3.Connection,
+    *,
+    proposal_id: int,
+    payload: Mapping[str, object],
+) -> None:
+    """Read-only comparison of durable receipt field rows to their payload."""
+    _verify_complete_receipt_relational_evidence(conn, child_id=proposal_id, payload=payload)
+
+
 def _verify_public_receipt_revision_edge(
     conn: sqlite3.Connection,
     child: Mapping[str, object],
@@ -1804,6 +1814,22 @@ def _verify_public_receipt_revision_edge(
     return parent
 
 
+def verify_public_receipt_revision_edge(
+    conn: sqlite3.Connection,
+    child: Mapping[str, object],
+    *,
+    content_hash: str,
+    proposal_version: int,
+) -> dict[str, Any] | None:
+    """Read-only proof for a public receipt supersession edge, if present."""
+    return _verify_public_receipt_revision_edge(
+        conn,
+        child,
+        expected_hash=content_hash,
+        expected_version=proposal_version,
+    )
+
+
 def _has_d1_publication_ancestor(conn: sqlite3.Connection, parser_output_id: int) -> bool:
     """Detect an expected D1 edge without trusting mutable parser attribution."""
     current_id: int | None = parser_output_id
@@ -1989,4 +2015,6 @@ __all__ = [
     "publish_receipt_nonmonetary_revision_in_transaction",
     "publish_text_human_revision_in_transaction",
     "verify_human_revision_descendant",
+    "verify_public_receipt_revision_edge",
+    "verify_receipt_relational_evidence",
 ]
