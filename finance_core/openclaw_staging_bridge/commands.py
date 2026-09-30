@@ -163,6 +163,7 @@ from finance_core.parser_proposals.human_drafts import (
 from finance_core.parser_proposals.human_revision import (
     HumanRevisionLineageError,
     publish_human_revision_in_transaction,
+    verify_human_revision_descendant,
 )
 from finance_core.parser_proposals.lifecycle import (
     CONFIRMED,
@@ -271,6 +272,14 @@ _CONTENT_HASH_LENGTH = 64
 _MONETARY_FIELDS = frozenset({"amount", "currency"})
 _NON_MONETARY_FIELDS = frozenset({"transaction_date", "merchant", "description", "category"})
 _ALLOWED_EDIT_FIELDS = _MONETARY_FIELDS | _NON_MONETARY_FIELDS
+_SOURCE_CONTEXT_FIELDS = frozenset(
+    {
+        "operator_actor_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3205,11 +3214,150 @@ def _classification(payload: dict[str, Any]) -> tuple[str, bool]:
     return application_review.classify_payload(payload)
 
 
+def _managed_source_refusal() -> errors.BridgeError:
+    return errors.bridge_error(
+        errors.PROPOSAL_UNAVAILABLE,
+        "Managed proposal source identity is unavailable or inconsistent.",
+        errors.EXIT_AUTHORITY_REFUSED,
+    )
+
+
+def _managed_workspace_argument(arguments: dict[str, Any]) -> bool:
+    raw = arguments.get("workspace_path")
+    return isinstance(raw, str) and workspace_access.is_fixed_profile_workspace_path(Path(raw))
+
+
+def _require_managed_caller_context(workspace: Path, arguments: dict[str, Any]) -> None:
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return
+    if frozenset(arguments) & _SOURCE_CONTEXT_FIELDS != _SOURCE_CONTEXT_FIELDS:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Managed proposal command requires complete caller source context.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    _require_telegram_human_context(arguments)
+
+
+def _require_managed_proposal_source(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    proposal: dict[str, Any],
+) -> None:
+    """Bind managed proposal access to a caller's frozen Telegram source."""
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return
+    _require_managed_caller_context(workspace, arguments)
+    context = _require_telegram_human_context(arguments)
+    source_public_id = proposal.get("source_public_id")
+    if not isinstance(source_public_id, str) or not source_public_id:
+        raise _managed_source_refusal()
+    intake = get_raw_intake_record_by_public_id(conn, source_public_id)
+    if intake is None or intake["public_id"] != source_public_id:
+        raise _managed_source_refusal()
+    message_id = intake.get("source_message_id")
+    if (
+        intake.get("source_type") != TELEGRAM_TEXT
+        or intake.get("source_channel") != "telegram"
+        or not isinstance(message_id, str)
+        or not message_id.isascii()
+        or not message_id.isdecimal()
+        or message_id.startswith("0")
+        or intake.get("external_source_id") != f"telegram:{context.conversation_id}:{message_id}"
+    ):
+        raise _managed_source_refusal()
+    try:
+        require_telegram_source_context(
+            conn,
+            raw_intake_record_id=int(intake["id"]),
+            context=TelegramSourceContext(
+                authenticated_actor_id=context.actor_id,
+                account_id=context.account_id,
+                conversation_id=context.conversation_id,
+                binding_id=context.binding_id,
+                message_id=message_id,
+            ),
+        )
+    except TelegramSourceContextError as exc:
+        raise _managed_source_refusal() from exc
+
+    # The intake pointer may advance to a D1 child or later replacement. An
+    # older proposal remains source-bound for an authenticated replay only if
+    # it occurs on that same-source parent chain, ending at a Telegram root.
+    current_id = intake.get("parser_output_id")
+    target_id = proposal.get("id")
+    seen: set[int] = set()
+    found_target = False
+    current_proposal: dict[str, Any] | None = None
+    while (
+        isinstance(current_id, int)
+        and not isinstance(current_id, bool)
+        and current_id > 0
+        and current_id not in seen
+        and len(seen) < 128
+    ):
+        seen.add(current_id)
+        row = conn.execute(
+            "SELECT * FROM parser_outputs WHERE id = ?",
+            (current_id,),
+        ).fetchone()
+        if row is None or row["source_public_id"] != source_public_id:
+            raise _managed_source_refusal()
+        if current_proposal is None:
+            current_proposal = dict(row)
+        found_target |= current_id == target_id
+        parent_id = row["parent_parser_output_id"]
+        if parent_id is None:
+            if not found_target or row["source_type"] != TELEGRAM_TEXT:
+                raise _managed_source_refusal()
+            assert current_proposal is not None
+            try:
+                _payload, version, content_hash = _proposal_effective_state(conn, current_proposal)
+                if len(seen) > 1:
+                    # Only sealed D1 or AI child edges are supported here.
+                    # An arbitrary same-source parent link is not provenance.
+                    d1_lineage = verify_human_revision_descendant(
+                        conn,
+                        current_proposal,
+                        content_hash=content_hash,
+                        proposal_version=version,
+                    )
+                    if (
+                        d1_lineage is None
+                        and verify_ai_fallback_child(
+                            conn,
+                            current_proposal,
+                            content_hash=content_hash,
+                            proposal_version=version,
+                            require_resolved=False,
+                        )
+                        is None
+                    ):
+                        raise _managed_source_refusal()
+                else:
+                    verify_ai_fallback_child(
+                        conn,
+                        current_proposal,
+                        content_hash=content_hash,
+                        proposal_version=version,
+                        require_resolved=False,
+                    )
+            except (HumanRevisionLineageError, AiFallbackServiceError) as exc:
+                raise _managed_source_refusal() from exc
+            return
+        current_id = parent_id
+    raise _managed_source_refusal()
+
+
 def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    optional = frozenset({"token_ttl_seconds"})
+    if _managed_workspace_argument(request.arguments):
+        optional |= _SOURCE_CONTEXT_FIELDS
     _require_exact_arguments(
         request.arguments,
         required=frozenset({"workspace_path", "proposal_public_id"}),
-        optional=frozenset({"token_ttl_seconds"}),
+        optional=optional,
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -3232,6 +3380,9 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
         try:
             with application_review.review_snapshot(conn):
                 deadline.check("review read")
+                _require_managed_caller_context(workspace, request.arguments)
+                proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+                _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
                 prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
                 proposal, version, content_hash = (
                     prepared.proposal,
@@ -3290,7 +3441,7 @@ _D1_DECISION_FIELDS = frozenset(
 )
 
 
-def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
+def _validate_decision_arguments(request: BridgeRequest, *, managed: bool) -> dict[str, Any]:
     arguments = request.arguments
     proposal_public_id = _require_string(
         arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -3321,7 +3472,9 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
         "callback_expiry": callback_expiry,
     }
     supplied_d1_fields = frozenset(arguments) & _D1_DECISION_FIELDS
-    if supplied_d1_fields and supplied_d1_fields != _D1_DECISION_FIELDS:
+    source_fields = _D1_DECISION_FIELDS - frozenset({"d1_reference_public_id"})
+    allowed = (_D1_DECISION_FIELDS, source_fields) if managed else (_D1_DECISION_FIELDS,)
+    if supplied_d1_fields and supplied_d1_fields not in allowed:
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
             "D1 decision authority fields must be supplied together.",
@@ -3329,6 +3482,7 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
         )
     if supplied_d1_fields:
         context = _require_telegram_human_context(arguments)
+    if supplied_d1_fields == _D1_DECISION_FIELDS:
         reference_public_id = _require_string(
             arguments["d1_reference_public_id"],
             "d1_reference_public_id",
@@ -3918,6 +4072,11 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
     )
 
     with _operation_context(request, deadline) as (workspace, conn):
+        _require_managed_caller_context(workspace, request.arguments)
+        proposal: dict[str, Any] | None = None
+        if workspace_access.is_fixed_profile_workspace_path(workspace):
+            proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+            _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
         if card_generation_public_id is not None:
             authority = get_human_draft_action_authority(conn, card_generation_public_id)
             if authority is None or authority.action_issue_batch_id != reference_batch_id:
@@ -3927,7 +4086,8 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
         deadline.check("human action reference key load")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        if proposal is None:
+            proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
         payload, version, content_hash = _proposal_effective_state(conn, proposal)
         try:
             ai_lineage = verify_ai_fallback_child(
@@ -4338,7 +4498,9 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
         required=_DECISION_REQUIRED_FIELDS,
         optional=_D1_DECISION_FIELDS,
     )
-    validated = _validate_decision_arguments(request)
+    validated = _validate_decision_arguments(
+        request, managed=_managed_workspace_argument(request.arguments)
+    )
     # The idempotency key must bind the proposal and action this command
     # authorizes; cross-proposal key reuse is refused before any lookup.
     _require_canonical_idempotency_key(
@@ -4348,7 +4510,9 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
 
     with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("decision replay reconstruction")
+        _require_managed_caller_context(workspace, request.arguments)
         proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
+        _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
         d1_decision_binding = None
         if "d1_reference_public_id" in validated:
             try:
@@ -4459,9 +4623,17 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
 
 def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(
-        request.arguments, required=_DECISION_REQUIRED_FIELDS | frozenset({"field_updates"})
+        request.arguments,
+        required=_DECISION_REQUIRED_FIELDS | frozenset({"field_updates"}),
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
     )
-    validated = _validate_decision_arguments(request)
+    validated = _validate_decision_arguments(
+        request, managed=_managed_workspace_argument(request.arguments)
+    )
     # The idempotency key must bind the proposal and the exact pre-edit
     # state this edit authorizes, so consecutive edit versions carry
     # distinct identities while identical redeliveries replay.
@@ -4511,7 +4683,9 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
 
     with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("edit replay reconstruction")
+        _require_managed_caller_context(workspace, request.arguments)
         proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
+        _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
         assert request.idempotency_key is not None
         replay = _edit_replay_result(
             conn, workspace, request, proposal, validated, deadline, monetary=monetary

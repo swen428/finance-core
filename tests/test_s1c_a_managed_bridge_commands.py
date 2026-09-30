@@ -16,9 +16,15 @@ import pytest
 
 from finance_core.managed_staging_profile import bootstrap_registered_staging
 from finance_core.openclaw_staging_bridge import envelope, errors, workspace_access
+from finance_core.parser_proposals.ai_fallback import (
+    claim_ai_fallback_invocation,
+    prepare_ai_fallback,
+    record_ai_fallback_result,
+)
 from finance_core.profile_gate import exclusive_cut
 from finance_core.profile_paths import ManagedStagingProfile, ProfilePaths
 from finance_core.receipt_staging_runner.workspace import generate_callback_signing_key
+from tests.test_ai_fallback_service_v1 import _response_body
 from tests.test_managed_staging_profile import _blank_profile
 
 ACTOR = "111"
@@ -106,7 +112,13 @@ def managed_workspace(
         blank.close()
 
 
-def _seed_proposal(workspace: ManagedBridgeWorkspace) -> str:
+def _seed_proposal(
+    workspace: ManagedBridgeWorkspace,
+    *,
+    source_text: str = "lunch 12.50",
+    amount: str = "12.50",
+    transaction_date: str | None = "2026-09-21",
+) -> str:
     """Attach a synthetic proposal to a real, routed S1C-A text capture.
 
     The S3 parser command remains refused.  The test seeds only the proposal
@@ -116,15 +128,15 @@ def _seed_proposal(workspace: ManagedBridgeWorkspace) -> str:
     payload = {
         "intent": "personal_expense_log",
         "transaction_type": "personal_expense",
-        "amount": "12.50",
+        "amount": amount,
         "currency": "SGD",
-        "transaction_date": "2026-09-21",
+        "transaction_date": transaction_date,
         "merchant": "Cafe",
         "description": "Lunch",
         "category": "food",
     }
     captured, _capture_request = _capture_route(
-        workspace, "lunch 12.50", message_id=int(SEEDED_MESSAGE_ID)
+        workspace, source_text, message_id=int(SEEDED_MESSAGE_ID)
     )
     assert captured.exit_code == errors.EXIT_OK, captured.response
     captured_result = captured.response["result"]
@@ -139,10 +151,10 @@ def _seed_proposal(workspace: ManagedBridgeWorkspace) -> str:
             INSERT INTO parser_outputs (
                 public_id, source_type, source_public_id, parser_name, parser_version,
                 raw_text, parsed_payload, parse_status
-            ) VALUES (?, 'telegram_text', ?, 'test', '1', 'lunch 12.50', ?,
+            ) VALUES (?, 'telegram_text', ?, 'test', '1', ?, ?,
                       'parsed_pending_confirmation')
             """,
-            (SEEDED_PROPOSAL_ID, intake_public_id, json.dumps(payload)),
+            (SEEDED_PROPOSAL_ID, intake_public_id, source_text, json.dumps(payload)),
         )
         parser_output_id = int(
             conn.execute(
@@ -160,6 +172,55 @@ def _seed_proposal(workspace: ManagedBridgeWorkspace) -> str:
         assert conn.execute("SELECT changes()").fetchone()[0] == 1
         conn.commit()
     return SEEDED_PROPOSAL_ID
+
+
+def _seed_managed_ai_fallback_child(workspace: ManagedBridgeWorkspace) -> str:
+    """Record a synthetic, provider-free AI result for a captured Telegram source."""
+    _seed_proposal(
+        workspace,
+        source_text="paid SGD 12.34 at Cafe",
+        amount="12.34",
+        transaction_date=None,
+    )
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-seed-s1c-a-ai-fallback"
+    ) as conn:
+        parent = conn.execute(
+            "SELECT id, source_public_id, parsed_payload, normalized_payload "
+            "FROM parser_outputs WHERE public_id = ?",
+            (SEEDED_PROPOSAL_ID,),
+        ).fetchone()
+        assert parent is not None
+        parsed_payload = json.loads(parent["parsed_payload"])
+        for column in ("parsed_payload", "normalized_payload"):
+            raw_payload = parent[column]
+            payload = json.loads(raw_payload) if raw_payload is not None else parsed_payload.copy()
+            payload.update({"description": None, "account": None, "category": None})
+            conn.execute(
+                f"UPDATE parser_outputs SET {column} = ? WHERE id = ?",
+                (json.dumps(payload, sort_keys=True), parent["id"]),
+            )
+        conn.commit()
+
+        attempt = prepare_ai_fallback(
+            conn, intake_public_id=str(parent["source_public_id"]), now_ms=100_000
+        )
+        claim = claim_ai_fallback_invocation(
+            conn, attempt_public_id=str(attempt["attempt_public_id"]), now_ms=100_001
+        )
+        _synthetic_body, result_arguments = _response_body(claim)
+        result = record_ai_fallback_result(
+            conn,
+            attempt_public_id=str(attempt["attempt_public_id"]),
+            transport_outcome="response_received",
+            arguments=result_arguments,
+            now_ms=100_002,
+        )
+        assert result["result_status"] == "proposal_created", (
+            result["result_status"],
+            result["non_child_reason"],
+        )
+        return str(result["proposal_public_id"])
 
 
 def _request(
@@ -277,6 +338,66 @@ def _issue_actions(
     return _run(workspace, request), request
 
 
+def _reject_managed_ai_proposal(
+    workspace: ManagedBridgeWorkspace,
+    proposal_id: str,
+    *,
+    batch_id: str,
+    callback_id: str,
+) -> tuple[
+    dict[str, object],
+    support.CliOutcome,
+    support.CliOutcome,
+    dict[str, object],
+    support.CliOutcome,
+    support.CliOutcome,
+]:
+    review = _review(workspace, proposal_id, context=_context(workspace))
+    assert review["callback_tokens"] is None
+    issued, _issue_request = _issue_actions(workspace, proposal_id, review, batch_id=batch_id)
+    assert issued.exit_code == errors.EXIT_OK, issued.response
+    assert set(issued.response["result"]["actions"]) == {"reject"}
+
+    callback_arguments = {
+        **_context(workspace),
+        "short_reference": issued.response["result"]["actions"]["reject"]["reference"],
+        "action": "reject",
+        "callback_id": callback_id,
+        "callback_message_id": 21,
+    }
+    callback_request = _request(
+        workspace,
+        envelope.COMMAND_REDEEM_HUMAN_ACTION,
+        callback_arguments,
+        idempotency_key=support.canonical_human_action_redemption_key(callback_id),
+    )
+    redeemed = _run(workspace, callback_request)
+    assert redeemed.exit_code == errors.EXIT_OK, redeemed.response
+    redeemed_result = redeemed.response["result"]
+
+    decision_arguments = {
+        **_context(workspace),
+        "proposal_public_id": proposal_id,
+        "operator_actor_id": redeemed_result["operator_actor_id"],
+        "proposal_version": redeemed_result["proposal_version"],
+        "content_hash": redeemed_result["content_hash"],
+        "callback_token": redeemed_result["callback_token"],
+        "callback_expiry": redeemed_result["callback_expiry"],
+    }
+    decision_request = _request(
+        workspace,
+        envelope.COMMAND_REJECT,
+        decision_arguments,
+        idempotency_key=str(redeemed_result["decision_idempotency_key"]),
+    )
+    decision = _run(workspace, decision_request)
+    assert decision.exit_code == errors.EXIT_OK, decision.response
+    replay = _run(workspace, decision_request)
+    assert replay.exit_code == errors.EXIT_OK, replay.response
+    assert replay.response["idempotent_replay"] is True
+    return review, issued, redeemed, decision_request, decision, replay
+
+
 def _redeem_edit(
     workspace: ManagedBridgeWorkspace,
     issued: support.CliOutcome,
@@ -328,7 +449,9 @@ def _capture_route(
         workspace,
         envelope.COMMAND_CAPTURE_INTERACTION,
         arguments,
-        idempotency_key=support.canonical_capture_key(message_id=message_id),
+        idempotency_key=support.canonical_capture_key(
+            chat_id=int(resolved_conversation_id), message_id=message_id
+        ),
     )
     return _run(workspace, request), request
 
@@ -528,12 +651,14 @@ def test_managed_review_binds_initial_and_d1_proposals_to_frozen_source_context(
     lineage = _read_one(
         managed_workspace,
         """
-        SELECT child.parent_parser_output_id, child.source_public_id,
-               intake.public_id, intake.parser_output_id, source.authenticated_actor_id,
-               source.telegram_account_id, source.telegram_conversation_id,
-               source.conversation_binding_id, source.source_message_id,
-               source.source_identity_sha256
+        SELECT child.id, child.parent_parser_output_id, parent.id,
+               parent.source_public_id, child.source_public_id,
+               intake.public_id, intake.parser_output_id,
+               source.authenticated_actor_id, source.telegram_account_id,
+               source.telegram_conversation_id, source.conversation_binding_id,
+               source.source_message_id, source.source_identity_sha256
         FROM parser_outputs AS child
+        JOIN parser_outputs AS parent ON parent.id = child.parent_parser_output_id
         JOIN raw_intake_records AS intake ON intake.public_id = child.source_public_id
         JOIN d2_telegram_source_contexts AS source
           ON source.raw_intake_record_id = intake.id
@@ -542,14 +667,15 @@ def test_managed_review_binds_initial_and_d1_proposals_to_frozen_source_context(
         (proposal_id,),
     )
     assert lineage is not None
-    assert lineage[0] == lineage[3]
-    assert lineage[1] == lineage[2]
-    assert lineage[4] == ACTOR
-    assert lineage[5] == ACCOUNT
-    assert lineage[6] == CONVERSATION
-    assert lineage[7] == BINDING
-    assert lineage[8] == SEEDED_MESSAGE_ID
-    assert len(str(lineage[9])) == 64
+    assert lineage[0] == lineage[6]  # intake points to the current D1 child
+    assert lineage[1] == lineage[2]  # child points to its parent proposal
+    assert lineage[3] == lineage[4] == lineage[5]  # source identity is preserved
+    assert lineage[7] == ACTOR
+    assert lineage[8] == ACCOUNT
+    assert lineage[9] == CONVERSATION
+    assert lineage[10] == BINDING
+    assert lineage[11] == SEEDED_MESSAGE_ID
+    assert len(str(lineage[12])) == 64
 
     attacker_context = _context(
         managed_workspace,
@@ -605,6 +731,119 @@ def test_managed_source_context_refuses_orphan_proposal_without_origin_or_digest
         ),
     )
     assert refused.exit_code == errors.EXIT_AUTHORITY_REFUSED
+
+
+def test_managed_review_action_and_decision_accepts_sealed_ai_fallback_child(
+    managed_workspace: ManagedBridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse_network(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("Synthetic S1C-A review and decision must not call a provider")
+
+    monkeypatch.setattr("socket.socket.connect", refuse_network)
+    monkeypatch.setattr("socket.create_connection", refuse_network)
+
+    proposal_id = _seed_managed_ai_fallback_child(managed_workspace)
+    review, issued, redeemed, _decision_request, decision, replay = _reject_managed_ai_proposal(
+        managed_workspace,
+        proposal_id,
+        batch_id="d" * 32,
+        callback_id="s1c-a-ai-fallback-reject",
+    )
+
+    assert review["proposal_public_id"] == proposal_id
+    assert issued.response["result"]["proposal_public_id"] == proposal_id
+    assert redeemed.response["result"]["action"] == "reject"
+    assert decision.response["result"]["decision"] == "rejected"
+    assert decision.response["result"]["final_transaction_created"] is False
+    assert replay.response["result"] == decision.response["result"]
+    assert _read_one(managed_workspace, "SELECT COUNT(*) FROM transactions")[0] == 0
+
+
+def test_managed_unverified_same_source_child_blocks_issue_and_decision_replay(
+    managed_workspace: ManagedBridgeWorkspace,
+) -> None:
+    proposal_id = _seed_managed_ai_fallback_child(managed_workspace)
+    review, _issued, _redeemed, decision_request, _decision, _replay = _reject_managed_ai_proposal(
+        managed_workspace,
+        proposal_id,
+        batch_id="e" * 32,
+        callback_id="s1c-a-ai-fallback-replay",
+    )
+    forged_id = _forge_same_source_child_without_d1_publication(managed_workspace, proposal_id)
+
+    refused_review = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(managed_workspace, forged_id, context=_context(managed_workspace)),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert refused_review.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
+    assert "callback_tokens" not in json.dumps(refused_review.response, sort_keys=True)
+
+    issue_request = _request(
+        managed_workspace,
+        envelope.COMMAND_ISSUE_HUMAN_ACTIONS,
+        {
+            **_context(managed_workspace),
+            "proposal_public_id": forged_id,
+            "reference_batch_id": "f" * 32,
+            "token_ttl_seconds": 600,
+            "expected_proposal_version": review["proposal_version"],
+            "expected_content_hash": review["effective_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key("f" * 32),
+    )
+    refused_issue = _assert_refused_without_writes(
+        managed_workspace,
+        issue_request,
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert refused_issue.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
+    assert "actions" not in json.dumps(refused_issue.response, sort_keys=True)
+
+    forged_decision_arguments = dict(decision_request["arguments"])
+    forged_decision_arguments["proposal_public_id"] = forged_id
+    forged_decision = _request(
+        managed_workspace,
+        envelope.COMMAND_REJECT,
+        forged_decision_arguments,
+        idempotency_key=support.canonical_decision_key(
+            action="reject", proposal_public_id=forged_id
+        ),
+    )
+    refused_forged_decision = _assert_refused_without_writes(
+        managed_workspace,
+        forged_decision,
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert refused_forged_decision.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
+
+    refused_replay = _assert_refused_without_writes(
+        managed_workspace,
+        decision_request,
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert refused_replay.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
+
+
+def test_managed_review_without_source_context_hides_proposal_presence(
+    managed_workspace: ManagedBridgeWorkspace,
+) -> None:
+    existing_proposal_id = _seed_proposal(managed_workspace)
+    existing_refusal = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(managed_workspace, existing_proposal_id),
+    )
+    missing_refusal = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(managed_workspace, "prop_s1c_a_missing_without_context"),
+    )
+
+    existing_error = existing_refusal.response["error"]
+    missing_error = missing_refusal.response["error"]
+    assert existing_refusal.exit_code == missing_refusal.exit_code
+    assert existing_error["code"] == missing_error["code"]
+    assert existing_error["message"] == missing_error["message"]
 
 
 def test_ordinary_get_review_preserves_legacy_request_without_source_context(
@@ -996,6 +1235,64 @@ def _seed_orphan_proposal(workspace: ManagedBridgeWorkspace) -> str:
         )
         conn.commit()
     return proposal_id
+
+
+def _forge_same_source_child_without_d1_publication(
+    workspace: ManagedBridgeWorkspace,
+    parent_public_id: str,
+) -> str:
+    """Model an invalid D1 pointer edge after bypassing its synthetic DB guard."""
+    trigger_name = "trg_ai_fallback_raw_intake_no_lineage_escape"
+    child_public_id = "prop_s1c_a_forged_same_source_child"
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-forge-s1c-a-unverified-child"
+    ) as conn:
+        trigger = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()
+        assert trigger is not None and trigger["sql"] is not None
+        parent = conn.execute(
+            "SELECT id, source_type, source_public_id, raw_text, parsed_payload, "
+            "normalized_payload FROM parser_outputs WHERE public_id = ?",
+            (parent_public_id,),
+        ).fetchone()
+        assert parent is not None
+
+        conn.execute(f"DROP TRIGGER {trigger_name}")
+        conn.execute(
+            """
+            INSERT INTO parser_outputs (
+                public_id, source_type, source_public_id, parser_name, parser_version,
+                raw_text, parsed_payload, normalized_payload, parse_status,
+                parent_parser_output_id
+            ) VALUES (?, ?, ?, 'test-forged-child', '1', ?, ?, ?,
+                      'parsed_pending_confirmation', ?)
+            """,
+            (
+                child_public_id,
+                parent["source_type"],
+                parent["source_public_id"],
+                parent["raw_text"],
+                parent["parsed_payload"],
+                parent["normalized_payload"],
+                parent["id"],
+            ),
+        )
+        child = conn.execute(
+            "SELECT id FROM parser_outputs WHERE public_id = ?", (child_public_id,)
+        ).fetchone()
+        assert child is not None
+        updated = conn.execute(
+            "UPDATE raw_intake_records SET parser_output_id = ? "
+            "WHERE public_id = ? AND parser_output_id = ?",
+            (child["id"], parent["source_public_id"], parent["id"]),
+        )
+        assert updated.rowcount == 1
+        conn.commit()
+        conn.execute(str(trigger["sql"]))
+        conn.commit()
+    return child_public_id
 
 
 def test_managed_draft_card_delivery_unknown_and_reissue_stay_local(
