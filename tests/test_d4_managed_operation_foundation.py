@@ -103,6 +103,15 @@ _S1C_C_COMMANDS = frozenset(
     }
 )
 
+_S1D_COMMANDS = frozenset(
+    {
+        envelope.COMMAND_GET_CAPTURE_RECOVERY,
+        envelope.COMMAND_RESUME_CAPTURE_RECOVERY,
+        envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2,
+    }
+)
+
+
 _MANAGED_DATABASE_COMMANDS = frozenset(
     {
         envelope.COMMAND_HEALTH,
@@ -111,6 +120,7 @@ _MANAGED_DATABASE_COMMANDS = frozenset(
         *_S1C_A_COMMANDS,
         *_S1C_B_COMMANDS,
         *_S1C_C_COMMANDS,
+        *_S1D_COMMANDS,
     }
 )
 
@@ -381,8 +391,12 @@ def test_every_other_bridge_command_is_refused_before_managed_effects(
         - _MANAGED_DATABASE_COMMANDS
         - {envelope.COMMAND_VERIFY_AI_MODEL_COMPATIBILITY_CASE_V2}
     )
-    assert len(_MANAGED_DATABASE_COMMANDS) == 36
-    assert len(unsupported) == 6
+    assert len(_MANAGED_DATABASE_COMMANDS) == 39
+    assert set(unsupported) == {
+        envelope.COMMAND_CAPTURE,
+        envelope.COMMAND_PROPOSE,
+        envelope.COMMAND_PROCESS_CAPTURE_JOB,
+    }
     before = _snapshot_tree(managed_workspace.profile_base)
     database_open_attempts: list[str] = []
     network_attempts: list[str] = []

@@ -62,9 +62,9 @@ _CURSOR_SQL = (
 )
 
 
-def _require_source(
+def _require_raw_source(
     conn: sqlite3.Connection, row: sqlite3.Row, context: HumanActionContext
-) -> dict[str, Any]:
+) -> tuple[str, str]:
     message_id = str(row["source_message_id"] or "")
     if (
         not message_id
@@ -88,6 +88,48 @@ def _require_source(
         raise CaptureDiscoveryConflict("Captured Telegram identity is inconsistent") from exc
     if digest != row["source_identity_sha256"]:
         raise CaptureDiscoveryConflict("Captured Telegram identity digest differs")
+    return message_id, digest
+
+
+def require_intake_telegram_source(
+    conn: sqlite3.Connection, *, intake_public_id: str, context: HumanActionContext
+) -> None:
+    """Prove an early raw intake without requiring any proposal or AI attempt."""
+    require_staging_database(conn)
+    row = conn.execute(
+        "SELECT intake.id AS raw_intake_record_id, intake.source_message_id, "
+        "intake.source_channel, intake.external_source_id, source.source_identity_sha256 "
+        "FROM raw_intake_records AS intake "
+        "JOIN d2_telegram_source_contexts AS source "
+        "ON source.raw_intake_record_id = intake.id "
+        "WHERE intake.public_id = ? AND source.authenticated_actor_id = ? "
+        "AND source.telegram_account_id = ? AND source.telegram_conversation_id = ? "
+        "AND source.conversation_binding_id = ?",
+        (
+            intake_public_id,
+            context.actor_id,
+            context.account_id,
+            context.conversation_id,
+            context.binding_id,
+        ),
+    ).fetchone()
+    if row is None:
+        raise CaptureDiscoveryConflict("Captured Telegram source is unavailable")
+    message_id, _digest = _require_raw_source(conn, row, context)
+    if (
+        not message_id.isascii()
+        or not message_id.isdecimal()
+        or message_id.startswith("0")
+        or len(message_id) > 19
+        or int(message_id) > 2**63 - 1
+    ):
+        raise CaptureDiscoveryConflict("Captured Telegram message identity is not canonical")
+
+
+def _require_source(
+    conn: sqlite3.Connection, row: sqlite3.Row, context: HumanActionContext
+) -> dict[str, Any]:
+    message_id, digest = _require_raw_source(conn, row, context)
     return {
         "job_public_id": str(row["public_id"]),
         "telegram_message_id": message_id,
