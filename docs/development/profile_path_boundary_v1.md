@@ -102,8 +102,8 @@ Nine posting/finalization commands also use short managed sessions:
 `prepare_posting_review`, `issue_posting_review_actions`, `confirm_and_post`,
 `resume_posting`, `finalize`, `prepare_receipt_completion`,
 `get_finalization_snapshot_review`, `authorize_finalization`, and `apply_fact_set`.
-Together with the seven AI bookkeeping entries below, this makes 36 admitted
-and 6 refused database commands, plus the unchanged
+Together with the seven AI bookkeeping entries and three recovery/status entries
+below, this makes 39 admitted and 3 refused database commands, plus the unchanged
 workspace-free compatibility verifier. Each retains its existing identity,
 signature, replay and financial authority
 checks and service-owned transactions. The session remains held through query
@@ -168,9 +168,17 @@ service-owned outcomes and their terminal replay. Ordinary staging shapes and
 provider/model/runtime configuration remain unchanged. This component proof
 does not establish the later installed Bridge/Host lease integration.
 
-`get_ai_processing_status_v2` remains in that refused group because its existing
-request does not carry the authenticated Telegram context required to isolate
-another conversation's intake.
+The three local recovery/status entries are `get_capture_recovery`,
+`resume_capture_recovery`, and `get_ai_processing_status_v2`. Managed status
+requires the four-field caller context and matches the raw intake's frozen
+Telegram source before projecting processing state; early or failed processing
+needs no proposal or OCR result. Local recovery retains the original source,
+stale-step, decision and result verification. Frozen edit replay reuses the
+current session, and corrected results use the controlled correction adapter's
+registered factory after any probe session has actually closed. Acquisition
+branches remain refused before claim, attachment or OCR work. See
+[`managed_local_recovery_v1.md`](managed_local_recovery_v1.md) for the direct
+source, action and refusal contract.
 The Bridge commands include gate acquisition and session close in their
 cooperative command deadline. An error after an admitted command's service
 transaction commits, including a close/deadline error, leaves its result
@@ -179,8 +187,9 @@ not infer that no change was written. The same rule applies to a receipt
 consumer error after its existing posting authority commits: inspect or replay
 the receipt token.
 This partial integration does not admit the `capture`, `propose`, or
-`process_capture_job` attachment/OCR paths, correction, migration, or any full
-backup cut.
+`process_capture_job` attachment/OCR paths, migration, or any full backup cut.
+The separate controlled correction CLI has its own managed factory and human
+wait contract; correction is not a new Bridge dispatcher command.
 
 The enrolled database component's resource inventory is `profile.json`, the
 fixed profile gate, the managed registration and pending name,

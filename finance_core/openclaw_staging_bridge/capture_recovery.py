@@ -11,7 +11,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from dataclasses import asdict
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from finance_core.application.corrections import CorrectionService
 from finance_core.intake.capture_jobs import get_capture_job
@@ -724,8 +724,9 @@ def resume_capture_recovery(
     context: HumanActionContext,
     correction_service: CorrectionService | None = None,
     expected_view: dict[str, object] | None = None,
+    source_validator: Callable[[sqlite3.Connection, dict[str, object]], None] | None = None,
 ) -> dict[str, object]:
-    """Advance at most one already-local stage, then return fresh status."""
+    """Advance one local stage; optional caller proof follows the fresh-view check."""
     if conn.in_transaction:
         raise CaptureRecoveryConflict("Recovery requires a fresh connection transaction")
     before = get_capture_recovery(
@@ -737,6 +738,13 @@ def resume_capture_recovery(
         return before
     action = before["next_action"]
     source_job_id = before["source_job_public_id"]
+    if source_validator is not None and action in {
+        "prepare_initial_review",
+        "prepare_child_review",
+        "resume_accepted_posting",
+        "enqueue_existing_result",
+    }:
+        source_validator(conn, before)
     if action == "prepare_initial_review" and isinstance(source_job_id, str):
         ensure_capture_review(conn, job_public_id=source_job_id)
     elif action == "prepare_child_review":

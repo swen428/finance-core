@@ -650,19 +650,23 @@ def _read_workspace_session(
 
 @contextmanager
 def _open_capture_recovery_context(
-    workspace: Path, context: human_actions.HumanActionContext
+    workspace: Path,
+    context: human_actions.HumanActionContext,
+    *,
+    corrected_probe_complete: bool = False,
 ) -> Iterator[tuple[sqlite3.Connection, Any]]:
     """Reopen a corrected ledger only through its bound local authority."""
     from finance_core.openclaw_staging_bridge.capture_recovery import has_correction_history
 
-    ordinary = workspace_access.open_workspace_database(workspace)
-    try:
-        has_corrections = has_correction_history(ordinary)
-        if not has_corrections:
-            yield ordinary, None
-            return
-    finally:
-        ordinary.close()
+    if not corrected_probe_complete:
+        ordinary = workspace_access.open_workspace_database(workspace)
+        try:
+            has_corrections = has_correction_history(ordinary)
+            if not has_corrections:
+                yield ordinary, None
+                return
+        finally:
+            ordinary.close()
 
     from finance_core.application.corrections import CorrectionService
     from finance_core.correction_adapters.d2_source import D2OriginalSourceVerifier
@@ -690,6 +694,79 @@ def _open_capture_recovery_context(
             "Corrected result needs the matching local authority and workspace.",
             errors.EXIT_AUTHORITY_REFUSED,
         ) from exc
+
+
+class _ManagedCaptureRecoveryContext:
+    """Own one local phase without throwing frozen BridgeError into a generator."""
+
+    def __init__(
+        self,
+        request: BridgeRequest,
+        deadline: Deadline,
+        workspace: Path,
+        context: human_actions.HumanActionContext,
+    ) -> None:
+        self.request = request
+        self.deadline = deadline
+        self.workspace = workspace
+        self.context = context
+        self.probe: AbstractContextManager[sqlite3.Connection] | None = None
+        self.corrected: AbstractContextManager[tuple[sqlite3.Connection, Any]] | None = None
+
+    def __enter__(self) -> tuple[sqlite3.Connection, Any]:
+        from finance_core.openclaw_staging_bridge.capture_recovery import has_correction_history
+
+        self.probe = workspace_access.workspace_database_session(
+            self.workspace,
+            operation_id=f"bridge:{self.request.request_id}",
+            deadline=self.deadline,
+        )
+        probe = self.probe.__enter__()
+        try:
+            if not has_correction_history(probe):
+                return probe, None
+        except BaseException as exc:
+            self.probe.__exit__(type(exc), exc, exc.__traceback__)
+            self.probe = None
+            raise
+        self.probe.__exit__(None, None, None)
+        self.probe = None
+        self.corrected = _open_capture_recovery_context(
+            self.workspace, self.context, corrected_probe_complete=True
+        )
+        opened = self.corrected.__enter__()
+        try:
+            self.deadline.check("corrected capture recovery session open")
+        except BaseException:
+            self.corrected.__exit__(None, None, None)
+            self.corrected = None
+            raise
+        return opened
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        # The corrected factory is generator-based, so avoid contextlib's
+        # mutation of frozen BridgeError.__traceback__. The workspace owner
+        # is class-based and needs the original exception for deadline policy.
+        if self.corrected is not None:
+            self.corrected.__exit__(None, None, None)
+            if exc_type is None:
+                self.deadline.check("corrected capture recovery session close")
+        elif self.probe is not None:
+            self.probe.__exit__(exc_type, exc_value, traceback)
+
+
+def _managed_capture_recovery_context(
+    request: BridgeRequest,
+    deadline: Deadline,
+    workspace: Path,
+    context: human_actions.HumanActionContext,
+) -> _ManagedCaptureRecoveryContext:
+    return _ManagedCaptureRecoveryContext(request, deadline, workspace, context)
 
 
 def _require_durable_capture_connection(conn: sqlite3.Connection) -> None:
@@ -2662,6 +2739,26 @@ def handle_get_capture_recovery(request: BridgeRequest, deadline: Deadline) -> H
     from finance_core.openclaw_staging_bridge.capture_recovery import get_capture_recovery
 
     job_id, context, _ = _capture_recovery_arguments(request)
+    if _managed_workspace_argument(request.arguments):
+        deadline.check("workspace validation")
+        workspace = workspace_access.validate_workspace_path(request.arguments["workspace_path"])
+        workspace_access.verify_workspace_structure(workspace)
+        deadline.check("capture recovery read")
+        try:
+            with _managed_capture_recovery_context(request, deadline, workspace, context) as (
+                read_conn,
+                verifier,
+            ):
+                view = get_capture_recovery(
+                    read_conn,
+                    job_public_id=job_id,
+                    context=context,
+                    correction_service=verifier,
+                )
+                return _with_capture_recovery_step(view), False
+        except Exception as exc:
+            _raise_capture_recovery_error(exc)
+            raise AssertionError("unreachable")
     workspace, conn = _open_context(request.arguments, deadline)
     conn.close()
     deadline.check("capture recovery read")
@@ -2679,6 +2776,93 @@ def handle_get_capture_recovery(request: BridgeRequest, deadline: Deadline) -> H
         raise AssertionError("unreachable")
 
 
+def _frozen_capture_control_request(
+    conn: sqlite3.Connection,
+    request: BridgeRequest,
+    *,
+    job_id: str,
+    context: human_actions.HumanActionContext,
+    workspace: Path,
+) -> BridgeRequest:
+    """Rebuild only the saved D1/guided request and its canonical key."""
+    from finance_core.openclaw_staging_bridge.capture_recovery import frozen_control_material
+    from finance_core.parser_proposals.human_drafts import _parse_card_fields
+
+    route, raw_text = frozen_control_material(conn, job_public_id=job_id)
+    message_id = int(route["telegram_message_id"])
+    kind = str(route["route_kind"])
+    arguments: dict[str, Any] = {
+        "workspace_path": str(workspace),
+        "operator_actor_id": context.actor_id,
+        "telegram_account_id": context.account_id,
+        "telegram_conversation_id": context.conversation_id,
+        "conversation_binding_id": context.binding_id,
+        "telegram_message_id": message_id,
+    }
+    if kind == "whole_card":
+        card_id, fields = _parse_card_fields(raw_text)
+        operation_id = str(route["operation_key"])
+        if card_id != route["card_generation_public_id"]:
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Frozen card reference changed.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        arguments.update(
+            card_generation_public_id=card_id,
+            operation_public_id=operation_id,
+            raw_card_text=raw_text,
+            field_values=fields,
+        )
+        command = "apply_human_draft_card"
+        key = canonical_human_draft_apply_key(operation_id)
+    elif kind in {"guided_update", "guided_complete"}:
+        session_id = str(route["guided_session_public_id"])
+        arguments["session_public_id"] = session_id
+        if kind == "guided_update":
+            arguments["field_name"] = str(route["field_name"])
+            arguments["field_value"] = json.loads(str(route["field_value_json"]))
+            command = "apply_guided_edit_update"
+            key = canonical_guided_edit_update_key(session_id, message_id)
+        else:
+            command = "complete_guided_edit"
+            key = canonical_guided_edit_complete_key(session_id, message_id)
+    else:
+        raise errors.bridge_error(
+            errors.LIFECYCLE_CONFLICT,
+            "Interaction route has no recoverable control command.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    return BridgeRequest("v1", command, request.request_id, key, arguments)
+
+
+def _replay_frozen_capture_control_in_session(
+    conn: sqlite3.Connection,
+    request: BridgeRequest,
+    *,
+    job_id: str,
+    context: human_actions.HumanActionContext,
+    workspace: Path,
+    deadline: Deadline,
+) -> tuple[str, bool]:
+    """Replay frozen control with the trusted session's connection."""
+    replay = _frozen_capture_control_request(
+        conn, request, job_id=job_id, context=context, workspace=workspace
+    )
+    if replay.command == "apply_human_draft_card":
+        material = _validate_human_draft_card_request(replay)
+        _, already_done = _human_draft_card_in_session(conn, deadline, material)
+    elif replay.command == "apply_guided_edit_update":
+        update_material = _validate_guided_edit_update_request(replay)
+        _, already_done = _guided_edit_update_in_session(conn, deadline, update_material)
+    elif replay.command == "complete_guided_edit":
+        complete_material = _validate_guided_edit_complete_request(replay)
+        _, already_done = _guided_edit_complete_in_session(conn, deadline, complete_material)
+    else:
+        raise AssertionError("unsupported frozen control command")
+    return replay.command, already_done
+
+
 def _replay_frozen_capture_control(
     request: BridgeRequest,
     *,
@@ -2687,65 +2871,138 @@ def _replay_frozen_capture_control(
     workspace: Path,
     deadline: Deadline,
 ) -> tuple[str, bool]:
-    """Re-enter the existing D1/guided command with frozen route material."""
-    from finance_core.openclaw_staging_bridge.capture_recovery import frozen_control_material
-    from finance_core.parser_proposals.human_drafts import _parse_card_fields
-
+    """Preserve the ordinary separate-open replay path."""
     conn = workspace_access.open_workspace_database(workspace)
     try:
-        route, raw_text = frozen_control_material(conn, job_public_id=job_id)
-        message_id = int(route["telegram_message_id"])
-        kind = str(route["route_kind"])
-        arguments: dict[str, Any] = {
-            "workspace_path": str(workspace),
-            "operator_actor_id": context.actor_id,
-            "telegram_account_id": context.account_id,
-            "telegram_conversation_id": context.conversation_id,
-            "conversation_binding_id": context.binding_id,
-            "telegram_message_id": message_id,
-        }
-        if kind == "whole_card":
-            card_id, fields = _parse_card_fields(raw_text)
-            operation_id = str(route["operation_key"])
-            if card_id != route["card_generation_public_id"]:
-                raise errors.bridge_error(
-                    errors.LIFECYCLE_CONFLICT,
-                    "Frozen card reference changed.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            arguments.update(
-                card_generation_public_id=card_id,
-                operation_public_id=operation_id,
-                raw_card_text=raw_text,
-                field_values=fields,
-            )
-            command = "apply_human_draft_card"
-            key = canonical_human_draft_apply_key(operation_id)
-            handler = handle_apply_human_draft_card
-        elif kind in {"guided_update", "guided_complete"}:
-            session_id = str(route["guided_session_public_id"])
-            arguments["session_public_id"] = session_id
-            if kind == "guided_update":
-                arguments["field_name"] = str(route["field_name"])
-                arguments["field_value"] = json.loads(str(route["field_value_json"]))
-                command = "apply_guided_edit_update"
-                key = canonical_guided_edit_update_key(session_id, message_id)
-                handler = handle_apply_guided_edit_update
-            else:
-                command = "complete_guided_edit"
-                key = canonical_guided_edit_complete_key(session_id, message_id)
-                handler = handle_complete_guided_edit
-        else:
-            raise errors.bridge_error(
-                errors.LIFECYCLE_CONFLICT,
-                "Interaction route has no recoverable control command.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            )
+        replay = _frozen_capture_control_request(
+            conn, request, job_id=job_id, context=context, workspace=workspace
+        )
     finally:
         conn.close()
-    replay = BridgeRequest("v1", command, request.request_id, key, arguments)
-    _, already_done = handler(replay, deadline)
-    return command, already_done
+    handlers = {
+        "apply_human_draft_card": handle_apply_human_draft_card,
+        "apply_guided_edit_update": handle_apply_guided_edit_update,
+        "complete_guided_edit": handle_complete_guided_edit,
+    }
+    _, already_done = handlers[replay.command](replay, deadline)
+    return replay.command, already_done
+
+
+def _managed_recovery_source_validator(
+    request: BridgeRequest,
+    workspace: Path,
+    context: human_actions.HumanActionContext,
+) -> Callable[[sqlite3.Connection, dict[str, object]], None]:
+    """Check the durable D2 target selected by the freshly read recovery view."""
+
+    def validate(conn: sqlite3.Connection, before: dict[str, object]) -> None:
+        action = before["next_action"]
+        if action == "prepare_initial_review":
+            source_kind, source_identity = "initial_proposal", before.get("proposal_public_id")
+        elif action == "prepare_child_review":
+            child_kind = before.get("child_review_kind")
+            if child_kind == "d1_human_card":
+                source_kind = "card"
+            elif child_kind == "ai_initial_proposal":
+                source_kind = "initial_proposal"
+            else:
+                raise _managed_source_refusal()
+            source_identity = before.get("child_review_target")
+        elif action == "resume_accepted_posting":
+            source_kind, source_identity = "attempt", before.get("attempt_public_id")
+        elif action == "enqueue_existing_result":
+            source_kind, source_identity = "review", before.get("review_public_id")
+        else:
+            return
+        if not isinstance(source_identity, str) or not source_identity:
+            raise _managed_source_refusal()
+        _require_b_posting_source(
+            conn,
+            workspace,
+            request.arguments,
+            source_kind=source_kind,
+            source_identity=source_identity,
+            context=context,
+        )
+
+    return validate
+
+
+def _resume_managed_capture_recovery(
+    request: BridgeRequest,
+    deadline: Deadline,
+    *,
+    workspace: Path,
+    job_id: str,
+    context: human_actions.HumanActionContext,
+    step_token: str,
+) -> HandlerResult:
+    from finance_core.openclaw_staging_bridge.capture_recovery import (
+        get_capture_recovery,
+        resume_capture_recovery,
+    )
+
+    with _managed_capture_recovery_context(request, deadline, workspace, context) as (
+        conn,
+        verifier,
+    ):
+        deadline.check("capture recovery selection")
+        before = get_capture_recovery(
+            conn,
+            job_public_id=job_id,
+            context=context,
+            correction_service=verifier,
+        )
+        if step_token != _capture_recovery_step_token(before):
+            stale = _with_capture_recovery_step(before)
+            stale["performed_action"] = "none"
+            stale["stale_recovery_step"] = True
+            return stale, True
+        action = str(before["next_action"])
+        if action == "capture_processing_required":
+            raise errors.bridge_error(
+                errors.LIFECYCLE_CONFLICT,
+                "Managed capture processing remains unavailable.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        if action in {"d1_command_required", "guided_command_required"}:
+            fresh = get_capture_recovery(
+                conn,
+                job_public_id=job_id,
+                context=context,
+                correction_service=verifier,
+            )
+            if fresh != before:
+                stale = _with_capture_recovery_step(fresh)
+                stale["performed_action"] = "none"
+                stale["stale_recovery_step"] = True
+                return stale, True
+            performed, replay = _replay_frozen_capture_control_in_session(
+                conn,
+                request,
+                job_id=job_id,
+                context=context,
+                workspace=workspace,
+                deadline=deadline,
+            )
+            result = get_capture_recovery(
+                conn,
+                job_public_id=job_id,
+                context=context,
+                correction_service=verifier,
+            )
+            result["performed_action"] = performed
+            return _with_capture_recovery_step(result), replay
+        deadline.check("capture recovery local action")
+        result = resume_capture_recovery(
+            conn,
+            job_public_id=job_id,
+            context=context,
+            correction_service=verifier,
+            expected_view=before,
+            source_validator=_managed_recovery_source_validator(request, workspace, context),
+        )
+        return _with_capture_recovery_step(result), result.get("performed_action") == "none"
 
 
 def handle_resume_capture_recovery(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -2758,6 +3015,22 @@ def handle_resume_capture_recovery(request: BridgeRequest, deadline: Deadline) -
     job_id, context, step_token = _capture_recovery_arguments(request, resume=True)
     assert step_token is not None
     _require_canonical_idempotency_key(request, _capture_recovery_key(job_id, step_token))
+    if _managed_workspace_argument(request.arguments):
+        deadline.check("workspace validation")
+        workspace = workspace_access.validate_workspace_path(request.arguments["workspace_path"])
+        workspace_access.verify_workspace_structure(workspace)
+        try:
+            return _resume_managed_capture_recovery(
+                request,
+                deadline,
+                workspace=workspace,
+                job_id=job_id,
+                context=context,
+                step_token=step_token,
+            )
+        except Exception as exc:
+            _raise_capture_recovery_error(exc)
+            raise AssertionError("unreachable")
     workspace, conn = _open_context(request.arguments, deadline)
     conn.close()
     deadline.check("capture recovery selection")
@@ -3059,13 +3332,36 @@ def handle_record_ai_fallback_result_v2(
 
 
 def handle_get_ai_processing_status_v2(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    managed = _managed_workspace_argument(request.arguments)
     _require_exact_arguments(
         request.arguments,
-        required=frozenset({"workspace_path", "intake_public_id"}),
+        required=frozenset({"workspace_path", "intake_public_id"})
+        | (_SOURCE_CONTEXT_FIELDS if managed else frozenset()),
     )
     intake_public_id = _require_string(
         request.arguments["intake_public_id"], "intake_public_id", max_length=200
     )
+    if managed:
+        from finance_core.openclaw_staging_bridge.capture_discovery import (
+            CaptureDiscoveryConflict,
+            require_intake_telegram_source,
+        )
+
+        context = _require_telegram_human_context(request.arguments)
+        with _read_workspace_session(request, deadline) as conn:
+            deadline.check("AI processing source validation")
+            try:
+                require_intake_telegram_source(
+                    conn, intake_public_id=intake_public_id, context=context
+                )
+            except CaptureDiscoveryConflict as exc:
+                raise _managed_source_refusal() from exc
+            deadline.check("AI processing status v2")
+            try:
+                result = get_ai_processing_status_v2(conn, intake_public_id=intake_public_id)
+            except AiFallbackServiceError as exc:
+                raise _map_ai_fallback_error(exc) from exc
+            return result, False
     _workspace, conn = _open_context(request.arguments, deadline)
     try:
         deadline.check("AI processing status v2")
@@ -5525,7 +5821,10 @@ def _pending_guided_update(
     return result, replay
 
 
-def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+_GuidedUpdateMaterial = tuple[human_actions.HumanActionContext, str, int, str, str]
+
+
+def _validate_guided_edit_update_request(request: BridgeRequest) -> _GuidedUpdateMaterial:
     required = _GUIDED_EDIT_CONTEXT_FIELDS | frozenset(
         {"session_public_id", "telegram_message_id", "field_name", "field_value"}
     )
@@ -5546,126 +5845,140 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
     _require_canonical_idempotency_key(
         request, canonical_guided_edit_update_key(session_public_id, message_id)
     )
+    return context, session_public_id, message_id, field_name, field_value
 
-    with _operation_context(request, deadline) as (_workspace, conn):
-        deadline.check("guided edit session load")
-        session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
-        if session is None or session["status"] != "active":
+
+def _guided_edit_update_in_session(
+    conn: sqlite3.Connection, deadline: Deadline, material: _GuidedUpdateMaterial
+) -> HandlerResult:
+    context, session_public_id, message_id, field_name, field_value = material
+    deadline.check("guided edit session load")
+    session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
+    if session is None or session["status"] != "active":
+        raise errors.bridge_error(
+            errors.PROPOSAL_TERMINAL_STATE,
+            "Guided edit session is not active.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    replay_event = guided_edit.find_applied_replay(conn, int(session["id"]), message_id)
+    if replay_event is not None:
+        if (
+            replay_event["field_name"] != field_name
+            or json.loads(str(replay_event["field_value_json"])) != field_value
+        ):
             raise errors.bridge_error(
-                errors.PROPOSAL_TERMINAL_STATE,
-                "Guided edit session is not active.",
+                errors.IDEMPOTENCY_CONFLICT,
+                "Telegram edit message is already bound to different material.",
                 errors.EXIT_AUTHORITY_REFUSED,
             )
-        replay_event = guided_edit.find_applied_replay(conn, int(session["id"]), message_id)
-        if replay_event is not None:
-            if (
-                replay_event["field_name"] != field_name
-                or json.loads(str(replay_event["field_value_json"])) != field_value
-            ):
-                raise errors.bridge_error(
-                    errors.IDEMPOTENCY_CONFLICT,
-                    "Telegram edit message is already bound to different material.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            return {
-                "edit_kind": "guided_replay",
-                "session_public_id": session_public_id,
-                "proposal_public_id": str(replay_event["proposal_public_id"]),
-                "proposal_version": int(replay_event["after_proposal_version"]),
-                "effective_content_hash": str(replay_event["after_content_hash"]),
-                "parse_status": "edited_pending_confirmation",
-                "final_transaction_created": False,
-            }, True
-        refused_event = guided_edit.find_refused_replay(conn, int(session["id"]), message_id)
-        if refused_event is not None:
-            if (
-                refused_event["field_name"] != field_name
-                or json.loads(str(refused_event["field_value_json"])) != field_value
-            ):
-                raise errors.bridge_error(
-                    errors.IDEMPOTENCY_CONFLICT,
-                    "Telegram edit message is already bound to different material.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            refusal_code = str(refused_event["refusal_code"])
-            validation_codes = {
-                errors.ARGUMENTS_REFUSED,
-                errors.NO_MATERIAL_CHANGE,
-                errors.UNSUPPORTED_EDIT,
-            }
+        return {
+            "edit_kind": "guided_replay",
+            "session_public_id": session_public_id,
+            "proposal_public_id": str(replay_event["proposal_public_id"]),
+            "proposal_version": int(replay_event["after_proposal_version"]),
+            "effective_content_hash": str(replay_event["after_content_hash"]),
+            "parse_status": "edited_pending_confirmation",
+            "final_transaction_created": False,
+        }, True
+    refused_event = guided_edit.find_refused_replay(conn, int(session["id"]), message_id)
+    if refused_event is not None:
+        if (
+            refused_event["field_name"] != field_name
+            or json.loads(str(refused_event["field_value_json"])) != field_value
+        ):
             raise errors.bridge_error(
-                refusal_code,
-                "Guided edit update was previously refused.",
-                errors.EXIT_VALIDATION_REFUSED
-                if refusal_code in validation_codes
-                else errors.EXIT_AUTHORITY_REFUSED,
+                errors.IDEMPOTENCY_CONFLICT,
+                "Telegram edit message is already bound to different material.",
+                errors.EXIT_AUTHORITY_REFUSED,
             )
-        if session["pending_message_id"] is not None:
-            pending_message_id = int(session["pending_message_id"])
-            if pending_message_id == message_id and (
-                session["pending_field_name"] != field_name
-                or json.loads(str(session["pending_field_value_json"])) != field_value
-            ):
-                raise errors.bridge_error(
-                    errors.IDEMPOTENCY_CONFLICT,
-                    "Telegram edit message is already bound to different material.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            expired = int(session["expires_at"]) <= int(datetime.now(UTC).timestamp())
-            if expired and pending_message_id != message_id:
-                raise errors.bridge_error(
-                    errors.CALLBACK_EXPIRED,
-                    "Guided edit session expired with different recovery material.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            recovered, _replay = _pending_guided_update(conn, session)
-            if pending_message_id == message_id:
-                return {**recovered, "session_public_id": session_public_id}, True
-            session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
-            assert session is not None
-
-        if int(session["expires_at"]) <= int(datetime.now(UTC).timestamp()):
+        refusal_code = str(refused_event["refusal_code"])
+        validation_codes = {
+            errors.ARGUMENTS_REFUSED,
+            errors.NO_MATERIAL_CHANGE,
+            errors.UNSUPPORTED_EDIT,
+        }
+        raise errors.bridge_error(
+            refusal_code,
+            "Guided edit update was previously refused.",
+            errors.EXIT_VALIDATION_REFUSED
+            if refusal_code in validation_codes
+            else errors.EXIT_AUTHORITY_REFUSED,
+        )
+    if session["pending_message_id"] is not None:
+        pending_message_id = int(session["pending_message_id"])
+        if pending_message_id == message_id and (
+            session["pending_field_name"] != field_name
+            or json.loads(str(session["pending_field_value_json"])) != field_value
+        ):
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Telegram edit message is already bound to different material.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        expired = int(session["expires_at"]) <= int(datetime.now(UTC).timestamp())
+        if expired and pending_message_id != message_id:
             raise errors.bridge_error(
                 errors.CALLBACK_EXPIRED,
-                "Guided edit session has expired.",
+                "Guided edit session expired with different recovery material.",
                 errors.EXIT_AUTHORITY_REFUSED,
             )
+        recovered, _replay = _pending_guided_update(conn, session)
+        if pending_message_id == message_id:
+            return {**recovered, "session_public_id": session_public_id}, True
+        session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
+        assert session is not None
 
-        operation_key = canonical_edit_key(
-            proposal_public_id=str(session["proposal_public_id"]),
-            version=int(session["current_proposal_version"]),
-            content_hash=str(session["current_content_hash"]),
+    if int(session["expires_at"]) <= int(datetime.now(UTC).timestamp()):
+        raise errors.bridge_error(
+            errors.CALLBACK_EXPIRED,
+            "Guided edit session has expired.",
+            errors.EXIT_AUTHORITY_REFUSED,
         )
 
-        def authorize_guided_update(locked: sqlite3.Connection) -> None:
-            _require_frozen_command_route(
-                locked,
-                context=context,
-                message_id=message_id,
-                route_kind="guided_update",
-                operation_key=canonical_guided_edit_update_key(session_public_id, message_id),
-                session_id=session_public_id,
-                field_name=field_name,
-                field_value=field_value,
-            )
+    operation_key = canonical_edit_key(
+        proposal_public_id=str(session["proposal_public_id"]),
+        version=int(session["current_proposal_version"]),
+        content_hash=str(session["current_content_hash"]),
+    )
 
-        try:
-            pending = guided_edit.request_update(
-                conn,
-                session,
-                message_id=message_id,
-                operation_key=operation_key,
-                field_name=field_name,
-                field_value=field_value,
-                authority_validator=authorize_guided_update,
-            )
-        except guided_edit.GuidedEditError as exc:
-            _raise_guided_edit_error(exc)
-        result, replay = _pending_guided_update(conn, pending)
-        return {**result, "session_public_id": session_public_id}, replay
+    def authorize_guided_update(locked: sqlite3.Connection) -> None:
+        _require_frozen_command_route(
+            locked,
+            context=context,
+            message_id=message_id,
+            route_kind="guided_update",
+            operation_key=canonical_guided_edit_update_key(session_public_id, message_id),
+            session_id=session_public_id,
+            field_name=field_name,
+            field_value=field_value,
+        )
+
+    try:
+        pending = guided_edit.request_update(
+            conn,
+            session,
+            message_id=message_id,
+            operation_key=operation_key,
+            field_name=field_name,
+            field_value=field_value,
+            authority_validator=authorize_guided_update,
+        )
+    except guided_edit.GuidedEditError as exc:
+        _raise_guided_edit_error(exc)
+    result, replay = _pending_guided_update(conn, pending)
+    return {**result, "session_public_id": session_public_id}, replay
 
 
-def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    material = _validate_guided_edit_update_request(request)
+    with _operation_context(request, deadline) as (_workspace, conn):
+        return _guided_edit_update_in_session(conn, deadline, material)
+
+
+_GuidedCompleteMaterial = tuple[human_actions.HumanActionContext, str, int]
+
+
+def _validate_guided_edit_complete_request(request: BridgeRequest) -> _GuidedCompleteMaterial:
     required = _GUIDED_EDIT_CONTEXT_FIELDS | frozenset({"session_public_id", "telegram_message_id"})
     _require_exact_arguments(request.arguments, required=required)
     context = _require_telegram_human_context(request.arguments)
@@ -5676,69 +5989,81 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
     _require_canonical_idempotency_key(
         request, canonical_guided_edit_complete_key(session_public_id, message_id)
     )
-    with _operation_context(request, deadline) as (_workspace, conn):
-        session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
-        if session is None:
-            raise errors.bridge_error(
-                errors.ACTOR_MISMATCH,
-                "Guided edit session does not match this private conversation.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            )
-        if session["status"] == "completed" and session["completed_message_id"] == message_id:
-            try:
-                review_batch_id = guided_edit.claim_review_batch(
-                    conn, session, context=context, message_id=message_id
-                )
-            except guided_edit.GuidedEditError as exc:
-                _raise_guided_edit_error(exc)
-            return _guided_completion_payload(
-                conn,
-                session,
-                context=context,
-                review_batch_id=review_batch_id,
-            ), True
-        if session["status"] != "active":
-            raise errors.bridge_error(
-                errors.PROPOSAL_TERMINAL_STATE,
-                "Guided edit session is not active.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            )
-        if session["pending_message_id"] is not None:
-            if int(session["expires_at"]) <= int(datetime.now(UTC).timestamp()):
-                raise errors.bridge_error(
-                    errors.CALLBACK_EXPIRED,
-                    "Guided edit session has expired.",
-                    errors.EXIT_AUTHORITY_REFUSED,
-                )
-            _pending_guided_update(conn, session)
-            session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
-            assert session is not None
+    return context, session_public_id, message_id
+
+
+def _guided_edit_complete_in_session(
+    conn: sqlite3.Connection, deadline: Deadline, material: _GuidedCompleteMaterial
+) -> HandlerResult:
+    context, session_public_id, message_id = material
+    session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
+    if session is None:
+        raise errors.bridge_error(
+            errors.ACTOR_MISMATCH,
+            "Guided edit session does not match this private conversation.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    if session["status"] == "completed" and session["completed_message_id"] == message_id:
         try:
-            completed = guided_edit.complete_session(
-                conn,
-                session,
-                context=context,
-                message_id=message_id,
-                authority_validator=lambda locked: _require_frozen_command_route(
-                    locked,
-                    context=context,
-                    message_id=message_id,
-                    route_kind="guided_complete",
-                    operation_key=canonical_guided_edit_complete_key(session_public_id, message_id),
-                    session_id=session_public_id,
-                ),
-            )
             review_batch_id = guided_edit.claim_review_batch(
-                conn, completed, context=context, message_id=message_id
+                conn, session, context=context, message_id=message_id
             )
         except guided_edit.GuidedEditError as exc:
             _raise_guided_edit_error(exc)
         return _guided_completion_payload(
             conn,
-            completed,
+            session,
             context=context,
             review_batch_id=review_batch_id,
-        ), False
+        ), True
+    if session["status"] != "active":
+        raise errors.bridge_error(
+            errors.PROPOSAL_TERMINAL_STATE,
+            "Guided edit session is not active.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
+    if session["pending_message_id"] is not None:
+        if int(session["expires_at"]) <= int(datetime.now(UTC).timestamp()):
+            raise errors.bridge_error(
+                errors.CALLBACK_EXPIRED,
+                "Guided edit session has expired.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            )
+        _pending_guided_update(conn, session)
+        session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
+        assert session is not None
+    try:
+        completed = guided_edit.complete_session(
+            conn,
+            session,
+            context=context,
+            message_id=message_id,
+            authority_validator=lambda locked: _require_frozen_command_route(
+                locked,
+                context=context,
+                message_id=message_id,
+                route_kind="guided_complete",
+                operation_key=canonical_guided_edit_complete_key(session_public_id, message_id),
+                session_id=session_public_id,
+            ),
+        )
+        review_batch_id = guided_edit.claim_review_batch(
+            conn, completed, context=context, message_id=message_id
+        )
+    except guided_edit.GuidedEditError as exc:
+        _raise_guided_edit_error(exc)
+    return _guided_completion_payload(
+        conn,
+        completed,
+        context=context,
+        review_batch_id=review_batch_id,
+    ), False
+
+
+def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    material = _validate_guided_edit_complete_request(request)
+    with _operation_context(request, deadline) as (_workspace, conn):
+        return _guided_edit_complete_in_session(conn, deadline, material)
 
 
 _HUMAN_DRAFT_FIELDS = frozenset(
@@ -5853,7 +6178,12 @@ def _raise_human_draft_error(exc: HumanDraftError) -> None:
     ) from exc
 
 
-def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+_HumanDraftCardMaterial = tuple[
+    human_actions.HumanActionContext, str, int, str, str, dict[str, str]
+]
+
+
+def _validate_human_draft_card_request(request: BridgeRequest) -> _HumanDraftCardMaterial:
     required = _HUMAN_DRAFT_CONTEXT_FIELDS | frozenset(
         {
             "card_generation_public_id",
@@ -5897,47 +6227,58 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
         )
     field_values = _require_human_draft_field_values(request.arguments["field_values"])
     _require_canonical_idempotency_key(request, canonical_human_draft_apply_key(operation_id))
+    return context, card_id, message_id, operation_id, raw_card_text, field_values
 
+
+def _human_draft_card_in_session(
+    conn: sqlite3.Connection, deadline: Deadline, material: _HumanDraftCardMaterial
+) -> HandlerResult:
+    context, card_id, message_id, operation_id, raw_card_text, field_values = material
+    deadline.check("human draft whole-card apply")
+
+    def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
+        _require_frozen_command_route(
+            locked,
+            context=context,
+            message_id=message_id,
+            route_kind="whole_card",
+            operation_key=operation_id,
+            card_id=card_id,
+            raw_text=raw_card_text,
+        )
+
+    try:
+        result = apply_human_draft_card(
+            conn,
+            HumanDraftCommand(
+                card_generation_public_id=card_id,
+                telegram_message_id=message_id,
+                operation_public_id=operation_id,
+                authenticated_actor_id=context.actor_id,
+                telegram_account_id=context.account_id,
+                telegram_conversation_id=context.conversation_id,
+                conversation_binding_id=context.binding_id,
+                raw_card_text=raw_card_text,
+                field_values=field_values,
+            ),
+            publish=publish_human_revision_in_transaction,
+            authority_validator=authorize_whole_card_write,
+        )
+    except HumanDraftError as exc:
+        _raise_human_draft_error(exc)
+    except HumanRevisionLineageError as exc:
+        raise errors.bridge_error(
+            errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+            "D1 human revision lineage refused publication.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        ) from exc
+    return _human_draft_result_payload(conn, result), result.idempotent_replay
+
+
+def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    material = _validate_human_draft_card_request(request)
     with _operation_context(request, deadline) as (_workspace, conn):
-        deadline.check("human draft whole-card apply")
-
-        def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
-            _require_frozen_command_route(
-                locked,
-                context=context,
-                message_id=message_id,
-                route_kind="whole_card",
-                operation_key=operation_id,
-                card_id=card_id,
-                raw_text=raw_card_text,
-            )
-
-        try:
-            result = apply_human_draft_card(
-                conn,
-                HumanDraftCommand(
-                    card_generation_public_id=card_id,
-                    telegram_message_id=message_id,
-                    operation_public_id=operation_id,
-                    authenticated_actor_id=context.actor_id,
-                    telegram_account_id=context.account_id,
-                    telegram_conversation_id=context.conversation_id,
-                    conversation_binding_id=context.binding_id,
-                    raw_card_text=raw_card_text,
-                    field_values=field_values,
-                ),
-                publish=publish_human_revision_in_transaction,
-                authority_validator=authorize_whole_card_write,
-            )
-        except HumanDraftError as exc:
-            _raise_human_draft_error(exc)
-        except HumanRevisionLineageError as exc:
-            raise errors.bridge_error(
-                errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
-                "D1 human revision lineage refused publication.",
-                errors.EXIT_AUTHORITY_REFUSED,
-            ) from exc
-        return _human_draft_result_payload(conn, result), result.idempotent_replay
+        return _human_draft_card_in_session(conn, deadline, material)
 
 
 def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -7359,6 +7700,8 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_GET_INTERACTION_ROUTE,
             envelope.COMMAND_LIST_CAPTURE_RECOVERY_CANDIDATES,
             envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
+            envelope.COMMAND_GET_CAPTURE_RECOVERY,
+            envelope.COMMAND_RESUME_CAPTURE_RECOVERY,
             envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
             envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
             envelope.COMMAND_CAPTURE_INTERACTION,
@@ -7384,6 +7727,7 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_AUTHORIZE_FINALIZATION,
             envelope.COMMAND_APPLY_FACT_SET,
             envelope.COMMAND_REGISTER_AI_MODEL_COMPATIBILITY_RECEIPT_V2,
+            envelope.COMMAND_GET_AI_PROCESSING_STATUS_V2,
             envelope.COMMAND_PREPARE_AI_FALLBACK_V2,
             envelope.COMMAND_CLAIM_AI_FALLBACK_INVOCATION_V2,
             envelope.COMMAND_RECORD_AI_FALLBACK_RESULT_V2,
