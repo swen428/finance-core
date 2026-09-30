@@ -43,6 +43,15 @@ class ParserProposalRepository:
         row = cursor.fetchone()
         return None if row is None else row_to_dict(row, cursor.description)
 
+    def get_lineage_row_by_id(self, parser_output_id: int) -> dict[str, Any] | None:
+        """Read the complete proposal row for source and lineage verification."""
+        cursor = self._conn.execute(
+            "SELECT * FROM parser_outputs WHERE id = ?",
+            (parser_output_id,),
+        )
+        row = cursor.fetchone()
+        return None if row is None else row_to_dict(row, cursor.description)
+
     def update_status(self, parser_output_id: int, status: str) -> None:
         self._conn.execute(
             "UPDATE parser_outputs SET parse_status = ?, "

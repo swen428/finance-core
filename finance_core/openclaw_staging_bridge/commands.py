@@ -23,6 +23,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Callable, Iterator, Mapping
 
 from finance_core.application import review as application_review
@@ -162,6 +163,7 @@ from finance_core.parser_proposals.human_drafts import (
 from finance_core.parser_proposals.human_revision import (
     HumanRevisionLineageError,
     publish_human_revision_in_transaction,
+    verify_human_revision_descendant,
 )
 from finance_core.parser_proposals.lifecycle import (
     CONFIRMED,
@@ -270,6 +272,14 @@ _CONTENT_HASH_LENGTH = 64
 _MONETARY_FIELDS = frozenset({"amount", "currency"})
 _NON_MONETARY_FIELDS = frozenset({"transaction_date", "merchant", "description", "category"})
 _ALLOWED_EDIT_FIELDS = _MONETARY_FIELDS | _NON_MONETARY_FIELDS
+_SOURCE_CONTEXT_FIELDS = frozenset(
+    {
+        "operator_actor_id",
+        "telegram_account_id",
+        "telegram_conversation_id",
+        "conversation_binding_id",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +591,43 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
     deadline.check("database open")
     conn = workspace_access.open_workspace_database(workspace)
     return workspace, conn
+
+
+class _OperationContext:
+    """Own a command session without throwing frozen BridgeError into a generator."""
+
+    def __init__(self, request: BridgeRequest, deadline: Deadline) -> None:
+        self.request = request
+        self.deadline = deadline
+        self.session: AbstractContextManager[sqlite3.Connection] | None = None
+
+    def __enter__(self) -> tuple[Path, sqlite3.Connection]:
+        self.deadline.check("workspace validation")
+        workspace = workspace_access.validate_workspace_path(
+            self.request.arguments["workspace_path"]
+        )
+        self.deadline.check("workspace structure verification")
+        workspace_access.verify_workspace_structure(workspace)
+        self.deadline.check("database open")
+        self.session = workspace_access.workspace_database_session(
+            workspace,
+            operation_id=f"bridge:{self.request.request_id}",
+            deadline=self.deadline,
+        )
+        return workspace, self.session.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        assert self.session is not None
+        return self.session.__exit__(exc_type, exc_value, traceback)
+
+
+def _operation_context(request: BridgeRequest, deadline: Deadline) -> _OperationContext:
+    return _OperationContext(request, deadline)
 
 
 def _read_workspace_session(
@@ -1669,85 +1716,83 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
         conversation_id=source_context.conversation_id,
         binding_id=source_context.binding_id,
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
-        _require_durable_capture_connection(conn)
-        deadline.check("interaction capture")
-        begin_interaction_capture(conn)
+    with _operation_context(request, deadline) as (_workspace, conn):
         try:
-            key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
-            intake = get_raw_intake_record_by_idempotency_key(conn, key)
-            if intake is None:
-                intake = create_raw_intake_record(
-                    conn,
-                    validated.text,
-                    source_type=TELEGRAM_TEXT,
-                    source_channel="telegram",
-                    source_metadata=validated.source_metadata,
-                )
-                effect = _capture_context_effect(source_context)
-                assert effect is not None
-                effect(conn, intake)
-                job = ensure_capture_job(
-                    conn,
-                    intake_id=int(intake["id"]),
-                    capture_kind="text",
-                    ingress_identity_digest=ingress_digest,
-                )
-                route = freeze_interaction_route(
-                    conn,
-                    job_public_id=str(job["public_id"]),
-                    text=validated.text,
-                    context=context,
-                    message_id=validated.message_id,
-                )
-                if route["route_kind"] == "control_refused":
-                    mark_control_refusal(
+            _require_durable_capture_connection(conn)
+            deadline.check("interaction capture")
+            begin_interaction_capture(conn)
+            try:
+                key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
+                intake = get_raw_intake_record_by_idempotency_key(conn, key)
+                if intake is None:
+                    intake = create_raw_intake_record(
+                        conn,
+                        validated.text,
+                        source_type=TELEGRAM_TEXT,
+                        source_channel="telegram",
+                        source_metadata=validated.source_metadata,
+                    )
+                    effect = _capture_context_effect(source_context)
+                    assert effect is not None
+                    effect(conn, intake)
+                    job = ensure_capture_job(
+                        conn,
+                        intake_id=int(intake["id"]),
+                        capture_kind="text",
+                        ingress_identity_digest=ingress_digest,
+                    )
+                    route = freeze_interaction_route(
                         conn,
                         job_public_id=str(job["public_id"]),
-                        refusal_code=str(route["refusal_code"]),
+                        text=validated.text,
+                        context=context,
+                        message_id=validated.message_id,
                     )
-                replay = False
-            else:
-                if intake.get("content_fingerprint") != _expected_text_fingerprint(validated):
-                    raise InteractionRouteConflictError(
-                        "Telegram text conflicts with captured source"
+                    if route["route_kind"] == "control_refused":
+                        mark_control_refusal(
+                            conn,
+                            job_public_id=str(job["public_id"]),
+                            refusal_code=str(route["refusal_code"]),
+                        )
+                    replay = False
+                else:
+                    if intake.get("content_fingerprint") != _expected_text_fingerprint(validated):
+                        raise InteractionRouteConflictError(
+                            "Telegram text conflicts with captured source"
+                        )
+                    _require_replay_source_context(conn, intake, source_context)
+                    existing_job = get_capture_job(conn, intake_public_id=str(intake["public_id"]))
+                    if (
+                        existing_job is None
+                        or existing_job["ingress_identity_digest"] != ingress_digest
+                    ):
+                        raise InteractionRouteConflictError(
+                            "Telegram ingress conflicts with captured job"
+                        )
+                    route = require_replayed_interaction_route(
+                        conn,
+                        job_public_id=str(existing_job["public_id"]),
+                        text=validated.text,
+                        context=context,
+                        message_id=validated.message_id,
                     )
-                _require_replay_source_context(conn, intake, source_context)
-                existing_job = get_capture_job(conn, intake_public_id=str(intake["public_id"]))
-                if (
-                    existing_job is None
-                    or existing_job["ingress_identity_digest"] != ingress_digest
-                ):
-                    raise InteractionRouteConflictError(
-                        "Telegram ingress conflicts with captured job"
-                    )
-                route = require_replayed_interaction_route(
-                    conn,
-                    job_public_id=str(existing_job["public_id"]),
-                    text=validated.text,
-                    context=context,
-                    message_id=validated.message_id,
-                )
-                replay = True
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        return {**_text_capture_result(conn, intake), "interaction_route": route}, replay
-    except (
-        InteractionRouteConflictError,
-        CaptureJobConflictError,
-        RawIntakeIdempotencyConflictError,
-        sqlite3.IntegrityError,
-    ) as exc:
-        raise errors.bridge_error(
-            errors.IDEMPOTENCY_CONFLICT,
-            "Interaction capture conflicts with frozen evidence.",
-            errors.EXIT_AUTHORITY_REFUSED,
-        ) from exc
-    finally:
-        conn.close()
+                    replay = True
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return {**_text_capture_result(conn, intake), "interaction_route": route}, replay
+        except (
+            InteractionRouteConflictError,
+            CaptureJobConflictError,
+            RawIntakeIdempotencyConflictError,
+            sqlite3.IntegrityError,
+        ) as exc:
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Interaction capture conflicts with frozen evidence.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
 
 
 def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3169,11 +3214,164 @@ def _classification(payload: dict[str, Any]) -> tuple[str, bool]:
     return application_review.classify_payload(payload)
 
 
+def _managed_source_refusal() -> errors.BridgeError:
+    return errors.bridge_error(
+        errors.PROPOSAL_UNAVAILABLE,
+        "Managed proposal source identity is unavailable or inconsistent.",
+        errors.EXIT_AUTHORITY_REFUSED,
+    )
+
+
+def _managed_workspace_argument(arguments: dict[str, Any]) -> bool:
+    raw = arguments.get("workspace_path")
+    return isinstance(raw, str) and workspace_access.is_fixed_profile_workspace_path(Path(raw))
+
+
+def _require_managed_caller_context(workspace: Path, arguments: dict[str, Any]) -> None:
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return
+    if frozenset(arguments) & _SOURCE_CONTEXT_FIELDS != _SOURCE_CONTEXT_FIELDS:
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Managed proposal command requires complete caller source context.",
+            errors.EXIT_VALIDATION_REFUSED,
+        )
+    _require_telegram_human_context(arguments)
+
+
+def _require_managed_proposal_source(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    proposal: dict[str, Any],
+) -> None:
+    """Bind managed proposal access to a caller's frozen Telegram source."""
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return
+    _require_managed_caller_context(workspace, arguments)
+    context = _require_telegram_human_context(arguments)
+    source_public_id = proposal.get("source_public_id")
+    if not isinstance(source_public_id, str) or not source_public_id:
+        raise _managed_source_refusal()
+    intake = get_raw_intake_record_by_public_id(conn, source_public_id)
+    if intake is None or intake["public_id"] != source_public_id:
+        raise _managed_source_refusal()
+    message_id = intake.get("source_message_id")
+    if (
+        intake.get("source_type") != TELEGRAM_TEXT
+        or intake.get("source_channel") != "telegram"
+        or not isinstance(message_id, str)
+        or not message_id.isascii()
+        or not message_id.isdecimal()
+        or message_id.startswith("0")
+        or intake.get("external_source_id") != f"telegram:{context.conversation_id}:{message_id}"
+    ):
+        raise _managed_source_refusal()
+    try:
+        require_telegram_source_context(
+            conn,
+            raw_intake_record_id=int(intake["id"]),
+            context=TelegramSourceContext(
+                authenticated_actor_id=context.actor_id,
+                account_id=context.account_id,
+                conversation_id=context.conversation_id,
+                binding_id=context.binding_id,
+                message_id=message_id,
+            ),
+        )
+    except TelegramSourceContextError as exc:
+        raise _managed_source_refusal() from exc
+
+    # The intake pointer may advance to a D1 child or later replacement. An
+    # older proposal remains source-bound for an authenticated replay only if
+    # it occurs on that same-source parent chain, ending at a Telegram root.
+    current_id = intake.get("parser_output_id")
+    target_id = proposal.get("id")
+    seen: set[int] = set()
+    found_target = False
+    current_proposal: dict[str, Any] | None = None
+    proposal_repository = ParserProposalRepository(conn)
+    while (
+        isinstance(current_id, int)
+        and not isinstance(current_id, bool)
+        and current_id > 0
+        and current_id not in seen
+        and len(seen) < 128
+    ):
+        seen.add(current_id)
+        row = proposal_repository.get_lineage_row_by_id(current_id)
+        if row is None or row["source_public_id"] != source_public_id:
+            raise _managed_source_refusal()
+        if current_proposal is None:
+            current_proposal = row
+        found_target |= current_id == target_id
+        parent_id = row["parent_parser_output_id"]
+        if parent_id is None:
+            if not found_target or row["source_type"] != TELEGRAM_TEXT:
+                raise _managed_source_refusal()
+            assert current_proposal is not None
+            try:
+                _payload, version, content_hash = _proposal_effective_state(conn, current_proposal)
+                if len(seen) > 1:
+                    # Only sealed D1 or AI child edges are supported here.
+                    # An arbitrary same-source parent link is not provenance.
+                    d1_lineage = verify_human_revision_descendant(
+                        conn,
+                        current_proposal,
+                        content_hash=content_hash,
+                        proposal_version=version,
+                    )
+                    if (
+                        d1_lineage is None
+                        and verify_ai_fallback_child(
+                            conn,
+                            current_proposal,
+                            content_hash=content_hash,
+                            proposal_version=version,
+                            require_resolved=False,
+                        )
+                        is None
+                    ):
+                        raise _managed_source_refusal()
+                else:
+                    verify_ai_fallback_child(
+                        conn,
+                        current_proposal,
+                        content_hash=content_hash,
+                        proposal_version=version,
+                        require_resolved=False,
+                    )
+            except (HumanRevisionLineageError, AiFallbackServiceError) as exc:
+                raise _managed_source_refusal() from exc
+            return
+        current_id = parent_id
+    raise _managed_source_refusal()
+
+
+def _fetch_source_bound_proposal(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    proposal_public_id: str,
+) -> dict[str, Any]:
+    """Hide managed proposal existence until its source authority is proven."""
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return _fetch_proposal_by_public_id(conn, proposal_public_id)
+    proposal = ParserProposalRepository(conn).get_by_public_id(proposal_public_id)
+    if proposal is None:
+        raise _managed_source_refusal()
+    _require_managed_proposal_source(conn, workspace, arguments, proposal)
+    return proposal
+
+
 def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
+    optional = frozenset({"token_ttl_seconds"})
+    if _managed_workspace_argument(request.arguments):
+        optional |= _SOURCE_CONTEXT_FIELDS
     _require_exact_arguments(
         request.arguments,
         required=frozenset({"workspace_path", "proposal_public_id"}),
-        optional=frozenset({"token_ttl_seconds"}),
+        optional=optional,
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -3192,41 +3390,41 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
                 errors.EXIT_VALIDATION_REFUSED,
             )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
-        with application_review.review_snapshot(conn):
-            deadline.check("review read")
-            prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
-            proposal, version, content_hash = (
-                prepared.proposal,
-                prepared.version,
-                prepared.content_hash,
-            )
-            callback_tokens_payload: dict[str, dict[str, object]] | None = None
-            parse_status = str(proposal["parse_status"])
-            if parse_status not in TERMINAL_STATUSES:
-                deadline.check("callback token issuance")
-                # get_review is strictly read-only: a missing or unsafe callback
-                # key fails closed instead of creating or repairing the key.
-                key = _load_callback_key(workspace)
-                expiry = int(datetime.now(UTC).timestamp()) + token_ttl
-                callback_tokens_payload = callback_tokens.issue_callback_tokens(
-                    key,
-                    proposal_public_id=proposal["public_id"],
-                    version=version,
-                    content_hash=content_hash,
-                    expiry=expiry,
+    with _operation_context(request, deadline) as (workspace, conn):
+        try:
+            with application_review.review_snapshot(conn):
+                deadline.check("review read")
+                _require_managed_caller_context(workspace, request.arguments)
+                _fetch_source_bound_proposal(conn, workspace, request.arguments, proposal_public_id)
+                prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
+                proposal, version, content_hash = (
+                    prepared.proposal,
+                    prepared.version,
+                    prepared.content_hash,
                 )
+                callback_tokens_payload: dict[str, dict[str, object]] | None = None
+                parse_status = str(proposal["parse_status"])
+                if parse_status not in TERMINAL_STATUSES:
+                    deadline.check("callback token issuance")
+                    # get_review is strictly read-only: a missing or unsafe callback
+                    # key fails closed instead of creating or repairing the key.
+                    key = _load_callback_key(workspace)
+                    expiry = int(datetime.now(UTC).timestamp()) + token_ttl
+                    callback_tokens_payload = callback_tokens.issue_callback_tokens(
+                        key,
+                        proposal_public_id=proposal["public_id"],
+                        version=version,
+                        content_hash=content_hash,
+                        expiry=expiry,
+                    )
 
-            result = application_review.project_proposal_review(conn, prepared)
-            if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
-                callback_tokens_payload = None
-            result["callback_tokens"] = callback_tokens_payload
-            return result, False
-    except application_review.ReviewError as exc:
-        raise _map_review_error(exc) from exc
-    finally:
-        conn.close()
+                result = application_review.project_proposal_review(conn, prepared)
+                if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
+                    callback_tokens_payload = None
+                result["callback_tokens"] = callback_tokens_payload
+                return result, False
+        except application_review.ReviewError as exc:
+            raise _map_review_error(exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -3256,7 +3454,7 @@ _D1_DECISION_FIELDS = frozenset(
 )
 
 
-def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
+def _validate_decision_arguments(request: BridgeRequest, *, managed: bool) -> dict[str, Any]:
     arguments = request.arguments
     proposal_public_id = _require_string(
         arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -3287,7 +3485,9 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
         "callback_expiry": callback_expiry,
     }
     supplied_d1_fields = frozenset(arguments) & _D1_DECISION_FIELDS
-    if supplied_d1_fields and supplied_d1_fields != _D1_DECISION_FIELDS:
+    source_fields = _D1_DECISION_FIELDS - frozenset({"d1_reference_public_id"})
+    allowed = (_D1_DECISION_FIELDS, source_fields) if managed else (_D1_DECISION_FIELDS,)
+    if supplied_d1_fields and supplied_d1_fields not in allowed:
         raise errors.bridge_error(
             errors.ARGUMENTS_REFUSED,
             "D1 decision authority fields must be supplied together.",
@@ -3295,6 +3495,7 @@ def _validate_decision_arguments(request: BridgeRequest) -> dict[str, Any]:
         )
     if supplied_d1_fields:
         context = _require_telegram_human_context(arguments)
+    if supplied_d1_fields == _D1_DECISION_FIELDS:
         reference_public_id = _require_string(
             arguments["d1_reference_public_id"],
             "d1_reference_public_id",
@@ -3883,8 +4084,13 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
         request, canonical_human_action_issuance_key(reference_batch_id)
     )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
+        _require_managed_caller_context(workspace, request.arguments)
+        proposal: dict[str, Any] | None = None
+        if workspace_access.is_fixed_profile_workspace_path(workspace):
+            proposal = _fetch_source_bound_proposal(
+                conn, workspace, request.arguments, proposal_public_id
+            )
         if card_generation_public_id is not None:
             authority = get_human_draft_action_authority(conn, card_generation_public_id)
             if authority is None or authority.action_issue_batch_id != reference_batch_id:
@@ -3894,7 +4100,10 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                     errors.EXIT_AUTHORITY_REFUSED,
                 )
         deadline.check("human action reference key load")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        if proposal is None:
+            proposal = _fetch_source_bound_proposal(
+                conn, workspace, request.arguments, proposal_public_id
+            )
         payload, version, content_hash = _proposal_effective_state(conn, proposal)
         try:
             ai_lineage = verify_ai_fallback_child(
@@ -3986,8 +4195,6 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
             ),
             "final_transaction_created": False,
         }, replay
-    finally:
-        conn.close()
 
 
 def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -4024,8 +4231,7 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
     )
     _require_canonical_idempotency_key(request, canonical_human_action_redemption_key(callback_id))
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("human action redemption key load")
         key = _load_callback_key(workspace)
         deadline.check("human action atomic redemption")
@@ -4145,8 +4351,6 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                 )
             result["human_draft_card"] = _human_draft_result_payload(conn, draft)
         return result, redeemed.idempotent_replay
-    finally:
-        conn.close()
 
 
 def _validate_redeemed_human_action(
@@ -4310,7 +4514,9 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
         required=_DECISION_REQUIRED_FIELDS,
         optional=_D1_DECISION_FIELDS,
     )
-    validated = _validate_decision_arguments(request)
+    validated = _validate_decision_arguments(
+        request, managed=_managed_workspace_argument(request.arguments)
+    )
     # The idempotency key must bind the proposal and action this command
     # authorizes; cross-proposal key reuse is refused before any lookup.
     _require_canonical_idempotency_key(
@@ -4318,10 +4524,12 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
         canonical_decision_key(action=action, proposal_public_id=validated["proposal_public_id"]),
     )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("decision replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
+        _require_managed_caller_context(workspace, request.arguments)
+        proposal = _fetch_source_bound_proposal(
+            conn, workspace, request.arguments, validated["proposal_public_id"]
+        )
         d1_decision_binding = None
         if "d1_reference_public_id" in validated:
             try:
@@ -4423,8 +4631,6 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
             "to_status": result["to_status"],
             "final_transaction_created": bool(result["final_transaction_created"]),
         }, bool(result["idempotent"])
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4434,9 +4640,17 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
 
 def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     _require_exact_arguments(
-        request.arguments, required=_DECISION_REQUIRED_FIELDS | frozenset({"field_updates"})
+        request.arguments,
+        required=_DECISION_REQUIRED_FIELDS | frozenset({"field_updates"}),
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
     )
-    validated = _validate_decision_arguments(request)
+    validated = _validate_decision_arguments(
+        request, managed=_managed_workspace_argument(request.arguments)
+    )
     # The idempotency key must bind the proposal and the exact pre-edit
     # state this edit authorizes, so consecutive edit versions carry
     # distinct identities while identical redeliveries replay.
@@ -4484,10 +4698,12 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
 
     monetary = _MONETARY_FIELDS & frozenset(field_updates)
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("edit replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
+        _require_managed_caller_context(workspace, request.arguments)
+        proposal = _fetch_source_bound_proposal(
+            conn, workspace, request.arguments, validated["proposal_public_id"]
+        )
         assert request.idempotency_key is not None
         replay = _edit_replay_result(
             conn, workspace, request, proposal, validated, deadline, monetary=monetary
@@ -4504,8 +4720,6 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         if monetary:
             return _edit_receipt_monetary(conn, request, proposal, field_updates, current_hash)
         return _edit_completion(conn, request, proposal, field_updates, current_hash)
-    finally:
-        conn.close()
 
 
 def _require_replay_decision_context_matches(
@@ -5280,8 +5494,7 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
         request, canonical_guided_edit_update_key(session_public_id, message_id)
     )
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("guided edit session load")
         session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
         if session is None or session["status"] != "active":
@@ -5397,8 +5610,6 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
             _raise_guided_edit_error(exc)
         result, replay = _pending_guided_update(conn, pending)
         return {**result, "session_public_id": session_public_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5412,8 +5623,7 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
     _require_canonical_idempotency_key(
         request, canonical_guided_edit_complete_key(session_public_id, message_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
         if session is None:
             raise errors.bridge_error(
@@ -5476,8 +5686,6 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
             context=context,
             review_batch_id=review_batch_id,
         ), False
-    finally:
-        conn.close()
 
 
 _HUMAN_DRAFT_FIELDS = frozenset(
@@ -5637,8 +5845,7 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
     field_values = _require_human_draft_field_values(request.arguments["field_values"])
     _require_canonical_idempotency_key(request, canonical_human_draft_apply_key(operation_id))
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft whole-card apply")
 
         def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
@@ -5678,8 +5885,6 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
                 errors.EXIT_AUTHORITY_REFUSED,
             ) from exc
         return _human_draft_result_payload(conn, result), result.idempotent_replay
-    finally:
-        conn.close()
 
 
 def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5839,8 +6044,7 @@ def handle_begin_human_draft_card_delivery(
     if target is not None:
         target = _require_string(target, "outbound_target_message_id", max_length=200)
     _require_canonical_idempotency_key(request, canonical_human_draft_delivery_key(attempt_id))
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft delivery attempt")
         changes_before = conn.total_changes
         try:
@@ -5858,8 +6062,6 @@ def handle_begin_human_draft_card_delivery(
             _raise_human_draft_error(exc)
         replay = conn.total_changes == changes_before
         return {"attempt_public_id": result_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_record_human_draft_card_delivery_outcome(
@@ -5900,8 +6102,7 @@ def handle_record_human_draft_card_delivery_outcome(
     _require_canonical_idempotency_key(
         request, canonical_human_draft_observation_key(observation_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft delivery outcome")
         changes_before = conn.total_changes
         try:
@@ -5920,8 +6121,6 @@ def handle_record_human_draft_card_delivery_outcome(
             _raise_human_draft_error(exc)
         replay = conn.total_changes == changes_before
         return {"observation_public_id": result_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5956,8 +6155,7 @@ def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) 
     )
     reason = _require_string(request.arguments["reason"], "reason", max_length=32)
     _require_canonical_idempotency_key(request, canonical_human_draft_reissue_key(recovery_id))
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft card reissue")
         try:
             result = reissue_human_draft_card(
@@ -5974,8 +6172,6 @@ def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) 
         except HumanDraftError as exc:
             _raise_human_draft_error(exc)
         return _human_draft_result_payload(conn, result), result.idempotent_replay
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7084,6 +7280,19 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
             envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
             envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_CAPTURE_INTERACTION,
+            envelope.COMMAND_GET_REVIEW,
+            envelope.COMMAND_CONFIRM,
+            envelope.COMMAND_EDIT,
+            envelope.COMMAND_REJECT,
+            envelope.COMMAND_ISSUE_HUMAN_ACTIONS,
+            envelope.COMMAND_REDEEM_HUMAN_ACTION,
+            envelope.COMMAND_APPLY_GUIDED_EDIT_UPDATE,
+            envelope.COMMAND_COMPLETE_GUIDED_EDIT,
+            envelope.COMMAND_APPLY_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_BEGIN_HUMAN_DRAFT_CARD_DELIVERY,
+            envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
+            envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD,
         }:
             raise errors.bridge_error(
                 errors.STAGING_REFUSED,
