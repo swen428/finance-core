@@ -2897,8 +2897,7 @@ def handle_register_ai_model_compatibility_receipt_v2(
     _require_canonical_idempotency_key(
         request, canonical_register_ai_model_receipt_v2_key(projection)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("AI model compatibility receipt registration")
         try:
             result = register_ai_model_compatibility_receipt_v2(
@@ -2910,8 +2909,6 @@ def handle_register_ai_model_compatibility_receipt_v2(
         except ModelCompatibilityError as exc:
             raise _map_model_compatibility_error(exc) from exc
         return result, bool(result["idempotent_replay"])
-    finally:
-        conn.close()
 
 
 def handle_verify_ai_model_compatibility_case_v2(
@@ -2963,8 +2960,7 @@ def handle_prepare_ai_fallback_v2(request: BridgeRequest, deadline: Deadline) ->
     _require_canonical_idempotency_key(
         request, canonical_prepare_ai_fallback_v2_key(intake_public_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("AI fallback v2 preparation")
         try:
             result = prepare_ai_fallback_v2(
@@ -2976,8 +2972,6 @@ def handle_prepare_ai_fallback_v2(request: BridgeRequest, deadline: Deadline) ->
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, result["claim_disposition"] == "do_not_claim"
-    finally:
-        conn.close()
 
 
 def handle_claim_ai_fallback_invocation_v2(
@@ -2993,16 +2987,13 @@ def handle_claim_ai_fallback_invocation_v2(
     _require_canonical_idempotency_key(
         request, canonical_claim_ai_fallback_v2_key(attempt_public_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("AI fallback v2 invocation claim")
         try:
             result = claim_ai_fallback_invocation_v2(conn, attempt_public_id=attempt_public_id)
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, result["invocation_disposition"] == "do_not_invoke"
-    finally:
-        conn.close()
 
 
 _AI_RESULT_OPTIONAL_ARGUMENTS = frozenset(
@@ -3049,8 +3040,7 @@ def handle_record_ai_fallback_result_v2(
     _require_canonical_idempotency_key(
         request, canonical_record_ai_fallback_v2_key(attempt_public_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("AI fallback v2 result")
         try:
             result, replay = record_ai_fallback_result_v2(
@@ -3066,8 +3056,6 @@ def handle_record_ai_fallback_result_v2(
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, replay
-    finally:
-        conn.close()
 
 
 def handle_get_ai_processing_status_v2(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3099,8 +3087,7 @@ def handle_prepare_ai_fallback(request: BridgeRequest, deadline: Deadline) -> Ha
         request.arguments["intake_public_id"], "intake_public_id", max_length=200
     )
     _require_canonical_idempotency_key(request, canonical_prepare_ai_fallback_key(intake_public_id))
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("AI fallback preparation")
         try:
             result = prepare_ai_fallback(
@@ -3111,8 +3098,6 @@ def handle_prepare_ai_fallback(request: BridgeRequest, deadline: Deadline) -> Ha
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, result["claim_disposition"] == "do_not_claim"
-    finally:
-        conn.close()
 
 
 def handle_claim_ai_fallback_invocation(
@@ -3126,8 +3111,7 @@ def handle_claim_ai_fallback_invocation(
         request.arguments["attempt_public_id"], "attempt_public_id", max_length=100
     )
     _require_canonical_idempotency_key(request, canonical_claim_ai_fallback_key(attempt_public_id))
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("AI fallback invocation claim")
         try:
             result = claim_ai_fallback_invocation(
@@ -3137,8 +3121,6 @@ def handle_claim_ai_fallback_invocation(
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, result["invocation_disposition"] == "do_not_invoke"
-    finally:
-        conn.close()
 
 
 def handle_record_ai_fallback_result(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3179,8 +3161,7 @@ def handle_record_ai_fallback_result(request: BridgeRequest, deadline: Deadline)
         request.arguments["transport_outcome"], "transport_outcome", max_length=64
     )
     _require_canonical_idempotency_key(request, canonical_record_ai_fallback_key(attempt_public_id))
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("AI fallback result")
         try:
             result, replay = record_ai_fallback_result_with_disposition(
@@ -3196,8 +3177,6 @@ def handle_record_ai_fallback_result(request: BridgeRequest, deadline: Deadline)
         except AiFallbackServiceError as exc:
             raise _map_ai_fallback_error(exc) from exc
         return result, replay
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7404,6 +7383,13 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_GET_FINALIZATION_SNAPSHOT_REVIEW,
             envelope.COMMAND_AUTHORIZE_FINALIZATION,
             envelope.COMMAND_APPLY_FACT_SET,
+            envelope.COMMAND_REGISTER_AI_MODEL_COMPATIBILITY_RECEIPT_V2,
+            envelope.COMMAND_PREPARE_AI_FALLBACK_V2,
+            envelope.COMMAND_CLAIM_AI_FALLBACK_INVOCATION_V2,
+            envelope.COMMAND_RECORD_AI_FALLBACK_RESULT_V2,
+            envelope.COMMAND_PREPARE_AI_FALLBACK,
+            envelope.COMMAND_CLAIM_AI_FALLBACK_INVOCATION,
+            envelope.COMMAND_RECORD_AI_FALLBACK_RESULT,
         }:
             raise errors.bridge_error(
                 errors.STAGING_REFUSED,

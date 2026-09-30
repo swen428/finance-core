@@ -102,7 +102,8 @@ Nine posting/finalization commands also use short managed sessions:
 `prepare_posting_review`, `issue_posting_review_actions`, `confirm_and_post`,
 `resume_posting`, `finalize`, `prepare_receipt_completion`,
 `get_finalization_snapshot_review`, `authorize_finalization`, and `apply_fact_set`.
-This makes 29 admitted and 13 refused database commands, plus the unchanged
+Together with the seven AI bookkeeping entries below, this makes 36 admitted
+and 6 refused database commands, plus the unchanged
 workspace-free compatibility verifier. Each retains its existing identity,
 signature, replay and financial authority
 checks and service-owned transactions. The session remains held through query
@@ -145,6 +146,27 @@ snapshot-hash authorization, version/conflict or replay checks. Receipt test
 fixtures may prepopulate existing evidence because managed capture/propose
 remains outside this integration; their success cannot certify the complete
 receipt acquisition path or attachment backup completeness.
+
+Seven trusted machine bookkeeping commands use the same short sessions:
+`prepare_ai_fallback`, `claim_ai_fallback_invocation`,
+`record_ai_fallback_result`, `register_ai_model_compatibility_receipt_v2`,
+`prepare_ai_fallback_v2`, `claim_ai_fallback_invocation_v2`, and
+`record_ai_fallback_result_v2`. Their existing source, current-parent, request,
+claim, result, compatibility-receipt and replay checks remain authoritative.
+Attempt/claim IDs and hashes identify durable machine work; they do not
+authenticate a Telegram user or constitute human authorization. Compatibility
+registration only revalidates supplied harness observations and records the
+existing immutable receipt; it does not invoke a model or activate a config.
+
+Prepare, claim and result each open and close a separate session. A model wait
+belongs between those closed Core requests, so it holds no Core database gate.
+Result recording creates pending proposals or failure evidence; it creates no
+confirmation or final financial fact. Existing v2 missing-receipt refusal may
+commit its terminal admission-denial evidence, and unsupported supplied results
+may commit a non-child refusal; session cleanup preserves those intentional
+service-owned outcomes and their terminal replay. Ordinary staging shapes and
+provider/model/runtime configuration remain unchanged. This component proof
+does not establish the later installed Bridge/Host lease integration.
 
 `get_ai_processing_status_v2` remains in that refused group because its existing
 request does not carry the authenticated Telegram context required to isolate
