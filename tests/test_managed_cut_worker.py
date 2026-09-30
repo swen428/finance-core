@@ -44,9 +44,7 @@ _LIMITS = {
 def synthetic_profile(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[tuple[Path, Path, ManagedStagingProfile]]:
-    support, profile_root, blank = _blank_profile(
-        tmp_path, monkeypatch, profile_id="cut-worker"
-    )
+    support, profile_root, blank = _blank_profile(tmp_path, monkeypatch, profile_id="cut-worker")
     managed = bootstrap_registered_staging(blank)
     try:
         yield support, profile_root, managed
@@ -190,8 +188,9 @@ def _start_worker(
     child_control.close()
     for fd in child_fds:
         os.close(fd)
-    return _WorkerHarness(process, parent_control, stage, gate_fd, profile_fd, stage_fd,
-                          child_fds), _request(profile_root, selected_cut)
+    return _WorkerHarness(
+        process, parent_control, stage, gate_fd, profile_fd, stage_fd, child_fds
+    ), _request(profile_root, selected_cut)
 
 
 def _read_frame(control: socket.socket, timeout: float = 10.0) -> dict[str, object]:
@@ -246,8 +245,10 @@ def _seed_large_synthetic_rows(managed: ManagedStagingProfile, *, count: int = 7
             "INSERT INTO raw_intake_records "
             "(public_id, source_type, source_channel, raw_input, received_at) "
             "VALUES (?, 'manual_entry', 'manual', ?, '2026-01-01T00:00:00Z')",
-            ((f"synthetic-cut-payload-{index}", "synthetic-cut-payload" * 2048)
-             for index in range(count)),
+            (
+                (f"synthetic-cut-payload-{index}", "synthetic-cut-payload" * 2048)
+                for index in range(count)
+            ),
         )
         connection.commit()
 
@@ -336,12 +337,16 @@ def test_fd3_eof_during_backup_aborts_real_worker_and_child_holds_ex_until_close
     try:
         harness.control.sendall(_request_line(request))
         assert _read_frame(harness.control)["type"] == "ready"
-        harness.control.sendall(_request_line({
-            "version": "delegated-cut-worker-v1",
-            "type": "go",
-            "cut_id": request["cut_id"],
-            "worker_id": request["worker_id"],
-        }))
+        harness.control.sendall(
+            _request_line(
+                {
+                    "version": "delegated-cut-worker-v1",
+                    "type": "go",
+                    "cut_id": request["cut_id"],
+                    "worker_id": request["worker_id"],
+                }
+            )
+        )
 
         output = harness.stage / "core.sqlite"
         deadline = time.monotonic() + 15.0
@@ -379,18 +384,20 @@ def test_success_frame_precedes_late_child_close_and_keeps_inherited_exclusion(
     synthetic_profile: tuple[Path, Path, ManagedStagingProfile],
 ) -> None:
     support, profile_root, managed = synthetic_profile
-    harness, request = _start_worker(
-        support, profile_root, managed, hold_after_terminal_ms=700
-    )
+    harness, request = _start_worker(support, profile_root, managed, hold_after_terminal_ms=700)
     try:
         harness.control.sendall(_request_line(request))
         assert _read_frame(harness.control)["type"] == "ready"
-        harness.control.sendall(_request_line({
-            "version": "delegated-cut-worker-v1",
-            "type": "go",
-            "cut_id": request["cut_id"],
-            "worker_id": request["worker_id"],
-        }))
+        harness.control.sendall(
+            _request_line(
+                {
+                    "version": "delegated-cut-worker-v1",
+                    "type": "go",
+                    "cut_id": request["cut_id"],
+                    "worker_id": request["worker_id"],
+                }
+            )
+        )
         terminal = _read_frame(harness.control)
         assert terminal["type"] == "staged"
         assert harness.process.poll() is None, (
