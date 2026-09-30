@@ -56,27 +56,35 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
             return 0
-        with open_local_authority_connection() as conn:
-            authority = LocalApprovalAuthority()
-            service = CorrectionService(conn, D2OriginalSourceVerifier(), authority)
-            if args.command == "show":
-                _emit(asdict(service.lookup(args.transaction_id)))
-            elif args.command == "preview":
-                changes = {
-                    name: value
-                    for name in ("amount", "currency", "date", "merchant")
-                    if (value := getattr(args, name)) is not None
-                }
-                _emit(asdict(service.preview(args.transaction_id, changes, args.reason)))
-            else:
+        authority = LocalApprovalAuthority()
+        if args.command == "confirm":
+            with open_local_authority_connection() as conn:
+                service = CorrectionService(conn, D2OriginalSourceVerifier(), authority)
                 committed = service.recover(args.plan_id)
                 if committed is not None:
-                    _emit(asdict(committed))
-                    return 0
-                plan = service.read_plan(args.plan_id)
+                    response = asdict(committed)
+                else:
+                    plan = service.read_plan(args.plan_id)
+            if committed is None:
+                # No connection or profile gate remains held during human input.
                 signed = authority.sign_with_terminal(plan)
-                _emit(asdict(service.apply(args.plan_id, signed)))
-            return 0
+                with open_local_authority_connection() as conn:
+                    service = CorrectionService(conn, D2OriginalSourceVerifier(), authority)
+                    response = asdict(service.apply(args.plan_id, signed))
+        else:
+            with open_local_authority_connection() as conn:
+                service = CorrectionService(conn, D2OriginalSourceVerifier(), authority)
+                if args.command == "show":
+                    response = asdict(service.lookup(args.transaction_id))
+                else:
+                    changes = {
+                        name: value
+                        for name in ("amount", "currency", "date", "merchant")
+                        if (value := getattr(args, name)) is not None
+                    }
+                    response = asdict(service.preview(args.transaction_id, changes, args.reason))
+        _emit(response)
+        return 0
     except (ValueError, RuntimeError, sqlite3.Error, OSError) as exc:
         print(f"correction refused: {exc}", file=sys.stderr)
         return 2
