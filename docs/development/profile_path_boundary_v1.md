@@ -98,7 +98,13 @@ also use short managed sessions. The thirteen are `capture_interaction`,
 `redeem_human_action`, `apply_guided_edit_update`, `complete_guided_edit`,
 `apply_human_draft_card`, `begin_human_draft_card_delivery`,
 `record_human_draft_card_delivery_outcome`, and `reissue_human_draft_card`.
-Each retains its existing identity, signature, replay and financial authority
+Nine posting/finalization commands also use short managed sessions:
+`prepare_posting_review`, `issue_posting_review_actions`, `confirm_and_post`,
+`resume_posting`, `finalize`, `prepare_receipt_completion`,
+`get_finalization_snapshot_review`, `authorize_finalization`, and `apply_fact_set`.
+This makes 29 admitted and 13 refused database commands, plus the unchanged
+workspace-free compatibility verifier. Each retains its existing identity,
+signature, replay and financial authority
 checks and service-owned transactions. The session remains held through query
 or local transition completion and actual connection close. Draft delivery
 commands only record local attempt/failure/unknown state; they do not send or
@@ -120,6 +126,25 @@ the update and pass its context through the Bridge. Existing Bridge review and
 decision calls omit that complete context, so they refuse on managed profiles
 until the later caller-integration work is delivered. The ordinary temporary
 staging request format remains unchanged.
+
+The nine posting/finalization entries also require the complete four-field
+context on managed profiles. Before amounts, tokens, snapshots, financial writes
+or any replay result, Core binds the persisted target to the same Telegram raw
+intake, frozen context and current proposal lineage. Posting card/review/reference/
+attempt locators select a durable target; the existing callback, delivery,
+confirmation and posting services still decide financial authority. The five
+finalization commands retain their original ordinary-staging request shape;
+managed `apply_fact_set` verifies source before reading its command file.
+
+The B source guard supports text and image receipts, with read-only checks of
+existing attachment/OCR source links, hashes and paths and sealed D1/AI/receipt
+revision provenance. It reads no original image bytes, performs no OCR and
+creates or repairs no evidence. A's review/decision guard stays text-only.
+The managed source guard does not replace receipt conversion, human fact-set,
+snapshot-hash authorization, version/conflict or replay checks. Receipt test
+fixtures may prepopulate existing evidence because managed capture/propose
+remains outside this integration; their success cannot certify the complete
+receipt acquisition path or attachment backup completeness.
 
 `get_ai_processing_status_v2` remains in that refused group because its existing
 request does not carry the authenticated Telegram context required to isolate

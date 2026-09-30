@@ -99,6 +99,10 @@ from finance_core.openclaw_staging_bridge import (
     workspace_access,
 )
 from finance_core.openclaw_staging_bridge.envelope import BridgeRequest
+from finance_core.openclaw_staging_bridge.managed_proposal_source import (
+    ManagedSourceUnavailable,
+    require_managed_proposal_source,
+)
 from finance_core.openclaw_staging_bridge.ocr_boundary import build_ocr_engine
 from finance_core.openclaw_staging_bridge.receipt_handoff import (
     publish_receipt_handoff,
@@ -3364,6 +3368,56 @@ def _fetch_source_bound_proposal(
     return proposal
 
 
+def _fetch_b_source_bound_proposal(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    proposal_public_id: str,
+) -> dict[str, Any]:
+    """Hide a B target and its business details until source proof succeeds."""
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return _fetch_proposal_by_public_id(conn, proposal_public_id)
+    _require_managed_caller_context(workspace, arguments)
+    proposal = ParserProposalRepository(conn).get_by_public_id(proposal_public_id)
+    if proposal is None:
+        raise _managed_source_refusal()
+    try:
+        require_managed_proposal_source(
+            conn,
+            context=_require_telegram_human_context(arguments),
+            proposal=proposal,
+            supported_source_types=frozenset({TELEGRAM_TEXT, TELEGRAM_PHOTO_SOURCE_TYPE}),
+        )
+    except ManagedSourceUnavailable as exc:
+        raise _managed_source_refusal() from exc
+    return proposal
+
+
+def _require_b_posting_source(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    *,
+    source_kind: str,
+    source_identity: str,
+    context: human_actions.HumanActionContext,
+) -> None:
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return
+    from finance_core import posting_authority
+
+    try:
+        target = posting_authority.resolve_posting_source_proposal(
+            conn,
+            source_kind=source_kind,
+            source_identity=source_identity,
+            context=context,
+        )
+    except posting_authority.PostingAuthorityError as exc:
+        raise _managed_source_refusal() from exc
+    _fetch_b_source_bound_proposal(conn, workspace, arguments, target)
+
+
 def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     optional = frozenset({"token_ttl_seconds"})
     if _managed_workspace_argument(request.arguments):
@@ -3805,10 +3859,17 @@ def handle_prepare_posting_review(request: BridgeRequest, deadline: Deadline) ->
         )
     )
     _require_canonical_idempotency_key(request, canonical_key)
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         from finance_core import posting_authority
 
+        _require_b_posting_source(
+            conn,
+            workspace,
+            request.arguments,
+            source_kind="card" if has_card else "initial_proposal",
+            source_identity=card_generation_public_id or proposal_public_id or "",
+            context=context,
+        )
         deadline.check("D2 posting review preparation")
         try:
             prepared = posting_authority.prepare_posting_review(
@@ -3837,8 +3898,6 @@ def handle_prepare_posting_review(request: BridgeRequest, deadline: Deadline) ->
             "expires_at": prepared.expires_at,
             "final_transaction_created": False,
         }, prepared.idempotent
-    finally:
-        conn.close()
 
 
 def handle_issue_posting_review_actions(
@@ -3866,10 +3925,17 @@ def handle_issue_posting_review_actions(
     _require_canonical_idempotency_key(
         request, canonical_issue_posting_review_actions_key(review_public_id)
     )
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         from finance_core import posting_authority
 
+        _require_b_posting_source(
+            conn,
+            workspace,
+            request.arguments,
+            source_kind="review",
+            source_identity=review_public_id,
+            context=context,
+        )
         key = _load_callback_key(workspace)
         deadline.check("D2 Confirm action issuance")
         try:
@@ -3904,8 +3970,6 @@ def handle_issue_posting_review_actions(
             "delivery_attempt_nonce": manifest.delivery_attempt_nonce,
             "final_transaction_created": False,
         }, manifest.idempotent
-    finally:
-        conn.close()
 
 
 def handle_confirm_and_post(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3933,10 +3997,17 @@ def handle_confirm_and_post(request: BridgeRequest, deadline: Deadline) -> Handl
         request.arguments["callback_message_id"], "callback_message_id", maximum=2**63 - 1
     )
     _require_canonical_idempotency_key(request, canonical_confirm_and_post_key(callback_id))
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         from finance_core import posting_authority
 
+        _require_b_posting_source(
+            conn,
+            workspace,
+            request.arguments,
+            source_kind="reference",
+            source_identity=reference,
+            context=context,
+        )
         key = _load_callback_key(workspace)
         try:
             prior = posting_authority.get_status_by_reference(
@@ -3958,8 +4029,6 @@ def handle_confirm_and_post(request: BridgeRequest, deadline: Deadline) -> Handl
         except sqlite3.OperationalError as exc:
             _raise_posting_sqlite_error(exc)
         return _posting_status_payload(status), prior.state != "awaiting_confirmation"
-    finally:
-        conn.close()
 
 
 def handle_resume_posting(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3981,10 +4050,17 @@ def handle_resume_posting(request: BridgeRequest, deadline: Deadline) -> Handler
     )
     context = _require_telegram_human_context(request.arguments)
     _require_canonical_idempotency_key(request, canonical_resume_posting_key(attempt_public_id))
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         from finance_core import posting_authority
 
+        _require_b_posting_source(
+            conn,
+            workspace,
+            request.arguments,
+            source_kind="attempt",
+            source_identity=attempt_public_id,
+            context=context,
+        )
         deadline.check("D2 posting resume")
         try:
             status = posting_authority.resume_posting(
@@ -3997,8 +4073,6 @@ def handle_resume_posting(request: BridgeRequest, deadline: Deadline) -> Handler
         except sqlite3.OperationalError as exc:
             _raise_posting_sqlite_error(exc)
         return _posting_status_payload(status), False
-    finally:
-        conn.close()
 
 
 def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -6224,7 +6298,13 @@ def handle_prepare_receipt_completion(request: BridgeRequest, deadline: Deadline
     personal-only guards as receipt finalization.
     """
     _require_exact_arguments(
-        request.arguments, required=_PREPARE_RECEIPT_COMPLETION_REQUIRED_FIELDS
+        request.arguments,
+        required=_PREPARE_RECEIPT_COMPLETION_REQUIRED_FIELDS,
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -6240,10 +6320,11 @@ def handle_prepare_receipt_completion(request: BridgeRequest, deadline: Deadline
         request, canonical_prepare_receipt_completion_key(proposal_public_id)
     )
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("receipt preparation replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        proposal = _fetch_b_source_bound_proposal(
+            conn, workspace, request.arguments, proposal_public_id
+        )
         payload, version, durable_hash = _proposal_effective_state(conn, proposal)
         if version != proposal_version:
             raise errors.bridge_error(
@@ -6284,8 +6365,6 @@ def handle_prepare_receipt_completion(request: BridgeRequest, deadline: Deadline
             "conversion_result_hash": conversion_result_hash,
             "content_hash": content_hash,
         }, idempotent_replay
-    finally:
-        conn.close()
 
 
 def handle_get_finalization_snapshot_review(
@@ -6298,7 +6377,13 @@ def handle_get_finalization_snapshot_review(
     finalize a receipt, including when an authorization already exists.
     """
     _require_exact_arguments(
-        request.arguments, required=_FINALIZATION_SNAPSHOT_REVIEW_REQUIRED_FIELDS
+        request.arguments,
+        required=_FINALIZATION_SNAPSHOT_REVIEW_REQUIRED_FIELDS,
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -6312,10 +6397,11 @@ def handle_get_finalization_snapshot_review(
         request, canonical_finalization_snapshot_review_key(proposal_public_id)
     )
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("snapshot review replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        proposal = _fetch_b_source_bound_proposal(
+            conn, workspace, request.arguments, proposal_public_id
+        )
         if str(proposal["parse_status"]) != CONFIRMED:
             raise _finalization_refused(
                 "not_confirmed", "Only confirmed receipt proposals can be reviewed."
@@ -6371,8 +6457,6 @@ def handle_get_finalization_snapshot_review(
             self_participant_id=self_participant_id,
             prepared=prepared,
         ), prepared.idempotent_replay
-    finally:
-        conn.close()
 
 
 def handle_finalize(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -6390,7 +6474,12 @@ def handle_finalize(request: BridgeRequest, deadline: Deadline) -> HandlerResult
     _require_exact_arguments(
         request.arguments,
         required=_FINALIZE_REQUIRED_FIELDS,
-        optional=_FINALIZE_OPTIONAL_FIELDS,
+        optional=_FINALIZE_OPTIONAL_FIELDS
+        | (
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
     )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
@@ -6411,10 +6500,11 @@ def handle_finalize(request: BridgeRequest, deadline: Deadline) -> HandlerResult
         )
     _require_canonical_idempotency_key(request, canonical_finalize_key(proposal_public_id))
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("finalize replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        proposal = _fetch_b_source_bound_proposal(
+            conn, workspace, request.arguments, proposal_public_id
+        )
         payload, version, durable_hash = _proposal_effective_state(conn, proposal)
         if version != proposal_version:
             raise errors.bridge_error(
@@ -6448,8 +6538,6 @@ def handle_finalize(request: BridgeRequest, deadline: Deadline) -> HandlerResult
                 "unsupported_path", "receipt-only finalize supports receipt proposals only."
             )
         return _finalize_text(conn, proposal, content_hash)
-    finally:
-        conn.close()
 
 
 def _finalize_text(
@@ -6895,7 +6983,15 @@ def handle_authorize_finalization(request: BridgeRequest, deadline: Deadline) ->
     mirroring the proven B5.1 runner authorize pattern.  No callback token
     action is involved.
     """
-    _require_exact_arguments(request.arguments, required=_AUTHORIZE_FINALIZATION_REQUIRED_FIELDS)
+    _require_exact_arguments(
+        request.arguments,
+        required=_AUTHORIZE_FINALIZATION_REQUIRED_FIELDS,
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
+    )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
     )
@@ -6909,10 +7005,11 @@ def handle_authorize_finalization(request: BridgeRequest, deadline: Deadline) ->
         request, canonical_authorize_finalization_key(proposal_public_id)
     )
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("authorize replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        proposal = _fetch_b_source_bound_proposal(
+            conn, workspace, request.arguments, proposal_public_id
+        )
         if str(proposal["parse_status"]) != CONFIRMED:
             raise _finalization_refused(
                 "not_confirmed", "Only confirmed proposals can be authorized for finalization."
@@ -7025,8 +7122,6 @@ def handle_authorize_finalization(request: BridgeRequest, deadline: Deadline) ->
             "calculation_snapshot_id": prepared.calculation_snapshot_id,
             "calculation_snapshot_hash": prepared.calculation_snapshot_hash,
         }, False
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7043,7 +7138,15 @@ def handle_apply_fact_set(request: BridgeRequest, deadline: Deadline) -> Handler
     structural personal-only bindings and delegates all monetary validation
     to the existing guarded IAF boundary unchanged.
     """
-    _require_exact_arguments(request.arguments, required=_APPLY_FACT_SET_REQUIRED_FIELDS)
+    _require_exact_arguments(
+        request.arguments,
+        required=_APPLY_FACT_SET_REQUIRED_FIELDS,
+        optional=(
+            _SOURCE_CONTEXT_FIELDS - frozenset({"operator_actor_id"})
+            if _managed_workspace_argument(request.arguments)
+            else frozenset()
+        ),
+    )
     proposal_public_id = _require_string(
         request.arguments["proposal_public_id"], "proposal_public_id", max_length=200
     )
@@ -7055,10 +7158,11 @@ def handle_apply_fact_set(request: BridgeRequest, deadline: Deadline) -> Handler
     )
     _require_canonical_idempotency_key(request, canonical_apply_fact_set_key(proposal_public_id))
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("apply_fact_set replay reconstruction")
-        proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+        proposal = _fetch_b_source_bound_proposal(
+            conn, workspace, request.arguments, proposal_public_id
+        )
         if str(proposal["parse_status"]) != CONFIRMED:
             raise _finalization_refused(
                 "not_confirmed", "Fact sets apply only to confirmed proposals."
@@ -7171,8 +7275,6 @@ def handle_apply_fact_set(request: BridgeRequest, deadline: Deadline) -> Handler
             "item_count": result.item_count,
             "allocation_count": result.allocation_count,
         }, bool(result.idempotent)
-    finally:
-        conn.close()
 
 
 def _require_personal_fact_set_bindings(
@@ -7293,6 +7395,15 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_BEGIN_HUMAN_DRAFT_CARD_DELIVERY,
             envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
             envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_PREPARE_POSTING_REVIEW,
+            envelope.COMMAND_ISSUE_POSTING_REVIEW_ACTIONS,
+            envelope.COMMAND_CONFIRM_AND_POST,
+            envelope.COMMAND_RESUME_POSTING,
+            envelope.COMMAND_FINALIZE,
+            envelope.COMMAND_PREPARE_RECEIPT_COMPLETION,
+            envelope.COMMAND_GET_FINALIZATION_SNAPSHOT_REVIEW,
+            envelope.COMMAND_AUTHORIZE_FINALIZATION,
+            envelope.COMMAND_APPLY_FACT_SET,
         }:
             raise errors.bridge_error(
                 errors.STAGING_REFUSED,

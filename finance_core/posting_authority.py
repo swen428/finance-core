@@ -314,6 +314,105 @@ def _review_row(conn: sqlite3.Connection, review_public_id: str) -> sqlite3.Row:
     return row
 
 
+def resolve_posting_source_proposal(
+    conn: sqlite3.Connection,
+    *,
+    source_kind: str,
+    source_identity: str,
+    context: HumanActionContext,
+) -> str:
+    """Select a persisted D2 decision target for read-only source admission.
+
+    This locator confers no posting authority. The service still verifies the
+    full card, callback, delivery, decision and replay chain in its transaction.
+    """
+    _require_context(context)
+    if source_kind == "initial_proposal":
+        row = conn.execute(
+            "SELECT public_id AS proposal_public_id FROM parser_outputs WHERE public_id = ?",
+            (source_identity,),
+        ).fetchone()
+    elif source_kind == "card":
+        row = conn.execute(
+            """
+            SELECT proposals.public_id AS proposal_public_id
+            FROM parser_human_draft_cards AS cards
+            JOIN parser_outputs AS proposals
+              ON proposals.id = cards.decision_target_parser_output_id
+            WHERE cards.card_generation_public_id = ?
+              AND cards.authenticated_actor_id = ?
+              AND cards.telegram_account_id = ?
+              AND cards.telegram_conversation_id = ?
+              AND cards.conversation_binding_id = ?
+            """,
+            (
+                source_identity,
+                context.actor_id,
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
+            ),
+        ).fetchone()
+    elif source_kind in {"review", "attempt"}:
+        join = (
+            ""
+            if source_kind == "review"
+            else "JOIN d2_posting_attempts AS attempts "
+            "ON attempts.review_public_id = reviews.review_public_id "
+        )
+        selector = (
+            "reviews.review_public_id" if source_kind == "review" else "attempts.attempt_public_id"
+        )
+        row = conn.execute(
+            "SELECT proposals.public_id AS proposal_public_id "
+            "FROM d2_posting_reviews AS reviews "
+            + join
+            + "JOIN parser_outputs AS proposals ON proposals.id = reviews.parser_output_id "
+            + f"WHERE {selector} = ? "
+            + "AND reviews.authenticated_actor_id = ? "
+            "AND reviews.telegram_account_id = ? "
+            "AND reviews.telegram_conversation_id = ? "
+            "AND reviews.conversation_binding_id = ?",
+            (
+                source_identity,
+                context.actor_id,
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
+            ),
+        ).fetchone()
+    elif source_kind == "reference":
+        row = conn.execute(
+            """
+            SELECT proposals.public_id AS proposal_public_id
+            FROM openclaw_human_action_references AS refs
+            JOIN d2_posting_review_action_bindings AS bindings ON bindings.reference_id = refs.id
+            JOIN d2_posting_reviews AS reviews
+              ON reviews.review_public_id = bindings.review_public_id
+            JOIN parser_outputs AS proposals ON proposals.id = reviews.parser_output_id
+            WHERE refs.reference_sha256 = ? AND refs.action = 'confirm'
+              AND refs.authenticated_actor_id = ? AND refs.channel_account_id = ?
+              AND refs.channel_conversation_id = ? AND refs.conversation_binding_id = ?
+              AND reviews.authenticated_actor_id = refs.authenticated_actor_id
+              AND reviews.telegram_account_id = refs.channel_account_id
+              AND reviews.telegram_conversation_id = refs.channel_conversation_id
+              AND reviews.conversation_binding_id = refs.conversation_binding_id
+            """,
+            (
+                _sha256_text(source_identity),
+                context.actor_id,
+                context.account_id,
+                context.conversation_id,
+                context.binding_id,
+            ),
+        ).fetchone()
+    else:
+        raise PostingAuthorityError("posting source kind is invalid")
+    if row is None:
+        raise PostingAuthorityError("posting source is unavailable")
+    return str(row["proposal_public_id"])
+
+
 def _projection_for_review(
     conn: sqlite3.Connection,
     *,
@@ -3090,5 +3189,6 @@ __all__ = [
     "prepare_posting_review",
     "record_posting_review_delivery",
     "replace_posting_review_delivery",
+    "resolve_posting_source_proposal",
     "resume_posting",
 ]
