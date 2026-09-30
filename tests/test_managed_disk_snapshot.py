@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -11,6 +12,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator
 from contextlib import closing
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Literal
 
@@ -22,7 +24,11 @@ from finance_core.intake.raw_text_repository import create_raw_intake_record
 from finance_core.managed_disk_snapshot import (
     DiskSnapshotError,
     DiskSnapshotLimits,
+    DiskSnapshotReceipt,
+    StagedDiskSnapshot,
     create_disk_snapshot,
+    stage_disk_snapshot,
+    verify_staged_disk_snapshot,
 )
 from finance_core.parser_proposals.receipt_item_allocation_facts import (
     supersede_receipt_item_allocation_facts,
@@ -182,6 +188,260 @@ def test_wal_snapshot_preserves_rowid_and_returns_closed_delete_file(
     assert source.execute("SELECT rowid, label FROM snapshot_rows").fetchall() == [
         (37, "committed-in-wal")
     ]
+
+
+def test_stage_defers_child_readback_and_verify_can_run_after_source_close(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, database = wal_source
+    wal_path = Path(f"{database}-wal")
+    assert wal_path.is_file() and wal_path.stat().st_size > 0
+    source_before = _table_contents(source)
+    source_identity = (database.stat().st_dev, database.stat().st_ino)
+    wal_bytes = wal_path.read_bytes()
+    stage = _private_stage(tmp_path)
+
+    def reject_child_readback(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("stage_disk_snapshot must not start a readback child")
+
+    with monkeypatch.context() as stage_only:
+        stage_only.setattr(disk_snapshot.subprocess, "run", reject_child_readback)
+        staged = stage_disk_snapshot(
+            source,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert isinstance(staged, StagedDiskSnapshot)
+    assert not isinstance(staged, DiskSnapshotReceipt)
+    assert not hasattr(staged, "schema_object_count")
+    assert staged.output == str(stage / "core.sqlite")
+    output = Path(staged.output)
+    output_info = output.stat()
+    stage_info = stage.stat()
+    assert (staged.output_dev, staged.output_ino) == (output_info.st_dev, output_info.st_ino)
+    assert (staged.stage_dev, staged.stage_ino) == (stage_info.st_dev, stage_info.st_ino)
+    assert staged.byte_length == output_info.st_size
+    assert staged.sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+
+    # Staging copies committed WAL facts without checkpointing or otherwise
+    # changing the caller-owned source database and WAL.
+    assert _table_contents(source) == source_before
+    assert (database.stat().st_dev, database.stat().st_ino) == source_identity
+    assert wal_path.read_bytes() == wal_bytes
+
+    # Verification is deliberately independent of the source connection.
+    transported = StagedDiskSnapshot(**json.loads(json.dumps(asdict(staged))))
+    assert transported == staged
+    source.close()
+    receipt = verify_staged_disk_snapshot(
+        transported,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+
+    assert isinstance(receipt, DiskSnapshotReceipt)
+    assert receipt.output == output
+    assert receipt.byte_length == staged.byte_length
+    assert receipt.sha256 == staged.sha256
+    assert receipt.journal_mode == "delete"
+    assert (output.stat().st_dev, output.stat().st_ino) == (
+        staged.output_dev,
+        staged.output_ino,
+    )
+    assert not any(Path(f"{output}{suffix}").exists() for suffix in _SIDECAR_SUFFIXES)
+    with closing(sqlite3.connect(output.as_uri() + "?mode=ro", uri=True)) as copied:
+        assert copied.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert copied.execute("SELECT rowid, id, label FROM snapshot_rows").fetchall() == [
+            (37, 37, "committed-in-wal")
+        ]
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt", "replaced"])
+def test_verify_rejects_missing_corrupt_or_replaced_staged_output(
+    damage: Literal["missing", "corrupt", "replaced"],
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path)
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    output = Path(staged.output)
+    original_bytes = output.read_bytes()
+    original_identity = (output.stat().st_dev, output.stat().st_ino)
+
+    if damage == "missing":
+        output.unlink()
+    elif damage == "corrupt":
+        output.write_bytes(b"\x00" + original_bytes[1:])
+    else:
+        replacement = tmp_path / "replacement.sqlite"
+        replacement.write_bytes(original_bytes)
+        replacement.chmod(0o600)
+        os.replace(replacement, output)
+        assert (output.stat().st_dev, output.stat().st_ino) != original_identity
+
+    with pytest.raises(DiskSnapshotError):
+        verify_staged_disk_snapshot(
+            staged,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    # Failed verification leaves the candidate exactly as the caller changed it.
+    if damage == "missing":
+        assert not output.exists()
+        assert list(stage.iterdir()) == []
+    elif damage == "corrupt":
+        assert output.read_bytes() == b"\x00" + original_bytes[1:]
+        assert (output.stat().st_dev, output.stat().st_ino) == original_identity
+    else:
+        assert output.read_bytes() == original_bytes
+        assert (output.stat().st_dev, output.stat().st_ino) != original_identity
+    assert _table_contents(source)["snapshot_rows"] == ((37, "committed-in-wal"),)
+
+
+def test_verify_refuses_and_preserves_sidecar_added_after_staging(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path)
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    output = Path(staged.output)
+    output_bytes = output.read_bytes()
+    sidecar = Path(f"{output}-wal")
+    sidecar_bytes = b"synthetic unexpected WAL sidecar"
+    sidecar.write_bytes(sidecar_bytes)
+
+    with pytest.raises(DiskSnapshotError, match="sidecar"):
+        verify_staged_disk_snapshot(
+            staged,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert output.read_bytes() == output_bytes
+    assert sidecar.read_bytes() == sidecar_bytes
+
+
+def test_verify_rejects_replaced_stage_directory_and_preserves_both_candidates(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path, name="stage-to-replace")
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    output_bytes = Path(staged.output).read_bytes()
+    displaced_stage = tmp_path / "displaced-stage"
+    stage.rename(displaced_stage)
+    replacement_stage = _private_stage(tmp_path, name="stage-to-replace")
+    replacement_output = replacement_stage / "core.sqlite"
+    replacement_output.write_bytes(output_bytes)
+    replacement_output.chmod(0o600)
+    assert (replacement_stage.stat().st_dev, replacement_stage.stat().st_ino) != (
+        staged.stage_dev,
+        staged.stage_ino,
+    )
+
+    with pytest.raises(DiskSnapshotError, match="stage identity changed"):
+        verify_staged_disk_snapshot(
+            staged,
+            private_stage=replacement_stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert (displaced_stage / "core.sqlite").read_bytes() == output_bytes
+    assert replacement_output.read_bytes() == output_bytes
+
+
+def test_verify_binds_output_to_caller_supplied_private_stage_before_opening_it(
+    wal_source: tuple[sqlite3.Connection, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path, name="owned-stage")
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    output = Path(staged.output)
+    output_bytes = output.read_bytes()
+    wrong_stage = _private_stage(tmp_path, name="untrusted-stage")
+    output_opens: list[object] = []
+    actual_open = os.open
+
+    def observe_output_open(path: object, *args: object, **kwargs: object) -> int:
+        if os.fspath(path) == staged.output:
+            output_opens.append(path)
+        return actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(disk_snapshot.os, "open", observe_output_open)
+    with pytest.raises(DiskSnapshotError):
+        verify_staged_disk_snapshot(
+            staged,
+            private_stage=wrong_stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    assert output_opens == []
+    assert output.read_bytes() == output_bytes
+
+
+def test_verify_rejects_untrusted_page_count_in_staged_descriptor(
+    wal_source: tuple[sqlite3.Connection, Path], tmp_path: Path
+) -> None:
+    source, _database = wal_source
+    stage = _private_stage(tmp_path)
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    forged = replace(staged, page_count=staged.page_count + 1)
+
+    with pytest.raises(DiskSnapshotError, match="readback failed verification"):
+        verify_staged_disk_snapshot(
+            forged,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+        )
+
+    receipt = verify_staged_disk_snapshot(
+        staged,
+        private_stage=stage,
+        limits=_LIMITS,
+        deadline_monotonic=time.monotonic() + 30.0,
+    )
+    assert receipt.page_count == staged.page_count
 
 
 def test_existing_stage_output_collision_is_refused_and_preserved(

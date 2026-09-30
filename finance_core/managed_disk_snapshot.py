@@ -38,8 +38,9 @@ try:
     integrity = connection.execute("PRAGMA integrity_check").fetchmany(2)
     fk_problem = connection.execute("PRAGMA foreign_key_check").fetchone()
     schema_count = connection.execute("SELECT count(*) FROM sqlite_schema").fetchone()[0]
+    page_count = connection.execute("PRAGMA page_count").fetchone()[0]
     print(json.dumps({"mode": mode, "integrity": integrity, "fk_problem": fk_problem,
-                      "schema_count": schema_count}))
+                      "schema_count": schema_count, "page_count": page_count}))
 finally:
     connection.close()
 """
@@ -78,6 +79,25 @@ class DiskSnapshotReceipt:
     page_count: int
     schema_object_count: int
     journal_mode: str
+
+
+@dataclass(frozen=True)
+class StagedDiskSnapshot:
+    """Unverified, JSON-serializable stage evidence; never a success receipt.
+
+    A parent must supply its own trusted ``private_stage`` to verification.
+    In particular, the output path in a worker's descriptor grants no authority
+    to choose which file the parent opens.
+    """
+
+    output: str
+    byte_length: int
+    sha256: str
+    page_count: int
+    stage_dev: int
+    stage_ino: int
+    output_dev: int
+    output_ino: int
 
 
 def _check_deadline(deadline: float) -> None:
@@ -165,20 +185,22 @@ def _check_stage_bytes(stage_fd: int, maximum: int) -> None:
             raise DiskSnapshotError("Snapshot stage exceeded byte limit")
 
 
-def create_disk_snapshot(
+def stage_disk_snapshot(
     source: sqlite3.Connection,
     *,
     private_stage: Path,
     limits: DiskSnapshotLimits,
     deadline_monotonic: float,
-) -> DiskSnapshotReceipt:
-    """Backup one frozen source into fixed ``core.sqlite`` and verify the file.
+) -> StagedDiskSnapshot:
+    """Backup one frozen source into fixed ``core.sqlite`` without readback.
 
     The trusted caller supplies a live source connection and a fresh 0700 stage
     under validated custody, holds the exclusive managed cut throughout this
     call, and closes the source itself before releasing that cut. A connection or
     directory path alone cannot establish those preconditions. No source path is
-    accepted, and the source is never normalized or modified here.
+    accepted, and the source is never normalized or modified here. This returns
+    only unverified stage evidence; the caller must close/reap the source worker
+    and separately verify before treating the output as a component snapshot.
     """
     if not isinstance(source, sqlite3.Connection):
         raise DiskSnapshotError("A SQLite source connection is required")
@@ -271,6 +293,108 @@ def create_disk_snapshot(
             raise DiskSnapshotError("Snapshot exceeds stage size limit")
         before_hash = _hash_closed_file(output, closed_info, deadline_monotonic)
         _check_deadline(deadline_monotonic)
+        final_stage = os.fstat(stage_fd)
+        if final_stage.st_uid != os.getuid() or stat.S_IMODE(final_stage.st_mode) != 0o700:
+            raise DiskSnapshotError("Stage must be owner-only 0700")
+        _check_private_acl(stage_fd, private_stage)
+        final_path = os.stat(private_stage, follow_symlinks=False)
+        if (final_stage.st_dev, final_stage.st_ino) != (stage_info.st_dev, stage_info.st_ino):
+            raise DiskSnapshotError("Stage path changed during snapshot")
+        if (final_path.st_dev, final_path.st_ino) != (final_stage.st_dev, final_stage.st_ino):
+            raise DiskSnapshotError("Stage path changed during snapshot")
+        return StagedDiskSnapshot(
+            output=str(output),
+            byte_length=closed_info.st_size,
+            sha256=before_hash,
+            page_count=page_count,
+            stage_dev=stage_info.st_dev,
+            stage_ino=stage_info.st_ino,
+            output_dev=created_info.st_dev,
+            output_ino=created_info.st_ino,
+        )
+    finally:
+        os.close(stage_fd)
+
+
+def verify_staged_disk_snapshot(
+    staged: StagedDiskSnapshot,
+    *,
+    private_stage: Path,
+    limits: DiskSnapshotLimits,
+    deadline_monotonic: float,
+) -> DiskSnapshotReceipt:
+    """Independently read back a staged file after its worker has been reaped.
+
+    The descriptor is untrusted. The parent supplies its own expected private
+    stage; descriptor paths are compared before opening, never followed as
+    authority. A verified receipt is returned only after readback and sync.
+    """
+    if not isinstance(staged, StagedDiskSnapshot):
+        raise DiskSnapshotError("Staged disk snapshot evidence is required")
+    if not isinstance(private_stage, Path) or not private_stage.is_absolute():
+        raise DiskSnapshotError("A private stage path is required")
+    output = private_stage / _OUTPUT
+    if staged.output != str(output):
+        raise DiskSnapshotError("Staged disk snapshot output does not match expected stage")
+    if not isinstance(limits, DiskSnapshotLimits):
+        raise DiskSnapshotError("Disk snapshot limits are required")
+    limits.validate()
+    if type(deadline_monotonic) is not float or not (
+        time.monotonic() < deadline_monotonic < float("inf")
+    ):
+        raise DiskSnapshotError("A finite future deadline is required")
+    if (
+        type(staged.byte_length) is not int
+        or staged.byte_length <= 0
+        or staged.byte_length > limits.max_core_db_bytes
+        or staged.byte_length > limits.max_stage_bytes
+        or type(staged.page_count) is not int
+        or staged.page_count <= 0
+        or type(staged.sha256) is not str
+        or len(staged.sha256) != 64
+        or any(char not in "0123456789abcdef" for char in staged.sha256)
+        or any(
+            type(value) is not int or value < 0
+            for value in (
+                staged.stage_dev,
+                staged.stage_ino,
+                staged.output_dev,
+                staged.output_ino,
+            )
+        )
+    ):
+        raise DiskSnapshotError("Staged disk snapshot evidence is invalid")
+
+    try:
+        stage_fd = os.open(private_stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise DiskSnapshotError("Expected private snapshot stage is unavailable") from exc
+    try:
+        stage_info = os.fstat(stage_fd)
+        if stage_info.st_uid != os.getuid() or stat.S_IMODE(stage_info.st_mode) != 0o700:
+            raise DiskSnapshotError("Stage must be owner-only 0700")
+        if (stage_info.st_dev, stage_info.st_ino) != (staged.stage_dev, staged.stage_ino):
+            raise DiskSnapshotError("Staged disk snapshot stage identity changed")
+        _check_private_acl(stage_fd, private_stage)
+        path_info = os.stat(private_stage, follow_symlinks=False)
+        if (path_info.st_dev, path_info.st_ino) != (stage_info.st_dev, stage_info.st_ino):
+            raise DiskSnapshotError("Stage path changed")
+        _check_deadline(deadline_monotonic)
+        _check_stage_bytes(stage_fd, limits.max_stage_bytes)
+        _sidecars_absent(output)
+        try:
+            expected = os.stat(output, follow_symlinks=False)
+        except OSError as exc:
+            raise DiskSnapshotError("Staged disk snapshot output is unavailable") from exc
+        if (expected.st_dev, expected.st_ino) != (staged.output_dev, staged.output_ino):
+            raise DiskSnapshotError("Staged disk snapshot output identity changed")
+        closed_info = _closed_output_info(output, expected, limits.max_core_db_bytes)
+        if closed_info.st_size != staged.byte_length:
+            raise DiskSnapshotError("Staged disk snapshot size changed")
+        before_hash = _hash_closed_file(output, closed_info, deadline_monotonic)
+        if before_hash != staged.sha256:
+            raise DiskSnapshotError("Staged disk snapshot content changed")
+        _check_deadline(deadline_monotonic)
         try:
             run = subprocess.run(
                 [sys.executable, "-I", "-c", _READBACK, str(output)],
@@ -287,23 +411,25 @@ def create_disk_snapshot(
             readback = json.loads(run.stdout)
         except (ValueError, TypeError) as exc:
             raise DiskSnapshotError("Fresh-process readback was malformed") from exc
-        if (
+        if not isinstance(readback, dict) or (
             readback.get("mode") != "delete"
             or readback.get("integrity") != [["ok"]]
             or readback.get("fk_problem") is not None
             or type(readback.get("schema_count")) is not int
+            or type(readback.get("page_count")) is not int
+            or readback["page_count"] != staged.page_count
         ):
             raise DiskSnapshotError("Fresh-process snapshot readback failed verification")
         _check_deadline(deadline_monotonic)
         _check_stage_bytes(stage_fd, limits.max_stage_bytes)
         _sidecars_absent(output)
-        after_info = _closed_output_info(output, created_info, limits.max_core_db_bytes)
+        after_info = _closed_output_info(output, expected, limits.max_core_db_bytes)
         after_hash = _hash_closed_file(output, after_info, deadline_monotonic)
-        if before_hash != after_hash or closed_info.st_size != after_info.st_size:
+        if staged.sha256 != after_hash or staged.byte_length != after_info.st_size:
             raise DiskSnapshotError("Snapshot changed during independent readback")
         sync_fd = os.open(output, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
-            sync_info = _check_output_role(sync_fd, output, created_info)
+            sync_info = _check_output_role(sync_fd, output, expected)
             if sync_info.st_size != after_info.st_size:
                 raise DiskSnapshotError("Disk snapshot identity changed before sync")
             os.fsync(sync_fd)
@@ -315,19 +441,41 @@ def create_disk_snapshot(
             raise DiskSnapshotError("Stage must be owner-only 0700")
         _check_private_acl(stage_fd, private_stage)
         final_path = os.stat(private_stage, follow_symlinks=False)
-        if (final_stage.st_dev, final_stage.st_ino) != (stage_info.st_dev, stage_info.st_ino):
+        if (final_stage.st_dev, final_stage.st_ino) != (staged.stage_dev, staged.stage_ino):
             raise DiskSnapshotError("Stage path changed during snapshot")
         if (final_path.st_dev, final_path.st_ino) != (final_stage.st_dev, final_stage.st_ino):
             raise DiskSnapshotError("Stage path changed during snapshot")
-        _closed_output_info(output, created_info, limits.max_core_db_bytes)
+        _closed_output_info(output, expected, limits.max_core_db_bytes)
         _check_deadline(deadline_monotonic)
         return DiskSnapshotReceipt(
             output=output,
             byte_length=after_info.st_size,
             sha256=after_hash,
-            page_count=page_count,
+            page_count=readback["page_count"],
             schema_object_count=readback["schema_count"],
             journal_mode="delete",
         )
     finally:
         os.close(stage_fd)
+
+
+def create_disk_snapshot(
+    source: sqlite3.Connection,
+    *,
+    private_stage: Path,
+    limits: DiskSnapshotLimits,
+    deadline_monotonic: float,
+) -> DiskSnapshotReceipt:
+    """Preserve the existing one-call verified component snapshot API."""
+    staged = stage_disk_snapshot(
+        source,
+        private_stage=private_stage,
+        limits=limits,
+        deadline_monotonic=deadline_monotonic,
+    )
+    return verify_staged_disk_snapshot(
+        staged,
+        private_stage=private_stage,
+        limits=limits,
+        deadline_monotonic=deadline_monotonic,
+    )

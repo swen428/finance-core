@@ -1,7 +1,7 @@
 # Managed disk snapshot primitive (D4-3 P2)
 
-`finance_core.managed_disk_snapshot.create_disk_snapshot()` is an internal,
-component-level SQLite backup primitive. A trusted caller supplies an already
+`finance_core.managed_disk_snapshot` is an internal, component-level SQLite
+backup primitive. A trusted caller supplies an already
 opened and recovered source connection, a newly created private `0700` stage,
 finite limits, and a monotonic deadline. The caller owns source connection
 closure and the exclusion of concurrent writers. A path or connection alone
@@ -15,14 +15,19 @@ private; the file must be owner-held with one link. It uses SQLite's online
 backup API in bounded page steps.
 After backup, it closes the destination, reopens that private file, checkpoints
 WAL when present, and requires the actual journal mode to become `DELETE`.
-It never removes a SQLite sidecar by hand. With all destination handles closed,
-it checks the file identity and size, hashes it, then uses a fresh Python
-process with ordinary read-only SQLite access to check journal mode, database
-integrity, foreign keys, and schema readability. The source remains owned by
-the caller. A second closed-file hash, sidecar check, and private-file role
-check must match, followed by file and stage-directory synchronization. Only
-then is a component receipt
-returned with the fixed output path, size, hash, page count, and schema count.
+It never removes a SQLite sidecar by hand. S2-A separates writing the closed
+file from independently reading it back. The writing step checks its identity,
+size, hash and sidecars, then returns only an **unverified stage descriptor**.
+That descriptor is not a backup success receipt. The caller remains responsible
+for closing the source and ending the writing process before independent
+readback. Readback uses a fresh Python process with ordinary read-only SQLite
+access to check journal mode, database integrity, foreign keys, and schema
+readability. It then checks the closed-file hash, sidecars and private-file
+role again and synchronizes the file and stage directory. Only after all of
+that may it return a component receipt with the fixed output path, size,
+hash, page count and schema count. The existing `create_disk_snapshot()` entry
+keeps its verified component behavior by composing both steps; it is not the
+entry for a worker that must exit before readback.
 
 Any collision, limit or deadline breach, SQLite error, incomplete checkpoint,
 unexpected sidecar, readback mismatch, or sync failure returns no receipt.
