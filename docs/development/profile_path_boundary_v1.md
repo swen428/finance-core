@@ -108,6 +108,19 @@ request flag or arbitrary database path. Every other Bridge database command
 targeting the managed layout still refuses before its handler can open the
 database or perform an external effect. Ordinary staging workspaces retain
 their existing route.
+
+On a managed profile, `get_review`, `confirm`, `edit`, `reject`, and
+`issue_human_actions` require `operator_actor_id`, `telegram_account_id`,
+`telegram_conversation_id`, and `conversation_binding_id`. Core matches them to
+the proposal's frozen Telegram source and verified proposal lineage before
+returning review content, issuing actions, replaying a result, or recording a
+decision. These
+request fields do not authenticate a Telegram update: the Host must authenticate
+the update and pass its context through the Bridge. Existing Bridge review and
+decision calls omit that complete context, so they refuse on managed profiles
+until the later caller-integration work is delivered. The ordinary temporary
+staging request format remains unchanged.
+
 `get_ai_processing_status_v2` remains in that refused group because its existing
 request does not carry the authenticated Telegram context required to isolate
 another conversation's intake.

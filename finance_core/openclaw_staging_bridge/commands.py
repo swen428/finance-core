@@ -3350,6 +3350,22 @@ def _require_managed_proposal_source(
     raise _managed_source_refusal()
 
 
+def _fetch_source_bound_proposal(
+    conn: sqlite3.Connection,
+    workspace: Path,
+    arguments: dict[str, Any],
+    proposal_public_id: str,
+) -> dict[str, Any]:
+    """Hide managed proposal existence until its source authority is proven."""
+    if not workspace_access.is_fixed_profile_workspace_path(workspace):
+        return _fetch_proposal_by_public_id(conn, proposal_public_id)
+    proposal = ParserProposalRepository(conn).get_by_public_id(proposal_public_id)
+    if proposal is None:
+        raise _managed_source_refusal()
+    _require_managed_proposal_source(conn, workspace, arguments, proposal)
+    return proposal
+
+
 def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     optional = frozenset({"token_ttl_seconds"})
     if _managed_workspace_argument(request.arguments):
@@ -3381,8 +3397,7 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
             with application_review.review_snapshot(conn):
                 deadline.check("review read")
                 _require_managed_caller_context(workspace, request.arguments)
-                proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
-                _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
+                _fetch_source_bound_proposal(conn, workspace, request.arguments, proposal_public_id)
                 prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
                 proposal, version, content_hash = (
                     prepared.proposal,
@@ -4075,8 +4090,9 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
         _require_managed_caller_context(workspace, request.arguments)
         proposal: dict[str, Any] | None = None
         if workspace_access.is_fixed_profile_workspace_path(workspace):
-            proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
-            _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
+            proposal = _fetch_source_bound_proposal(
+                conn, workspace, request.arguments, proposal_public_id
+            )
         if card_generation_public_id is not None:
             authority = get_human_draft_action_authority(conn, card_generation_public_id)
             if authority is None or authority.action_issue_batch_id != reference_batch_id:
@@ -4087,7 +4103,9 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
                 )
         deadline.check("human action reference key load")
         if proposal is None:
-            proposal = _fetch_proposal_by_public_id(conn, proposal_public_id)
+            proposal = _fetch_source_bound_proposal(
+                conn, workspace, request.arguments, proposal_public_id
+            )
         payload, version, content_hash = _proposal_effective_state(conn, proposal)
         try:
             ai_lineage = verify_ai_fallback_child(
@@ -4511,8 +4529,9 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
     with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("decision replay reconstruction")
         _require_managed_caller_context(workspace, request.arguments)
-        proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
-        _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
+        proposal = _fetch_source_bound_proposal(
+            conn, workspace, request.arguments, validated["proposal_public_id"]
+        )
         d1_decision_binding = None
         if "d1_reference_public_id" in validated:
             try:
@@ -4684,8 +4703,9 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("edit replay reconstruction")
         _require_managed_caller_context(workspace, request.arguments)
-        proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
-        _require_managed_proposal_source(conn, workspace, request.arguments, proposal)
+        proposal = _fetch_source_bound_proposal(
+            conn, workspace, request.arguments, validated["proposal_public_id"]
+        )
         assert request.idempotency_key is not None
         replay = _edit_replay_result(
             conn, workspace, request, proposal, validated, deadline, monetary=monetary

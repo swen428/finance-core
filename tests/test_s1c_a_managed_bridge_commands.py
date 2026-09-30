@@ -555,6 +555,37 @@ def test_managed_decision_commands_replay_refuse_conflicts_and_create_no_final_f
     assert _read_one(managed_workspace, "SELECT COUNT(*) FROM transactions")[0] == 0
 
 
+@pytest.mark.parametrize("action", ("confirm", "edit", "reject"))
+def test_managed_decisions_without_source_context_refuse_without_writes_or_details(
+    managed_workspace: ManagedBridgeWorkspace,
+    action: str,
+) -> None:
+    proposal_id = _seed_proposal(managed_workspace)
+    review = _review(managed_workspace, proposal_id)
+    arguments = _decision_arguments(review, action, context={})
+    if action == "edit":
+        arguments["field_updates"] = {"merchant": "Synthetic Updated Cafe"}
+
+    refused = _assert_refused_without_writes(
+        managed_workspace,
+        _request(
+            managed_workspace,
+            action,
+            arguments,
+            idempotency_key=_decision_key(action, review),
+        ),
+        expected_exit_codes=(errors.EXIT_VALIDATION_REFUSED,),
+    )
+
+    assert refused.response["error"]["code"] == errors.ARGUMENTS_REFUSED
+    response_text = json.dumps(refused.response, sort_keys=True)
+    assert proposal_id not in response_text
+    assert review["effective_content_hash"] not in response_text
+    assert review["callback_tokens"][action]["token"] not in response_text
+    assert "callback_tokens" not in response_text
+    assert "confirmation_id" not in response_text
+
+
 def test_managed_capture_interaction_replays_without_running_s3_proposal_processing(
     managed_workspace: ManagedBridgeWorkspace,
 ) -> None:
@@ -612,7 +643,7 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
     for field_name in ("proposal_public_id", "proposal_version", "effective_content_hash"):
         assert first.response["result"][field_name] == second.response["result"][field_name]
 
-    missing = _run(
+    missing = _assert_refused_without_writes(
         managed_workspace,
         _request(
             managed_workspace,
@@ -622,9 +653,9 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
                 "proposal_public_id": "prop_s1c_a_missing",
             },
         ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
     )
-    assert missing.exit_code == errors.EXIT_VALIDATION_REFUSED
-    assert missing.response["error"]["code"] == errors.PROPOSAL_NOT_FOUND
+    assert missing.response["error"]["code"] == errors.PROPOSAL_UNAVAILABLE
     profile = workspace_access.managed_profile_for_workspace(managed_workspace.workspace_path)
     assert profile is not None
     try:
@@ -844,6 +875,55 @@ def test_managed_review_without_source_context_hides_proposal_presence(
     assert existing_refusal.exit_code == missing_refusal.exit_code
     assert existing_error["code"] == missing_error["code"]
     assert existing_error["message"] == missing_error["message"]
+
+
+def test_managed_review_with_foreign_context_hides_proposal_presence(
+    managed_workspace: ManagedBridgeWorkspace,
+) -> None:
+    existing_proposal_id = _seed_proposal(managed_workspace)
+    owner_review = _review(managed_workspace, existing_proposal_id)
+    foreign_context = _context(
+        managed_workspace,
+        actor_id=OTHER_ACTOR,
+        account_id=OTHER_ACCOUNT,
+        conversation_id=OTHER_ACTOR,
+        binding_id=OTHER_BINDING,
+    )
+    existing_refusal = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(
+            managed_workspace,
+            existing_proposal_id,
+            context=foreign_context,
+        ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    missing_proposal_id = "prop_s1c_a_missing_foreign_context"
+    missing_refusal = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(
+            managed_workspace,
+            missing_proposal_id,
+            context=foreign_context,
+        ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+
+    existing_error = existing_refusal.response["error"]
+    missing_error = missing_refusal.response["error"]
+    assert existing_refusal.exit_code == missing_refusal.exit_code
+    assert existing_error["code"] == missing_error["code"] == errors.PROPOSAL_UNAVAILABLE
+    assert existing_error["message"] == missing_error["message"]
+    for proposal_id, refusal in (
+        (existing_proposal_id, existing_refusal),
+        (missing_proposal_id, missing_refusal),
+    ):
+        response_text = json.dumps(refusal.response, sort_keys=True)
+        assert proposal_id not in response_text
+        assert owner_review["effective_content_hash"] not in response_text
+        assert owner_review["callback_tokens"]["confirm"]["token"] not in response_text
+        assert "callback_tokens" not in response_text
+        assert "actions" not in response_text
 
 
 def test_ordinary_get_review_preserves_legacy_request_without_source_context(
