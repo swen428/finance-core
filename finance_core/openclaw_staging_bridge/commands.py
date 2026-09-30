@@ -3290,6 +3290,7 @@ def _require_managed_proposal_source(
     seen: set[int] = set()
     found_target = False
     current_proposal: dict[str, Any] | None = None
+    proposal_repository = ParserProposalRepository(conn)
     while (
         isinstance(current_id, int)
         and not isinstance(current_id, bool)
@@ -3298,14 +3299,11 @@ def _require_managed_proposal_source(
         and len(seen) < 128
     ):
         seen.add(current_id)
-        row = conn.execute(
-            "SELECT * FROM parser_outputs WHERE id = ?",
-            (current_id,),
-        ).fetchone()
+        row = proposal_repository.get_lineage_row_by_id(current_id)
         if row is None or row["source_public_id"] != source_public_id:
             raise _managed_source_refusal()
         if current_proposal is None:
-            current_proposal = dict(row)
+            current_proposal = row
         found_target |= current_id == target_id
         parent_id = row["parent_parser_output_id"]
         if parent_id is None:
