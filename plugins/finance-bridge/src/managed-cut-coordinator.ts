@@ -16,6 +16,7 @@ import {
 const VERSION = "delegated-cut-worker-v1";
 const MAX_FRAME = 8192;
 const MAX_HOLD_MS = 30_000;
+const GATE_CANCEL_POLL_MS = 100;
 const REAP_GRACE_MS = 1_000;
 const HASH = /^[0-9a-f]{64}$/u;
 const HEX32 = /^[0-9a-f]{32}$/u;
@@ -104,6 +105,37 @@ function boundedMs(value: number | undefined, fallback: number): number {
     throw new Error("Managed cut timeout must be an integer from 1 through 30000 milliseconds.");
   }
   return result;
+}
+
+function assertNotCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new Error("Managed cut cancelled.");
+}
+
+async function acquireCutLease(gate: ReturnType<typeof openProfileGate>, waitMs: number,
+  maxHoldMs: number, signal: AbortSignal | undefined): Promise<ExclusiveProfileGateLease> {
+  assertNotCancelled(signal);
+  if (signal === undefined) return await gate.acquireExclusive(waitMs, maxHoldMs);
+  const deadline = performance.now() + waitMs;
+  for (;;) {
+    assertNotCancelled(signal);
+    const remaining = Math.ceil(deadline - performance.now());
+    if (remaining <= 0) throw new Error("Profile gate wait deadline exceeded.");
+    let lease: ExclusiveProfileGateLease;
+    try {
+      lease = await gate.acquireExclusive(Math.min(remaining, GATE_CANCEL_POLL_MS), maxHoldMs);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Profile gate wait deadline exceeded.") {
+        throw error;
+      }
+      continue;
+    }
+    if (signal.aborted || performance.now() > deadline) {
+      lease.close();
+      assertNotCancelled(signal);
+      throw new Error("Profile gate wait deadline exceeded.");
+    }
+    return lease;
+  }
 }
 
 function normalizedLimits(input: ManagedCoreSnapshotLimits): Record<string, number> {
@@ -384,8 +416,11 @@ export async function runManagedCoreSnapshot(options: ManagedCoreSnapshotOptions
   const limits = normalizedLimits(options.limits);
   const waitMs = boundedMs(options.waitMs, 5_000);
   const maxHoldMs = boundedMs(options.maxHoldMs, 30_000);
+  assertNotCancelled(options.signal);
   await revalidatePythonExecutableForSpawn(options.config);
+  assertNotCancelled(options.signal);
   await verifyCoreDistributionV1(options.config);
+  assertNotCancelled(options.signal);
   const profileRoot = join(options.applicationSupportRoot, "Finance-Codex", "profiles", options.profileId);
   const profileFd = openDirectory(profileRoot);
   let workFd: number | undefined;
@@ -404,8 +439,9 @@ export async function runManagedCoreSnapshot(options: ManagedCoreSnapshotOptions
       profileRoot); }
     finally { closeSync(registrationFd); }
     gate = openProfileGate(profileRoot);
-    lease = await gate.acquireExclusive(waitMs, maxHoldMs);
+    lease = await acquireCutLease(gate, waitMs, maxHoldMs, options.signal);
     lease.assertValid();
+    assertNotCancelled(options.signal);
     const cutId = randomBytes(16).toString("hex");
     const stageName = `core-cut-${cutId}`;
     stageFd = createDirectoryExclusiveAt(workFd, stageName);

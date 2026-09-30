@@ -3,7 +3,7 @@ import { execFile as execFileCallback, spawn, spawnSync } from "node:child_proce
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
@@ -46,7 +46,7 @@ async function waitForLine(child: ReturnType<typeof spawn>, expected: string): P
   });
 }
 
-async function coreDistributionFixture(root: string, commit: string): Promise<{
+async function coreDistributionFixture(root: string, commit: string, overrideRoot?: string): Promise<{
   manifestSha256: string;
   wheelSha256: string;
   migrationLedgerDigest: string;
@@ -56,12 +56,20 @@ import base64,csv,hashlib,io,json,pathlib,sys,zipfile
 source=pathlib.Path(sys.argv[1])/'finance_core'
 root=pathlib.Path(sys.argv[2])
 commit=sys.argv[3]
+override_root=pathlib.Path(sys.argv[4]) if len(sys.argv)>4 else None
 allowed={'.json','.py','.sql','.txt'}
 files={}
 for path in source.rglob('*'):
     if path.is_file() and path.suffix in allowed:
         name=path.relative_to(source.parent).as_posix()
         files[name]=path.read_bytes()
+if override_root is not None:
+    for path in override_root.rglob('*'):
+        if path.is_file() and path.suffix in allowed:
+            name=path.relative_to(override_root).as_posix()
+            if name not in files:
+                raise SystemExit(f'override is not a packaged Core file: {name}')
+            files[name]=path.read_bytes()
         target=root/name
         target.parent.mkdir(parents=True,exist_ok=True)
         target.write_bytes(files[name])
@@ -104,12 +112,37 @@ checks={entry['filename']:entry['sha256'] for entry in artifacts}; checks[manife
 (root/'SHA256SUMS').write_text(''.join(f'{value}  {name}\n' for name,value in sorted(checks.items())))
 print(json.dumps({'manifestSha256':sha(manifest_path),'wheelSha256':sha(wheel),'migrationLedgerDigest':ledger}))
 `;
-  const result = await execFile("/usr/bin/python3", ["-c", program, REPOSITORY_ROOT, root, commit]);
+  const args = ["-c", program, REPOSITORY_ROOT, root, commit];
+  if (overrideRoot !== undefined) args.push(overrideRoot);
+  const result = await execFile("/usr/bin/python3", args);
   return JSON.parse(result.stdout) as {
     manifestSha256: string;
     wheelSha256: string;
     migrationLedgerDigest: string;
   };
+}
+
+async function waitUntil(description: string, timeoutMs: number, predicate: () => Promise<boolean>): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await delay(25);
+  }
+  assert.fail(`Timed out waiting for ${description}.`);
+}
+
+async function stageWithMarker(workRoot: string, markerName: string): Promise<string | undefined> {
+  for (const name of await readdir(workRoot)) {
+    if (!name.startsWith("core-cut-")) continue;
+    const stagePath = join(workRoot, name);
+    try {
+      await stat(join(stagePath, markerName));
+      return stagePath;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+  return undefined;
 }
 
 async function makeProfile(applicationSupport: string): Promise<string> {
@@ -143,7 +176,16 @@ async function makeProfile(applicationSupport: string): Promise<string> {
 test("managed Core snapshot runs real children, excludes SH contention, and bounds EX wait", async (t) => {
   assert.ok(PYTHON_EXECUTABLE, "PYTHON_EXECUTABLE must name the pinned Python 3.12 interpreter");
   const scratch = await realpath(await mkdtemp(join(tmpdir(), "finance-managed-cut-e2e-")));
-  t.after(async () => rm(scratch, { recursive: true, force: true }));
+  let forcedReleasePath: string | undefined;
+  let forcedGatePath: string | undefined;
+  t.after(async () => {
+    if (forcedReleasePath !== undefined && forcedGatePath !== undefined) {
+      await writeFile(forcedReleasePath, "release\n", { mode: 0o600 }).catch(() => undefined);
+      await waitUntil("test worker's late close during cleanup", 8_000, async () =>
+        trySharedLock(forcedGatePath!) === "held");
+    }
+    await rm(scratch, { recursive: true, force: true });
+  });
   const applicationSupport = join(scratch, "Application Support");
   const repoRoot = join(scratch, "runtime-repo");
   const coreDistributionRoot = join(scratch, "core-distribution");
@@ -165,6 +207,9 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
   await rm(privateSitePackages, { recursive: true, force: true });
   await symlink(sitePackages, privateSitePackages, "dir");
   const profileRoot = await makeProfile(applicationSupport);
+  const workRoot = join(profileRoot, "work");
+  const gatePath = join(profileRoot, ".profile-gate.v1.lock");
+  forcedGatePath = gatePath;
   const distribution = await coreDistributionFixture(coreDistributionRoot, "a".repeat(40));
 
   const bootstrap = [
@@ -241,7 +286,6 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
     waitMs: 2_000,
     maxHoldMs: 20_000,
   });
-  const gatePath = join(profileRoot, ".profile-gate.v1.lock");
   const contentionDeadline = Date.now() + 5_000;
   let sharedWasExcluded = false;
   while (Date.now() < contentionDeadline) {
@@ -325,7 +369,24 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
     gate.close();
   }
 
-  const workRoot = join(profileRoot, "work");
+  const stagesBeforePreAbort = await readdir(workRoot);
+  const preAborted = new AbortController();
+  preAborted.abort();
+  await assert.rejects(runManagedCoreSnapshot({
+    config,
+    applicationSupportRoot: applicationSupport,
+    profileId: "synthetic",
+    limits: {
+      maxCoreDbBytes: 32 * 1024 * 1024,
+      maxStageBytes: 64 * 1024 * 1024,
+      minFreeBytes: 1024 * 1024,
+      backupPagesPerStep: 128,
+    },
+    signal: preAborted.signal,
+  }), /cancelled/u);
+  assert.deepEqual(await readdir(workRoot), stagesBeforePreAbort,
+    "an already-aborted cut must not create a stage");
+
   const existingStages = new Set(await readdir(workRoot));
   const cancellation = new AbortController();
   const cancellationStarted = Date.now();
@@ -396,4 +457,214 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
     maxHoldMs: 2_000,
   }), /deadline exceeded/u);
   assert.equal(await holderExit, 0);
+
+  const cancelHolderRelease = join(scratch, "cancel-ex-holder.release");
+  const cancelHolder = spawn(process.execPath, ["--input-type=commonjs", "-e", [
+    "const fs=require('node:fs');const{flockSync}=require('fs-ext');",
+    "const fd=fs.openSync(process.argv[1],'r+');flockSync(fd,'exnb');console.log('locked');",
+    "const release=process.argv[2];const deadline=Date.now()+10000;",
+    "const timer=setInterval(()=>{if(fs.existsSync(release)){clearInterval(timer);fs.closeSync(fd);process.exit(0)}",
+    "if(Date.now()>=deadline){clearInterval(timer);fs.closeSync(fd);process.exit(4)}},10);",
+  ].join(""), gatePath, cancelHolderRelease], {
+    cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"],
+  });
+  const cancelHolderExit = new Promise<number | null>((resolvePromise) => {
+    cancelHolder.once("exit", (code) => resolvePromise(code));
+  });
+  const cancelStagesBeforeWait = await readdir(workRoot);
+  let gateCancellation: AbortController | undefined;
+  let waitingCut: Promise<Awaited<ReturnType<typeof runManagedCoreSnapshot>>> | undefined;
+  try {
+    await waitForLine(cancelHolder, "locked");
+    gateCancellation = new AbortController();
+    waitingCut = runManagedCoreSnapshot({
+      config,
+      applicationSupportRoot: applicationSupport,
+      profileId: "synthetic",
+      limits: {
+        maxCoreDbBytes: 32 * 1024 * 1024,
+        maxStageBytes: 64 * 1024 * 1024,
+        minFreeBytes: 1024 * 1024,
+        backupPagesPerStep: 128,
+      },
+      waitMs: 2_000,
+      maxHoldMs: 5_000,
+      signal: gateCancellation.signal,
+    });
+    const reachedAbortPoint = await Promise.race([
+      waitingCut.then(() => true, () => true),
+      delay(200).then(() => false),
+    ]);
+    assert.equal(reachedAbortPoint, false,
+      "a cut should remain pending while another process owns EX");
+    assert.deepEqual(await readdir(workRoot), cancelStagesBeforeWait,
+      "a cut waiting for EX must not create a stage");
+    assert.match(trySharedLock(gatePath), /EAGAIN|EWOULDBLOCK/u,
+      "the independent holder must still own EX before cancellation");
+    gateCancellation.abort();
+    await assert.rejects(waitingCut, /cancelled/u);
+    assert.deepEqual(await readdir(workRoot), cancelStagesBeforeWait,
+      "cancellation while EX is held must not leave a stage or late lease");
+  } finally {
+    gateCancellation?.abort();
+    await waitingCut?.catch(() => undefined);
+    await writeFile(cancelHolderRelease, "release\n", { mode: 0o600 }).catch(() => undefined);
+    const holderCode = await Promise.race([
+      cancelHolderExit,
+      delay(2_000).then(() => undefined),
+    ]);
+    if (holderCode === undefined) {
+      cancelHolder.kill("SIGKILL");
+      await cancelHolderExit;
+    }
+  }
+  assert.equal(await cancelHolderExit, 0);
+  const stagesBeforePostCancelCut = new Set(await readdir(workRoot));
+  const postCancelReceipt = await runManagedCoreSnapshot({
+    config,
+    applicationSupportRoot: applicationSupport,
+    profileId: "synthetic",
+    limits: {
+      maxCoreDbBytes: 32 * 1024 * 1024,
+      maxStageBytes: 64 * 1024 * 1024,
+      minFreeBytes: 1024 * 1024,
+      backupPagesPerStep: 128,
+    },
+    waitMs: 2_000,
+    maxHoldMs: 5_000,
+  });
+  const stagesAfterPostCancelCut = await readdir(workRoot);
+  assert.deepEqual(stagesAfterPostCancelCut.filter((name) => !stagesBeforePostCancelCut.has(name)),
+    [basename(postCancelReceipt.stagePath)],
+    "a normal cut after gate-wait cancellation must acquire the released EX without a late stage");
+
+  const releasePath = join(scratch, "unknown-close.release");
+  forcedReleasePath = releasePath;
+  const overlayRoot = join(scratch, "unknown-close-worker-overlay");
+  const overlayPackage = join(overlayRoot, "finance_core");
+  const unknownCloseDistributionRoot = join(scratch, "unknown-close-core-distribution");
+  await mkdir(overlayPackage, { recursive: true, mode: 0o700 });
+  await chmod(overlayPackage, 0o700);
+  await mkdir(unknownCloseDistributionRoot, { mode: 0o700 });
+  await chmod(unknownCloseDistributionRoot, 0o700);
+  const rogueWorker = String.raw`
+import json
+import os
+from pathlib import Path
+import signal
+import time
+
+control = os.fdopen(3, "r+b", buffering=0)
+request = json.loads(control.readline(8193))
+if request.get("version") != "delegated-cut-worker-v1" or request.get("operation") != "core_snapshot":
+    raise SystemExit(2)
+def send(frame):
+    control.write((json.dumps(frame, sort_keys=True, separators=(",", ":")) + "\n").encode())
+send({"version": "delegated-cut-worker-v1", "type": "ready",
+      "cut_id": request["cut_id"], "worker_id": request["worker_id"]})
+go = json.loads(control.readline(8193))
+if go.get("type") != "go" or go.get("cut_id") != request["cut_id"] or go.get("worker_id") != request["worker_id"]:
+    raise SystemExit(3)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+descendant = os.fork()
+if descendant == 0:
+    for fd in (5, 6):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    stage = Path(os.environ["FINANCE_CUT_STAGE_PATH"])
+    stage.joinpath("fd-holder-ready").write_text("ready\n", encoding="ascii")
+    release = Path(os.environ["FINANCE_CUT_APPLICATION_SUPPORT"]).parent / "unknown-close.release"
+    end = time.monotonic() + 15
+    while time.monotonic() < end and not release.exists():
+        time.sleep(0.01)
+    for fd in (3, 4):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    os._exit(0)
+while True:
+    time.sleep(1)
+`;
+  await writeFile(join(overlayPackage, "managed_cut_worker.py"), rogueWorker, { mode: 0o600 });
+  const unknownCloseDistribution = await coreDistributionFixture(
+    unknownCloseDistributionRoot, "a".repeat(40), overlayRoot);
+  const unknownCloseConfig = await validatePluginConfig({
+    repoRoot,
+    coreDistributionRoot: unknownCloseDistributionRoot,
+    pythonExecutable,
+    workspaceRoot,
+    agentProfileV2: {
+      ...config.agentProfileV2,
+      coreManifestSha256: unknownCloseDistribution.manifestSha256,
+      coreWheelSha256: unknownCloseDistribution.wheelSha256,
+      coreMigrationLedgerDigest: unknownCloseDistribution.migrationLedgerDigest,
+    },
+  });
+  const beforeUnknownClose = new Set(await readdir(workRoot));
+  const unknownCloseOutcome = runManagedCoreSnapshot({
+    config: unknownCloseConfig,
+    applicationSupportRoot: applicationSupport,
+    profileId: "synthetic",
+    limits: {
+      maxCoreDbBytes: 32 * 1024 * 1024,
+      maxStageBytes: 64 * 1024 * 1024,
+      minFreeBytes: 1024 * 1024,
+      backupPagesPerStep: 128,
+    },
+    waitMs: 2_000,
+    maxHoldMs: 2_000,
+  }).then(
+    (receipt) => ({ kind: "resolved" as const, receipt }),
+    (error: unknown) => ({ kind: "rejected" as const,
+      error: error instanceof Error ? error : new Error(String(error)) }),
+  );
+  let rogueStagePath: string | undefined;
+  try {
+    const markerWait = waitUntil("forked worker holding FD3 and FD4", 5_000, async () => {
+      rogueStagePath = await stageWithMarker(workRoot, "fd-holder-ready");
+      return rogueStagePath !== undefined;
+    });
+    const firstObserved = await Promise.race([
+      markerWait.then(() => ({ kind: "marker" as const })),
+      unknownCloseOutcome.then((outcome) => ({ kind: "outcome" as const, outcome })),
+    ]);
+    if (firstObserved.kind === "outcome") {
+      assert.equal(firstObserved.outcome.kind, "rejected",
+        "the synthetic worker must not return a success receipt");
+      assert.match(firstObserved.outcome.error.message, /child close\/reap is unknown/u,
+        "the actual coordinator close outcome must be unknown-close");
+      assert.fail("the coordinator reported unknown close before the forked FD holder marked readiness");
+    }
+    const unknownCloseResult = await unknownCloseOutcome;
+    assert.equal(unknownCloseResult.kind, "rejected");
+    assert.match(unknownCloseResult.error.message, /child close\/reap is unknown/u);
+    assert.ok(rogueStagePath);
+    assert.match(trySharedLock(gatePath), /EAGAIN|EWOULDBLOCK/u,
+      "the inherited EX descriptor must remain held after TERM, KILL, and unknown close");
+    const stagesBeforeUnhealthyCheck = await readdir(workRoot);
+    await assert.rejects(runManagedCoreSnapshot({
+      config: unknownCloseConfig,
+      applicationSupportRoot: applicationSupport,
+      profileId: "synthetic",
+      limits: {
+        maxCoreDbBytes: 32 * 1024 * 1024,
+        maxStageBytes: 64 * 1024 * 1024,
+        minFreeBytes: 1024 * 1024,
+        backupPagesPerStep: 128,
+      },
+    }), /unhealthy after uncertain child closure/u);
+    assert.deepEqual(await readdir(workRoot), stagesBeforeUnhealthyCheck,
+      "an uncertain coordinator must refuse a later cut before creating a stage");
+  } finally {
+    await writeFile(releasePath, "release\n", { mode: 0o600 }).catch(() => undefined);
+    await waitUntil("late close releasing the retained profile gate", 8_000, async () =>
+      trySharedLock(gatePath) === "held");
+  }
+  assert.ok(rogueStagePath);
+  assert.ok((await readdir(workRoot)).includes(basename(rogueStagePath)));
+  assert.notDeepEqual(await readdir(workRoot), [...beforeUnknownClose],
+    "the injected child must have entered a real staged cut before timing out");
 });
