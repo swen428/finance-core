@@ -82,6 +82,7 @@ from finance_core.intake.telegram_attachment_acquisition import (
     TelegramFileMetadata,
     acquire_and_persist_telegram_attachment,
 )
+from finance_core.openclaw_staging_bridge import receipt_handoff
 from finance_core.parser_proposals import (
     confirm_proposal,
     convert_confirmed_receipt_proposal_to_facts,
@@ -195,7 +196,12 @@ class B5Pipeline:
 
 
 def _run_b5_pipeline(
-    conn: sqlite3.Connection, tmp_path: Path, suffix: str, *, seed: bool = True
+    conn: sqlite3.Connection,
+    tmp_path: Path,
+    suffix: str,
+    *,
+    seed: bool = True,
+    managed_publication_workspace: Path | None = None,
 ) -> B5Pipeline:
     """B1 raw intake -> attachment -> OCR -> proposal -> confirm -> B4.1 ->
     IAF fact set, all through public boundaries (COLD STORAGE, SGD 12.34)."""
@@ -214,19 +220,50 @@ def _run_b5_pipeline(
         )
     raw_intake_id = int(intake["id"])
 
-    storage_root = _private_storage(tmp_path, f"attachments_{suffix}")
     transport = _make_transport(content)
-    acquisition = acquire_and_persist_telegram_attachment(
-        conn,
-        transport=transport,
-        storage_root=storage_root,
-        public_id=f"tgae_b5_{suffix}",
-        raw_intake_id=raw_intake_id,
-        telegram_file_id=f"file_b5_{suffix}",
-        telegram_file_unique_id=f"unique_b5_{suffix}",
-        original_filename=f"receipt_{suffix}.jpg",
-        declared_mime_type="image/jpeg",
-    )
+    if managed_publication_workspace is None:
+        storage_root = _private_storage(tmp_path, f"attachments_{suffix}")
+        acquisition = acquire_and_persist_telegram_attachment(
+            conn,
+            transport=transport,
+            storage_root=storage_root,
+            public_id=f"tgae_b5_{suffix}",
+            raw_intake_id=raw_intake_id,
+            telegram_file_id=f"file_b5_{suffix}",
+            telegram_file_unique_id=f"unique_b5_{suffix}",
+            original_filename=f"receipt_{suffix}.jpg",
+            declared_mime_type="image/jpeg",
+        )
+    else:
+        storage_root = managed_publication_workspace / "attachments"
+        handoff_dir = tmp_path / f"handoff_{suffix}"
+        handoff_dir.mkdir(mode=0o700)
+        handoff_dir.chmod(0o700)
+        handoff_path = handoff_dir / f"receipt_{suffix}.jpg"
+        handoff_path.write_bytes(content)
+        handoff_path.chmod(0o600)
+        handoff = receipt_handoff.publish_receipt_handoff(
+            conn,
+            workspace=managed_publication_workspace,
+            handoff_path=handoff_path,
+            attachment_evidence_public_id=f"tgae_b5_{suffix}",
+            raw_intake_id=raw_intake_id,
+            original_filename=f"receipt_{suffix}.jpg",
+            declared_mime_type="image/jpeg",
+        )
+        acquisition = TelegramAttachmentAcquisitionResult(
+            attachment_path=handoff.final_path,
+            observed_file_size=handoff.observed_file_size,
+            content_hash=handoff.content_hash,
+            detected_mime_type=handoff.mime_type,
+            canonical_extension=handoff.canonical_extension,
+            network_download_occurred=False,
+            durable_file_reused=handoff.durable_file_reused,
+            persistence_result=handoff.persistence_result,
+            persistence_idempotent=handoff.persistence_idempotent,
+        )
+        assert transport.metadata_calls == 0
+        assert transport.download_calls == 0
     attachment_id = int(acquisition.persistence_result["attachment_id"])
 
     engine = FakeEngine(
