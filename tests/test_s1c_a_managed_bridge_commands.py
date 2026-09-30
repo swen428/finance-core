@@ -25,6 +25,9 @@ ACTOR = "111"
 ACCOUNT = "acct"
 CONVERSATION = "111"
 BINDING = "binding"
+OTHER_ACTOR = "222"
+OTHER_ACCOUNT = "acct-222"
+OTHER_BINDING = "binding-222"
 SEEDED_MESSAGE_ID = "77"
 SEEDED_PROPOSAL_ID = "prop_s1c_a_seed_text"
 
@@ -173,16 +176,26 @@ def _request(
     )
 
 
-def _run(workspace: ManagedBridgeWorkspace, request: dict[str, object]) -> support.CliOutcome:
+def _run(
+    workspace: ManagedBridgeWorkspace,
+    request: dict[str, object],
+    *,
+    expected_sessions: int | None = 1,
+) -> support.CliOutcome:
     before = len(workspace.sessions)
     outcome = support.run_cli(request)
     opened = workspace.sessions[before:]
-    assert len(opened) == 1, (request["command"], outcome.response, len(opened))
-    observation = opened[0]
-    assert observation.workspace_path == workspace.workspace_path
-    assert observation.operation_id.startswith("bridge:")
-    with pytest.raises(sqlite3.ProgrammingError):
-        observation.connection.execute("SELECT 1")
+    if expected_sessions is not None:
+        assert len(opened) == expected_sessions, (
+            request["command"],
+            outcome.response,
+            len(opened),
+        )
+    for observation in opened:
+        assert observation.workspace_path == workspace.workspace_path
+        assert observation.operation_id.startswith("bridge:")
+        with pytest.raises(sqlite3.ProgrammingError):
+            observation.connection.execute("SELECT 1")
     return outcome
 
 
@@ -193,24 +206,44 @@ def _read_one(workspace: ManagedBridgeWorkspace, sql: str, parameters: tuple[obj
         return conn.execute(sql, parameters).fetchone()
 
 
-def _context(workspace: ManagedBridgeWorkspace) -> dict[str, object]:
+def _context(
+    workspace: ManagedBridgeWorkspace,
+    *,
+    actor_id: str = ACTOR,
+    account_id: str = ACCOUNT,
+    conversation_id: str | None = None,
+    binding_id: str = BINDING,
+) -> dict[str, object]:
     return {
         "workspace_path": str(workspace.workspace_path),
-        "operator_actor_id": ACTOR,
-        "telegram_account_id": ACCOUNT,
-        "telegram_conversation_id": CONVERSATION,
-        "conversation_binding_id": BINDING,
+        "operator_actor_id": actor_id,
+        "telegram_account_id": account_id,
+        "telegram_conversation_id": actor_id if conversation_id is None else conversation_id,
+        "conversation_binding_id": binding_id,
     }
 
 
-def _review(workspace: ManagedBridgeWorkspace, proposal_id: str) -> dict[str, object]:
+def _review_request(
+    workspace: ManagedBridgeWorkspace,
+    proposal_id: str,
+    *,
+    context: dict[str, object] | None = None,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {"proposal_public_id": proposal_id}
+    if context is not None:
+        arguments.update(context)
+    return _request(workspace, envelope.COMMAND_GET_REVIEW, arguments)
+
+
+def _review(
+    workspace: ManagedBridgeWorkspace,
+    proposal_id: str,
+    *,
+    context: dict[str, object] | None = None,
+) -> dict[str, object]:
     outcome = _run(
         workspace,
-        _request(
-            workspace,
-            envelope.COMMAND_GET_REVIEW,
-            {"proposal_public_id": proposal_id},
-        ),
+        _review_request(workspace, proposal_id, context=context or _context(workspace)),
     )
     assert outcome.exit_code == errors.EXIT_OK, outcome.response
     return outcome.response["result"]
@@ -223,9 +256,10 @@ def _issue_actions(
     *,
     batch_id: str = "a" * 32,
     card_generation_id: str | None = None,
+    context: dict[str, object] | None = None,
 ) -> tuple[support.CliOutcome, dict[str, object]]:
     arguments: dict[str, object] = {
-        **_context(workspace),
+        **(context or _context(workspace)),
         "proposal_public_id": proposal_id,
         "reference_batch_id": batch_id,
         "token_ttl_seconds": 600,
@@ -270,17 +304,24 @@ def _capture_route(
     text: str,
     *,
     message_id: int,
+    actor_id: str = ACTOR,
+    account_id: str = ACCOUNT,
+    conversation_id: str | None = None,
+    binding_id: str = BINDING,
 ) -> tuple[support.CliOutcome, dict[str, object]]:
+    resolved_conversation_id = actor_id if conversation_id is None else conversation_id
     update = support.telegram_text_update(
         text,
         update_id=1000 + message_id,
         message_id=message_id,
+        chat_id=int(resolved_conversation_id),
+        sender_id=int(actor_id),
     )
     arguments = support.authenticated_text_capture_arguments(
         workspace,
         update,
-        account_id=ACCOUNT,
-        binding_id=BINDING,
+        account_id=account_id,
+        binding_id=binding_id,
     )
     arguments.pop("kind")
     request = _request(
@@ -304,10 +345,15 @@ def _start_guided_edit(
     return proposal_id, redeemed, redemption_request
 
 
-def _decision_arguments(review: dict[str, object], action: str) -> dict[str, object]:
+def _decision_arguments(
+    review: dict[str, object],
+    action: str,
+    *,
+    context: dict[str, object] | None = None,
+) -> dict[str, object]:
     callback_tokens = cast(dict[str, dict[str, object]], review["callback_tokens"])
     entry = callback_tokens[action]
-    return {
+    arguments: dict[str, object] = {
         "proposal_public_id": review["proposal_public_id"],
         "operator_actor_id": ACTOR,
         "proposal_version": review["proposal_version"],
@@ -315,6 +361,17 @@ def _decision_arguments(review: dict[str, object], action: str) -> dict[str, obj
         "callback_token": entry["token"],
         "callback_expiry": entry["expiry"],
     }
+    if context is not None:
+        arguments.update({key: value for key, value in context.items() if key != "workspace_path"})
+    else:
+        arguments.update(
+            {
+                "telegram_account_id": ACCOUNT,
+                "telegram_conversation_id": CONVERSATION,
+                "conversation_binding_id": BINDING,
+            }
+        )
+    return arguments
 
 
 def _decision_key(action: str, review: dict[str, object]) -> str:
@@ -414,7 +471,7 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
         _request(
             managed_workspace,
             envelope.COMMAND_GET_REVIEW,
-            {"proposal_public_id": proposal_id},
+            {**_context(managed_workspace), "proposal_public_id": proposal_id},
         ),
     )
     second = _run(
@@ -422,7 +479,7 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
         _request(
             managed_workspace,
             envelope.COMMAND_GET_REVIEW,
-            {"proposal_public_id": proposal_id},
+            {**_context(managed_workspace), "proposal_public_id": proposal_id},
         ),
     )
     assert first.exit_code == errors.EXIT_OK, first.response
@@ -437,7 +494,10 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
         _request(
             managed_workspace,
             envelope.COMMAND_GET_REVIEW,
-            {"proposal_public_id": "prop_s1c_a_missing"},
+            {
+                **_context(managed_workspace),
+                "proposal_public_id": "prop_s1c_a_missing",
+            },
         ),
     )
     assert missing.exit_code == errors.EXIT_VALIDATION_REFUSED
@@ -449,6 +509,217 @@ def test_managed_get_review_is_read_only_and_refuses_missing_proposal(
             pass
     finally:
         profile.close()
+
+
+def test_managed_review_binds_initial_and_d1_proposals_to_frozen_source_context(
+    managed_workspace: ManagedBridgeWorkspace,
+) -> None:
+    proposal_id = _create_d1_child_proposal(managed_workspace)
+    _capture_other_actor(managed_workspace)
+
+    owner_context = _context(managed_workspace)
+    first = _review(managed_workspace, proposal_id, context=owner_context)
+    same_context_replay = _review(managed_workspace, proposal_id, context=owner_context)
+    assert first["proposal_public_id"] == proposal_id
+    assert first["callback_tokens"] is not None
+    assert same_context_replay["proposal_public_id"] == proposal_id
+    assert same_context_replay["callback_tokens"] is not None
+
+    lineage = _read_one(
+        managed_workspace,
+        """
+        SELECT child.parent_parser_output_id, child.source_public_id,
+               intake.public_id, intake.parser_output_id, source.authenticated_actor_id,
+               source.telegram_account_id, source.telegram_conversation_id,
+               source.conversation_binding_id, source.source_message_id,
+               source.source_identity_sha256
+        FROM parser_outputs AS child
+        JOIN raw_intake_records AS intake ON intake.public_id = child.source_public_id
+        JOIN d2_telegram_source_contexts AS source
+          ON source.raw_intake_record_id = intake.id
+        WHERE child.public_id = ?
+        """,
+        (proposal_id,),
+    )
+    assert lineage is not None
+    assert lineage[0] == lineage[3]
+    assert lineage[1] == lineage[2]
+    assert lineage[4] == ACTOR
+    assert lineage[5] == ACCOUNT
+    assert lineage[6] == CONVERSATION
+    assert lineage[7] == BINDING
+    assert lineage[8] == SEEDED_MESSAGE_ID
+    assert len(str(lineage[9])) == 64
+
+    attacker_context = _context(
+        managed_workspace,
+        actor_id=OTHER_ACTOR,
+        account_id=OTHER_ACCOUNT,
+        conversation_id=OTHER_ACTOR,
+        binding_id=OTHER_BINDING,
+    )
+    wrong_contexts: tuple[tuple[str, dict[str, object] | None], ...] = (
+        ("missing", None),
+        ("partial", {"operator_actor_id": ACTOR}),
+        ("other-actor-and-conversation", attacker_context),
+        (
+            "wrong-account",
+            _context(managed_workspace, account_id="another-account"),
+        ),
+        (
+            "wrong-conversation",
+            _context(managed_workspace, conversation_id=OTHER_ACTOR),
+        ),
+        (
+            "wrong-binding",
+            _context(managed_workspace, binding_id="another-binding"),
+        ),
+    )
+    for name, supplied_context in wrong_contexts:
+        refused = _assert_refused_without_writes(
+            managed_workspace,
+            _review_request(managed_workspace, proposal_id, context=supplied_context),
+        )
+        assert refused.exit_code in (
+            errors.EXIT_AUTHORITY_REFUSED,
+            errors.EXIT_VALIDATION_REFUSED,
+        ), (
+            name,
+            refused.response,
+        )
+        refused_json = json.dumps(refused.response, sort_keys=True)
+        assert proposal_id not in refused_json
+        assert "callback_tokens" not in refused_json
+
+
+def test_managed_source_context_refuses_orphan_proposal_without_origin_or_digest(
+    managed_workspace: ManagedBridgeWorkspace,
+) -> None:
+    proposal_id = _seed_orphan_proposal(managed_workspace)
+    refused = _assert_refused_without_writes(
+        managed_workspace,
+        _review_request(
+            managed_workspace,
+            proposal_id,
+            context=_context(managed_workspace),
+        ),
+    )
+    assert refused.exit_code == errors.EXIT_AUTHORITY_REFUSED
+
+
+def test_ordinary_get_review_preserves_legacy_request_without_source_context(
+    tmp_path: Path,
+) -> None:
+    ordinary = support.create_bridge_workspace(tmp_path, name="s1c-a-ordinary-review")
+    proposal_id = "prop_s1c_a_ordinary_compat"
+    payload = {
+        "intent": "personal_expense_log",
+        "transaction_type": "personal_expense",
+        "amount": "12.50",
+        "currency": "SGD",
+        "transaction_date": "2026-09-21",
+        "merchant": "Cafe",
+        "description": "Lunch",
+        "category": "food",
+    }
+    with workspace_access.workspace_database_session(
+        ordinary.workspace_path, operation_id="test-seed-ordinary-review"
+    ) as conn:
+        conn.execute(
+            """
+            INSERT INTO parser_outputs (
+                public_id, source_type, source_public_id, parser_name, parser_version,
+                raw_text, parsed_payload, parse_status
+            ) VALUES (?, 'text', 'ordinary-synthetic-intake', 'test', '1', 'lunch 12.50', ?,
+                      'parsed_pending_confirmation')
+            """,
+            (proposal_id, json.dumps(payload)),
+        )
+        conn.commit()
+
+    outcome = support.run_cli(
+        support.make_request(
+            envelope.COMMAND_GET_REVIEW,
+            {
+                "workspace_path": str(ordinary.workspace_path),
+                "proposal_public_id": proposal_id,
+            },
+        )
+    )
+    assert outcome.exit_code == errors.EXIT_OK, outcome.response
+    assert outcome.response["result"]["proposal_public_id"] == proposal_id
+    assert outcome.response["result"]["callback_tokens"] is not None
+
+
+@pytest.mark.parametrize("action", ("confirm", "edit", "reject"))
+def test_managed_decisions_and_reference_issuance_cannot_cross_source_context(
+    managed_workspace: ManagedBridgeWorkspace,
+    action: str,
+) -> None:
+    proposal_id = _seed_proposal(managed_workspace)
+    owner_context = _context(managed_workspace)
+    review = _review(managed_workspace, proposal_id, context=owner_context)
+    _capture_other_actor(managed_workspace)
+    attacker_context = _context(
+        managed_workspace,
+        actor_id=OTHER_ACTOR,
+        account_id=OTHER_ACCOUNT,
+        conversation_id=OTHER_ACTOR,
+        binding_id=OTHER_BINDING,
+    )
+
+    before_issue = _authority_snapshot(managed_workspace)
+    issue_request = _request(
+        managed_workspace,
+        envelope.COMMAND_ISSUE_HUMAN_ACTIONS,
+        {
+            **attacker_context,
+            "proposal_public_id": proposal_id,
+            "reference_batch_id": "b" * 32,
+            "token_ttl_seconds": 600,
+            "expected_proposal_version": review["proposal_version"],
+            "expected_content_hash": review["effective_content_hash"],
+        },
+        idempotency_key=support.canonical_human_action_issuance_key("b" * 32),
+    )
+    issue_refused = _assert_refused_without_writes(
+        managed_workspace,
+        issue_request,
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert "actions" not in issue_refused.response
+    assert _authority_snapshot(managed_workspace) == before_issue
+
+    decision_arguments = _decision_arguments(review, action, context=attacker_context)
+    if action == "edit":
+        decision_arguments["field_updates"] = {"merchant": "Attacker Cafe"}
+    decision_refused = _assert_refused_without_writes(
+        managed_workspace,
+        _request(
+            managed_workspace,
+            action,
+            decision_arguments,
+            idempotency_key=_decision_key(action, review),
+        ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    assert "confirmation_id" not in decision_refused.response
+    assert (
+        _read_one(
+            managed_workspace,
+            "SELECT COUNT(*) FROM parser_proposal_confirmations WHERE parser_output_id = "
+            "(SELECT id FROM parser_outputs WHERE public_id = ?)",
+            (proposal_id,),
+        )[0]
+        == 0
+    )
+    assert (
+        _read_one(
+            managed_workspace,
+            "SELECT COUNT(*) FROM transactions",
+        )[0]
+        == 0
+    )
 
 
 def test_managed_human_action_issue_and_redemption_are_context_bound_and_replayable(
@@ -601,6 +872,132 @@ def _whole_card_text(card_id: str) -> str:
     )
 
 
+def _create_d1_child_proposal(workspace: ManagedBridgeWorkspace) -> str:
+    _parent_id, redeemed, _ = _start_guided_edit(workspace)
+    card = redeemed.response["result"]["human_draft_card"]
+    card_id = str(card["card_generation_public_id"])
+    raw_text = _whole_card_text(card_id)
+    route, _ = _capture_route(workspace, raw_text, message_id=90)
+    assert route.exit_code == errors.EXIT_OK, route.response
+    operation_id = str(route.response["result"]["interaction_route"]["operation_key"])
+    applied = _run(
+        workspace,
+        _request(
+            workspace,
+            envelope.COMMAND_APPLY_HUMAN_DRAFT_CARD,
+            {
+                **_context(workspace),
+                "card_generation_public_id": card_id,
+                "telegram_message_id": 90,
+                "operation_public_id": operation_id,
+                "raw_card_text": raw_text,
+                "field_values": {
+                    "amount": "12.50",
+                    "currency": "SGD",
+                    "transaction_date": "2026-09-19",
+                    "merchant": "Synthetic Cafe",
+                    "description": "Lunch",
+                    "category": "Food",
+                },
+            },
+            idempotency_key=f"bridge-human-draft-apply:{operation_id}",
+        ),
+    )
+    assert applied.exit_code == errors.EXIT_OK, applied.response
+    child_id = str(applied.response["result"]["proposal_public_id"])
+    assert child_id.startswith("po_d1_")
+    return child_id
+
+
+def _capture_other_actor(workspace: ManagedBridgeWorkspace) -> None:
+    outcome, _ = _capture_route(
+        workspace,
+        "separate synthetic source for actor 222",
+        message_id=78,
+        actor_id=OTHER_ACTOR,
+        account_id=OTHER_ACCOUNT,
+        conversation_id=OTHER_ACTOR,
+        binding_id=OTHER_BINDING,
+    )
+    assert outcome.exit_code == errors.EXIT_OK, outcome.response
+    assert outcome.response["result"]["proposal_public_id"] is None
+
+
+_AUTHORITY_SNAPSHOT_TABLES = (
+    "raw_intake_records",
+    "parser_outputs",
+    "d2_telegram_source_contexts",
+    "parser_proposal_events",
+    "parser_proposal_confirmations",
+    "parser_proposal_completions",
+    "parser_human_draft_operations",
+    "parser_human_draft_publications",
+    "openclaw_human_action_references",
+    "openclaw_human_action_redemptions",
+    "financial_audit_events",
+    "transactions",
+)
+
+
+def _authority_snapshot(workspace: ManagedBridgeWorkspace) -> tuple[tuple[str, int], ...]:
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-authority-snapshot"
+    ) as conn:
+        return tuple(
+            (table, int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]))
+            for table in _AUTHORITY_SNAPSHOT_TABLES
+        )
+
+
+def _assert_refused_without_writes(
+    workspace: ManagedBridgeWorkspace,
+    request: dict[str, object],
+    *,
+    expected_exit_codes: tuple[int, ...] = (
+        errors.EXIT_AUTHORITY_REFUSED,
+        errors.EXIT_VALIDATION_REFUSED,
+    ),
+) -> support.CliOutcome:
+    before_counts = _authority_snapshot(workspace)
+    before_sessions = len(workspace.sessions)
+    outcome = _run(workspace, request, expected_sessions=None)
+    assert outcome.exit_code in expected_exit_codes, outcome.response
+    assert "result" not in outcome.response
+    for observation in workspace.sessions[before_sessions:]:
+        assert observation.total_changes == 0
+    assert _authority_snapshot(workspace) == before_counts
+    return outcome
+
+
+def _seed_orphan_proposal(workspace: ManagedBridgeWorkspace) -> str:
+    proposal_id = "prop_s1c_a_without_source_lineage"
+    payload = {
+        "intent": "personal_expense_log",
+        "transaction_type": "personal_expense",
+        "amount": "12.50",
+        "currency": "SGD",
+        "transaction_date": "2026-09-21",
+        "merchant": "Cafe",
+        "description": "Lunch",
+        "category": "food",
+    }
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-seed-orphan-proposal"
+    ) as conn:
+        conn.execute(
+            """
+            INSERT INTO parser_outputs (
+                public_id, source_type, source_public_id, parser_name, parser_version,
+                raw_text, parsed_payload, parse_status
+            ) VALUES (?, 'text', 'missing-synthetic-source', 'test', '1', 'lunch 12.50', ?,
+                      'parsed_pending_confirmation')
+            """,
+            (proposal_id, json.dumps(payload)),
+        )
+        conn.commit()
+    return proposal_id
+
+
 def test_managed_draft_card_delivery_unknown_and_reissue_stay_local(
     managed_workspace: ManagedBridgeWorkspace,
     monkeypatch: pytest.MonkeyPatch,
@@ -668,6 +1065,58 @@ def test_managed_draft_card_delivery_unknown_and_reissue_stay_local(
     assert attempt.exit_code == errors.EXIT_OK, attempt.response
     assert attempt_replay.exit_code == errors.EXIT_OK, attempt_replay.response
     assert attempt_replay.response["idempotent_replay"] is True
+
+    claimed_success_id = _framed_hash("d1-card-observation-v1", attempt_id, "unverified-success")
+    claimed_success_arguments = {
+        **_context(managed_workspace),
+        "attempt_public_id": attempt_id,
+        "observation_public_id": claimed_success_id,
+        "outcome": "success",
+        "error_code": None,
+        "outbound_message_id": "synthetic-unverified-outbound-id",
+        "trusted_receipt_hash": "c" * 64,
+    }
+    claimed_success = _assert_refused_without_writes(
+        managed_workspace,
+        _request(
+            managed_workspace,
+            envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
+            claimed_success_arguments,
+            idempotency_key=f"bridge-human-draft-observation:{claimed_success_id}",
+        ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    claimed_success_error = cast(dict[str, object], claimed_success.response["error"])
+    assert claimed_success_error["code"] in {
+        errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+        errors.HUMAN_DRAFT_CONFLICT,
+    }
+
+    claimed_receipt_id = _framed_hash("d1-card-observation-v1", attempt_id, "unverified-receipt")
+    claimed_receipt_arguments = {
+        **_context(managed_workspace),
+        "attempt_public_id": attempt_id,
+        "observation_public_id": claimed_receipt_id,
+        "outcome": "unknown",
+        "error_code": None,
+        "outbound_message_id": None,
+        "trusted_receipt_hash": "d" * 64,
+    }
+    claimed_receipt = _assert_refused_without_writes(
+        managed_workspace,
+        _request(
+            managed_workspace,
+            envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
+            claimed_receipt_arguments,
+            idempotency_key=f"bridge-human-draft-observation:{claimed_receipt_id}",
+        ),
+        expected_exit_codes=(errors.EXIT_AUTHORITY_REFUSED,),
+    )
+    claimed_receipt_error = cast(dict[str, object], claimed_receipt.response["error"])
+    assert claimed_receipt_error["code"] in {
+        errors.HUMAN_DRAFT_AUTHORITY_REFUSED,
+        errors.HUMAN_DRAFT_CONFLICT,
+    }
 
     observation_id = _framed_hash("d1-card-observation-v1", attempt_id, "initial")
     outcome_arguments = {
