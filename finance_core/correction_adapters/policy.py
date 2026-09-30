@@ -8,14 +8,24 @@ import secrets
 import sqlite3
 import stat
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, cast
 
+from finance_core.managed_staging_profile import managed_staging_operation
+from finance_core.openclaw_staging_bridge import errors as bridge_errors
+from finance_core.openclaw_staging_bridge import workspace_access
+from finance_core.profile_gate import ProfileGateError
+from finance_core.profile_paths import ManagedStagingProfile, ProfilePathError
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
 from finance_core.runtime_paths import require_runtime_root
-from finance_core.staging_guard import open_staging_database, require_staging_database
+from finance_core.staging_guard import (
+    StagingDatabaseError,
+    open_staging_database,
+    require_staging_database,
+)
 
 from .wire import CorrectionWireError, key_id
 
@@ -68,7 +78,8 @@ class LocalPolicy:
 @dataclass(frozen=True)
 class _RegisteredConnection:
     policy: LocalPolicy
-    anchor_fd: int
+    anchor_fd: int | None = None
+    managed_profile: ManagedStagingProfile | None = None
 
 
 _REGISTRY: dict[sqlite3.Connection, _RegisteredConnection] = {}
@@ -152,6 +163,39 @@ def _anchor_witness(fd: int) -> tuple[int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)
 
 
+def _is_managed_database_path(database: Path) -> bool:
+    workspace = database.parent.parent
+    return workspace_access.is_fixed_profile_workspace_path(workspace)
+
+
+def _managed_profile_for_database(database: Path) -> ManagedStagingProfile | None:
+    """Select only the enrolled fixed workspace named by the owner policy."""
+    if not _is_managed_database_path(database):
+        return None
+    workspace = database.parent.parent
+    if database != workspace_access.database_path_for(workspace):
+        raise LocalPolicyError("managed correction database path is not fixed")
+    try:
+        profile = workspace_access.managed_profile_for_workspace(workspace)
+    except bridge_errors.BridgeError as exc:
+        raise LocalPolicyError("managed correction profile is unavailable") from exc
+    if profile is None or profile.staging_database != database:
+        if profile is not None:
+            profile.close()
+        raise LocalPolicyError("managed correction database identity is unavailable")
+    return profile
+
+
+def _managed_witness(profile: ManagedStagingProfile) -> tuple[int, int, int, int]:
+    """Reuse enrolled identity without a second main-file descriptor."""
+    try:
+        profile.revalidate()
+        info = profile.staging_database.lstat()
+    except (OSError, ProfilePathError) as exc:
+        raise LocalPolicyError("managed correction database witness is unavailable") from exc
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)
+
+
 @contextmanager
 def _open_anchored_staging(
     path: Path, witness: tuple[int, int, int, int]
@@ -197,6 +241,28 @@ def open_local_authority_connection() -> Iterator[sqlite3.Connection]:
     the local policy through ``load_policy_for_connection``.
     """
     policy = _read_policy()
+    profile = _managed_profile_for_database(policy.database_path)
+    if profile is not None:
+        try:
+            try:
+                with managed_staging_operation(
+                    profile, operation_id="correction-local-authority"
+                ) as conn:
+                    with _REGISTRY_LOCK:
+                        if conn in _REGISTRY:
+                            raise LocalPolicyError("database connection is already registered")
+                        _REGISTRY[conn] = _RegisteredConnection(policy, managed_profile=profile)
+                    try:
+                        load_policy_for_connection(conn)
+                        yield conn
+                    finally:
+                        with _REGISTRY_LOCK:
+                            _REGISTRY.pop(conn, None)
+            except (ProfilePathError, ProfileGateError, StagingDatabaseError) as exc:
+                raise LocalPolicyError("managed correction session is unavailable") from exc
+        finally:
+            profile.close()
+        return
     with _open_anchored_staging(policy.database_path, _policy_witness(policy)) as (
         conn,
         anchor_fd,
@@ -326,7 +392,7 @@ def _read_policy() -> LocalPolicy:
 
 
 def load_policy_for_connection(conn: sqlite3.Connection) -> LocalPolicy:
-    """Recheck a factory-registered connection, policy and retained file anchor."""
+    """Recheck a factory-registered connection and its owner witness."""
     with _REGISTRY_LOCK:
         registration = _REGISTRY.get(conn)
     if registration is None:
@@ -338,35 +404,31 @@ def load_policy_for_connection(conn: sqlite3.Connection) -> LocalPolicy:
     opened_path = _connection_path(conn)
     if opened_path != policy.database_path:
         raise LocalPolicyError("opened database does not match policy path")
-    if _anchor_witness(registration.anchor_fd) != _policy_witness(policy) or _database_witness(
-        opened_path
-    ) != _policy_witness(policy):
+    if registration.managed_profile is not None:
+        if (
+            registration.anchor_fd is not None
+            or registration.managed_profile.staging_database != opened_path
+            or _managed_witness(registration.managed_profile) != _policy_witness(policy)
+        ):
+            raise LocalPolicyError("database instance does not match policy witness")
+    elif (
+        registration.anchor_fd is None
+        or _anchor_witness(registration.anchor_fd) != _policy_witness(policy)
+        or _database_witness(opened_path) != _policy_witness(policy)
+    ):
         raise LocalPolicyError("database instance does not match policy witness")
     return policy
 
 
-def provision(database: Path, actor: str) -> LocalPolicy:
-    """Exclusively create the first local policy for an empty schema-051 ledger."""
-    if type(actor) is not str or not actor or len(actor.encode("utf-8")) > 1024:
-        raise LocalPolicyError("original actor is invalid")
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in actor):
-        raise LocalPolicyError("original actor contains controls")
-    root = require_runtime_root()
-    if not database.is_absolute() or database.resolve(strict=True) != database:
-        raise LocalPolicyError("database path must be canonical")
-    witness = _database_witness(database)
-    policy_path = root / _POLICY_DIR / _POLICY_FILE
-    if policy_path.exists() or policy_path.is_symlink():
-        raise LocalPolicyError("local correction policy already exists")
-    with _open_anchored_staging(database, witness) as (conn, _anchor_fd):
-        conn.execute("BEGIN IMMEDIATE")
-        _empty_correction_ledger(conn)
-        ledger = conn.execute(
-            "SELECT 1 FROM schema_migrations WHERE migration_id = '051' LIMIT 1"
-        ).fetchone()
-        if ledger is None:
-            raise LocalPolicyError("migration 051 is not applied")
-        conn.rollback()
+def _publish_first_policy(
+    *,
+    policy_path: Path,
+    database: Path,
+    actor: str,
+    witness: tuple[int, int, int, int],
+    witness_is_current: Callable[[], bool],
+) -> LocalPolicy:
+    """Publish one owner-only policy after its caller's ledger and witness check."""
     directory = policy_path.parent
     try:
         directory.mkdir(mode=0o700, exist_ok=False)
@@ -378,7 +440,7 @@ def provision(database: Path, actor: str) -> LocalPolicy:
         ):
             raise LocalPolicyError("policy directory must be owner-only") from None
     key = secrets.token_bytes(32)
-    if _database_witness(database) != witness:
+    if not witness_is_current():
         raise LocalPolicyError("database instance changed during first policy setup")
     payload: dict[str, object] = {
         "schema": "correction-local-policy-v1",
@@ -416,12 +478,76 @@ def provision(database: Path, actor: str) -> LocalPolicy:
     return _read_policy()
 
 
+def provision(database: Path, actor: str) -> LocalPolicy:
+    """Exclusively create the first local policy for an empty schema-051 ledger."""
+    if type(actor) is not str or not actor or len(actor.encode("utf-8")) > 1024:
+        raise LocalPolicyError("original actor is invalid")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in actor):
+        raise LocalPolicyError("original actor contains controls")
+    root = require_runtime_root()
+    if not database.is_absolute() or database.resolve(strict=True) != database:
+        raise LocalPolicyError("database path must be canonical")
+    policy_path = root / _POLICY_DIR / _POLICY_FILE
+    profile = _managed_profile_for_database(database)
+    if profile is not None:
+        try:
+            if policy_path.exists() or policy_path.is_symlink():
+                raise LocalPolicyError("local correction policy already exists")
+            try:
+                with managed_staging_operation(
+                    profile, operation_id="correction-provision"
+                ) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    _empty_correction_ledger(conn)
+                    ledger = conn.execute(
+                        "SELECT 1 FROM schema_migrations WHERE migration_id = '051' LIMIT 1"
+                    ).fetchone()
+                    if ledger is None:
+                        raise LocalPolicyError("migration 051 is not applied")
+                    witness = _managed_witness(profile)
+                    policy = _publish_first_policy(
+                        policy_path=policy_path,
+                        database=database,
+                        actor=actor,
+                        witness=witness,
+                        witness_is_current=lambda: _managed_witness(profile) == witness,
+                    )
+                    conn.rollback()
+                return policy
+            except (ProfilePathError, ProfileGateError, StagingDatabaseError) as exc:
+                raise LocalPolicyError("managed correction provision is unavailable") from exc
+        finally:
+            profile.close()
+
+    witness = _database_witness(database)
+    if policy_path.exists() or policy_path.is_symlink():
+        raise LocalPolicyError("local correction policy already exists")
+    with _open_anchored_staging(database, witness) as (conn, _anchor_fd):
+        conn.execute("BEGIN IMMEDIATE")
+        _empty_correction_ledger(conn)
+        ledger = conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE migration_id = '051' LIMIT 1"
+        ).fetchone()
+        if ledger is None:
+            raise LocalPolicyError("migration 051 is not applied")
+        conn.rollback()
+    return _publish_first_policy(
+        policy_path=policy_path,
+        database=database,
+        actor=actor,
+        witness=witness,
+        witness_is_current=lambda: _database_witness(database) == witness,
+    )
+
+
 def quarantine_incomplete_policy(database: Path) -> Path:
     """Manual first-policy recovery; retains malformed bytes as evidence.
 
     There is no CLI command for this. An owner must separately invoke it after
     reviewing the malformed file and its retained destination.
     """
+    if _is_managed_database_path(database):
+        raise LocalPolicyError("managed correction policy quarantine is unavailable")
     policy_path = _policy_path()
     _trusted_directory(policy_path.parent)
     try:
