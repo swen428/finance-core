@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hmac
 import io
 import json
+import os
 import shutil
 import sqlite3
 from pathlib import Path
@@ -208,6 +210,11 @@ def _policy_file(runtime_root: Any) -> Any:
     return runtime_root / "correction_authority" / "policy.json"
 
 
+def _assert_secret_file_bytes_unchanged(actual: bytes, expected: bytes) -> None:
+    assert len(actual) == len(expected), "retained policy file length changed"
+    assert hmac.compare_digest(actual, expected), "retained policy file bytes changed"
+
+
 def test_managed_provision_refuses_runtime_mismatch_and_unregistered_fixed_profile(
     managed_workspace: s1ca.ManagedBridgeWorkspace,
     tmp_path: Any,
@@ -265,6 +272,163 @@ def test_managed_provision_refuses_runtime_mismatch_and_unregistered_fixed_profi
         assert not _policy_file(copied_runtime).exists()
     finally:
         blank_profile.close()
+
+
+def test_managed_reprovision_refuses_nonempty_correction_ledger_after_policy_retained(
+    managed_workspace: s1ca.ManagedBridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = create_posted_managed_transaction(managed_workspace, "text")
+    transaction_id = source.transaction_public_id
+    _assert_provisioned_over_nonempty_finance_ledger(managed_workspace, transaction_id, capsys)
+
+    connections = _connection_observer(monkeypatch)
+    plan = _preview_managed_correction(capsys, transaction_id, "13.50")
+    sign_calls = _prepare_real_terminal_signer(managed_workspace, monkeypatch, connections)
+    exit_code, stdout, stderr = _invoke_correction_cli(
+        capsys,
+        "confirm",
+        str(plan["plan_id"]),
+    )
+    assert exit_code == 0, (stdout, stderr)
+    assert sign_calls == [str(plan["plan_id"])]
+    assert correction_ledger_counts(managed_workspace)["correction_versions"] == 1
+    assert correction_ledger_counts(managed_workspace)["correction_authorities"] == 1
+
+    runtime_root = managed_workspace.profile_base / "runtime"
+    database = workspace_access.database_path_for(managed_workspace.workspace_path)
+    policy_path = _policy_file(runtime_root)
+    retained_policy_path = policy_path.with_name("policy.json.retained-ledger-evidence")
+    original_policy_bytes = policy_path.read_bytes()
+    policy_path.rename(retained_policy_path)
+    assert not policy_path.exists()
+    _assert_secret_file_bytes_unchanged(retained_policy_path.read_bytes(), original_policy_bytes)
+
+    before_domain_counts = table_counts(managed_workspace)
+    exit_code, stdout, stderr = _invoke_correction_cli(
+        capsys,
+        "provision",
+        "--database",
+        str(database),
+        "--actor",
+        s1ca.ACTOR,
+    )
+    assert exit_code == 2
+    assert not stdout
+    assert "correction ledger already contains authority" in stderr.lower()
+    assert not policy_path.exists()
+    assert table_counts(managed_workspace) == before_domain_counts
+    _assert_secret_file_bytes_unchanged(retained_policy_path.read_bytes(), original_policy_bytes)
+    acquire_exclusive_profile_gate(managed_workspace)
+
+
+def test_managed_first_policy_partial_write_is_retained_and_fails_closed(
+    managed_workspace: s1ca.ManagedBridgeWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    create_posted_managed_transaction(managed_workspace, "text")
+    database = workspace_access.database_path_for(managed_workspace.workspace_path)
+    runtime_root = managed_workspace.profile_base / "runtime"
+    policy_path = _policy_file(runtime_root)
+    before_domain_counts = table_counts(managed_workspace)
+    assert_correction_ledger_empty(managed_workspace)
+
+    real_os_open = correction_policy.os.open
+    real_os_write = correction_policy.os.write
+    policy_create_flags: list[int] = []
+    policy_fd_identities: list[tuple[int, int]] = []
+    policy_write_attempt_lengths: list[int] = []
+    partial_policy_bytes = bytearray()
+
+    def observe_open(file: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        descriptor = real_os_open(file, flags, *args, **kwargs)
+        try:
+            requested_path = Path(os.fsdecode(os.fspath(file)))
+        except (TypeError, ValueError):
+            return descriptor
+        if requested_path == policy_path:
+            policy_create_flags.append(flags)
+            opened = os.fstat(descriptor)
+            current_path = policy_path.lstat()
+            policy_fd_identities.append((opened.st_dev, opened.st_ino))
+            assert (opened.st_dev, opened.st_ino) == (current_path.st_dev, current_path.st_ino)
+        return descriptor
+
+    def fail_after_real_policy_prefix(descriptor: int, data: bytes) -> int:
+        opened = os.fstat(descriptor)
+        try:
+            current_path = policy_path.lstat()
+        except FileNotFoundError:
+            return real_os_write(descriptor, data)
+        if (opened.st_dev, opened.st_ino) != (current_path.st_dev, current_path.st_ino):
+            return real_os_write(descriptor, data)
+
+        policy_write_attempt_lengths.append(len(data))
+        if len(policy_write_attempt_lengths) == 1:
+            prefix_length = max(1, len(data) // 3)
+            prefix = bytes(data[:prefix_length])
+            actual_count = real_os_write(descriptor, prefix)
+            partial_policy_bytes.extend(prefix[:actual_count])
+            return actual_count
+        raise OSError("synthetic policy partial-write interruption")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(correction_policy.os, "open", observe_open)
+        scoped.setattr(correction_policy.os, "write", fail_after_real_policy_prefix)
+        exit_code, stdout, stderr = _invoke_correction_cli(
+            capsys,
+            "provision",
+            "--database",
+            str(database),
+            "--actor",
+            s1ca.ACTOR,
+        )
+
+    assert exit_code == 2
+    assert not stdout
+    assert "synthetic policy partial-write interruption" in stderr
+    assert len(policy_create_flags) == 1
+    assert policy_create_flags[0] & os.O_CREAT
+    assert policy_create_flags[0] & os.O_EXCL
+    assert len(policy_fd_identities) == 1
+    assert len(policy_write_attempt_lengths) == 2
+    assert partial_policy_bytes
+    assert policy_path.exists()
+    retained_partial_bytes = policy_path.read_bytes()
+    _assert_secret_file_bytes_unchanged(retained_partial_bytes, bytes(partial_policy_bytes))
+    assert table_counts(managed_workspace) == before_domain_counts
+    acquire_exclusive_profile_gate(managed_workspace)
+
+    with pytest.raises(correction_policy.LocalPolicyError, match="policy"):
+        with correction_policy.open_local_authority_connection():
+            pytest.fail("a partial owner policy must not yield an authority connection")
+    assert table_counts(managed_workspace) == before_domain_counts
+    _assert_secret_file_bytes_unchanged(policy_path.read_bytes(), retained_partial_bytes)
+
+    retry_exit, retry_stdout, retry_stderr = _invoke_correction_cli(
+        capsys,
+        "provision",
+        "--database",
+        str(database),
+        "--actor",
+        s1ca.ACTOR,
+    )
+    assert retry_exit == 2
+    assert not retry_stdout
+    assert "policy already exists" in retry_stderr.lower()
+    assert table_counts(managed_workspace) == before_domain_counts
+    _assert_secret_file_bytes_unchanged(policy_path.read_bytes(), retained_partial_bytes)
+
+    with pytest.raises(
+        correction_policy.LocalPolicyError,
+        match="managed correction policy quarantine is unavailable",
+    ):
+        correction_policy.quarantine_incomplete_policy(database)
+    assert table_counts(managed_workspace) == before_domain_counts
+    _assert_secret_file_bytes_unchanged(policy_path.read_bytes(), retained_partial_bytes)
+    acquire_exclusive_profile_gate(managed_workspace)
 
 
 def test_managed_current_binding_does_not_reopen_main_database(
