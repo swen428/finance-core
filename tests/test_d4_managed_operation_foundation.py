@@ -59,6 +59,33 @@ _MANAGED_READ_COMMANDS = frozenset(
     }
 )
 
+_S1C_A_COMMANDS = frozenset(
+    {
+        envelope.COMMAND_CAPTURE_INTERACTION,
+        envelope.COMMAND_GET_REVIEW,
+        envelope.COMMAND_CONFIRM,
+        envelope.COMMAND_EDIT,
+        envelope.COMMAND_REJECT,
+        envelope.COMMAND_ISSUE_HUMAN_ACTIONS,
+        envelope.COMMAND_REDEEM_HUMAN_ACTION,
+        envelope.COMMAND_APPLY_GUIDED_EDIT_UPDATE,
+        envelope.COMMAND_COMPLETE_GUIDED_EDIT,
+        envelope.COMMAND_APPLY_HUMAN_DRAFT_CARD,
+        envelope.COMMAND_BEGIN_HUMAN_DRAFT_CARD_DELIVERY,
+        envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
+        envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD,
+    }
+)
+
+_MANAGED_DATABASE_COMMANDS = frozenset(
+    {
+        envelope.COMMAND_HEALTH,
+        envelope.COMMAND_GET_STATUS,
+        *_MANAGED_READ_COMMANDS,
+        *_S1C_A_COMMANDS,
+    }
+)
+
 
 @pytest.fixture()
 def managed_workspace(
@@ -323,9 +350,11 @@ def test_every_other_bridge_command_is_refused_before_managed_effects(
 ) -> None:
     unsupported = sorted(
         envelope.ALLOWED_COMMANDS
-        - {envelope.COMMAND_HEALTH, envelope.COMMAND_GET_STATUS}
-        - _MANAGED_READ_COMMANDS
+        - _MANAGED_DATABASE_COMMANDS
+        - {envelope.COMMAND_VERIFY_AI_MODEL_COMPATIBILITY_CASE_V2}
     )
+    assert len(_MANAGED_DATABASE_COMMANDS) == 20
+    assert len(unsupported) == 22
     before = _snapshot_tree(managed_workspace.profile_base)
     database_open_attempts: list[str] = []
     network_attempts: list[str] = []

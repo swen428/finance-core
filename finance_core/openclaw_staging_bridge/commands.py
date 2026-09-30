@@ -23,6 +23,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
+from types import TracebackType
 from typing import Any, Callable, Iterator, Mapping
 
 from finance_core.application import review as application_review
@@ -581,6 +582,43 @@ def _open_context(arguments: dict[str, Any], deadline: Deadline) -> tuple[Path, 
     deadline.check("database open")
     conn = workspace_access.open_workspace_database(workspace)
     return workspace, conn
+
+
+class _OperationContext:
+    """Own a command session without throwing frozen BridgeError into a generator."""
+
+    def __init__(self, request: BridgeRequest, deadline: Deadline) -> None:
+        self.request = request
+        self.deadline = deadline
+        self.session: AbstractContextManager[sqlite3.Connection] | None = None
+
+    def __enter__(self) -> tuple[Path, sqlite3.Connection]:
+        self.deadline.check("workspace validation")
+        workspace = workspace_access.validate_workspace_path(
+            self.request.arguments["workspace_path"]
+        )
+        self.deadline.check("workspace structure verification")
+        workspace_access.verify_workspace_structure(workspace)
+        self.deadline.check("database open")
+        self.session = workspace_access.workspace_database_session(
+            workspace,
+            operation_id=f"bridge:{self.request.request_id}",
+            deadline=self.deadline,
+        )
+        return workspace, self.session.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool | None:
+        assert self.session is not None
+        return self.session.__exit__(exc_type, exc_value, traceback)
+
+
+def _operation_context(request: BridgeRequest, deadline: Deadline) -> _OperationContext:
+    return _OperationContext(request, deadline)
 
 
 def _read_workspace_session(
@@ -1669,85 +1707,83 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
         conversation_id=source_context.conversation_id,
         binding_id=source_context.binding_id,
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
-        _require_durable_capture_connection(conn)
-        deadline.check("interaction capture")
-        begin_interaction_capture(conn)
+    with _operation_context(request, deadline) as (_workspace, conn):
         try:
-            key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
-            intake = get_raw_intake_record_by_idempotency_key(conn, key)
-            if intake is None:
-                intake = create_raw_intake_record(
-                    conn,
-                    validated.text,
-                    source_type=TELEGRAM_TEXT,
-                    source_channel="telegram",
-                    source_metadata=validated.source_metadata,
-                )
-                effect = _capture_context_effect(source_context)
-                assert effect is not None
-                effect(conn, intake)
-                job = ensure_capture_job(
-                    conn,
-                    intake_id=int(intake["id"]),
-                    capture_kind="text",
-                    ingress_identity_digest=ingress_digest,
-                )
-                route = freeze_interaction_route(
-                    conn,
-                    job_public_id=str(job["public_id"]),
-                    text=validated.text,
-                    context=context,
-                    message_id=validated.message_id,
-                )
-                if route["route_kind"] == "control_refused":
-                    mark_control_refusal(
+            _require_durable_capture_connection(conn)
+            deadline.check("interaction capture")
+            begin_interaction_capture(conn)
+            try:
+                key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
+                intake = get_raw_intake_record_by_idempotency_key(conn, key)
+                if intake is None:
+                    intake = create_raw_intake_record(
+                        conn,
+                        validated.text,
+                        source_type=TELEGRAM_TEXT,
+                        source_channel="telegram",
+                        source_metadata=validated.source_metadata,
+                    )
+                    effect = _capture_context_effect(source_context)
+                    assert effect is not None
+                    effect(conn, intake)
+                    job = ensure_capture_job(
+                        conn,
+                        intake_id=int(intake["id"]),
+                        capture_kind="text",
+                        ingress_identity_digest=ingress_digest,
+                    )
+                    route = freeze_interaction_route(
                         conn,
                         job_public_id=str(job["public_id"]),
-                        refusal_code=str(route["refusal_code"]),
+                        text=validated.text,
+                        context=context,
+                        message_id=validated.message_id,
                     )
-                replay = False
-            else:
-                if intake.get("content_fingerprint") != _expected_text_fingerprint(validated):
-                    raise InteractionRouteConflictError(
-                        "Telegram text conflicts with captured source"
+                    if route["route_kind"] == "control_refused":
+                        mark_control_refusal(
+                            conn,
+                            job_public_id=str(job["public_id"]),
+                            refusal_code=str(route["refusal_code"]),
+                        )
+                    replay = False
+                else:
+                    if intake.get("content_fingerprint") != _expected_text_fingerprint(validated):
+                        raise InteractionRouteConflictError(
+                            "Telegram text conflicts with captured source"
+                        )
+                    _require_replay_source_context(conn, intake, source_context)
+                    existing_job = get_capture_job(conn, intake_public_id=str(intake["public_id"]))
+                    if (
+                        existing_job is None
+                        or existing_job["ingress_identity_digest"] != ingress_digest
+                    ):
+                        raise InteractionRouteConflictError(
+                            "Telegram ingress conflicts with captured job"
+                        )
+                    route = require_replayed_interaction_route(
+                        conn,
+                        job_public_id=str(existing_job["public_id"]),
+                        text=validated.text,
+                        context=context,
+                        message_id=validated.message_id,
                     )
-                _require_replay_source_context(conn, intake, source_context)
-                existing_job = get_capture_job(conn, intake_public_id=str(intake["public_id"]))
-                if (
-                    existing_job is None
-                    or existing_job["ingress_identity_digest"] != ingress_digest
-                ):
-                    raise InteractionRouteConflictError(
-                        "Telegram ingress conflicts with captured job"
-                    )
-                route = require_replayed_interaction_route(
-                    conn,
-                    job_public_id=str(existing_job["public_id"]),
-                    text=validated.text,
-                    context=context,
-                    message_id=validated.message_id,
-                )
-                replay = True
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        return {**_text_capture_result(conn, intake), "interaction_route": route}, replay
-    except (
-        InteractionRouteConflictError,
-        CaptureJobConflictError,
-        RawIntakeIdempotencyConflictError,
-        sqlite3.IntegrityError,
-    ) as exc:
-        raise errors.bridge_error(
-            errors.IDEMPOTENCY_CONFLICT,
-            "Interaction capture conflicts with frozen evidence.",
-            errors.EXIT_AUTHORITY_REFUSED,
-        ) from exc
-    finally:
-        conn.close()
+                    replay = True
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+            return {**_text_capture_result(conn, intake), "interaction_route": route}, replay
+        except (
+            InteractionRouteConflictError,
+            CaptureJobConflictError,
+            RawIntakeIdempotencyConflictError,
+            sqlite3.IntegrityError,
+        ) as exc:
+            raise errors.bridge_error(
+                errors.IDEMPOTENCY_CONFLICT,
+                "Interaction capture conflicts with frozen evidence.",
+                errors.EXIT_AUTHORITY_REFUSED,
+            ) from exc
 
 
 def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -3192,41 +3228,39 @@ def handle_get_review(request: BridgeRequest, deadline: Deadline) -> HandlerResu
                 errors.EXIT_VALIDATION_REFUSED,
             )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
-        with application_review.review_snapshot(conn):
-            deadline.check("review read")
-            prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
-            proposal, version, content_hash = (
-                prepared.proposal,
-                prepared.version,
-                prepared.content_hash,
-            )
-            callback_tokens_payload: dict[str, dict[str, object]] | None = None
-            parse_status = str(proposal["parse_status"])
-            if parse_status not in TERMINAL_STATUSES:
-                deadline.check("callback token issuance")
-                # get_review is strictly read-only: a missing or unsafe callback
-                # key fails closed instead of creating or repairing the key.
-                key = _load_callback_key(workspace)
-                expiry = int(datetime.now(UTC).timestamp()) + token_ttl
-                callback_tokens_payload = callback_tokens.issue_callback_tokens(
-                    key,
-                    proposal_public_id=proposal["public_id"],
-                    version=version,
-                    content_hash=content_hash,
-                    expiry=expiry,
+    with _operation_context(request, deadline) as (workspace, conn):
+        try:
+            with application_review.review_snapshot(conn):
+                deadline.check("review read")
+                prepared = application_review.prepare_proposal_review(conn, proposal_public_id)
+                proposal, version, content_hash = (
+                    prepared.proposal,
+                    prepared.version,
+                    prepared.content_hash,
                 )
+                callback_tokens_payload: dict[str, dict[str, object]] | None = None
+                parse_status = str(proposal["parse_status"])
+                if parse_status not in TERMINAL_STATUSES:
+                    deadline.check("callback token issuance")
+                    # get_review is strictly read-only: a missing or unsafe callback
+                    # key fails closed instead of creating or repairing the key.
+                    key = _load_callback_key(workspace)
+                    expiry = int(datetime.now(UTC).timestamp()) + token_ttl
+                    callback_tokens_payload = callback_tokens.issue_callback_tokens(
+                        key,
+                        proposal_public_id=proposal["public_id"],
+                        version=version,
+                        content_hash=content_hash,
+                        expiry=expiry,
+                    )
 
-            result = application_review.project_proposal_review(conn, prepared)
-            if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
-                callback_tokens_payload = None
-            result["callback_tokens"] = callback_tokens_payload
-            return result, False
-    except application_review.ReviewError as exc:
-        raise _map_review_error(exc) from exc
-    finally:
-        conn.close()
+                result = application_review.project_proposal_review(conn, prepared)
+                if result["proposal_origin"] == "ai_fallback" and result["ambiguity_indicators"]:
+                    callback_tokens_payload = None
+                result["callback_tokens"] = callback_tokens_payload
+                return result, False
+        except application_review.ReviewError as exc:
+            raise _map_review_error(exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -3883,8 +3917,7 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
         request, canonical_human_action_issuance_key(reference_batch_id)
     )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         if card_generation_public_id is not None:
             authority = get_human_draft_action_authority(conn, card_generation_public_id)
             if authority is None or authority.action_issue_batch_id != reference_batch_id:
@@ -3986,8 +4019,6 @@ def handle_issue_human_actions(request: BridgeRequest, deadline: Deadline) -> Ha
             ),
             "final_transaction_created": False,
         }, replay
-    finally:
-        conn.close()
 
 
 def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -4024,8 +4055,7 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
     )
     _require_canonical_idempotency_key(request, canonical_human_action_redemption_key(callback_id))
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("human action redemption key load")
         key = _load_callback_key(workspace)
         deadline.check("human action atomic redemption")
@@ -4145,8 +4175,6 @@ def handle_redeem_human_action(request: BridgeRequest, deadline: Deadline) -> Ha
                 )
             result["human_draft_card"] = _human_draft_result_payload(conn, draft)
         return result, redeemed.idempotent_replay
-    finally:
-        conn.close()
 
 
 def _validate_redeemed_human_action(
@@ -4318,8 +4346,7 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
         canonical_decision_key(action=action, proposal_public_id=validated["proposal_public_id"]),
     )
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("decision replay reconstruction")
         proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
         d1_decision_binding = None
@@ -4423,8 +4450,6 @@ def _handle_decision(request: BridgeRequest, deadline: Deadline, *, action: str)
             "to_status": result["to_status"],
             "final_transaction_created": bool(result["final_transaction_created"]),
         }, bool(result["idempotent"])
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -4484,8 +4509,7 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
 
     monetary = _MONETARY_FIELDS & frozenset(field_updates)
 
-    workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         deadline.check("edit replay reconstruction")
         proposal = _fetch_proposal_by_public_id(conn, validated["proposal_public_id"])
         assert request.idempotency_key is not None
@@ -4504,8 +4528,6 @@ def handle_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         if monetary:
             return _edit_receipt_monetary(conn, request, proposal, field_updates, current_hash)
         return _edit_completion(conn, request, proposal, field_updates, current_hash)
-    finally:
-        conn.close()
 
 
 def _require_replay_decision_context_matches(
@@ -5280,8 +5302,7 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
         request, canonical_guided_edit_update_key(session_public_id, message_id)
     )
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("guided edit session load")
         session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
         if session is None or session["status"] != "active":
@@ -5397,8 +5418,6 @@ def handle_apply_guided_edit_update(request: BridgeRequest, deadline: Deadline) 
             _raise_guided_edit_error(exc)
         result, replay = _pending_guided_update(conn, pending)
         return {**result, "session_public_id": session_public_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5412,8 +5431,7 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
     _require_canonical_idempotency_key(
         request, canonical_guided_edit_complete_key(session_public_id, message_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         session = guided_edit.get_session_by_public_id(conn, session_public_id, context)
         if session is None:
             raise errors.bridge_error(
@@ -5476,8 +5494,6 @@ def handle_complete_guided_edit(request: BridgeRequest, deadline: Deadline) -> H
             context=context,
             review_batch_id=review_batch_id,
         ), False
-    finally:
-        conn.close()
 
 
 _HUMAN_DRAFT_FIELDS = frozenset(
@@ -5637,8 +5653,7 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
     field_values = _require_human_draft_field_values(request.arguments["field_values"])
     _require_canonical_idempotency_key(request, canonical_human_draft_apply_key(operation_id))
 
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft whole-card apply")
 
         def authorize_whole_card_write(locked: sqlite3.Connection) -> None:
@@ -5678,8 +5693,6 @@ def handle_apply_human_draft_card(request: BridgeRequest, deadline: Deadline) ->
                 errors.EXIT_AUTHORITY_REFUSED,
             ) from exc
         return _human_draft_result_payload(conn, result), result.idempotent_replay
-    finally:
-        conn.close()
 
 
 def handle_get_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5839,8 +5852,7 @@ def handle_begin_human_draft_card_delivery(
     if target is not None:
         target = _require_string(target, "outbound_target_message_id", max_length=200)
     _require_canonical_idempotency_key(request, canonical_human_draft_delivery_key(attempt_id))
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft delivery attempt")
         changes_before = conn.total_changes
         try:
@@ -5858,8 +5870,6 @@ def handle_begin_human_draft_card_delivery(
             _raise_human_draft_error(exc)
         replay = conn.total_changes == changes_before
         return {"attempt_public_id": result_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_record_human_draft_card_delivery_outcome(
@@ -5900,8 +5910,7 @@ def handle_record_human_draft_card_delivery_outcome(
     _require_canonical_idempotency_key(
         request, canonical_human_draft_observation_key(observation_id)
     )
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft delivery outcome")
         changes_before = conn.total_changes
         try:
@@ -5920,8 +5929,6 @@ def handle_record_human_draft_card_delivery_outcome(
             _raise_human_draft_error(exc)
         replay = conn.total_changes == changes_before
         return {"observation_public_id": result_id}, replay
-    finally:
-        conn.close()
 
 
 def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -5956,8 +5963,7 @@ def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) 
     )
     reason = _require_string(request.arguments["reason"], "reason", max_length=32)
     _require_canonical_idempotency_key(request, canonical_human_draft_reissue_key(recovery_id))
-    _workspace, conn = _open_context(request.arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (_workspace, conn):
         deadline.check("human draft card reissue")
         try:
             result = reissue_human_draft_card(
@@ -5974,8 +5980,6 @@ def handle_reissue_human_draft_card(request: BridgeRequest, deadline: Deadline) 
         except HumanDraftError as exc:
             _raise_human_draft_error(exc)
         return _human_draft_result_payload(conn, result), result.idempotent_replay
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7084,6 +7088,19 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_GET_CAPTURE_JOB_FOR_MESSAGE,
             envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
             envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_CAPTURE_INTERACTION,
+            envelope.COMMAND_GET_REVIEW,
+            envelope.COMMAND_CONFIRM,
+            envelope.COMMAND_EDIT,
+            envelope.COMMAND_REJECT,
+            envelope.COMMAND_ISSUE_HUMAN_ACTIONS,
+            envelope.COMMAND_REDEEM_HUMAN_ACTION,
+            envelope.COMMAND_APPLY_GUIDED_EDIT_UPDATE,
+            envelope.COMMAND_COMPLETE_GUIDED_EDIT,
+            envelope.COMMAND_APPLY_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_BEGIN_HUMAN_DRAFT_CARD_DELIVERY,
+            envelope.COMMAND_RECORD_HUMAN_DRAFT_CARD_DELIVERY_OUTCOME,
+            envelope.COMMAND_REISSUE_HUMAN_DRAFT_CARD,
         }:
             raise errors.bridge_error(
                 errors.STAGING_REFUSED,

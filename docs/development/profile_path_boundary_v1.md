@@ -88,28 +88,39 @@ path regardless of enrollment state. Reopening that fixed path is available
 only through the scoped managed operation while its shared gate is held;
 ordinary temporary staging paths retain the existing generic factory behavior.
 
-The first caller integration is deliberately narrow: the Bridge `health` and
-`get_status` commands and its separate delivery-receipt consumer use short
-managed database sessions. A later read-only group also admits
-`get_interaction_route`, `list_capture_recovery_candidates`,
+The separate delivery-receipt consumer and Bridge `health` and `get_status`
+commands use short managed database sessions. Five identity-bound local reads
+(`get_interaction_route`, `list_capture_recovery_candidates`,
 `get_capture_job_for_message`, `get_guided_edit_session`, and
-`get_human_draft_card`. Each uses one managed
-session through query completion and actual connection close; its existing
-identity checks and ordinary staging result semantics remain in force. The
-caller derives the enrolled profile from the fixed workspace layout and the
-configured `FINANCE_RUNTIME_ROOT`, not from a request flag or arbitrary
-database path. Every remaining Bridge command targeting the managed layout
-refuses before its handler can open the database or perform an external effect.
-Ordinary staging workspaces retain their existing route.
+`get_human_draft_card`) and thirteen local interaction/review/edit commands
+also use short managed sessions. The thirteen are `capture_interaction`,
+`get_review`, `confirm`, `edit`, `reject`, `issue_human_actions`,
+`redeem_human_action`, `apply_guided_edit_update`, `complete_guided_edit`,
+`apply_human_draft_card`, `begin_human_draft_card_delivery`,
+`record_human_draft_card_delivery_outcome`, and `reissue_human_draft_card`.
+Each retains its existing identity, signature, replay and financial authority
+checks and service-owned transactions. The session remains held through query
+or local transition completion and actual connection close. Draft delivery
+commands only record local attempt/failure/unknown state; they do not send or
+accept a trusted success receipt. The caller derives the enrolled profile from
+the fixed workspace layout and configured `FINANCE_RUNTIME_ROOT`, not from a
+request flag or arbitrary database path. Every other Bridge database command
+targeting the managed layout still refuses before its handler can open the
+database or perform an external effect. Ordinary staging workspaces retain
+their existing route.
 `get_ai_processing_status_v2` remains in that refused group because its existing
 request does not carry the authenticated Telegram context required to isolate
 another conversation's intake.
 The Bridge commands include gate acquisition and session close in their
-cooperative command deadline. A receipt consumer error after the existing
-posting authority commits is an unverified outcome; its caller must inspect or
-replay the receipt token, not infer that no observation was written.
-This partial integration does not admit capture, OCR, correction, migration, or
-any full backup cut.
+cooperative command deadline. An error after an admitted command's service
+transaction commits, including a close/deadline error, leaves its result
+unverified; the caller must query or replay its durable operation identity,
+not infer that no change was written. The same rule applies to a receipt
+consumer error after its existing posting authority commits: inspect or replay
+the receipt token.
+This partial integration does not admit the `capture`, `propose`, or
+`process_capture_job` attachment/OCR paths, correction, migration, or any full
+backup cut.
 
 The enrolled database component's resource inventory is `profile.json`, the
 fixed profile gate, the managed registration and pending name,
