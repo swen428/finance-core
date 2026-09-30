@@ -7,7 +7,9 @@ import { fileURLToPath } from "node:url";
 export const PROFILE_GATE_BASENAME = ".profile-gate.v1.lock";
 const MAX_LOCK_WAIT_MS = 30_000;
 const SHARED_LEASE_BRAND: unique symbol = Symbol("shared-profile-gate-lease");
+const EXCLUSIVE_LEASE_BRAND: unique symbol = Symbol("exclusive-profile-gate-lease");
 const liveSharedLeases = new WeakSet<object>();
+const liveExclusiveLeases = new WeakSet<object>();
 const requireFromModule = createRequire(import.meta.url);
 
 interface NativeGateFs {
@@ -74,8 +76,14 @@ export interface SharedProfileGateLease {
 }
 
 export interface ExclusiveProfileGateLease {
+  readonly [EXCLUSIVE_LEASE_BRAND]: true;
   /** Cooperative hold bound, not preemption; exporters check every transition. */
   assertValid(): void;
+  /** The delegated child inherits this description without reacquiring SH. */
+  fdForChild(): number;
+  /** Exactly one child may remain bound until actual close/reap. */
+  reserveChild(): void;
+  unbindChild(): void;
   close(): void;
 }
 
@@ -87,6 +95,10 @@ export interface ProfileGate {
 
 export function isSharedProfileGateLease(value: unknown): value is SharedProfileGateLease {
   return typeof value === "object" && value !== null && liveSharedLeases.has(value);
+}
+
+export function isExclusiveProfileGateLease(value: unknown): value is ExclusiveProfileGateLease {
+  return typeof value === "object" && value !== null && liveExclusiveLeases.has(value);
 }
 
 function currentUid(): number {
@@ -214,10 +226,13 @@ function exclusiveLease(
   onClose: () => void,
 ): ExclusiveProfileGateLease {
   let closed = false;
+  let bound = false;
   const close = (): void => {
     if (closed) return;
+    if (bound) throw new Error("Exclusive profile gate remains bound until child reap.");
     closeSync(fd);
     closed = true;
+    liveExclusiveLeases.delete(lease);
     onClose();
   };
   const checkHoldDeadline = (): void => {
@@ -225,15 +240,33 @@ function exclusiveLease(
       throw new Error("Exclusive profile gate hold deadline exceeded.");
     }
   };
-  return Object.freeze({
+  const lease: ExclusiveProfileGateLease = Object.freeze({
+    [EXCLUSIVE_LEASE_BRAND]: true as const,
     assertValid(): void {
       if (closed) throw new Error("Exclusive profile gate lease is closed.");
       checkHoldDeadline();
       validate();
       checkHoldDeadline();
     },
+    fdForChild(): number {
+      if (closed || !bound) throw new Error("Exclusive profile gate has no reserved child.");
+      return fd;
+    },
+    reserveChild(): void {
+      if (closed || bound) throw new Error("Exclusive profile gate cannot reserve another child.");
+      checkHoldDeadline();
+      validate();
+      checkHoldDeadline();
+      bound = true;
+    },
+    unbindChild(): void {
+      if (closed || !bound) throw new Error("Exclusive profile gate has no reserved child.");
+      bound = false;
+    },
     close,
   });
+  liveExclusiveLeases.add(lease);
+  return lease;
 }
 
 /**
