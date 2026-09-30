@@ -237,12 +237,19 @@ def test_stage_defers_child_readback_and_verify_can_run_after_source_close(
     transported = StagedDiskSnapshot(**json.loads(json.dumps(asdict(staged))))
     assert transported == staged
     source.close()
-    receipt = verify_staged_disk_snapshot(
-        transported,
-        private_stage=stage,
-        limits=_LIMITS,
-        deadline_monotonic=time.monotonic() + 30.0,
-    )
+
+    def reject_reader_descendant(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("direct staged readback must not start a reader descendant")
+
+    with monkeypatch.context() as direct_readback:
+        direct_readback.setattr(disk_snapshot.subprocess, "run", reject_reader_descendant)
+        receipt = verify_staged_disk_snapshot(
+            transported,
+            private_stage=stage,
+            limits=_LIMITS,
+            deadline_monotonic=time.monotonic() + 30.0,
+            _direct_reader=True,
+        )
 
     assert isinstance(receipt, DiskSnapshotReceipt)
     assert receipt.output == output

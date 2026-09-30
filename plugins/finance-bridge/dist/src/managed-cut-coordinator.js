@@ -31,6 +31,17 @@ const BOOTSTRAP = [
 // An unresolved close cannot be converted into lease release by a timer.
 const uncertainCuts = new Set();
 let unhealthy = false;
+function releaseContext(context) {
+    if (context.released)
+        return;
+    // Child close/reap (or a pre-spawn failure) is the only caller path.
+    closeSync(context.stageFd);
+    context.lease.close();
+    context.gate.close();
+    closeSync(context.workFd);
+    closeSync(context.profileFd);
+    context.released = true;
+}
 function exactObject(value, keys) {
     if (typeof value !== "object" || value === null || Array.isArray(value) ||
         Object.keys(value).sort().join(",") !== [...keys].sort().join(",")) {
@@ -71,7 +82,7 @@ function checkedDirectory(fd, path) {
     }
     rejectAclGrants(fd);
 }
-function checkedRegistration(fd, path, profileId) {
+function checkedRegistration(fd, path, profileId, profileRoot) {
     const opened = fstatSync(fd, { bigint: true });
     const named = lstatSync(path, { bigint: true });
     if (!opened.isFile() || named.isSymbolicLink() || opened.dev !== named.dev ||
@@ -86,6 +97,10 @@ function checkedRegistration(fd, path, profileId) {
     const entry = exactObject(parsed, ["version", "profile_id", "runtime_root", "workspace_root",
         "staging_database", "main_device", "main_inode", "migration_contract_sha256", "instance_id"]);
     if (entry.version !== 1 || entry.profile_id !== profileId ||
+        entry.runtime_root !== join(profileRoot, "runtime") ||
+        entry.workspace_root !== join(profileRoot, "workspace") ||
+        entry.staging_database !== join(profileRoot, "workspace", "database", "staging.sqlite") ||
+        typeof entry.instance_id !== "string" || !HEX32.test(entry.instance_id) ||
         typeof entry.migration_contract_sha256 !== "string" ||
         !HASH.test(entry.migration_contract_sha256)) {
         throw new Error("Managed cut registration does not match profile.");
@@ -183,12 +198,6 @@ async function runFixedChild(context, options, operation, request, deadline) {
         throw error;
     }
     const control = child.stdio[3];
-    if (control === null) {
-        child.kill("SIGKILL");
-        unhealthy = true;
-        uncertainCuts.add(context);
-        throw new Error("Managed cut control pipe is missing; child close is unknown.");
-    }
     return await new Promise((resolvePromise, reject) => {
         let bytes = Buffer.alloc(0);
         let ready = false;
@@ -219,6 +228,7 @@ async function runFixedChild(context, options, operation, request, deadline) {
                         return;
                     settled = true;
                     unhealthy = true;
+                    context.uncertain = true;
                     uncertainCuts.add(context);
                     cleanup();
                     reject(new Error("Managed cut child close/reap is unknown; profile remains held."));
@@ -227,10 +237,9 @@ async function runFixedChild(context, options, operation, request, deadline) {
         };
         const onAbort = () => terminate(new Error("Managed cut cancelled."));
         const deadlineTimer = setTimeout(() => terminate(new Error("Managed cut deadline expired.")), Math.max(0, Math.floor(deadline - performance.now())));
-        options.signal?.addEventListener("abort", onAbort, { once: true });
         child.once("error", () => terminate(new Error("Managed cut child startup failed.")));
-        control.on("error", () => terminate(new Error("Managed cut control failed.")));
-        control.on("data", (chunk) => {
+        control?.on("error", () => terminate(new Error("Managed cut control failed.")));
+        control?.on("data", (chunk) => {
             if (failure !== undefined || settled)
                 return;
             bytes = Buffer.concat([bytes, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
@@ -288,11 +297,25 @@ async function runFixedChild(context, options, operation, request, deadline) {
             }
             catch {
                 unhealthy = true;
+                context.uncertain = true;
                 uncertainCuts.add(context);
                 releaseError = new Error("Managed cut child reservation could not be released.");
             }
-            if (settled)
+            if (settled) {
+                // The bounded wait reported unknown, but an eventual actual close is
+                // now observed. Keep the attempt failed and release exclusion safely.
+                if (releaseError === undefined && context.uncertain) {
+                    try {
+                        releaseContext(context);
+                        uncertainCuts.delete(context);
+                        unhealthy = uncertainCuts.size !== 0;
+                    }
+                    catch {
+                        unhealthy = true;
+                    }
+                }
                 return;
+            }
             settled = true;
             cleanup();
             if (releaseError !== undefined)
@@ -304,11 +327,19 @@ async function runFixedChild(context, options, operation, request, deadline) {
             }
             resolvePromise(terminal);
         });
-        try {
-            sendFrame(control, request);
-        }
-        catch {
-            terminate(new Error("Managed cut request could not be sent."));
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        // Abort can occur after the pre-spawn check but before this listener exists.
+        if (options.signal?.aborted)
+            onAbort();
+        if (failure === undefined && control === null)
+            terminate(new Error("Managed cut control pipe is missing."));
+        else if (failure === undefined && control !== null) {
+            try {
+                sendFrame(control, request);
+            }
+            catch {
+                terminate(new Error("Managed cut request could not be sent."));
+            }
         }
     });
 }
@@ -342,7 +373,7 @@ export async function runManagedCoreSnapshot(options) {
         const registrationFd = openFileAt(profileFd, ".managed-staging.v1.json", constants.O_RDONLY | constants.O_NONBLOCK);
         let registration;
         try {
-            registration = checkedRegistration(registrationFd, registrationPath, options.profileId);
+            registration = checkedRegistration(registrationFd, registrationPath, options.profileId, profileRoot);
         }
         finally {
             closeSync(registrationFd);
@@ -356,7 +387,8 @@ export async function runManagedCoreSnapshot(options) {
         const stagePath = join(profileRoot, "work", stageName);
         checkedDirectory(stageFd, stagePath);
         fsyncSync(workFd);
-        context = { gate, lease, profileFd, workFd, stageFd, stagePath };
+        context = { gate, lease, profileFd, workFd, stageFd, stagePath,
+            released: false, uncertain: false };
         const deadline = performance.now() + maxHoldMs;
         const common = {
             version: VERSION, cut_id: cutId, profile_id: options.profileId,
@@ -395,7 +427,11 @@ export async function runManagedCoreSnapshot(options) {
             schemaObjectCount: verified.schema_object_count, journalMode: "delete" });
     }
     finally {
-        if (context === undefined || !uncertainCuts.has(context)) {
+        if (context !== undefined) {
+            if (!context.uncertain)
+                releaseContext(context);
+        }
+        else {
             if (stageFd !== undefined)
                 closeSync(stageFd);
             if (lease !== undefined)

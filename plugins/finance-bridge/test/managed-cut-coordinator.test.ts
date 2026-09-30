@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -169,18 +169,45 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
 
   const bootstrap = [
     "from finance_core.profile_paths import validate_profile_paths",
-    "from finance_core.managed_staging_profile import bootstrap_registered_staging",
-    "support, profile_id = __import__('sys').argv[1:]",
+    "from finance_core.managed_staging_profile import bootstrap_registered_staging, _managed_staging_connection",
+    "from finance_core.parser_proposals.receipt_item_allocation_facts import supersede_receipt_item_allocation_facts",
+    "from finance_core.receipt_finalization import authorize_receipt_finalization, finalize_prepared_receipt, prepare_receipt_calculation",
+    "from pathlib import Path",
+    "from tests.test_receipt_b5_staging_e2e_v1 import _run_b5_pipeline",
+    "from tests.test_receipt_item_allocation_facts_supersession_v1 import correction_command, replacement_items",
+    "support, profile_id, scratch_root = __import__('sys').argv[1:]",
     "blank = validate_profile_paths(support, profile_id)",
     "try:",
     "    managed = bootstrap_registered_staging(blank)",
-    "    managed.close()",
+    "    try:",
+    "        with _managed_staging_connection(managed, purpose='reopen') as connection:",
+    "            connection.execute('PRAGMA journal_mode=WAL')",
+    "            connection.execute('PRAGMA wal_autocheckpoint=0')",
+    "            rowids = []",
+    "            for label in ('before', 'hole', 'after'):",
+    "                cursor = connection.execute(\"INSERT INTO raw_intake_records (public_id, source_type, source_channel, raw_input, received_at) VALUES (?, 'manual_entry', 'manual', ?, '2026-01-01T00:00:00Z')\", ('synthetic-rowid-' + label, 'synthetic ' + label))",
+    "                rowids.append(cursor.lastrowid)",
+    "            connection.execute('DELETE FROM raw_intake_records WHERE id=?', (rowids[1],))",
+    "            connection.executemany(\"INSERT INTO raw_intake_records (public_id, source_type, source_channel, raw_input, received_at) VALUES (?, 'manual_entry', 'manual', ?, '2026-01-01T00:00:00Z')\", ((f'synthetic-cut-payload-{index}', 'x' * 24576) for index in range(512)))",
+    "            scratch = Path(scratch_root)",
+    "            scratch.mkdir(mode=0o700, exist_ok=True)",
+    "            pipeline = _run_b5_pipeline(connection, scratch, 's2b_coordinator')",
+    "            v2 = supersede_receipt_item_allocation_facts(connection, correction_command(pipeline.suffix, pipeline.ctx, pipeline.iaf_result))",
+    "            v3 = supersede_receipt_item_allocation_facts(connection, correction_command(pipeline.suffix + '_v3', pipeline.ctx, v2, items=replacement_items('S2-B synthetic correction'))) ",
+    "            prepared = prepare_receipt_calculation(connection, pipeline.conversion.receipt_public_id)",
+    "            authorization = authorize_receipt_finalization(connection, prepared, actor_id='owner')",
+    "            assert finalize_prepared_receipt(connection, authorization).status == 'finalized'",
+    "            connection.commit()",
+    "            assert connection.execute('PRAGMA journal_mode').fetchone()[0].lower() == 'wal'",
+    "            assert Path(str(managed.staging_database) + '-wal').stat().st_size > 32",
+    "    finally:",
+    "        managed.close()",
     "finally:",
     "    blank.close()",
   ].join("\n");
-  await execFile(pythonExecutable, ["-c", bootstrap, applicationSupport, "synthetic"], {
+  await execFile(pythonExecutable, ["-c", bootstrap, applicationSupport, "synthetic", scratch], {
     env: { ...process.env, FINANCE_RUNTIME_ROOT: join(profileRoot, "runtime"),
-      PYTHONPATH: REPOSITORY_ROOT },
+      PYTHONPATH: `${REPOSITORY_ROOT}/tests:${REPOSITORY_ROOT}` },
   });
 
   const config = await validatePluginConfig({
@@ -235,12 +262,115 @@ test("managed Core snapshot runs real children, excludes SH contention, and boun
   assert.ok(receipt.schemaObjectCount > 0);
   assert.equal(receipt.stagePath.startsWith(join(profileRoot, "work", "core-cut-")), true);
 
+  const snapshotCheck = [
+    "import json, sqlite3, sys",
+    "from finance_core.financial_audit import verify_financial_audit_chain",
+    "connection = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)",
+    "connection.row_factory = sqlite3.Row",
+    "rowids = connection.execute(\"SELECT public_id, id FROM raw_intake_records WHERE public_id LIKE 'synthetic-rowid-%' ORDER BY id\").fetchall()",
+    "payload_count = connection.execute(\"SELECT count(*) FROM raw_intake_records WHERE public_id LIKE 'synthetic-cut-payload-%'\").fetchone()[0]",
+    "fact_sets = connection.execute('SELECT version, fact_set_public_id, supersedes_fact_set_public_id, superseded_by_fact_set_public_id FROM receipt_item_allocation_fact_sets ORDER BY version').fetchall()",
+    "aggregates = connection.execute('SELECT DISTINCT aggregate_type, aggregate_public_id FROM financial_audit_events').fetchall()",
+    "audit_valid = bool(aggregates) and all(verify_financial_audit_chain(connection, aggregate_type=row['aggregate_type'], aggregate_public_id=row['aggregate_public_id']).valid for row in aggregates)",
+    "summary = {'rowids': [dict(row) for row in rowids], 'payload_count': payload_count, 'journal_mode': connection.execute('PRAGMA journal_mode').fetchone()[0], 'fact_versions': [row['version'] for row in fact_sets], 'fact_sets': [dict(row) for row in fact_sets], 'audit_count': connection.execute('SELECT count(*) FROM financial_audit_events').fetchone()[0], 'audit_valid': audit_valid, 'finalization_audit_count': connection.execute('SELECT count(*) FROM receipt_finalization_audit').fetchone()[0], 'transactions_count': connection.execute('SELECT count(*) FROM transactions').fetchone()[0]}",
+    "print(json.dumps(summary))",
+    "connection.close()",
+  ].join("\n");
+  const snapshotCheckOutput = await execFile(pythonExecutable, ["-c", snapshotCheck,
+    join(receipt.stagePath, "core.sqlite")], {
+      env: { ...process.env, PYTHONPATH: REPOSITORY_ROOT },
+    });
+  const snapshotFacts = JSON.parse(snapshotCheckOutput.stdout) as {
+    rowids: { public_id: string; id: number }[];
+    payload_count: number;
+    journal_mode: string;
+    fact_versions: number[];
+    fact_sets: {
+      fact_set_public_id: string;
+      supersedes_fact_set_public_id: string | null;
+      superseded_by_fact_set_public_id: string | null;
+    }[];
+    audit_count: number;
+    audit_valid: boolean;
+    finalization_audit_count: number;
+    transactions_count: number;
+  };
+  assert.deepEqual(snapshotFacts.rowids.map((row) => row.public_id), [
+    "synthetic-rowid-before", "synthetic-rowid-after",
+  ]);
+  assert.ok(snapshotFacts.rowids[1]!.id - snapshotFacts.rowids[0]!.id > 1,
+    "closed coordinator output must preserve committed rowid gaps");
+  assert.equal(snapshotFacts.payload_count, 512,
+    "closed coordinator output must include committed synthetic WAL rows");
+  assert.equal(snapshotFacts.journal_mode, "delete");
+  assert.deepEqual(snapshotFacts.fact_versions, [1, 2, 3]);
+  assert.equal(snapshotFacts.fact_sets[0]!.superseded_by_fact_set_public_id,
+    snapshotFacts.fact_sets[1]!.fact_set_public_id);
+  assert.equal(snapshotFacts.fact_sets[1]!.supersedes_fact_set_public_id,
+    snapshotFacts.fact_sets[0]!.fact_set_public_id);
+  assert.equal(snapshotFacts.fact_sets[1]!.superseded_by_fact_set_public_id,
+    snapshotFacts.fact_sets[2]!.fact_set_public_id);
+  assert.equal(snapshotFacts.fact_sets[2]!.supersedes_fact_set_public_id,
+    snapshotFacts.fact_sets[1]!.fact_set_public_id);
+  assert.ok(snapshotFacts.audit_count > 0);
+  assert.equal(snapshotFacts.audit_valid, true);
+  assert.equal(snapshotFacts.finalization_audit_count, 1);
+  assert.equal(snapshotFacts.transactions_count, 1);
+
   const gate = openProfileGate(profileRoot);
   try {
     const shared = await gate.acquireShared(1_000);
     shared.close();
   } finally {
     gate.close();
+  }
+
+  const workRoot = join(profileRoot, "work");
+  const existingStages = new Set(await readdir(workRoot));
+  const cancellation = new AbortController();
+  const cancellationStarted = Date.now();
+  const cancellationPromise = runManagedCoreSnapshot({
+    config,
+    applicationSupportRoot: applicationSupport,
+    profileId: "synthetic",
+    limits: {
+      maxCoreDbBytes: 32 * 1024 * 1024,
+      maxStageBytes: 64 * 1024 * 1024,
+      minFreeBytes: 1024 * 1024,
+      backupPagesPerStep: 1,
+    },
+    waitMs: 2_000,
+    maxHoldMs: 20_000,
+    signal: cancellation.signal,
+  });
+  const stageDeadline = Date.now() + 5_000;
+  let workerOutputObserved = false;
+  while (Date.now() < stageDeadline) {
+    for (const name of await readdir(workRoot)) {
+      if (!name.startsWith("core-cut-") || existingStages.has(name)) continue;
+      try {
+        await stat(join(workRoot, name, "core.sqlite"));
+        workerOutputObserved = true;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    if (workerOutputObserved) break;
+    await delay(2);
+  }
+  assert.equal(workerOutputObserved, true,
+    "fixed worker should create its output file before in-flight cancellation");
+  cancellation.abort();
+  await assert.rejects(cancellationPromise, /cancelled/u);
+  assert.ok(Date.now() - cancellationStarted < 5_000, "cancellation must not wait for the full hold deadline");
+
+  const afterCancellationGate = openProfileGate(profileRoot);
+  try {
+    const shared = await afterCancellationGate.acquireShared(1_000);
+    shared.close();
+  } finally {
+    afterCancellationGate.close();
   }
 
   const holder = spawn(process.execPath, ["--input-type=commonjs", "-e", [

@@ -48,6 +48,7 @@ def main() -> int:
             limits=limits,
             deadline_monotonic=deadline,
             _direct_reader=True,
+            _control_check=lambda: check_control_alive(deadline),
         )
         check_control_alive(deadline)
         write_frame(

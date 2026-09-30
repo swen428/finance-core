@@ -29,7 +29,11 @@ def main() -> int:
         check_control_alive(deadline)
         with _delegated_cut_source(profile) as source:
             staged = stage_disk_snapshot(
-                source, private_stage=stage, limits=limits, deadline_monotonic=deadline
+                source,
+                private_stage=stage,
+                limits=limits,
+                deadline_monotonic=deadline,
+                _control_check=lambda: check_control_alive(deadline),
             )
         check_control_alive(deadline)
         write_frame(

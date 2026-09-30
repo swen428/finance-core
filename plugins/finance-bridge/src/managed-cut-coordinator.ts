@@ -293,7 +293,6 @@ async function runFixedChild(context: CutContext, options: ManagedCoreSnapshotOp
     const onAbort = (): void => terminate(new Error("Managed cut cancelled."));
     const deadlineTimer = setTimeout(() => terminate(new Error("Managed cut deadline expired.")),
       Math.max(0, Math.floor(deadline - performance.now())));
-    options.signal?.addEventListener("abort", onAbort, { once: true });
     child.once("error", () => terminate(new Error("Managed cut child startup failed.")));
     control?.on("error", () => terminate(new Error("Managed cut control failed.")));
     control?.on("data", (chunk: Buffer | string) => {
@@ -362,8 +361,11 @@ async function runFixedChild(context: CutContext, options: ManagedCoreSnapshotOp
       }
       resolvePromise(terminal);
     });
-    if (control === null) terminate(new Error("Managed cut control pipe is missing."));
-    else {
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    // Abort can occur after the pre-spawn check but before this listener exists.
+    if (options.signal?.aborted) onAbort();
+    if (failure === undefined && control === null) terminate(new Error("Managed cut control pipe is missing."));
+    else if (failure === undefined && control !== null) {
       try { sendFrame(control, request); }
       catch { terminate(new Error("Managed cut request could not be sent.")); }
     }
