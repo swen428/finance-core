@@ -29,6 +29,7 @@ from finance_core.managed_disk_snapshot import (
 from finance_core.openclaw_staging_bridge.workspace_access import managed_profile_for_workspace
 from finance_core.profile_gate import exclusive_cut, initialize_profile_gate
 from finance_core.profile_layout import (
+    has_managed_staging_ancestor,
     is_fixed_staging_path,
     is_linux_managed_namespace,
     is_managed_namespace,
@@ -103,6 +104,17 @@ def test_fixed_linux_layout_recognizes_unregistered_and_copied_trees(tmp_path: P
     with pytest.raises(MigrationTargetError, match="managed profile namespace"):
         validate_migration_target(database)
     assert not is_linux_managed_namespace(tmp_path / "ordinary/staging.sqlite")
+
+
+def test_marker_check_passes_non_directory_ancestors_and_still_checks_higher_markers(
+    tmp_path: Path,
+) -> None:
+    blocked_parent = tmp_path / "ordinary-file"
+    blocked_parent.write_text("synthetic file", encoding="utf-8")
+    target = blocked_parent / "nested/backup.sqlite"
+    assert not has_managed_staging_ancestor(target)
+    (tmp_path / ".managed-staging.v1.pending").symlink_to(tmp_path / "absent-marker-target")
+    assert has_managed_staging_ancestor(target)
 
 
 @pytest.mark.parametrize(
@@ -203,6 +215,21 @@ def test_linux_blank_enrollment_reopen_gate_and_generic_preopen_refusal(
     finally:
         managed.close()
         blank.close()
+
+
+@LINUX_ONLY
+def test_linux_root_remains_exact_0700_on_admission_and_revalidation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, _base = _linux_tree(tmp_path, monkeypatch)
+    with profile_paths.validate_linux_profile_paths(root, "synthetic") as blank:
+        root.chmod(0o755)
+        with pytest.raises(profile_paths.ProfilePathError, match="private"):
+            blank.revalidate()
+        with pytest.raises(profile_paths.ProfilePathError, match="private"):
+            profile_paths.validate_linux_profile_paths(root, "synthetic")
+        root.chmod(0o700)
+        blank.revalidate()
 
 
 @LINUX_ONLY

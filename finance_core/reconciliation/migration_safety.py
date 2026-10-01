@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
-from finance_core.profile_layout import is_managed_namespace
+from finance_core.profile_layout import has_managed_staging_ancestor, is_managed_namespace
 from finance_core.reconciliation.migrations import (
     FINANCE_APPLICATION_ID,
     LIVE_DB_PATH,
@@ -522,16 +522,7 @@ def _is_managed_profile_namespace(path: Path) -> bool:
     for candidate in candidates:
         if is_managed_namespace(candidate):
             return True
-        try:
-            if any(
-                (parent / marker).exists() or (parent / marker).is_symlink()
-                for parent in candidate.parents
-                for marker in (".managed-staging.v1.json", ".managed-staging.v1.pending")
-            ):
-                return True
-        except (OSError, RuntimeError):
-            return True
-    return False
+    return has_managed_staging_ancestor(raw)
 
 
 def _require_legacy_backup_source(

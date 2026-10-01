@@ -61,12 +61,17 @@ choose a production location or grant production write authority.
 
 Both layouts enforce the same fixed runtime/workspace/database names, ancestor
 ownership, symlink/Git exclusion, descriptor identity, single-link files,
-0700 directories, 0600 manifests, blank reserved database paths and ongoing
-revalidation. Linux includes the data-root directory in private permission
-checks. Generic staging access and legacy backup/migration recognize both managed
-namespaces before opening SQLite, including unregistered, pending, copied or
-corrupt profiles; a new spelling cannot escape managed registration and gate
-requirements. Linux enrolled reopening uses `verify_registered_linux_staging()`
+0700 Finance directories, 0600 manifests, blank reserved database paths and
+ongoing revalidation. Linux includes the data-root directory in private
+permission checks; the Mac Application Support root retains its original trusted
+ancestor rules, including safe 0755 roots. Generic staging creation/opening
+reject the entire Linux managed namespace even without registration. Ordinary
+staging access in either layout rejects ancestor registration or pending markers,
+including renamed/copied trees and corrupt markers, before SQLite or creation
+effects. Marker presence is refusal evidence, never authority. Mac fixed-path
+reopening refusal and unregistered generic creation retain their original
+behavior. Legacy backup/migration reject both complete managed namespaces.
+Linux enrolled reopening uses `verify_registered_linux_staging()`
 and the same source, migration, identity and SQLite/gate lifetime contracts.
 
 On Linux, descriptor-bound inspection rejects any `system.posix_acl_access` or

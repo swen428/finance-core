@@ -651,6 +651,10 @@ def _open_profile_paths(
         pins: dict[str, int] = {}
         try:
             for name in _DIRECTORIES:
+                if name == "layout_root" and layout == "mac":
+                    # Application Support retains the trusted-ancestor rules;
+                    # every Finance descendant (and the Linux root) is private.
+                    continue
                 pins[name] = _open_checked(paths[name], directory=True)
             if not managed:
                 _require_blank_databases(paths)

@@ -1,4 +1,4 @@
-"""Pure recognition and derivation of the two fixed managed profile layouts.
+"""Recognition and derivation of the two fixed managed profile layouts.
 
 Recognition is refusal-only. It never grants authority to a path; the trusted
 locator and descriptor checks live in :mod:`finance_core.profile_paths`.
@@ -54,3 +54,26 @@ def is_linux_managed_namespace(path: Path) -> bool:
     return any(
         parts[index : index + 2] == ("finance-codex", "profiles") for index in range(len(parts))
     )
+
+
+def has_managed_staging_ancestor(path: Path) -> bool:
+    """Refuse marker-bearing trees and aliases, without trusting marker contents.
+
+    A corrupt, pending or dangling marker still reserves the tree. Inspect both
+    lexical and resolved ancestors; any ambiguous inspection fails closed.
+    """
+    try:
+        raw = path.expanduser().absolute()
+        for candidate in (raw, raw.resolve(strict=False)):
+            for parent in candidate.parents:
+                for marker in (".managed-staging.v1.json", ".managed-staging.v1.pending"):
+                    try:
+                        (parent / marker).lstat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        # A missing parent or regular file cannot contain a marker;
+                        # higher ancestors can still reserve this path.
+                        continue
+                    return True
+    except (OSError, RuntimeError):
+        return True
+    return False

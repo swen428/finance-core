@@ -13,8 +13,13 @@ children. Profile locators are trusted local configuration, not message inputs.
 The blank witness cannot open a populated database or authorize a writer.
 Enrollment and subsequent managed access retain registration, private permissions,
 descriptor revalidation and the existing profile gate/SQLite lifetime rules.
-Generic staging and legacy backup/migration reject both managed namespaces before
-opening their files, including incomplete/corrupt registrations.
+Generic staging creation and opening reject the Linux managed namespace even
+without registration. Both layouts reject ordinary staging access beneath
+registration or pending markers, including renamed trees and corrupt markers;
+markers signal refusal, never authority. The original Mac fixed-path reopening
+refusal remains in force, while unregistered Mac generic creation retains its
+existing behavior. Legacy backup/migration reject both complete managed
+namespaces before file effects.
 
 Both Core and Bridge reject Linux access/default POSIX ACL attributes using
 actual filesystem inspection; mode bits alone are insufficient. Missing ACLs are

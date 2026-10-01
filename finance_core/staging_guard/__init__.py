@@ -38,7 +38,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
-from finance_core.profile_layout import is_fixed_staging_path, is_linux_managed_namespace
+from finance_core.profile_layout import (
+    has_managed_staging_ancestor,
+    is_fixed_staging_path,
+    is_linux_managed_namespace,
+)
 from finance_core.runtime_paths import RuntimePathConfigurationError, live_database_path
 from finance_core.sqlite_connection import configure_sqlite_connection
 
@@ -394,7 +398,9 @@ def _create_staging_database(
     configured_live_database = _configured_live_database_path()
 
     if (
-        is_linux_managed_namespace(Path(path).absolute()) or is_linux_managed_namespace(db_path)
+        is_linux_managed_namespace(Path(path).absolute())
+        or is_linux_managed_namespace(db_path)
+        or has_managed_staging_ancestor(Path(path))
     ) and not managed_bootstrap:
         raise StagingDatabaseError(
             "Fixed profile staging requires the managed profile gate and enrollment"
@@ -598,14 +604,17 @@ def require_unmanaged_staging_database(conn: sqlite3.Connection) -> None:
 
     This is a refusal-only refinement of the staging guard. It cannot turn an
     untrusted connection into managed authority or open another SQLite handle.
+    Location checks use SQLite's reported main path; a connection does not retain
+    lexical aliases that SQLite has already canonicalized away.
     """
-    require_staging_database(conn)
     db_file = _get_db_file_path(conn)
     if db_file and (
         _is_fixed_profile_staging_path(Path(db_file).resolve())
         or is_linux_managed_namespace(Path(db_file).resolve())
+        or has_managed_staging_ancestor(Path(db_file))
     ):
         raise StagingDatabaseError("A managed staging profile requires its fixed operation owner.")
+    require_staging_database(conn)
 
 
 def open_staging_database(
@@ -677,6 +686,7 @@ def _open_staging_database(
         _is_fixed_profile_staging_path(db_path)
         or is_linux_managed_namespace(Path(path).absolute())
         or is_linux_managed_namespace(db_path)
+        or has_managed_staging_ancestor(Path(path))
     ) and not managed:
         raise StagingDatabaseError(
             "Fixed profile staging requires the managed profile gate and enrollment"
