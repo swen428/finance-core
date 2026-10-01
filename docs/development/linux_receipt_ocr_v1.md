@@ -76,6 +76,45 @@ receives only `LANG=C`, `LC_ALL=C`, `TZ=UTC`, `OMP_THREAD_LIMIT=1`; no parent
 variables. Existing single-main-thread POSIX restriction, process-group cleanup,
 output ceilings and OS limits remain. Default address-space limit is 512 MiB.
 
+## Explicit total parser identity
+
+Only a newly resolved trusted schema-v2 pinned Linux engine carries the internal
+capability selecting parser `v2` with fixed contract
+`receipt-total-proposal-tsv-hierarchy-v2`. The selection belongs to the exact
+verified engine built from that configuration; it does not reread configuration
+or infer a version from a platform, engine name or request field. The existing
+engine-factory test seam remains. Schema-v1 Vision, legacy Tesseract and direct
+API calls retain parser `v1` and its default contract; legal legacy custom
+contract tokens retain v1 behavior, including a token whose literal later names
+the v2 contract. A contract token alone never selects v2. Unknown parser versions
+and explicit v2 paired with any other contract are refused.
+
+The opt-in v2 loader reads the complete persisted OCR fields and recomputes the
+original normalized-result hash using the existing OCR normalization contract
+before trusting geometry. It groups succeeded TSV tokens by complete
+`(page, block, paragraph, line)` identity and stable left / original-sequence
+order. Missing or malformed hierarchy, duplicate sequences, nonpositive heights,
+disjoint vertical spans or a normalized hash mismatch refuse the whole judgment;
+no invalid group is discarded to manufacture a clear amount. Non-succeeded OCR
+keeps its existing incomplete status. Amount, currency, date, conflict and human
+confirmation rules are unchanged. The original image, OCR rows and normalized
+hash are retained.
+
+Parser version is bound into the proposal input hash, persisted parser identity,
+link contract and replay verification. Existing Bridge proposals are returned
+before engine resolution; they are never automatically reparsed, upgraded or
+replaced. Existing identifiers cannot be reused for another version. The legacy
+v1 grouping and AI ITEM / TOTAL role-proof helpers stay unchanged; v2 receipt
+grouping grants no new AI exemption. A resolved amount is still a pending proposal
+requiring human confirmation, with no final financial writes.
+
+Deterministic tests retain two minimal synthetic OCR vectors with their source
+and original normalized hashes. Independently generated frozen-code legacy
+snapshots cover Tesseract, Vision, custom contract tokens and colliding line
+numbers; replay checks exact IDs, hashes, stored payload / evidence and unchanged
+counts. These offline proofs supplement the actual lane; they do not establish
+actual Linux success for a new candidate.
+
 ## Actual acceptance and asset preparation
 
 `scripts/linux_ocr_assets_v1.json` pins the Apache-2.0 `tessdata_fast` upstream

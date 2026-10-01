@@ -14,11 +14,24 @@ import os
 import re
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from finance_core.intake.receipt_ocr_evidence import ReceiptOcrEngine
+from finance_core.intake.receipt_ocr_evidence import (
+    ReceiptOcrEngine,
+    ReceiptOcrEngineIdentity,
+    ReceiptOcrEngineResult,
+    ReceiptOcrLimits,
+    ReceiptOcrSource,
+)
 from finance_core.openclaw_staging_bridge import errors
+from finance_core.parser_proposals.receipt_total_parser import (
+    PARSER_CONTRACT_VERSION_DEFAULT,
+    PARSER_CONTRACT_VERSION_TSV_HIERARCHY,
+    PARSER_VERSION,
+    PARSER_VERSION_TSV_HIERARCHY,
+)
 
 OCR_ENGINE_CONFIG_FILENAME = "ocr_engine.json"
 OCR_ENGINE_CONFIG_SCHEMA_VERSION = "v1"
@@ -104,6 +117,33 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+@dataclass(frozen=True)
+class _PinnedLinuxReceiptEngine:
+    """Capability created only from this resolver's verified pinned configuration.
+
+    Keep the selected parser bound to the same engine used for extraction. No
+    independent configuration read, platform/name inference or request switch.
+    """
+
+    engine: ReceiptOcrEngine
+
+    @property
+    def identity(self) -> ReceiptOcrEngineIdentity:
+        return self.engine.identity
+
+    def extract(
+        self, source: ReceiptOcrSource, *, limits: ReceiptOcrLimits, deadline: float
+    ) -> ReceiptOcrEngineResult:
+        return self.engine.extract(source, limits=limits, deadline=deadline)
+
+
+def receipt_parser_identity(engine: ReceiptOcrEngine) -> tuple[str, str]:
+    """Select v2 only for the capability built by the trusted Linux resolver."""
+    if type(engine) is _PinnedLinuxReceiptEngine:
+        return PARSER_VERSION_TSV_HIERARCHY, PARSER_CONTRACT_VERSION_TSV_HIERARCHY
+    return PARSER_VERSION, PARSER_CONTRACT_VERSION_DEFAULT
+
+
 def _resolve_linux_engine(payload: dict[str, Any]) -> ReceiptOcrEngine:
     from finance_core.intake.receipt_ocr_evidence import TesseractTsvOcrEngine
     from finance_core.intake.tesseract_resources import (
@@ -166,7 +206,7 @@ def _resolve_linux_engine(payload: dict[str, Any]) -> ReceiptOcrEngine:
             raise ValueError("Binary hash mismatch.")
     except Exception as exc:
         raise _unavailable("Trusted Linux OCR resources failed identity verification.") from exc
-    return engine
+    return _PinnedLinuxReceiptEngine(engine)
 
 
 def _validated_engine_config(payload: dict[str, Any]) -> dict[str, Any]:

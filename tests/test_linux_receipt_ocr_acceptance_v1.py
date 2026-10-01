@@ -122,7 +122,17 @@ def test_actual_mixed_receipt_capture_propose_replay(
         payload = json.loads(
             conn.execute("SELECT parsed_payload FROM parser_outputs").fetchone()[0]
         )
-        assert payload["amount"] == "12.34", payload
+        assert payload["amount"] == "12.34" and payload["currency"] == "HKD", payload
+        assert payload["confirmation_required"] is True and payload["is_final"] is False
+        assert conn.execute("SELECT parser_version FROM parser_outputs").fetchone()[0] == "v2"
+        assert (
+            conn.execute(
+                "SELECT parser_contract_version FROM receipt_ocr_proposal_links"
+            ).fetchone()[0]
+            == "receipt-total-proposal-tsv-hierarchy-v2"
+        )
+        amount_evidence = next(e for e in payload["field_evidence"] if e["field_name"] == "amount")
+        assert amount_evidence["block_sequence_indexes"] == [22, 23, 24, 25]
     assert_evidence(workspace, name)
 
 
@@ -289,7 +299,7 @@ def test_actual_bad_resource_preserves_capture_and_refuses_ocr(
         errors.OCR_EXTRACTION_FAILED if failure == "version" else errors.OCR_ENGINE_UNAVAILABLE
     )
     with support.open_database(workspace) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM raw_intake_records_v2").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM raw_intake_records").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 0
         assert all(value == 0 for value in support.count_final_facts(conn).values())

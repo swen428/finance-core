@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import re
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 IMMUTABLE_OWNER_COMMENT_FILES = {
@@ -25,6 +28,15 @@ NEGATIVE_SECRET_FIXTURE_FILES = {
     "tests/test_ai_model_compatibility_receipts_v2.py",
 }
 BINARY_FIXTURE_SHA256 = {
+    "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png": (
+        "3d0f2b20ce2713babc596e27cb2d484704a717aa9ecb4df9a5773d3e557dd0db"
+    ),
+    "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg": (
+        "d7d1e62acc006b67d6a44e4c55459348a3fae5d25bb0dd94f1d99d57bef728bb"
+    ),
+    "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png": (
+        "69f6d080d7039cecbd179d339be4783cb284febdbe50f3c80c5aac8e76fc6634"
+    ),
     "tests/fixtures/receipt_ocr/synthetic_receipt_001.png": (
         "25336b8073d8862eae8f2dc699fea02e4240ce4bcb9b38b914e9450da3b04a15"
     ),
@@ -152,3 +164,27 @@ def test_no_runtime_data_or_credential_files_are_tracked() -> None:
         if path.name in prohibited_names or path.suffix.lower() in prohibited_suffixes
     ]
     assert findings == []
+
+
+@pytest.mark.parametrize("identity", ["approved", "changed", "unknown"])
+def test_binary_allowlist_keeps_exact_path_and_hash_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, identity: str
+) -> None:
+    payload = b"\xffsynthetic-binary"
+    path = tmp_path / "synthetic.bin"
+    path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    expected = {"synthetic.bin": digest}
+    if identity == "changed":
+        expected["synthetic.bin"] = "0" * 64
+    elif identity == "unknown":
+        expected = {"another.bin": digest}
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", tmp_path)
+    monkeypatch.setattr(module, "BINARY_FIXTURE_SHA256", expected)
+    monkeypatch.setattr(module, "_tracked_files", lambda: [path])
+    if identity == "approved":
+        assert _text_files() == []
+    else:
+        with pytest.raises(AssertionError, match="unapproved or changed binary file"):
+            _text_files()

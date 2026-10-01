@@ -28,6 +28,8 @@ from finance_core.money import (
 PARSER_CONTRACT_VERSION_DEFAULT = "receipt-total-proposal-v1"
 PARSER_NAME = "receipt-total-ocr-parser"
 PARSER_VERSION = "v1"
+PARSER_VERSION_TSV_HIERARCHY = "v2"
+PARSER_CONTRACT_VERSION_TSV_HIERARCHY = "receipt-total-proposal-tsv-hierarchy-v2"
 
 PROPOSAL_INTENT = "personal_expense_log"
 PROPOSAL_TRANSACTION_TYPE = "personal_expense"
@@ -266,6 +268,7 @@ def parse_receipt_total(
     blocks: Sequence[ParserOcrBlock],
     *,
     extraction_status: str,
+    parser_version: str = PARSER_VERSION,
 ) -> ReceiptTotalParseResult:
     """Parse normalized OCR blocks into a conservative total-level proposal.
 
@@ -273,6 +276,8 @@ def parse_receipt_total(
     non-``succeeded`` status yields an incomplete pending proposal with all
     financial fields null and a stable failure flag preserved.
     """
+    if parser_version not in (PARSER_VERSION, PARSER_VERSION_TSV_HIERARCHY):
+        raise ValueError("Unknown receipt total parser version.")
     flags = _FlagSet()
 
     if extraction_status != "succeeded":
@@ -282,7 +287,11 @@ def parse_receipt_total(
         flags.add(failure_flag)
         return _incomplete_result(flags)
 
-    lines = _build_lines(blocks)
+    lines = (
+        _build_tsv_hierarchy_lines(blocks)
+        if parser_version == PARSER_VERSION_TSV_HIERARCHY
+        else _build_lines(blocks)
+    )
     confidence_by_seq = {
         block.sequence_index: block.confidence_scaled
         for block in blocks
@@ -342,6 +351,72 @@ def _build_lines(blocks: Sequence[ParserOcrBlock]) -> list[_Line]:
                 upper=text.upper(),
                 block_sequence_indexes=tuple(b.sequence_index for b in ordered),
                 order_key=(page, min_seq),
+            )
+        )
+    lines.sort(key=lambda line: line.order_key)
+    return lines
+
+
+def _build_tsv_hierarchy_lines(blocks: Sequence[ParserOcrBlock]) -> list[_Line]:
+    """Group only complete TSV hierarchy; any unusable block rejects the parse.
+
+    This opt-in parser never grants AI role exemptions. The legacy grouping and
+    the proven-layout helpers remain independent of this version.
+    """
+    groups: dict[tuple[int, int, int, int], list[ParserOcrBlock]] = {}
+    sequences: set[int] = set()
+    for block in blocks:
+        indexes = (
+            block.sequence_index,
+            block.page_index,
+            block.engine_block_index,
+            block.engine_paragraph_index,
+            block.engine_line_index,
+            block.left,
+            block.top,
+        )
+        if any(type(value) is not int or value < 0 for value in indexes):
+            raise ValueError(
+                "TSV hierarchy and coordinates must be complete non-negative integers."
+            )
+        if type(block.height) is not int or block.height <= 0:
+            raise ValueError("TSV hierarchy requires positive block heights.")
+        if not isinstance(block.text, str) or not block.text:
+            raise ValueError("TSV hierarchy requires non-empty block text.")
+        if block.confidence_scaled is not None and (
+            type(block.confidence_scaled) is not int or not 0 <= block.confidence_scaled <= 10000
+        ):
+            raise ValueError("TSV hierarchy confidence is malformed.")
+        if block.sequence_index in sequences:
+            raise ValueError("TSV hierarchy sequence indexes must be unique.")
+        sequences.add(block.sequence_index)
+        # Runtime validation above proves these optional indexes are integers.
+        assert block.engine_block_index is not None
+        assert block.engine_paragraph_index is not None
+        assert block.engine_line_index is not None
+        key = (
+            block.page_index,
+            block.engine_block_index,
+            block.engine_paragraph_index,
+            block.engine_line_index,
+        )
+        groups.setdefault(key, []).append(block)
+    if not blocks or sequences != set(range(len(blocks))):
+        raise ValueError("TSV hierarchy sequence indexes must be contiguous from zero.")
+    lines: list[_Line] = []
+    for members in groups.values():
+        if max(b.top for b in members) >= min(b.top + (b.height or 0) for b in members):
+            raise ValueError("TSV hierarchy line has disjoint vertical spans.")
+        ordered = sorted(members, key=lambda b: (b.left, b.sequence_index))
+        text = " ".join(b.text for b in ordered)
+        page = ordered[0].page_index
+        lines.append(
+            _Line(
+                page_index=page,
+                text=text,
+                upper=text.upper(),
+                block_sequence_indexes=tuple(b.sequence_index for b in ordered),
+                order_key=(page, min(b.sequence_index for b in members)),
             )
         )
     lines.sort(key=lambda line: line.order_key)
