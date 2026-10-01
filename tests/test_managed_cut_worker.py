@@ -33,6 +33,8 @@ from finance_core.managed_staging_profile import (
 from finance_core.profile_paths import MANAGED_STAGING_FILENAME, ManagedStagingProfile
 from tests.test_managed_staging_profile import _blank_profile
 
+pytestmark = pytest.mark.usefixtures("core_package_metadata_v1")
+
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _LIMITS = {
     "max_core_db_bytes": 128 * 1024 * 1024,

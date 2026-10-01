@@ -366,7 +366,9 @@ async function createBundleScenario(scratch: string): Promise<{
   const gatePath = join(profileRoot, ".profile-gate.v1.lock");
   const pythonExecutable = await makePrivatePythonEnvironment(scratch);
   const coreVersion = (await execFile(pythonExecutable, [
-    "-c", "import importlib.metadata; print(importlib.metadata.version('finance-core'))",
+    "-I", "-c",
+    "import pathlib,sys,tomllib; print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text())['project']['version'])",
+    join(REPOSITORY_ROOT, "pyproject.toml"),
   ])).stdout.trim();
   const distribution = await coreDistributionFixture(
     coreDistributionRoot, "d".repeat(40), undefined, coreVersion,

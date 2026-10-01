@@ -46,6 +46,7 @@ from tests import test_s1c_a_managed_bridge_commands as managed_commands
 from tests import test_s3a_managed_capture_publication as capture_tests
 
 pytest_plugins = ("tests.test_s1c_a_managed_bridge_commands",)
+pytestmark = pytest.mark.usefixtures("core_package_metadata_v1")
 
 
 @pytest.fixture()
