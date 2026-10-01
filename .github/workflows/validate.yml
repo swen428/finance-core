@@ -284,6 +284,7 @@ jobs:
           name: linux-ocr-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/linux-ocr/preparation-receipt.json
+            ${{ runner.temp }}/linux-ocr-preparation-failure.json
             ${{ runner.temp }}/linux-ocr-acceptance.xml
           retention-days: 30
           if-no-files-found: warn

@@ -105,9 +105,18 @@ class PinnedTesseractResources:
             _safe_stat(before_directory, directory=True)
             if _identity(before_directory) != _identity(os.lstat(self.directory)):
                 raise InvalidOcrConfigurationError("OCR resource directory changed during opening.")
-            with tempfile.TemporaryDirectory(prefix="receipt-ocr-models-") as temporary:
-                snapshot_path = Path(temporary)
-                snapshot_path.chmod(0o700)
+            snapshot_path = Path(tempfile.mkdtemp(prefix="receipt-ocr-models-"))
+            created_directory = os.lstat(snapshot_path)
+            snapshot_fd = os.open(
+                snapshot_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+            )
+            try:
+                owned_directory = os.fstat(snapshot_fd)
+                _safe_stat(owned_directory, directory=True)
+                if _identity(created_directory) != _identity(owned_directory):
+                    raise InvalidOcrConfigurationError(
+                        "Private OCR directory changed during opening."
+                    )
                 try:
                     for model in self.languages:
                         check_deadline(deadline)
@@ -123,7 +132,12 @@ class PinnedTesseractResources:
                                     "OCR resource length does not match."
                                 )
                             target = snapshot_path / name
-                            target_fd = os.open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+                            target_fd = os.open(
+                                name,
+                                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600,
+                                dir_fd=snapshot_fd,
+                            )
                             try:
                                 _stream_checked(source_fd, model, deadline, target_fd=target_fd)
                                 if _identity(before) != _identity(os.fstat(source_fd)) or _identity(
@@ -149,12 +163,17 @@ class PinnedTesseractResources:
                         raise InvalidOcrConfigurationError(
                             "OCR resource directory changed during copying."
                         )
-                    snapshot = ResourceSnapshot(snapshot_path, files)
+                    snapshot = ResourceSnapshot(
+                        snapshot_path, snapshot_fd, _identity(os.fstat(snapshot_fd)), files
+                    )
                     snapshot.verify(deadline)
                     yield snapshot
                 finally:
                     for fd, _path, _model, _original in files:
                         os.close(fd)
+                    _cleanup_snapshot(snapshot_path, snapshot_fd, owned_directory, self.languages)
+            finally:
+                os.close(snapshot_fd)
         except OSError as exc:
             raise InvalidOcrConfigurationError(
                 "OCR resources changed or cannot be opened safely."
@@ -194,17 +213,62 @@ def _stream_checked(
 @dataclass
 class ResourceSnapshot:
     directory: Path
+    directory_fd: int
+    directory_identity: tuple[int, ...]
     files: list[tuple[int, Path, TesseractLanguageResource, tuple[int, ...]]]
 
+    @property
+    def invocation_directory(self) -> str:
+        # The descriptor is explicitly inherited by the Linux OCR child.
+        return f"/proc/self/fd/{self.directory_fd}"
+
+    def _verify_directory(self) -> None:
+        opened = os.fstat(self.directory_fd)
+        _safe_stat(opened, directory=True)
+        if self.directory_identity != _identity(opened) or self.directory_identity != _identity(
+            os.lstat(self.directory)
+        ):
+            raise InvalidOcrConfigurationError("Private OCR snapshot directory identity changed.")
+
     def verify(self, deadline: float) -> None:
+        check_deadline(deadline)
+        self._verify_directory()
         for fd, path, model, original in self.files:
             check_deadline(deadline)
-            if original != _identity(os.fstat(fd)) or original != _identity(os.lstat(path)):
+            if original != _identity(os.fstat(fd)) or original != _identity(
+                os.stat(path.name, dir_fd=self.directory_fd, follow_symlinks=False)
+            ):
                 raise InvalidOcrConfigurationError(
                     "Private OCR resource snapshot identity changed."
                 )
             _stream_checked(fd, model, deadline)
-            if original != _identity(os.fstat(fd)) or original != _identity(os.lstat(path)):
+            if original != _identity(os.fstat(fd)) or original != _identity(
+                os.stat(path.name, dir_fd=self.directory_fd, follow_symlinks=False)
+            ):
                 raise InvalidOcrConfigurationError(
                     "Private OCR resource snapshot changed during verification."
                 )
+        self._verify_directory()
+
+
+def _cleanup_snapshot(
+    path: Path,
+    directory_fd: int,
+    owned: os.stat_result,
+    languages: tuple[TesseractLanguageResource, ...],
+) -> None:
+    # Never recursively traverse a mutable pathname. Only our model entries are
+    # unlinked in the held directory; a replacement path (including its data) stays.
+    for model in languages:
+        try:
+            os.unlink(f"{model.language}.traineddata", dir_fd=directory_fd)
+        except OSError:
+            # A refused invocation keeps its original error. Unknown replacement
+            # entries are never recursively removed to make cleanup succeed.
+            pass
+    try:
+        current = os.lstat(path)
+        if (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+            os.rmdir(path)
+    except OSError:
+        pass

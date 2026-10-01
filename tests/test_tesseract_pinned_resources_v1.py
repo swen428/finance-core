@@ -9,11 +9,12 @@ import stat
 import time
 from pathlib import Path
 
+import openclaw_staging_bridge_support_v1 as support
 import pytest
 
 from finance_core.intake import receipt_ocr_evidence as ocr
 from finance_core.intake import tesseract_resources as resources
-from finance_core.openclaw_staging_bridge import errors, ocr_boundary
+from finance_core.openclaw_staging_bridge import commands, errors, ocr_boundary
 
 
 def descriptor(
@@ -99,6 +100,28 @@ def test_snapshot_tamper_and_exception_always_cleanup(tmp_path: Path, tamper: st
                     path.symlink_to(model.directory / "eng.traineddata")
             snapshot.verify(time.monotonic() + 5)
     assert not directory.exists()
+
+
+def test_snapshot_cleanup_error_keeps_original_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model = descriptor(tmp_path / "models")
+
+    def refused_unlink(*args, **kwargs):
+        raise PermissionError("Synthetic cleanup failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(resources.os, "unlink", refused_unlink)
+        with pytest.raises(ocr.InvalidOcrConfigurationError, match="snapshot identity changed"):
+            with model.snapshot(deadline=time.monotonic() + 5) as snapshot:
+                directory = snapshot.directory
+                path = directory / "eng.traineddata"
+                path.chmod(0o600)
+                path.write_bytes(b"modified-model!")
+                snapshot.verify(time.monotonic() + 5)
+    for entry in directory.iterdir():
+        entry.unlink()
+    directory.rmdir()
 
 
 @pytest.mark.parametrize(
@@ -207,11 +230,14 @@ def test_pinned_fixed_arguments_and_snapshot_check_after_runner(
             "-c",
             "tessedit_create_tsv=1",
         ]
-        snapshot = Path(argv[6])
-        assert snapshot != model.directory
-        path = snapshot / "eng.traineddata"
-        path.chmod(0o600)
-        path.write_bytes(b"modified-model!")
+        directory_fd = kwargs["pass_fds"][-1]
+        assert argv[6] == f"/proc/self/fd/{directory_fd}"
+        os.chmod("eng.traineddata", 0o600, dir_fd=directory_fd)
+        fd = os.open("eng.traineddata", os.O_WRONLY, dir_fd=directory_fd)
+        try:
+            os.write(fd, b"modified-model!")
+        finally:
+            os.close(fd)
         return ocr._ProcessOutput(0, b"")
 
     monkeypatch.setattr(ocr, "_run_bounded_process", runner)
@@ -223,6 +249,95 @@ def test_pinned_fixed_arguments_and_snapshot_check_after_runner(
         )
     assert len(launches) == 2
     assert not Path(launches[1][0][6]).exists()
+
+
+@pytest.mark.parametrize("restore", [True, False])
+def test_directory_swap_refuses_persistence_and_cleanup_preserves_foreign_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restore: bool
+) -> None:
+    monkeypatch.setattr(ocr, "_require_supported_process_platform", lambda: None)
+    model = descriptor(tmp_path / "models")
+    engine = ocr.TesseractTsvOcrEngine(
+        binary(tmp_path), expected_version="5.3.4", language="eng+chi_sim", pinned_resources=model
+    )
+    workspace = support.create_bridge_workspace(tmp_path)
+    image = support.PNG_BYTES
+    support.write_handoff_file(workspace, "receipt.png", image)
+    captured = support.run_cli(
+        support.make_request(
+            "capture",
+            support.capture_receipt_arguments(
+                workspace, handoff_filename="receipt.png", declared_mime_type="image/png"
+            ),
+            idempotency_key=support.canonical_capture_key(message_id=20),
+        )
+    )
+    assert captured.exit_code == errors.EXIT_OK
+    intake = captured.response["result"]["intake_public_id"]
+    monkeypatch.setattr(commands, "build_ocr_engine", lambda *a, **k: engine)
+    created = []
+    real_mkdtemp = resources.tempfile.mkdtemp
+
+    def record_directory(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        if kwargs.get("prefix") == "receipt-ocr-models-":
+            created.append(Path(path))
+        return path
+
+    monkeypatch.setattr(resources.tempfile, "mkdtemp", record_directory)
+    observed = []
+    saved = tmp_path / "saved-snapshot"
+    foreign = tmp_path / "foreign-snapshot"
+
+    def runner(argv, **kwargs):
+        if argv[-1] == "--version":
+            return ocr._ProcessOutput(0, b"tesseract 5.3.4\n")
+        directory = created[-1]
+        os.rename(directory, saved)
+        directory.mkdir(mode=0o700)
+        for language in ("eng", "chi_sim"):
+            (directory / f"{language}.traineddata").write_bytes(b"foreign-model")
+        (directory / "sentinel").write_bytes(b"other data")
+        assert (directory / "eng.traineddata").read_bytes() == b"foreign-model"
+        directory_fd = kwargs["pass_fds"][-1]
+        assert argv[6] == f"/proc/self/fd/{directory_fd}"
+        fd = os.open("eng.traineddata", os.O_RDONLY, dir_fd=directory_fd)
+        try:
+            observed.append(os.read(fd, 64))
+        finally:
+            os.close(fd)
+        if restore:
+            os.rename(directory, foreign)
+            os.rename(saved, directory)
+        return ocr._ProcessOutput(0, b"")
+
+    monkeypatch.setattr(ocr, "_run_bounded_process", runner)
+    refused = support.run_cli(
+        support.make_request(
+            "propose",
+            {"workspace_path": str(workspace.workspace_path), "intake_public_id": intake},
+            idempotency_key=support.canonical_propose_key(intake),
+        )
+    )
+    assert refused.exit_code != errors.EXIT_OK
+    assert observed == [b"synthetic-model"], refused.response
+    replacement = foreign if restore else created[-1]
+    assert (replacement / "sentinel").read_bytes() == b"other data"
+    assert (replacement / "eng.traineddata").read_bytes() == b"foreign-model"
+    assert not (saved / "eng.traineddata").exists()
+    if restore:
+        assert not created[-1].exists()
+    with support.open_database(workspace) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM receipt_ocr_extractions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM receipt_ocr_blocks").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM parser_outputs").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
+        assert all(value == 0 for value in support.count_final_facts(conn).values())
+    if not restore:
+        # Cleanup intentionally leaves this external directory; the test owns it.
+        for entry in replacement.iterdir():
+            entry.unlink()
+        replacement.rmdir()
 
 
 @pytest.mark.parametrize(
@@ -314,12 +429,13 @@ def test_source_mutation_during_copy_is_refused_and_private_directory_removed(
 ) -> None:
     model = descriptor(tmp_path / "models")
     real_stream = resources._stream_checked
-    real_temp = resources.tempfile.TemporaryDirectory
+    real_mkdtemp = resources.tempfile.mkdtemp
     directories = []
 
-    def temp(*args, **kwargs):
-        result = real_temp(*args, **kwargs)
-        directories.append(Path(result.name))
+    def record_directory(*args, **kwargs):
+        result = real_mkdtemp(*args, **kwargs)
+        if kwargs.get("prefix") == "receipt-ocr-models-":
+            directories.append(Path(result))
         return result
 
     def mutate(fd, identity, deadline, *, target_fd=None):
@@ -330,7 +446,7 @@ def test_source_mutation_during_copy_is_refused_and_private_directory_removed(
             path.write_bytes(b"changed-model!!")
 
     monkeypatch.setattr(resources, "_stream_checked", mutate)
-    monkeypatch.setattr(resources.tempfile, "TemporaryDirectory", temp)
+    monkeypatch.setattr(resources.tempfile, "mkdtemp", record_directory)
     with pytest.raises(ocr.InvalidOcrConfigurationError):
         model.validate()
     assert directories and all(not directory.exists() for directory in directories)
@@ -363,9 +479,8 @@ def test_v2_config_partial_json_oversize_and_replacement_refuse(
         ocr_boundary.resolve_workspace_ocr_engine(tmp_path)
 
 
-def test_asset_preparation_hashes_bounded_download_and_refuses_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.fixture()
+def preparation_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import importlib.util
     import io
     import subprocess
@@ -414,6 +529,13 @@ def test_asset_preparation_hashes_bounded_download_and_refuses_version(
         return subprocess.CompletedProcess(argv, 0, output, b"")
 
     monkeypatch.setattr(preparation.subprocess, "run", command)
+    return preparation, executable, value
+
+
+def test_asset_preparation_hashes_bounded_download_and_refuses_version(
+    tmp_path: Path, preparation_setup
+) -> None:
+    preparation, executable, _value = preparation_setup
     destination = tmp_path / "prepared"
     preparation.prepare(destination, executable)
     assert stat.S_IMODE((destination / "tesseract").stat().st_mode) == 0o500
@@ -424,21 +546,84 @@ def test_asset_preparation_hashes_bounded_download_and_refuses_version(
         receipt["observed_version"] == "5.3.4"
         and receipt["package"] == "tesseract-ocr\t5.3.4-1\tamd64"
     )
-    monkeypatch.setattr(
-        preparation.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(value + b"extra")
-    )
-    with pytest.raises(ValueError):
-        preparation.prepare(tmp_path / "oversize", executable)
-    assert not (tmp_path / "oversize").exists()
-    monkeypatch.setattr(
-        preparation.urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(value)
-    )
-    monkeypatch.setattr(
-        preparation.subprocess,
-        "run",
-        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"tesseract 9.9.9\n", b""),
-    )
-    with pytest.raises(ValueError):
-        preparation.prepare(tmp_path / "wrong-version", executable)
-    assert not (tmp_path / "wrong-version").exists()
     assert not list(tmp_path.glob("linux-ocr-preparation-*"))
+
+
+@pytest.mark.parametrize(
+    "failure,stage,category",
+    [
+        ("hash", "resource_download", "model_identity_mismatch"),
+        ("oversize", "resource_download", "model_size_mismatch"),
+        ("deadline", "resource_download", "deadline"),
+        ("version", "binary_version", "version_mismatch"),
+        ("download", "resource_download", "io_failure"),
+    ],
+)
+def test_preparation_failure_preserves_private_sanitized_receipt_and_cleans_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preparation_setup,
+    failure: str,
+    stage: str,
+    category: str,
+) -> None:
+    import io
+    import subprocess
+
+    preparation, executable, value = preparation_setup
+    if failure in {"hash", "oversize"}:
+        downloaded = b"X" * len(value) if failure == "hash" else value + b"extra"
+        monkeypatch.setattr(
+            preparation.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(downloaded)
+        )
+    elif failure == "deadline":
+        clock = iter([0.0, 121.0])
+        monkeypatch.setattr(preparation.time, "monotonic", lambda: next(clock))
+    elif failure == "version":
+        monkeypatch.setattr(
+            preparation.subprocess,
+            "run",
+            lambda argv, **k: subprocess.CompletedProcess(argv, 0, b"tesseract 9.9.9\n", b""),
+        )
+    else:
+
+        def fail_download(*args, **kwargs):
+            raise OSError("/private/host/secret-path?token=secret-download-token")
+
+        monkeypatch.setattr(preparation.urllib.request, "urlopen", fail_download)
+    destination = tmp_path / "failed"
+    with pytest.raises((ValueError, TimeoutError, OSError)):
+        preparation.prepare(destination, executable)
+    assert not destination.exists()
+    assert not list(tmp_path.glob("linux-ocr-preparation-*"))
+    path = preparation.failure_receipt_path(destination)
+    raw = path.read_bytes()
+    assert len(raw) <= preparation.MAX_FAILURE_RECEIPT_BYTES
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.stat().st_uid == os.getuid()
+    receipt = json.loads(raw)
+    assert receipt["status"] == "failed"
+    assert receipt["stage"] == stage
+    assert receipt["failure_category"] == category
+    assert receipt["expected_tesseract_version"] == "5.3.4"
+    expected = receipt["language_resources"][0]
+    assert len(receipt["language_resources"]) == 2
+    assert receipt["language_resources"][1]["expected_sha256"] == hashlib.sha256(value).hexdigest()
+    if stage == "resource_download":
+        assert receipt["language_resources"][1]["observed_sha256"] is None
+    assert expected["expected_size_bytes"] == len(value)
+    assert expected["expected_sha256"] == hashlib.sha256(value).hexdigest()
+    if failure == "hash":
+        assert expected["observed_size_bytes"] == len(value)
+        assert expected["observed_sha256"] == hashlib.sha256(b"X" * len(value)).hexdigest()
+    elif failure == "oversize":
+        assert expected["observed_size_bytes"] == len(value) + 1
+        assert expected["observed_sha256"] == hashlib.sha256(value + b"e").hexdigest()
+    elif failure == "version":
+        assert receipt["observed_version"] == "9.9.9"
+        assert receipt["binary_sha256"] == hashlib.sha256(executable.read_bytes()).hexdigest()
+    assert str(tmp_path).encode() not in raw and b"secret-download-token" not in raw
+    workflow = (Path(__file__).parents[1] / ".github/workflows/validate.yml").read_text()
+    evidence_step = workflow.split("- name: Preserve actual Linux OCR acceptance evidence", 1)[1]
+    assert "always() && runner.os == 'Linux'" in evidence_step
+    assert "${{ runner.temp }}/linux-ocr-preparation-failure.json" in evidence_step

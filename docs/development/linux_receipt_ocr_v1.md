@@ -54,17 +54,23 @@ remain separate identity fields. Existing extraction IDs conflict if rebound
 to a different identity; historical evidence is never rewritten.
 
 Each extraction streams checked source model bytes into its own 0700 snapshot,
-with 0400 model files. Held descriptors and path identities are checked during
-copy and before/after OCR. Snapshot copying/hashing, binary checks, version query
+with 0400 model files. The completed directory has a held descriptor and recorded
+identity including change time. Directory and model identities are checked during
+copy and before/after OCR; Linux model reads use the inherited directory descriptor
+through `/proc/self/fd`, so a replaced directory pathname cannot redirect them.
+Snapshot copying/hashing, binary checks, version query
 and OCR share the extraction deadline. Only this owned temporary directory is
-removed on completion or failure. Replacement of an original model after the
+cleaned on completion or failure using its held directory descriptor. Cleanup
+never recursively removes a replacement pathname or unknown entries; directory
+removal requires the original inode still at its pathname. Replacement of an original model after the
 snapshot is checked cannot change the current invocation; the next invocation
 must verify the newly opened source and refuse a mismatch. Mutation/replacement
 of the private snapshot or executable fails before evidence is accepted. This
-is an invocation snapshot, not an atomic snapshot of the entire machine.
+is an invocation snapshot, not an atomic snapshot of the entire machine or a
+defense against arbitrary hostile code under the service UID or a compromised OS.
 
 Pinned arguments are fixed: opened executable/input descriptors, `stdout`,
-`-l eng+chi_sim --tessdata-dir <private snapshot> --oem 1 --psm 3 --dpi 300
+`-l eng+chi_sim --tessdata-dir <opened snapshot directory descriptor> --oem 1 --psm 3 --dpi 300
 -c tessedit_create_tsv=1`. No external `tsv` configuration is loaded. The process
 receives only `LANG=C`, `LC_ALL=C`, `TZ=UTC`, `OMP_THREAD_LIMIT=1`; no parent
 variables. Existing single-main-thread POSIX restriction, process-group cleanup,
@@ -93,7 +99,14 @@ An actual process output cap proves bounded refusal. A deterministic deadline
 fault after observing the actual OCR launch verifies real process-group
 termination and zero partial evidence; it does not measure natural OCR latency.
 Preparation records distro/package/version/binary/resource identities and the
-lane preserves its receipt and actual acceptance JUnit timing, including failures. Deterministic tests cover
+lane preserves its receipt and actual acceptance JUnit timing, including failures.
+Failed asset preparation removes its partial models, binary and configuration,
+and independently retains a 0600, at most 16 KiB
+`<destination-name>-preparation-failure.json` beside the destination. This receipt
+records stage/status, sanitized failure category, expected and observed resource
+sizes/hashes and version available so far; it excludes exception text, download
+content, host paths and inherited environment. The always-upload step includes
+this separate failure receipt. Deterministic tests cover
 resource races, cleanup and compatibility; they do not certify actual Linux OCR.
 
 Linux recognition accuracy, memory fit and timing are established only by the

@@ -452,7 +452,7 @@ class TesseractTsvOcrEngine:
                         snapshot.verify(deadline)
                         arguments += [
                             "--tessdata-dir",
-                            str(snapshot.directory),
+                            snapshot.invocation_directory,
                             "--oem",
                             "1",
                             "--psm",
@@ -464,7 +464,8 @@ class TesseractTsvOcrEngine:
                         ]
                     process_output = _run_bounded_process(
                         arguments,
-                        pass_fds=(executable.fd, source.file_descriptor),
+                        pass_fds=(executable.fd, source.file_descriptor)
+                        + ((snapshot.directory_fd,) if snapshot is not None else ()),
                         limits=limits,
                         deadline=deadline,
                         working_directory=working_directory,
