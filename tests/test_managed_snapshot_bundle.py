@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import sqlite3
 import time
 import uuid
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import openclaw_staging_bridge_support_v1 as bridge_support
@@ -39,6 +41,7 @@ from finance_core.managed_staging_profile import _delegated_cut_source
 from finance_core.openclaw_staging_bridge import workspace_access
 from finance_core.profile_gate import exclusive_cut
 from finance_core.profile_paths import ManagedStagingProfile, _migration_contract_digest
+from finance_core.reconciliation.repository import ReconciliationRepository
 from tests import test_s1c_a_managed_bridge_commands as managed_commands
 from tests import test_s3a_managed_capture_publication as capture_tests
 
@@ -110,6 +113,59 @@ def _attachment_rows(
                 "SELECT id, public_id, file_hash, file_path FROM attachments ORDER BY id"
             )
         ]
+
+
+def _insert_statement_transaction(
+    workspace: managed_commands.ManagedBridgeWorkspace,
+    *,
+    public_id: str,
+    raw_row_payload_json: str | None = None,
+) -> tuple[object, ...]:
+    """Insert one migrated statement row through the public repository API."""
+    with workspace_access.workspace_database_session(
+        workspace.workspace_path, operation_id="test-bundle-create-statement-row"
+    ) as connection:
+        repository = ReconciliationRepository(connection)
+        batch_id = repository.create_statement_import_batch(
+            public_id=f"batch_{public_id}",
+            source_type="bank_statement",
+        )
+        if raw_row_payload_json is None:
+            transaction_id = repository.create_statement_transaction(
+                public_id=public_id,
+                batch_id=batch_id,
+                merchant_raw="Legacy statement merchant",
+                amount=Decimal("73.49"),
+                currency="SGD",
+                transaction_date="2020-04-05",
+                posted_date="2020-04-06",
+                statement_row_reference="legacy-row-null-payload",
+            )
+        else:
+            transaction_id = repository.create_statement_transaction(
+                public_id=public_id,
+                batch_id=batch_id,
+                merchant_raw="Legacy statement merchant",
+                amount=Decimal("73.49"),
+                currency="SGD",
+                transaction_date="2020-04-05",
+                posted_date="2020-04-06",
+                statement_row_reference="legacy-row-nonnull-payload",
+                raw_row_payload_json=raw_row_payload_json,
+            )
+        connection.commit()
+        row = connection.execute(
+            """
+            SELECT id, public_id, batch_id, transaction_date, posted_date,
+                   merchant_raw, amount, currency, statement_row_reference,
+                   raw_row_payload_json
+            FROM statement_transactions
+            WHERE id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+        assert row is not None
+        return tuple(row)
 
 
 def _add_historical_attachment_reference(
@@ -441,6 +497,88 @@ def test_real_registered_bundle_passes_independent_fresh_database_readback(
     assert member_paths == sorted(member_paths)
     assert member_paths.count("db/core.sqlite") == 1
     assert sum(path.startswith("attachments/") for path in member_paths) == 2
+
+
+def test_legacy_statement_row_with_null_payload_round_trips_through_fresh_bundle_readback(
+    managed_workspace: managed_commands.ManagedBridgeWorkspace,
+) -> None:
+    original = _insert_statement_transaction(
+        managed_workspace,
+        public_id="stmt_legacy_null_payload",
+    )
+    assert original[-1] is None, "repository default must persist historical SQL NULL payload"
+
+    stage, request, evidence = _stage_bundle(managed_workspace)
+    verified = verify_bundle(
+        stage=stage,
+        request=_reader_request(request, evidence),
+        deadline=time.monotonic() + 10.0,
+        control_check=lambda: None,
+    )
+
+    assert verified["tree_identity_sha256"]
+    snapshot_connection = sqlite3.connect(
+        f"{(stage / 'db' / 'core.sqlite').resolve().as_uri()}?mode=ro",
+        uri=True,
+    )
+    snapshot_connection.row_factory = sqlite3.Row
+    try:
+        row = snapshot_connection.execute(
+            """
+            SELECT id, public_id, batch_id, transaction_date, posted_date,
+                   merchant_raw, amount, currency, statement_row_reference,
+                   raw_row_payload_json
+            FROM statement_transactions
+            WHERE public_id = ?
+            """,
+            ("stmt_legacy_null_payload",),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == original
+        assert row["raw_row_payload_json"] is None
+        assert Decimal(str(row["amount"])) == Decimal("73.49")
+        assert row["merchant_raw"] == "Legacy statement merchant"
+        assert row["currency"] == "SGD"
+        assert row["statement_row_reference"] == "legacy-row-null-payload"
+    finally:
+        snapshot_connection.close()
+
+
+@pytest.mark.parametrize(
+    ("public_id", "raw_row_payload_json", "message"),
+    (
+        ("stmt_malformed_payload", "{", "Registered source JSON is invalid"),
+        (
+            "stmt_unknown_attachment_payload",
+            json.dumps(
+                {
+                    "evidence_contract_version": "statement-row-evidence-v99",
+                    "attachment_path": "attachments/aa/" + "a" * 64 + ".pdf",
+                }
+            ),
+            "Unknown statement row file reference",
+        ),
+        (
+            "stmt_unknown_source_path_payload",
+            json.dumps({"source_file_path": "attachments/aa/" + "a" * 64 + ".pdf"}),
+            "Unknown statement row file reference",
+        ),
+    ),
+)
+def test_nonnull_statement_payloads_remain_strictly_validated(
+    managed_workspace: managed_commands.ManagedBridgeWorkspace,
+    public_id: str,
+    raw_row_payload_json: str,
+    message: str,
+) -> None:
+    _insert_statement_transaction(
+        managed_workspace,
+        public_id=public_id,
+        raw_row_payload_json=raw_row_payload_json,
+    )
+
+    with pytest.raises(BundleError, match=message):
+        _collect(managed_workspace)
 
 
 @pytest.mark.parametrize(

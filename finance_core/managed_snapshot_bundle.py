@@ -549,6 +549,8 @@ def _collect_json_references(
     for row in _rows(
         conn, "statement_transactions", "id,raw_row_payload_json", limits["max_references"], check
     ):
+        if row["raw_row_payload_json"] is None:
+            continue
         payload = _load_json(row["raw_row_payload_json"], required=dict)
         if payload.get("evidence_contract_version") == "pdf-row-evidence-v2":
             claim(
