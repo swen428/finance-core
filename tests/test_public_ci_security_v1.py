@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -133,6 +134,27 @@ def _step_script(name: str) -> str:
         ("pull_request", "finance_core/money.py", "false"),
         ("pull_request", "finance_core/application/review.py", "true"),
         ("pull_request", "finance_core/intake/__init__.py", "true"),
+        ("pull_request", "finance_core/intake/receipt_ocr_evidence.py", "true"),
+        ("pull_request", "finance_core/intake/tesseract_resources.py", "true"),
+        ("pull_request", "finance_core/openclaw_staging_bridge/ocr_boundary.py", "true"),
+        ("pull_request", "tests/test_tesseract_pinned_resources_v1.py", "true"),
+        ("pull_request", "tests/test_linux_receipt_ocr_acceptance_v1.py", "true"),
+        ("pull_request", "tests/test_receipt_ocr_evidence.py", "true"),
+        (
+            "pull_request",
+            "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",
+            "true",
+        ),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png", "true"),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg", "true"),
+        (
+            "pull_request",
+            "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png",
+            "true",
+        ),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/provenance.json", "true"),
+        ("pull_request", "scripts/linux_ocr_assets_v1.json", "true"),
+        ("pull_request", "scripts/prepare_linux_ocr.py", "true"),
         ("pull_request", "finance_core/parser_proposals/__init__.py", "true"),
         ("pull_request", "plugins/finance-bridge/src/index.ts", "true"),
         ("pull_request", "requirements-dev.txt", "true"),
@@ -233,3 +255,40 @@ def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path)
     )
     assert completed.returncode == 0, completed.stderr
     assert output.read_text(encoding="utf-8") == "bridge=true\n"
+
+
+def test_linux_ocr_is_mandatory_in_existing_bridge_lane() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    assert "name: bridge (${{ matrix.os }})" in source
+    assert "runner: ubuntu-24.04" in source
+    assert "runs-on: ${{ matrix.runner }}" in source
+    assert 'FINANCE_LINUX_OCR_REQUIRED: "1"' in source
+    assert "tests/test_linux_receipt_ocr_acceptance_v1.py" in source
+    assert "scripts/prepare_linux_ocr.py" in source
+    assert "sudo apt-get install --no-install-recommends -y tesseract-ocr" in source
+    assert (
+        "continue-on-error"
+        not in source.split("- name: Prepare pinned Linux OCR acceptance assets", 1)[1].split(
+            "- name: Set up exact Node runtime", 1
+        )[0]
+    )
+
+
+def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    workflow_pattern = re.search(r"if grep -Eq '([^']+)' ", source)
+    assert workflow_pattern
+    tree = ast.parse((REPOSITORY_ROOT / "scripts" / "verify_candidate_validation.py").read_text())
+    patterns = [
+        ast.literal_eval(node.args[0])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compile"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and str(node.args[0].value).startswith(r"^(\.github/")
+    ]
+    assert patterns == [workflow_pattern.group(1)]
+    assert 'totals["tests"] < 13' in source
+    assert '("skipped", "failures", "errors")' in source

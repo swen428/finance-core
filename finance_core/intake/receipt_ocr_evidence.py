@@ -25,12 +25,16 @@ import threading
 import time
 import unicodedata
 from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from finance_core.intake.tesseract_resources import PinnedTesseractResources
 
 try:
     import resource
@@ -303,13 +307,29 @@ class TesseractTsvOcrEngine:
         *,
         expected_version: str,
         language: str = "eng",
+        pinned_resources: PinnedTesseractResources | None = None,
     ) -> None:
         _require_supported_process_platform()
         if not _safe_identity(expected_version, maximum=128):
             raise InvalidOcrConfigurationError("expected_version is malformed.")
         if not _safe_identity(language, maximum=32):
             raise InvalidOcrConfigurationError("language is malformed.")
-        executable = _open_verified_executable(executable_path)
+        if pinned_resources is not None:
+            from finance_core.intake.tesseract_resources import PinnedTesseractResources
+
+            if (
+                not isinstance(pinned_resources, PinnedTesseractResources)
+                or language != "eng+chi_sim"
+            ):
+                raise InvalidOcrConfigurationError(
+                    "Pinned OCR requires ordered eng+chi_sim resources."
+                )
+            pinned_resources.validate()
+        self._pinned_resources = pinned_resources
+        executable = _open_verified_executable(
+            executable_path,
+            deadline=time.monotonic() + 10.0 if pinned_resources is not None else None,
+        )
         try:
             path = executable.path
             binary_hash = executable.binary_hash
@@ -325,6 +345,34 @@ class TesseractTsvOcrEngine:
                 }
             )
         ).hexdigest()
+        if pinned_resources is not None:
+            from finance_core.intake.tesseract_resources import PINNED_ENVIRONMENT
+
+            config_hash = hashlib.sha256(
+                _canonical_json_bytes(
+                    {
+                        "adapter": "tesseract-tsv-pinned-v1",
+                        "arguments": [
+                            "<input-fd>",
+                            "stdout",
+                            "-l",
+                            "eng+chi_sim",
+                            "--tessdata-dir",
+                            "<private-tessdata>",
+                            "--oem",
+                            "1",
+                            "--psm",
+                            "3",
+                            "--dpi",
+                            "300",
+                            "-c",
+                            "tessedit_create_tsv=1",
+                        ],
+                        "resources": pinned_resources.identities(),
+                        "environment": PINNED_ENVIRONMENT,
+                    }
+                )
+            ).hexdigest()
         self._path = path
         self._language = language
         self._file_identity = file_identity
@@ -358,21 +406,34 @@ class TesseractTsvOcrEngine:
             raise InvalidOcrConfigurationError(
                 "TesseractTsvOcrEngine accepts only validated JPEG or PNG input."
             )
+        if self._pinned_resources is not None and time.monotonic() >= deadline:
+            raise OcrDeadlineExceededError("The OCR deadline expired before resource preparation.")
         executable = _open_verified_executable(
             self._path,
             expected_identity=self._file_identity,
             expected_hash=self._identity.binary_sha256,
+            **({"deadline": deadline} if self._pinned_resources is not None else {}),
         )
         try:
             executable_path = f"/proc/self/fd/{executable.fd}"
             try:
-                with tempfile.TemporaryDirectory(prefix="receipt-ocr-") as working_directory:
+                resources = (
+                    self._pinned_resources.snapshot(deadline=deadline)
+                    if self._pinned_resources is not None
+                    else nullcontext(None)
+                )
+                with (
+                    resources as snapshot,
+                    tempfile.TemporaryDirectory(prefix="receipt-ocr-") as working_directory,
+                ):
+                    runner_options = {"pinned_environment": True} if snapshot is not None else {}
                     version_output = _run_bounded_process(
                         [executable_path, "--version"],
                         pass_fds=(executable.fd,),
                         limits=limits,
                         deadline=deadline,
                         working_directory=working_directory,
+                        **runner_options,
                     )
                     if version_output.returncode != 0:
                         raise InvalidOcrConfigurationError(
@@ -384,22 +445,33 @@ class TesseractTsvOcrEngine:
                             "The configured OCR executable version does not match expected_version."
                         )
                     fd_path = f"/dev/fd/{source.file_descriptor}"
-                    process_output = _run_bounded_process(
-                        [
-                            executable_path,
-                            fd_path,
-                            "stdout",
-                            "-l",
-                            self._language,
+                    arguments = [executable_path, fd_path, "stdout", "-l", self._language]
+                    if snapshot is None:
+                        arguments += ["--dpi", "300", "tsv"]
+                    else:
+                        snapshot.verify(deadline)
+                        arguments += [
+                            "--tessdata-dir",
+                            str(snapshot.directory),
+                            "--oem",
+                            "1",
+                            "--psm",
+                            "3",
                             "--dpi",
                             "300",
-                            "tsv",
-                        ],
+                            "-c",
+                            "tessedit_create_tsv=1",
+                        ]
+                    process_output = _run_bounded_process(
+                        arguments,
                         pass_fds=(executable.fd, source.file_descriptor),
                         limits=limits,
                         deadline=deadline,
                         working_directory=working_directory,
+                        **runner_options,
                     )
+                    if snapshot is not None:
+                        snapshot.verify(deadline)
                 if process_output.returncode in {
                     -signal.SIGXCPU,
                     -getattr(signal, "SIGXFSZ", signal.SIGXCPU),
@@ -432,12 +504,14 @@ class TesseractTsvOcrEngine:
                     executable,
                     expected_identity=self._file_identity,
                     expected_hash=self._identity.binary_sha256,
+                    **({"deadline": deadline} if self._pinned_resources is not None else {}),
                 )
                 raise
             _reverify_opened_executable(
                 executable,
                 expected_identity=self._file_identity,
                 expected_hash=self._identity.binary_sha256,
+                **({"deadline": deadline} if self._pinned_resources is not None else {}),
             )
             return result
         finally:
@@ -483,6 +557,7 @@ def _open_verified_executable(
     *,
     expected_identity: tuple[int, int, int, int, int, int] | None = None,
     expected_hash: str | None = None,
+    deadline: float | None = None,
 ) -> _VerifiedExecutable:
     try:
         supplied = Path(executable_path)
@@ -515,6 +590,10 @@ def _open_verified_executable(
         _validate_executable_stat(before)
         digest = hashlib.sha256()
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise OcrDeadlineExceededError(
+                    "The OCR deadline expired during binary verification."
+                )
             chunk = os.read(fd, 65_536)
             if not chunk:
                 break
@@ -577,6 +656,7 @@ def _reverify_opened_executable(
     *,
     expected_identity: tuple[int, int, int, int, int, int],
     expected_hash: str,
+    deadline: float | None = None,
 ) -> None:
     try:
         before = os.fstat(executable.fd)
@@ -584,6 +664,10 @@ def _reverify_opened_executable(
         os.lseek(executable.fd, 0, os.SEEK_SET)
         digest = hashlib.sha256()
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise OcrDeadlineExceededError(
+                    "The OCR deadline expired during binary verification."
+                )
             chunk = os.read(executable.fd, 65_536)
             if not chunk:
                 break
@@ -637,6 +721,7 @@ def _run_bounded_process(
     limits: ReceiptOcrLimits,
     deadline: float,
     working_directory: str,
+    pinned_environment: bool = False,
 ) -> _ProcessOutput:
     remaining = deadline - time.monotonic()
     if remaining <= 0:
@@ -648,7 +733,12 @@ def _run_bounded_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=working_directory,
-            env={"LANG": "C", "LC_ALL": "C", "TZ": "UTC"},
+            env={
+                "LANG": "C",
+                "LC_ALL": "C",
+                "TZ": "UTC",
+                **({"OMP_THREAD_LIMIT": "1"} if pinned_environment else {}),
+            },
             shell=False,
             close_fds=True,
             pass_fds=pass_fds,

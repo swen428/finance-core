@@ -403,3 +403,36 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
     replies[f"{prefix}/commits/main"] = {"sha": "d" * 40}
     with pytest.raises(ValueError, match="base/main drifted"):
         verify(VERIFIER.collect(REPO, 7, 42))
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "finance_core/intake/receipt_ocr_evidence.py",
+        "finance_core/intake/tesseract_resources.py",
+        "finance_core/openclaw_staging_bridge/ocr_boundary.py",
+        "tests/test_tesseract_pinned_resources_v1.py",
+        "tests/test_linux_receipt_ocr_acceptance_v1.py",
+        "tests/test_receipt_ocr_evidence.py",
+        "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg",
+        "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/provenance.json",
+        "scripts/linux_ocr_assets_v1.json",
+        "scripts/prepare_linux_ocr.py",
+    ],
+)
+def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(path: str) -> None:
+    for item in (
+        {"filename": path},
+        {"filename": path, "status": "removed"},
+        {"filename": "archived/example.txt", "previous_filename": path},
+    ):
+        evidence = sample(bridge=True)
+        evidence["comparison"]["files"] = [item]
+        assert verify(evidence)["bridge_required"] is True
+        refused = sample(bridge=False)
+        refused["comparison"]["files"] = [item]
+        with pytest.raises(ValueError):
+            verify(refused)

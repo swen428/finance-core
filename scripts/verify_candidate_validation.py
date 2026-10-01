@@ -105,8 +105,8 @@ def verify(
     pattern = re.compile(
         r"^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|"
         r"plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|"
-        r"application/|intake/(__init__\.py$|macos_vision_receipt_ocr)|"
-        r"parser_proposals/(__init__\.py$|ai_)))"
+        r"application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_ocr_evidence\.py$|tesseract_resources\.py$)|"
+        r"parser_proposals/(__init__\.py$|ai_))|tests/(test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))"
     )
     actual_scope = any(
         pattern.search(path)
