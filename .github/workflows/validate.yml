@@ -27,7 +27,7 @@ env:
 
 concurrency:
   group: finance-core-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true && '-linux-ocr-diagnostic' || '' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true }}
 
 jobs:
   classify:

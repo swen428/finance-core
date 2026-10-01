@@ -153,6 +153,21 @@ def test_linux_ocr_diagnostic_is_manual_quality_only_and_bounded(
         "${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true "
         "&& '-linux-ocr-diagnostic' || '' }}"
     ) in source
+    cancellation_guard = (
+        "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' || "
+        "inputs.d4_linux_ocr_diagnostic != true }}"
+    )
+    assert cancellation_guard in source
+    for event_name, diagnostic_input, sqlite_f0_probe, expected_cancellation in [
+        ("push", False, False, True),
+        ("pull_request", True, False, True),
+        ("workflow_dispatch", False, False, True),  # default/manual stays cancellable
+        ("workflow_dispatch", False, True, True),  # F0-only stays cancellable
+        ("workflow_dispatch", True, False, False),  # isolated OCR diagnostic is not cancelled
+    ]:
+        assert isinstance(sqlite_f0_probe, bool)
+        actual_cancellation = event_name != "workflow_dispatch" or diagnostic_input is not True
+        assert actual_cancellation is expected_cancellation
 
     classify = jobs.split("  classify:\n", 1)[1].split("\n  quality:\n", 1)[0]
     pytest_job = jobs.split("  pytest:\n", 1)[1].split("\n  bridge:\n", 1)[0]
