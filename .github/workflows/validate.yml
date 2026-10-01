@@ -11,6 +11,11 @@ on:
         required: false
         type: boolean
         default: false
+      d4_linux_ocr_diagnostic:
+        description: "Run the bounded synthetic Ubuntu Linux OCR diagnostic only"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,11 +26,12 @@ env:
   CANDIDATE_PR_NUMBER: ${{ github.event.pull_request.number || 0 }}
 
 concurrency:
-  group: finance-core-${{ github.workflow }}-${{ github.ref }}
+  group: finance-core-${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true && '-linux-ocr-diagnostic' || '' }}
   cancel-in-progress: true
 
 jobs:
   classify:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -71,7 +77,7 @@ jobs:
           fi
 
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Check out candidate
@@ -90,17 +96,107 @@ jobs:
         id: identity
         run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
+      - name: Initialize bounded Linux OCR diagnostic evidence
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true }}
+        run: |
+          set -euo pipefail
+          mkdir -m 700 -p "$RUNNER_TEMP/d4-linux-ocr-diagnostic"
+          cp "$RUNNER_TEMP/candidate-identity.json" \
+            "$RUNNER_TEMP/d4-linux-ocr-diagnostic/candidate-identity.json"
+          chmod 600 "$RUNNER_TEMP/d4-linux-ocr-diagnostic/candidate-identity.json"
+
+      - name: Reject simultaneous diagnostic modes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LINUX_OCR_DIAGNOSTIC: ${{ inputs.d4_linux_ocr_diagnostic }}
+          SQLITE_F0_PROBE: ${{ inputs.d4_sqlite_f0_probe }}
+        run: |
+          set -euo pipefail
+          if test "$EVENT_NAME" = "workflow_dispatch" && \
+             test "$LINUX_OCR_DIAGNOSTIC" = "true" && \
+             test "$SQLITE_F0_PROBE" = "true"; then
+            echo "Linux OCR and SQLite F0 diagnostic modes cannot run together."
+            exit 1
+          fi
+
       - name: Install locked development dependencies
         run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
 
       - name: Run Python quality checks
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true }}
         run: |
           ruff check --exclude finance_core/resources/preflight/migration_029_preflight.py finance_core tests
           ruff format --check --exclude finance_core/resources/preflight/migration_029_preflight.py finance_core tests
           mypy finance_core
 
+      - name: Verify Linux OCR diagnostic platform
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true }}
+        run: |
+          python - <<'PY_PLATFORM'
+          import platform
+          import sys
+          identity = platform.freedesktop_os_release()
+          if (sys.platform, platform.machine(), identity.get("ID"), identity.get("VERSION_ID")) != ("linux", "x86_64", "ubuntu", "24.04"):
+              raise SystemExit("Linux OCR diagnostic requires Ubuntu 24.04 x86_64")
+          print("Verified Linux OCR diagnostic platform: Ubuntu 24.04 x86_64")
+          PY_PLATFORM
+
+      - name: Prepare pinned Linux OCR diagnostic assets
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y tesseract-ocr
+          python -I scripts/prepare_linux_ocr.py \
+            --executable /usr/bin/tesseract \
+            --destination "$RUNNER_TEMP/linux-ocr"
+
+      - name: Run required Linux OCR diagnostic cases
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true }}
+        env:
+          FINANCE_LINUX_OCR_REQUIRED: "1"
+          FINANCE_LINUX_OCR_CONFIG: ${{ runner.temp }}/linux-ocr/ocr_engine.json
+          FINANCE_LINUX_OCR_DIAGNOSTIC_DIR: ${{ runner.temp }}/d4-linux-ocr-diagnostic
+        run: |
+          set +e
+          python -I -m pytest -q tests/test_linux_receipt_ocr_acceptance_v1.py \
+            --junitxml="$RUNNER_TEMP/linux-ocr-diagnostic.xml" --durations=15
+          pytest_rc=$?
+          if test -f "$RUNNER_TEMP/linux-ocr-diagnostic.xml"; then
+            python -I - "$RUNNER_TEMP/linux-ocr-diagnostic.xml" <<'PY_OCR_DIAGNOSTIC'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse(sys.argv[1]).getroot().iter("testsuite"))
+          totals = {key: sum(int(suite.get(key, "0")) for suite in suites) for key in ("tests", "skipped", "failures", "errors")}
+          if totals["tests"] != 13 or any(totals[key] for key in ("skipped", "failures", "errors")):
+              raise SystemExit("Linux OCR diagnostic requires exactly 13 executed cases and zero skips/errors/failures")
+          print("Linux OCR diagnostic case inventory:", totals)
+          PY_OCR_DIAGNOSTIC
+            proof_rc=$?
+          else
+            echo "Linux OCR diagnostic did not produce a JUnit file."
+            proof_rc=1
+          fi
+          if test "$pytest_rc" -ne 0; then
+            exit "$pytest_rc"
+          fi
+          exit "$proof_rc"
+
+      - name: Preserve bounded Linux OCR diagnostic evidence
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: d4-linux-ocr-diagnostic-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/d4-linux-ocr-diagnostic/
+            ${{ runner.temp }}/linux-ocr/preparation-receipt.json
+            ${{ runner.temp }}/linux-ocr-preparation-failure.json
+            ${{ runner.temp }}/linux-ocr-diagnostic.xml
+          retention-days: 30
+          if-no-files-found: warn
+
       - name: Collect synthetic SQLite baseline inventory
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_sqlite_f0_probe == true }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_sqlite_f0_probe == true && inputs.d4_linux_ocr_diagnostic != true }}
         run: |
           mkdir -p "$RUNNER_TEMP/d4-sqlite-f0-probe"
           cp "$RUNNER_TEMP/candidate-identity.json" \
@@ -109,7 +205,7 @@ jobs:
             --output-dir "$RUNNER_TEMP/d4-sqlite-f0-probe"
 
       - name: Upload synthetic diagnostic evidence
-        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.d4_sqlite_f0_probe == true }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.d4_sqlite_f0_probe == true && inputs.d4_linux_ocr_diagnostic != true }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: d4-sqlite-f0-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -118,6 +214,7 @@ jobs:
           if-no-files-found: warn
 
   pytest:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true }}
     strategy:
       fail-fast: false
       matrix:
@@ -203,7 +300,7 @@ jobs:
 
   bridge:
     needs: classify
-    if: ${{ needs.classify.outputs.bridge == 'true' }}
+    if: ${{ needs.classify.outputs.bridge == 'true' && (github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true) }}
     strategy:
       fail-fast: false
       matrix:
@@ -336,7 +433,7 @@ jobs:
 
   pytest-report:
     needs: pytest
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -389,7 +486,7 @@ jobs:
           if-no-files-found: error
 
   validate:
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true) }}
     needs: [classify, quality, pytest, bridge, pytest-report]
     runs-on: ubuntu-latest
     timeout-minutes: 5

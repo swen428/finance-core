@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
@@ -121,6 +122,142 @@ def _step_script(name: str) -> str:
     match = re.search(r"^        run: \|\n((?:          .*\n|[ \t]*\n)+)", section, re.MULTILINE)
     assert match is not None
     return textwrap.dedent(match.group(1))
+
+
+def test_linux_ocr_diagnostic_is_manual_quality_only_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    normal_guard = (
+        "github.event_name != 'workflow_dispatch' || inputs.d4_linux_ocr_diagnostic != true"
+    )
+    diagnostic_guard = (
+        "github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true"
+    )
+    jobs = source.split("\njobs:\n", 1)[1]
+    job_names = re.findall(r"^  ([a-z][a-z0-9-]*):\s*$", jobs, re.MULTILINE)
+    assert job_names == ["classify", "quality", "pytest", "bridge", "pytest-report", "validate"]
+    assert "shard: [0, 1, 2, 3]" in jobs
+    assert "os: [ubuntu-latest, macos-15]" in jobs
+    assert "runner: ubuntu-24.04" in jobs
+
+    assert (
+        "d4_linux_ocr_diagnostic:\n"
+        '        description: "Run the bounded synthetic Ubuntu Linux OCR diagnostic only"\n'
+        "        required: false\n"
+        "        type: boolean\n"
+        "        default: false"
+    ) in source
+    assert (
+        "group: finance-core-${{ github.workflow }}-${{ github.ref }}"
+        "${{ github.event_name == 'workflow_dispatch' && inputs.d4_linux_ocr_diagnostic == true "
+        "&& '-linux-ocr-diagnostic' || '' }}"
+    ) in source
+
+    classify = jobs.split("  classify:\n", 1)[1].split("\n  quality:\n", 1)[0]
+    pytest_job = jobs.split("  pytest:\n", 1)[1].split("\n  bridge:\n", 1)[0]
+    bridge = jobs.split("  bridge:\n", 1)[1].split("\n  pytest-report:\n", 1)[0]
+    report = jobs.split("  pytest-report:\n", 1)[1].split("\n  validate:\n", 1)[0]
+    validate = jobs.split("  validate:\n", 1)[1]
+    assert normal_guard in classify
+    assert normal_guard in pytest_job
+    assert ("needs.classify.outputs.bridge == 'true' && (" + normal_guard + ")") in bridge
+    assert "always() && (" + normal_guard + ")" in report
+    assert "always() && (" + normal_guard + ")" in validate
+
+    quality = jobs.split("  quality:\n", 1)[1].split("\n  pytest:\n", 1)[0]
+    assert "timeout-minutes: 15" in quality
+    assert (
+        "runs-on: ${{ github.event_name == 'workflow_dispatch' && "
+        "inputs.d4_linux_ocr_diagnostic == true && 'ubuntu-24.04' || 'ubuntu-latest' }}"
+    ) in quality
+    assert "name: Verify candidate checkout identity" in quality
+    assert "name: Install locked development dependencies" in quality
+    assert "name: Initialize bounded Linux OCR diagnostic evidence" in quality
+    assert 'mkdir -m 700 -p "$RUNNER_TEMP/d4-linux-ocr-diagnostic"' in quality
+    assert 'chmod 600 "$RUNNER_TEMP/d4-linux-ocr-diagnostic/candidate-identity.json"' in quality
+    quality_checks = quality.split("- name: Run Python quality checks\n", 1)[1].split(
+        "\n      - name:", 1
+    )[0]
+    assert normal_guard in quality_checks
+    assert diagnostic_guard in quality
+    assert 'FINANCE_LINUX_OCR_REQUIRED: "1"' in quality
+    assert "FINANCE_LINUX_OCR_CONFIG: ${{ runner.temp }}/linux-ocr/ocr_engine.json" in quality
+    assert "FINANCE_LINUX_OCR_DIAGNOSTIC_DIR: ${{ runner.temp }}/d4-linux-ocr-diagnostic" in quality
+    assert "scripts/prepare_linux_ocr.py" in quality
+    assert '--junitxml="$RUNNER_TEMP/linux-ocr-diagnostic.xml"' in quality
+    assert 'totals["tests"] != 13' in quality
+
+    artifact = quality.split("- name: Preserve bounded Linux OCR diagnostic evidence\n", 1)[
+        1
+    ].split("\n      - name:", 1)[0]
+    assert "always() && " + diagnostic_guard in artifact
+    assert "retention-days: 30" in artifact
+    assert "candidate-validation" not in artifact
+    assert "linux-ocr-diagnostic.xml" in artifact
+    assert "preparation-receipt.json" in artifact
+    assert "linux-ocr-preparation-failure.json" in artifact
+    sqlite_upload = quality.split("- name: Upload synthetic diagnostic evidence\n", 1)[1]
+    assert "inputs.d4_linux_ocr_diagnostic != true" in sqlite_upload
+
+    conflict_script = _step_script("Reject simultaneous diagnostic modes")
+    for linux, sqlite, accepted in [
+        ("false", "false", True),
+        ("true", "false", True),
+        ("false", "true", True),
+        ("true", "true", False),
+    ]:
+        completed = subprocess.run(
+            ["bash", "-c", conflict_script],
+            env={
+                "EVENT_NAME": "workflow_dispatch",
+                "LINUX_OCR_DIAGNOSTIC": linux,
+                "SQLITE_F0_PROBE": sqlite,
+            },
+            capture_output=True,
+            text=True,
+        )
+        assert (completed.returncode == 0) is accepted
+
+    from tests import test_linux_receipt_ocr_acceptance_v1 as linux_ocr
+
+    payload = {
+        "schema": "finance-linux-ocr-synthetic-diagnostic-v1",
+        "fixture": {"name": "synthetic_mixed_receipt.jpg"},
+        "source": {"sha256": "a" * 64},
+        "run": {"event_name": None},
+        "engine": {"name": "tesseract_tsv"},
+        "extraction": {"status": "succeeded"},
+        "stored_ocr_hierarchy": [],
+        "loader_view": [],
+        "parser_grouped_lines": [],
+        "proposal": {"amount": None, "currency": None, "ambiguity_flags": []},
+        "counts": {"capture": {}, "extractions": 0, "proposals": 0, "final_facts": {}},
+    }
+    output_dir = tmp_path / "diagnostic"
+    monkeypatch.setenv("FINANCE_LINUX_OCR_DIAGNOSTIC_DIR", str(output_dir))
+    linux_ocr._write_diagnostic_artifact("synthetic_mixed_receipt.jpg", payload)
+    artifact_path = output_dir / "mixed-jpeg.json"
+    assert json.loads(artifact_path.read_text(encoding="utf-8")) == payload
+    assert artifact_path.stat().st_mode & 0o077 == 0
+
+    oversized_dir = tmp_path / "oversized"
+    monkeypatch.setenv("FINANCE_LINUX_OCR_DIAGNOSTIC_DIR", str(oversized_dir))
+    payload["stored_ocr_hierarchy"] = [{"text": "x" * 1024}] * 600
+    with pytest.raises(AssertionError, match="file-size bound"):
+        linux_ocr._write_diagnostic_artifact("synthetic_mixed_receipt.jpg", payload)
+    assert not oversized_dir.exists()
+
+    monkeypatch.setenv(
+        "FINANCE_LINUX_OCR_DIAGNOSTIC_DIR",
+        str(linux_ocr.REPOSITORY_ROOT / "diagnostic"),
+    )
+    payload["stored_ocr_hierarchy"] = []
+    with pytest.raises(AssertionError, match="outside the checkout"):
+        linux_ocr._write_diagnostic_artifact("synthetic_mixed_receipt.jpg", payload)
+    payload["source"]["database_path"] = "/synthetic/path"
+    with pytest.raises(AssertionError, match="prohibited field"):
+        linux_ocr._write_diagnostic_artifact("synthetic_mixed_receipt.jpg", payload)
 
 
 @pytest.mark.parametrize(
