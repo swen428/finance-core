@@ -11,6 +11,7 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
   truncate,
   writeFile,
@@ -764,6 +765,7 @@ for (const realLinux of [false, true]) {
     });
     await write(receiptPath, JSON.stringify(receipt()));
     assert.equal((await verify()).artifact_sha256, pluginArtifact.artifact_sha256);
+    let smokeLoadedBindings: (() => void) | undefined;
     if (realLinux) {
       const require = createRequire(import.meta.url);
       const native = require(join(pluginRoot, paths[0]!)) as {
@@ -773,11 +775,14 @@ for (const realLinux of [false, true]) {
         flock(fd: number, flags: number): void;
         constants: { LOCK_EX: number; LOCK_NB: number };
       };
-      const fd = native.openDirectory(pluginRoot);
-      try {
-        native.rejectAclGrants(fd);
-        fsExt.flock(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB);
-      } finally { closeSync(fd); }
+      smokeLoadedBindings = () => {
+        const fd = native.openDirectory(pluginRoot);
+        try {
+          native.rejectAclGrants(fd);
+          fsExt.flock(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB);
+        } finally { closeSync(fd); }
+      };
+      smokeLoadedBindings();
     }
     for (const [field, value] of [["codesign_verified", true], ["signature", "adhoc"],
       ["platform", "darwin-arm64"], ["reproducible_build_runs", 1]] as const) {
@@ -786,7 +791,19 @@ for (const realLinux of [false, true]) {
       await write(receiptPath, JSON.stringify(altered));
       await assert.rejects(verify(), /mismatch/u);
     }
-    await write(join(pluginRoot, paths[0]!), nativeHeader("darwin-arm64"));
+    const nativePath = join(pluginRoot, paths[0]!);
+    const loadedIdentity = await stat(nativePath);
+    const replacementPath = `${nativePath}.replacement`;
+    // Truncating a loaded ELF inode can invalidate its mapped pages, including
+    // process-exit code. Replace the fixture name with a fresh inode instead.
+    await writeFile(replacementPath, nativeHeader("darwin-arm64"), { flag: "wx", mode: 0o755 });
+    await rename(replacementPath, nativePath);
+    const replacementIdentity = await stat(nativePath);
+    assert.notDeepEqual(
+      [replacementIdentity.dev, replacementIdentity.ino],
+      [loadedIdentity.dev, loadedIdentity.ino],
+    );
+    smokeLoadedBindings?.();
     pluginArtifact = await computeArtifactHashV1("finance_plugin_build", pluginRoot);
     await write(receiptPath, JSON.stringify(receipt()));
     await assert.rejects(verify(), /ELF64/u);
