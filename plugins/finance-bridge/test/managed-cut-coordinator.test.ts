@@ -153,14 +153,15 @@ async function stageWithMarker(workRoot: string, markerName: string): Promise<st
   return undefined;
 }
 
-async function makeProfile(applicationSupport: string): Promise<string> {
+async function makeProfile(applicationSupport: string, linux = false): Promise<string> {
   const profileId = "synthetic";
-  const profileRoot = join(applicationSupport, "Finance-Codex", "profiles", profileId);
+  const productRoot = linux ? applicationSupport : join(applicationSupport, "Finance-Codex");
+  const profileRoot = join(productRoot, "profiles", profileId);
   const runtimeRoot = join(profileRoot, "runtime");
   const workspaceRoot = join(profileRoot, "workspace");
   for (const path of [
-    join(applicationSupport, "Finance-Codex"),
-    join(applicationSupport, "Finance-Codex", "profiles"),
+    ...(linux ? [] : [productRoot]),
+    join(productRoot, "profiles"),
     profileRoot,
     runtimeRoot,
     join(runtimeRoot, "database"),
@@ -202,6 +203,7 @@ async function bootstrapBundleCapture(
   pythonExecutable: string,
   applicationSupport: string,
   scratch: string,
+  linux = false,
 ): Promise<{
   stagingDatabase: string;
   markerPublicId: string;
@@ -212,14 +214,16 @@ async function bootstrapBundleCapture(
     "import hashlib, json, os, sqlite3, sys",
     "from pathlib import Path",
     "from finance_core.managed_staging_profile import bootstrap_registered_staging, _managed_staging_connection",
-    "from finance_core.profile_paths import validate_profile_paths",
+    linux ? "from finance_core.profile_paths import validate_linux_profile_paths as validate_profile_paths"
+      : "from finance_core.profile_paths import validate_profile_paths",
     "from finance_core.openclaw_staging_bridge import envelope",
     "from finance_core.receipt_staging_runner.workspace import generate_callback_signing_key",
     "import openclaw_staging_bridge_support_v1 as support",
     "from tests import test_s1c_a_managed_bridge_commands as managed_commands",
     "from tests import test_s3a_managed_capture_publication as capture_tests",
     "application_support, profile_id, scratch_root = sys.argv[1:]",
-    "profile_base = Path(application_support) / 'Finance-Codex' / 'profiles' / profile_id",
+    linux ? "profile_base = Path(application_support) / 'profiles' / profile_id"
+      : "profile_base = Path(application_support) / 'Finance-Codex' / 'profiles' / profile_id",
     "blank = validate_profile_paths(application_support, profile_id)",
     "try:",
     "    managed = bootstrap_registered_staging(blank)",
@@ -320,7 +324,7 @@ async function bootstrapBundleCapture(
   const result = await execFile(pythonExecutable, ["-c", script, applicationSupport, "synthetic", scratch], {
     env: {
       ...process.env,
-      FINANCE_RUNTIME_ROOT: join(applicationSupport, "Finance-Codex", "profiles", "synthetic", "runtime"),
+      FINANCE_RUNTIME_ROOT: join(applicationSupport, ...(linux ? [] : ["Finance-Codex"]), "profiles", "synthetic", "runtime"),
       PYTHONPATH: `${REPOSITORY_ROOT}/tests:${REPOSITORY_ROOT}`,
     },
   });
@@ -342,7 +346,7 @@ async function bootstrapBundleCapture(
   };
 }
 
-async function createBundleScenario(scratch: string): Promise<{
+async function createBundleScenario(scratch: string, linux = false): Promise<{
   applicationSupport: string;
   profileRoot: string;
   workRoot: string;
@@ -353,7 +357,7 @@ async function createBundleScenario(scratch: string): Promise<{
   walEvidence: Awaited<ReturnType<typeof bootstrapBundleCapture>>;
   config: Awaited<ReturnType<typeof validatePluginConfig>>;
 }> {
-  const applicationSupport = join(scratch, "Application Support");
+  const applicationSupport = join(scratch, linux ? "finance-codex" : "Application Support");
   const repoRoot = join(scratch, "runtime-repo");
   const coreDistributionRoot = join(scratch, "core-distribution");
   const workspaceRoot = join(scratch, "bridge-workspace");
@@ -361,7 +365,7 @@ async function createBundleScenario(scratch: string): Promise<{
     await mkdir(path, { mode: 0o700 });
     await chmod(path, 0o700);
   }
-  const profileRoot = await makeProfile(applicationSupport);
+  const profileRoot = await makeProfile(applicationSupport, linux);
   const workRoot = join(profileRoot, "work");
   const gatePath = join(profileRoot, ".profile-gate.v1.lock");
   const pythonExecutable = await makePrivatePythonEnvironment(scratch);
@@ -373,7 +377,7 @@ async function createBundleScenario(scratch: string): Promise<{
   const distribution = await coreDistributionFixture(
     coreDistributionRoot, "d".repeat(40), undefined, coreVersion,
   );
-  const walEvidence = await bootstrapBundleCapture(pythonExecutable, applicationSupport, scratch);
+  const walEvidence = await bootstrapBundleCapture(pythonExecutable, applicationSupport, scratch, linux);
   const config = await validatePluginConfig({
     repoRoot,
     coreDistributionRoot,
@@ -403,6 +407,31 @@ async function createBundleScenario(scratch: string): Promise<{
     config,
   };
 }
+
+test("Linux managed bundle runs fixed real children against an enrolled synthetic profile", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  const scratch = await realpath(await mkdtemp(join(tmpdir(), "finance-linux-managed-bundle-")));
+  t.after(async () => rm(scratch, { recursive: true, force: true }));
+  const scenario = await createBundleScenario(scratch, true);
+  const receipt = await runManagedCoreSnapshotBundle({
+    config: scenario.config, linuxDataRoot: scenario.applicationSupport,
+    profileId: "synthetic", waitMs: 5_000, maxHoldMs: 20_000,
+  });
+  assert.equal(receipt.status, "snapshot_verified");
+  assert.equal(receipt.scope, "core_committed_snapshot");
+  assert.ok(receipt.memberCount >= 2);
+  assert.ok(receipt.referenceCount > 0);
+  assert.equal(trySharedLock(scenario.gatePath), "held");
+  const manifest = await readFile(join(receipt.stagePath, "manifest.json"));
+  assert.equal(createHash("sha256").update(manifest).digest("hex"), receipt.manifestSha256);
+  const stages = await readdir(scenario.workRoot);
+  await assert.rejects(runManagedCoreSnapshotBundle({
+    config: scenario.config, linuxDataRoot: scenario.applicationSupport,
+    applicationSupportRoot: scenario.applicationSupport, profileId: "synthetic",
+  }), /Exactly one/u);
+  assert.deepEqual(await readdir(scenario.workRoot), stages);
+});
 
 async function createDelayedReaderConfig(
   scenario: Awaited<ReturnType<typeof createBundleScenario>>,

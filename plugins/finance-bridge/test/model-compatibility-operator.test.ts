@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
+import { closeSync } from "node:fs";
 import {
   chmod,
   cp,
@@ -10,11 +11,13 @@ import {
   realpath,
   rename,
   rm,
+  stat,
   symlink,
   truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
@@ -46,6 +49,7 @@ import {
 import {
   executeReceiptBoundCompatibilityV1,
   verifyPlatformArtifactReceiptV1,
+  verifyNativeBinaryIdentityV1,
 } from "../src/platform-artifact-verifier-v1.js";
 import { createBridgeRequest } from "../src/protocol.js";
 import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.js";
@@ -104,9 +108,26 @@ async function write(path: string, body: string | Buffer): Promise<void> {
   await writeFile(path, body);
 }
 
+function nativeHeader(platform: "darwin-arm64" | "linux-x64"): Buffer {
+  const bytes = Buffer.alloc(64);
+  if (platform === "linux-x64") {
+    bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
+    bytes.writeUInt16LE(3, 16);
+    bytes.writeUInt16LE(62, 18);
+    bytes.writeUInt32LE(1, 20);
+    bytes.writeUInt16LE(64, 52);
+  } else {
+    bytes.writeUInt32LE(0xfeedfacf, 0);
+    bytes.writeUInt32LE(0x0100000c, 4);
+    bytes.writeUInt32LE(8, 12);
+  }
+  return bytes;
+}
+
 async function artifact(
   kind: "openclaw_package" | "finance_plugin_build",
   openclawVersion = "1",
+  nativePlatform: "darwin-arm64" | "linux-x64" = "darwin-arm64",
 ): Promise<string> {
   const root = await realpath(await mkdtemp(join(tmpdir(), `finance-artifact-${kind}-`)));
   if (kind === "openclaw_package") {
@@ -221,10 +242,10 @@ async function artifact(
       join(root, "dist/src/finance-agent-runtime-v2.js"),
       "export const getLoadedOpenAIPluginSourceV2 = true;\n",
     );
-    await write(join(root, "build/Release/finance_bridge_posix.node"), Buffer.from([1, 2, 3]));
+    await write(join(root, "build/Release/finance_bridge_posix.node"), nativeHeader(nativePlatform));
     await write(
       join(root, "node_modules/fs-ext/build/Release/fs_ext.node"),
-      Buffer.from([4, 5, 6]),
+      nativeHeader(nativePlatform),
     );
     const sourceIdentity = await computeBuildSourceIdentityV1(root);
     await write(join(root, "dist/build-provenance-v1.json"), `${JSON.stringify({
@@ -316,6 +337,7 @@ print(json.dumps({'manifestSha256':sha(manifest_path),'wheelSha256':sha(wheel),'
 function platformReceipt(
   artifactValue: Awaited<ReturnType<typeof computeArtifactHashV1>>,
   openclawArtifact: Awaited<ReturnType<typeof computeArtifactHashV1>>,
+  nativePlatform: "darwin-arm64" | "linux-x64" = "darwin-arm64",
 ): Record<string, unknown> {
   const entry = (path: string) => {
     const value = artifactValue.entries.find((candidate) => candidate.path === path);
@@ -380,18 +402,18 @@ function platformReceipt(
         byte_count: artifactValue.byte_count,
         native_binding: {
           ...financeBinding,
-          platform: "darwin-arm64",
-          signature: "adhoc",
-          codesign_verified: true,
+          platform: nativePlatform,
+          signature: nativePlatform === "linux-x64" ? "not-applicable" : "adhoc",
+          codesign_verified: nativePlatform !== "linux-x64",
           reproducible_build_runs: 2,
         },
         native_dependencies: [{
           package_name: "fs-ext",
           package_version: "2.1.1",
           ...fsExtBinding,
-          platform: "darwin-arm64",
-          signature: "adhoc",
-          codesign_verified: true,
+          platform: nativePlatform,
+          signature: nativePlatform === "linux-x64" ? "not-applicable" : "adhoc",
+          codesign_verified: nativePlatform !== "linux-x64",
           reproducible_build_runs: 2,
         }],
         compiled_runtime: compiledRuntime,
@@ -697,6 +719,96 @@ test("artifact identity replacement cannot escape the bytes bound by the hash", 
   await rename(replacementPath, shrinkwrapPath);
   await assert.rejects(pendingHash, /Codex plugin package or manifest identity/u);
 });
+
+test("native binary identity rejects wrong Linux architecture, format, type, byte order and truncation", () => {
+  const valid = nativeHeader("linux-x64");
+  verifyNativeBinaryIdentityV1(valid, "linux", "x64");
+  for (const offset of [0, 4, 5, 6, 16, 18, 20, 52]) {
+    const changed = Buffer.from(valid);
+    changed[offset] ^= 0xff;
+    assert.throws(() => verifyNativeBinaryIdentityV1(changed, "linux", "x64"), /ELF64/u);
+  }
+  assert.throws(() => verifyNativeBinaryIdentityV1(valid.subarray(0, 63), "linux", "x64"), /ELF64/u);
+  assert.throws(() => verifyNativeBinaryIdentityV1(nativeHeader("darwin-arm64"), "linux", "x64"), /ELF64/u);
+  assert.throws(() => verifyNativeBinaryIdentityV1(valid, "linux", "arm64"), /Unsupported/u);
+  assert.throws(() => verifyNativeBinaryIdentityV1(valid, "darwin", "arm64"), /Mach-O/u);
+});
+
+for (const realLinux of [false, true]) {
+  test(realLinux ? "Linux native receipt binds the actual built binaries and current Node platform"
+    : "Linux receipt rejects fake codesign, wrong receipt platform and rehashed Mac bytes", {
+    skip: realLinux && process.platform !== "linux",
+  }, async (t) => {
+    const pluginRoot = await artifact("finance_plugin_build", "1", "linux-x64");
+    const openclawRoot = await artifact("openclaw_package", "2026.7.1");
+    t.after(async () => {
+      await rm(pluginRoot, { recursive: true, force: true });
+      await rm(openclawRoot, { recursive: true, force: true });
+    });
+    const paths = ["build/Release/finance_bridge_posix.node", "node_modules/fs-ext/build/Release/fs_ext.node"];
+    if (realLinux) {
+      for (const path of paths) await cp(join(REPO_ROOT, "plugins/finance-bridge", path), join(pluginRoot, path));
+    }
+    for (const path of paths) await chmod(join(pluginRoot, path), 0o755);
+    const openclawArtifact = await computeArtifactHashV1("openclaw_package", openclawRoot);
+    let pluginArtifact = await computeArtifactHashV1("finance_plugin_build", pluginRoot);
+    const receiptPath = join(pluginRoot, "platform/openclaw-2026.7.1-2-max-retries.json");
+    const receipt = () => platformReceipt(pluginArtifact, openclawArtifact, "linux-x64");
+    const environment = realLinux ? {
+      verifyCodeSignature() { assert.fail("Linux must not claim or run codesign."); },
+    } : {
+      nodeVersion: "v24.15.0", platform: "linux", arch: "x64",
+      verifyCodeSignature() { assert.fail("Linux must not claim or run codesign."); },
+    };
+    const verify = () => verifyPlatformArtifactReceiptV1({
+      pluginRoot, artifact: pluginArtifact, openclawArtifact, environment,
+    });
+    await write(receiptPath, JSON.stringify(receipt()));
+    assert.equal((await verify()).artifact_sha256, pluginArtifact.artifact_sha256);
+    let smokeLoadedBindings: (() => void) | undefined;
+    if (realLinux) {
+      const require = createRequire(import.meta.url);
+      const native = require(join(pluginRoot, paths[0]!)) as {
+        openDirectory(path: string): number; rejectAclGrants(fd: number): void;
+      };
+      const fsExt = require(join(pluginRoot, paths[1]!)) as {
+        flock(fd: number, flags: number): void;
+        constants: { LOCK_EX: number; LOCK_NB: number };
+      };
+      smokeLoadedBindings = () => {
+        const fd = native.openDirectory(pluginRoot);
+        try {
+          native.rejectAclGrants(fd);
+          fsExt.flock(fd, fsExt.constants.LOCK_EX | fsExt.constants.LOCK_NB);
+        } finally { closeSync(fd); }
+      };
+      smokeLoadedBindings();
+    }
+    for (const [field, value] of [["codesign_verified", true], ["signature", "adhoc"],
+      ["platform", "darwin-arm64"], ["reproducible_build_runs", 1]] as const) {
+      const altered = receipt();
+      (altered.verified_supply_chain as any).finance_plugin_artifact.native_binding[field] = value;
+      await write(receiptPath, JSON.stringify(altered));
+      await assert.rejects(verify(), /mismatch/u);
+    }
+    const nativePath = join(pluginRoot, paths[0]!);
+    const loadedIdentity = await stat(nativePath);
+    const replacementPath = `${nativePath}.replacement`;
+    // Truncating a loaded ELF inode can invalidate its mapped pages, including
+    // process-exit code. Replace the fixture name with a fresh inode instead.
+    await writeFile(replacementPath, nativeHeader("darwin-arm64"), { flag: "wx", mode: 0o755 });
+    await rename(replacementPath, nativePath);
+    const replacementIdentity = await stat(nativePath);
+    assert.notDeepEqual(
+      [replacementIdentity.dev, replacementIdentity.ino],
+      [loadedIdentity.dev, loadedIdentity.ino],
+    );
+    smokeLoadedBindings?.();
+    pluginArtifact = await computeArtifactHashV1("finance_plugin_build", pluginRoot);
+    await write(receiptPath, JSON.stringify(receipt()));
+    await assert.rejects(verify(), /ELF64/u);
+  });
+}
 
 test("platform receipt verifier executes artifact, runtime, native, and signature checks", async () => {
   const pluginRoot = await artifact("finance_plugin_build");

@@ -19,9 +19,11 @@ from typing import Protocol
 from finance_core.managed_staging_profile import managed_staging_operation
 from finance_core.openclaw_staging_bridge import errors
 from finance_core.profile_gate import DEFAULT_ACQUIRE_SECONDS, MAX_ACQUIRE_SECONDS, ProfileGateError
+from finance_core.profile_layout import is_linux_managed_namespace, workspace_layout
 from finance_core.profile_paths import (
     ManagedStagingProfile,
     ProfilePathError,
+    validate_registered_linux_staging_profile,
     validate_registered_staging_profile,
 )
 from finance_core.runtime_paths import (
@@ -77,7 +79,9 @@ def validate_workspace_path(raw_path: object) -> Path:
             "workspace_path cannot be resolved safely.",
             errors.EXIT_VALIDATION_REFUSED,
         ) from exc
-    if is_fixed_profile_workspace_path(resolved) and path != resolved:
+    if (
+        is_fixed_profile_workspace_path(resolved) or is_linux_managed_namespace(path)
+    ) and path != resolved:
         raise errors.bridge_error(
             errors.WORKSPACE_REFUSED,
             "Managed workspace_path must be the exact canonical profile workspace.",
@@ -128,14 +132,7 @@ def database_path_for(workspace: Path) -> Path:
 
 def is_fixed_profile_workspace_path(path: Path) -> bool:
     """Recognize the reserved profile layout without trusting a caller flag."""
-    parents = path.parents
-    return (
-        len(parents) >= 4
-        and path.name == "workspace"
-        and parents[1].name == "profiles"
-        and parents[2].name == "Finance-Codex"
-        and parents[3].name == "Application Support"
-    )
+    return workspace_layout(path) is not None
 
 
 def managed_profile_for_workspace(workspace: Path) -> ManagedStagingProfile | None:
@@ -143,12 +140,19 @@ def managed_profile_for_workspace(workspace: Path) -> ManagedStagingProfile | No
     if not is_fixed_profile_workspace_path(workspace):
         return None
     profile_base = workspace.parent
-    support = profile_base.parent.parent.parent
+    layout = workspace_layout(workspace)
     try:
         runtime = require_runtime_root()
         if workspace != workspace.resolve(strict=True) or runtime != profile_base / "runtime":
             raise ProfilePathError("Managed workspace or configured runtime does not match")
-        profile = validate_registered_staging_profile(support, profile_base.name)
+        if layout == "linux":
+            profile = validate_registered_linux_staging_profile(
+                profile_base.parent.parent, profile_base.name
+            )
+        else:
+            profile = validate_registered_staging_profile(
+                profile_base.parent.parent.parent, profile_base.name
+            )
         if profile.workspace != workspace or profile.runtime != runtime:
             profile.close()
             raise ProfilePathError("Managed workspace witness does not match")

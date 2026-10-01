@@ -50,9 +50,14 @@ async function build(root) {
     join(root, "build/Release/finance_bridge_posix.node"),
     join(root, "node_modules/fs-ext/build/Release/fs_ext.node"),
   ];
-  return await Promise.all(bindings.map(async (binding) => (
-    createHash("sha256").update(await readFile(binding)).digest("hex")
-  )));
+  const { verifyNativeBinaryIdentityV1 } = await import(
+    pathToFileURL(join(root, "dist/src/platform-artifact-verifier-v1.js")).href
+  );
+  return await Promise.all(bindings.map(async (binding) => {
+    const bytes = await readFile(binding);
+    verifyNativeBinaryIdentityV1(bytes, process.platform, process.arch);
+    return createHash("sha256").update(bytes).digest("hex");
+  }));
 }
 
 const stagingRoot = await realpath(

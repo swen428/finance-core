@@ -1,10 +1,10 @@
 /** A short, locally held profile cut and private stage for an owner-only exporter. */
 import { randomBytes, createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, readSync, realpathSync, writeSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, readSync, writeSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { openProfileGate } from "./profile-gate.js";
+import { checkProfileAncestors } from "./profile-layout.js";
 import { createDirectoryExclusiveAt, descriptorIdentitySync, openDirectory, openExistingDirectoryAt, openFileAt, listAt, rejectAclGrants, } from "./posix.js";
-const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const STAGE_PREFIX = "owner-export-";
 const MAX_MANIFEST_BYTES = 65_536;
 const MAX_STAGE_FILE_BYTES = 321_000_000;
@@ -15,48 +15,6 @@ function uid() {
     if (typeof process.getuid !== "function")
         throw new Error("Bridge profile requires POSIX owner identity.");
     return BigInt(process.getuid());
-}
-function canonicalPath(path) {
-    if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path ||
-        realpathSync(path) !== path || lstatSync(path).isSymbolicLink()) {
-        throw new Error("Bridge profile path must be absolute and canonical.");
-    }
-}
-function checkAncestors(applicationSupportRoot) {
-    canonicalPath(applicationSupportRoot);
-    if (basename(applicationSupportRoot) !== "Application Support") {
-        throw new Error("Explicit Application Support root is required.");
-    }
-    for (let path = applicationSupportRoot;; path = dirname(path)) {
-        const named = lstatSync(path, { bigint: true });
-        if (!named.isDirectory() || named.isSymbolicLink() ||
-            (named.uid !== 0n && named.uid !== uid()) ||
-            (((named.mode & 18n) !== 0n) && !(named.uid === 0n && (named.mode & 512n) !== 0n))) {
-            throw new Error("Unsafe Application Support ancestor.");
-        }
-        const fd = openDirectory(path);
-        try {
-            const opened = fstatSync(fd, { bigint: true });
-            if (opened.dev !== named.dev || opened.ino !== named.ino) {
-                throw new Error("Application Support ancestor changed.");
-            }
-            rejectAclGrants(fd);
-            // A profile under a repository is never an owner-selected profile.
-            try {
-                lstatSync(join(path, ".git"));
-                throw new Error("Repository path cannot be a profile.");
-            }
-            catch (error) {
-                if (!(error instanceof Error && "code" in error && error.code === "ENOENT"))
-                    throw error;
-            }
-        }
-        finally {
-            closeSync(fd);
-        }
-        if (dirname(path) === path)
-            break;
-    }
 }
 function checkedPin(path, fd, directory) {
     const status = fstatSync(fd, { bigint: true });
@@ -198,7 +156,7 @@ function checkManifest(fd, locator, workspaceRoot) {
     }
 }
 function validatePinned(active) {
-    checkAncestors(active.locator.applicationSupportRoot);
+    checkProfileAncestors(active.locator);
     for (const pin of active.pins) {
         const fresh = openDirectoryOrFile(pin.path, pin.directory);
         try {
@@ -333,11 +291,8 @@ function verifyStageOutputs(active) {
     }
 }
 function openProfile(locator) {
-    if (typeof locator !== "object" || locator === null || !PROFILE_ID.test(locator.profileId)) {
-        throw new Error("Invalid profile locator.");
-    }
-    checkAncestors(locator.applicationSupportRoot);
-    const profileRoot = join(locator.applicationSupportRoot, "Finance-Codex", "profiles", locator.profileId);
+    const layout = checkProfileAncestors(locator);
+    const profileRoot = layout.profileRoot;
     const runtimeRoot = join(profileRoot, "runtime");
     const workspaceRoot = join(profileRoot, "workspace");
     if (locator.runtimeRoot !== runtimeRoot) {
@@ -346,11 +301,11 @@ function openProfile(locator) {
     const pins = [];
     const absentFiles = [];
     try {
-        const rootFd = openDirectory(locator.applicationSupportRoot);
+        const rootFd = openDirectory(layout.root);
         let parentFd = rootFd;
         try {
-            for (const name of ["Finance-Codex", "profiles", locator.profileId]) {
-                const parentPath = pins.at(-1)?.path ?? locator.applicationSupportRoot;
+            for (const name of layout.components) {
+                const parentPath = pins.at(-1)?.path ?? layout.root;
                 const pin = existingPin(parentFd, parentPath, name, true);
                 pins.push(pin);
                 parentFd = pin.fd;
@@ -398,6 +353,7 @@ export async function withExclusiveBridgeCut(locator, callback, options = {}) {
         throw new Error("Invalid profile locator.");
     const selectedLocator = Object.freeze({
         applicationSupportRoot: locator.applicationSupportRoot,
+        linuxDataRoot: locator.linuxDataRoot,
         profileId: locator.profileId,
         runtimeRoot: locator.runtimeRoot,
     });

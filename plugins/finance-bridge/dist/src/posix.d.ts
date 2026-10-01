@@ -19,7 +19,7 @@ export declare function openExistingDirectoryAt(parentFd: number, name: string):
 /** Create a genuinely new descriptor-relative directory; EEXIST is fatal. */
 export declare function createDirectoryExclusiveAt(parentFd: number, name: string): number;
 export declare function openFileAt(directoryFd: number, name: string, flags: number, mode?: number): number;
-/** Reject Darwin extended ACL allow entries on a pinned descriptor. */
+/** Reject Darwin allow entries or Linux POSIX access/default ACLs on a pinned FD. */
 export declare function rejectAclGrants(fd: number): void;
 export declare function closeDescriptor(fd: number): Promise<void>;
 export declare function chmodDescriptor(fd: number, mode: number): Promise<void>;

@@ -12,6 +12,8 @@ export interface PlatformArtifactEvidenceV1 {
     compiled_runtime_sha256: string;
     source_identity_sha256: string;
 }
+/** Inspect bytes without loading executable code. Hash/build proof remains separate. */
+export declare function verifyNativeBinaryIdentityV1(bytes: Buffer, platform: string, arch: string): void;
 export declare function verifyPlatformArtifactReceiptV1(params: {
     pluginRoot: string;
     artifact: ArtifactHashResultV1;

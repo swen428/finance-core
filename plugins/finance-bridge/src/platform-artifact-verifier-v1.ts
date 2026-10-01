@@ -128,6 +128,28 @@ function defaultCodeSignatureVerifier(path: string): void {
   }
 }
 
+/** Inspect bytes without loading executable code. Hash/build proof remains separate. */
+export function verifyNativeBinaryIdentityV1(bytes: Buffer, platform: string, arch: string): void {
+  if (platform === "linux" && arch === "x64") {
+    if (bytes.length < 64 || !bytes.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) ||
+        bytes[4] !== 2 || bytes[5] !== 1 || bytes[6] !== 1 ||
+        bytes.readUInt16LE(16) !== 3 || bytes.readUInt16LE(18) !== 62 ||
+        bytes.readUInt32LE(20) !== 1 || bytes.readUInt16LE(52) !== 64) {
+      throw new Error("Native binding must be ELF64 little-endian x86_64 ET_DYN.");
+    }
+    return;
+  }
+  if (platform === "darwin" && (arch === "arm64" || arch === "x64")) {
+    const cpu = arch === "arm64" ? 0x0100000c : 0x01000007;
+    if (bytes.length < 32 || bytes.readUInt32LE(0) !== 0xfeedfacf ||
+        bytes.readUInt32LE(4) !== cpu || bytes.readUInt32LE(12) !== 8) {
+      throw new Error(`Native binding must be a 64-bit ${arch} Mach-O bundle.`);
+    }
+    return;
+  }
+  throw new Error(`Unsupported native binding platform: ${platform}/${arch}.`);
+}
+
 async function readRegularFile(root: string, relativePath: string): Promise<{
   bytes: Buffer;
   mode: number;
@@ -212,8 +234,11 @@ export async function verifyPlatformArtifactReceiptV1(params: {
       params.environment?.verifyCodeSignature ?? defaultCodeSignatureVerifier,
   };
   requireEqual(environment.nodeVersion, expectedNodeVersion, "Node version");
-  requireEqual(environment.platform, "darwin", "artifact platform");
-  requireEqual(environment.arch, "arm64", "artifact architecture");
+  const linux = environment.platform === "linux" && environment.arch === "x64";
+  if (!linux) {
+    requireEqual(environment.platform, "darwin", "artifact platform");
+    requireEqual(environment.arch, "arm64", "artifact architecture");
+  }
   requireEqual(params.artifact.artifact_kind, "finance_plugin_build", "artifact kind");
   requireEqual(params.artifact.package_version, packageJson.version, "artifact package version");
 
@@ -406,9 +431,9 @@ export async function verifyPlatformArtifactReceiptV1(params: {
     );
   }
   const financeBinding = record(expectedArtifact.native_binding, "Finance native binding");
-  requireEqual(financeBinding.platform, "darwin-arm64", "Finance native binding platform");
-  requireEqual(financeBinding.signature, "adhoc", "Finance native binding signature");
-  requireEqual(financeBinding.codesign_verified, true, "Finance native binding codesign receipt");
+  requireEqual(financeBinding.platform, linux ? "linux-x64" : "darwin-arm64", "Finance native binding platform");
+  requireEqual(financeBinding.signature, linux ? "not-applicable" : "adhoc", "Finance native binding signature");
+  requireEqual(financeBinding.codesign_verified, !linux, "Finance native binding codesign receipt");
   requireEqual(financeBinding.reproducible_build_runs, 2, "Finance native reproducibility runs");
   const financeBindingPath = await verifyBoundEntry({
     pluginRoot,
@@ -425,9 +450,9 @@ export async function verifyPlatformArtifactReceiptV1(params: {
   const fsExt = record(nativeDependencies[0], "fs-ext native binding");
   requireEqual(fsExt.package_name, "fs-ext", "native dependency package");
   requireEqual(fsExt.package_version, "2.1.1", "native dependency version");
-  requireEqual(fsExt.platform, "darwin-arm64", "fs-ext native binding platform");
-  requireEqual(fsExt.signature, "adhoc", "fs-ext native binding signature");
-  requireEqual(fsExt.codesign_verified, true, "fs-ext native binding codesign receipt");
+  requireEqual(fsExt.platform, linux ? "linux-x64" : "darwin-arm64", "fs-ext native binding platform");
+  requireEqual(fsExt.signature, linux ? "not-applicable" : "adhoc", "fs-ext native binding signature");
+  requireEqual(fsExt.codesign_verified, !linux, "fs-ext native binding codesign receipt");
   requireEqual(fsExt.reproducible_build_runs, 2, "fs-ext reproducibility runs");
   const fsExtPath = await verifyBoundEntry({
     pluginRoot,
@@ -470,8 +495,10 @@ export async function verifyPlatformArtifactReceiptV1(params: {
     throw new Error("Finance artifact source identity is missing.");
   }
 
-  environment.verifyCodeSignature(financeBindingPath);
-  environment.verifyCodeSignature(fsExtPath);
+  for (const nativePath of [financeBindingPath, fsExtPath]) {
+    verifyNativeBinaryIdentityV1(await readFile(nativePath), environment.platform, environment.arch);
+    if (!linux) environment.verifyCodeSignature(nativePath);
+  }
   return {
     artifact_sha256: params.artifact.artifact_sha256,
     file_count: params.artifact.file_count,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -43,10 +44,15 @@ _RAW_INTAKE_INSERT = (
 
 
 def _blank_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile_id: str = _PROFILE_ID
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_id: str = _PROFILE_ID,
+    *,
+    support_mode: int = 0o700,
 ) -> tuple[Path, Path, object]:
     support = tmp_path / "Application Support"
     support.mkdir(mode=0o700, exist_ok=True)
+    support.chmod(support_mode)
     base = support / "Finance-Codex" / "profiles" / profile_id
     directories = (
         base.parent.parent,
@@ -79,6 +85,160 @@ def _blank_profile(
     blank = validate_profile_paths(support, profile_id)
     initialize_profile_gate(blank)
     return support, base, blank
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="actual Darwin ancestor/ACL compatibility")
+def test_darwin_0755_support_blank_enrollment_reopen_and_private_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    support, base, blank = _blank_profile(tmp_path, monkeypatch, support_mode=0o755)
+    managed = managed_staging.bootstrap_registered_staging(blank)
+    try:
+        blank.close()
+        with managed_staging.verify_registered_staging(support, _PROFILE_ID) as reopened:
+            with managed_staging._managed_staging_connection(reopened, purpose="reopen") as conn:
+                assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            for directory in (
+                base.parent.parent,
+                base.parent,
+                base,
+                base / "runtime",
+                base / "runtime/database",
+                base / "workspace",
+                base / "workspace/database",
+                base / "backups",
+                base / "work",
+                base / "restore",
+            ):
+                directory.chmod(0o755)
+                with pytest.raises(ProfilePathError, match="private"):
+                    reopened.revalidate()
+                directory.chmod(0o700)
+                reopened.revalidate()
+            support.chmod(0o775)
+            with pytest.raises(ProfilePathError, match="ancestor"):
+                reopened.revalidate()
+            support.chmod(0o755)
+            reopened.revalidate()
+        assert stat.S_IMODE(support.stat().st_mode) == 0o755
+    finally:
+        managed.close()
+        blank.close()
+
+
+@pytest.mark.parametrize("marker", ["valid", "corrupt", "pending", "dangling", "dangling-pending"])
+@pytest.mark.parametrize("alias", ["direct", "resolved-ancestor", "raw-ancestor"])
+def test_renamed_managed_tree_markers_refuse_generic_staging_at_observable_paths_without_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker: str, alias: str
+) -> None:
+    support, base, blank = _blank_profile(tmp_path, monkeypatch)
+    managed = managed_staging.bootstrap_registered_staging(blank)
+    managed.close()
+    blank.close()
+    moved = tmp_path / "renamed-profile"
+    base.rename(moved)
+    monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(moved / "runtime"))
+    registration = moved / MANAGED_STAGING_FILENAME
+    if marker != "valid":
+        registration.unlink()
+        if marker == "corrupt":
+            registration.write_text("{", encoding="utf-8")
+        elif marker == "pending":
+            (moved / ".managed-staging.v1.pending").write_text("pending", encoding="utf-8")
+        else:
+            marker_path = (
+                registration if marker == "dangling" else moved / ".managed-staging.v1.pending"
+            )
+            marker_path.symlink_to(tmp_path / "absent-marker-target")
+    directory = moved / "workspace/database"
+    if alias == "resolved-ancestor":
+        alias_root = tmp_path / "ordinary-alias"
+        alias_root.symlink_to(moved, target_is_directory=True)
+        directory = alias_root / "workspace/database"
+    elif alias == "raw-ancestor":
+        external = tmp_path / "ordinary-target"
+        external.mkdir(mode=0o700)
+        baseline = create_staging_database(external / "staging.sqlite")
+        staging_guard.require_unmanaged_staging_database(baseline)
+        baseline.close()
+        directory.rename(directory.with_name("preserved-database"))
+        directory.symlink_to(external, target_is_directory=True)
+    existing = directory / "staging.sqlite"
+    new = directory / "new.sqlite"
+    conn = sqlite3.connect(existing)
+    # Give the adversarial fixture ordinary authorization at its current identity.
+    # The marker must refuse even when token/path checks would accept this connection.
+    conn.execute("UPDATE _staging_authorization SET db_identity=?", (str(existing.resolve()),))
+    conn.commit()
+    staging_guard.require_staging_database(conn)
+    conn.execute("BEGIN")
+    before = {
+        str(path.relative_to(tmp_path)): ("link", os.readlink(path))
+        if path.is_symlink()
+        else ("file", path.read_bytes())
+        for path in tmp_path.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    changes = conn.total_changes
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("refused managed tree reached a SQLite or file opener")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(staging_guard.sqlite3, "connect", forbidden)
+            patch.setattr(staging_guard.os, "open", forbidden)
+            with pytest.raises(StagingDatabaseError, match="managed profile gate"):
+                create_staging_database(new)
+            with pytest.raises(StagingDatabaseError, match="managed profile gate"):
+                open_staging_database(existing)
+            if alias == "raw-ancestor":
+                # SQLite reports the canonical ordinary target; this connection-only
+                # entry cannot recover a lexical alias that SQLite has discarded.
+                assert Path(staging_guard._get_db_file_path(conn)) == existing.resolve()
+                staging_guard.require_unmanaged_staging_database(conn)
+            else:
+                with pytest.raises(StagingDatabaseError, match="fixed operation owner"):
+                    staging_guard.require_unmanaged_staging_database(conn)
+        assert conn.total_changes == changes
+        assert conn.in_transaction
+        assert not new.exists()
+        after = {
+            str(path.relative_to(tmp_path)): ("link", os.readlink(path))
+            if path.is_symlink()
+            else ("file", path.read_bytes())
+            for path in tmp_path.rglob("*")
+            if path.is_file() or path.is_symlink()
+        }
+        assert after == before
+    finally:
+        conn.close()
+
+
+def test_unregistered_mac_generic_creation_and_ordinary_factory_reopen_remain_compatible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support, base, blank = _blank_profile(tmp_path, monkeypatch)
+    blank.close()
+    fixed = base / "workspace/database/staging.sqlite"
+    ordinary = base / "workspace/database/ordinary.sqlite"
+    with create_staging_database(fixed) as conn:
+        staging_guard.require_staging_database(conn)
+        with pytest.raises(StagingDatabaseError, match="fixed operation owner"):
+            staging_guard.require_unmanaged_staging_database(conn)
+    conn.close()
+    with pytest.raises(StagingDatabaseError, match="managed profile gate"):
+        open_staging_database(fixed)
+    conn = create_staging_database(ordinary)
+    try:
+        staging_guard.require_unmanaged_staging_database(conn)
+    finally:
+        conn.close()
+    conn = open_staging_database(ordinary)
+    try:
+        staging_guard.require_unmanaged_staging_database(conn)
+    finally:
+        conn.close()
 
 
 @pytest.fixture

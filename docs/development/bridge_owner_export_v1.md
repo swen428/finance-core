@@ -20,12 +20,19 @@ The public entry point is:
 
 ```ts
 exportBridgeOwnerState(
-  { applicationSupportRoot, profileId, runtimeRoot },
+  { applicationSupportRoot, profileId, runtimeRoot }, // existing Mac entry
   { waitMs?, maxHoldMs? },
 )
 ```
 
-The application-support root and runtime root must be explicit canonical
+The additive Linux entry uses `{ linuxDataRoot, profileId, runtimeRoot }` with
+an explicit root ending in `finance-codex` and `profiles/<id>` below it.
+Exactly one layout selector is required; both, neither and unsupported roots
+fail before source or stage effects. The Linux selector comes from trusted
+owner configuration, never a message or manifest. Profile gate, handoff custody,
+cut session, evidence preservation and stage-only result semantics are shared.
+
+The selected data root and runtime root must be explicit canonical
 paths, and the profile ID must select the profile already bound by
 `profile.json`. The exporter validates the fixed profile path boundary and
 requires the existing fixed profile gate. It does not read or require

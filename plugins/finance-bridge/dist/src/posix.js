@@ -118,7 +118,7 @@ export function createDirectoryExclusiveAt(parentFd, name) {
 export function openFileAt(directoryFd, name, flags, mode = 0) {
     return native.openFileAt(directoryFd, name, flags, mode);
 }
-/** Reject Darwin extended ACL allow entries on a pinned descriptor. */
+/** Reject Darwin allow entries or Linux POSIX access/default ACLs on a pinned FD. */
 export function rejectAclGrants(fd) {
     native.rejectAclGrants(fd);
 }

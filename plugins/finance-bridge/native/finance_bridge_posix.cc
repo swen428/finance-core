@@ -21,6 +21,7 @@
 #if defined(__linux__)
 #include <linux/fs.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #endif
 
 namespace {
@@ -523,13 +524,23 @@ napi_value RejectAclGrants(napi_env env, napi_callback_info info) {
       return nullptr;
     }
   }
-#else
-  // Linux has no Darwin extended ACL. The trusted profile boundary still
-  // validates ancestors and ownership before supplying this descriptor.
-  if (fcntl(fd, F_GETFD) < 0) {
-    ThrowErrno(env, "fcntl");
-    return nullptr;
+#elif defined(__linux__)
+  // Reject every stored access/default ACL, including masked and inherited
+  // grants. A mode-only check cannot establish this no-ACL policy.
+  for (const char* name : {"system.posix_acl_access", "system.posix_acl_default"}) {
+    errno = 0;
+    if (fgetxattr(fd, name, nullptr, 0) >= 0) {
+      napi_throw_error(env, nullptr, "Profile gate entry has a Linux POSIX ACL.");
+      return nullptr;
+    }
+    if (errno != ENODATA) {
+      ThrowErrno(env, "Cannot inspect Linux POSIX ACL");
+      return nullptr;
+    }
   }
+#else
+  napi_throw_error(env, nullptr, "Profile ACL verification is unsupported on this platform.");
+  return nullptr;
 #endif
   napi_value result;
   napi_get_undefined(env, &result);

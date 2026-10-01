@@ -1,13 +1,14 @@
 /** Fixed synthetic Core cuts. No Host/Bridge export or publication. */
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { closeSync, constants, fstatSync, fsyncSync, lstatSync, read, readFileSync, realpathSync } from "node:fs";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, fsyncSync, lstatSync, read, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { Duplex } from "node:stream";
 
 import { revalidatePythonExecutableForSpawn, type FinanceBridgeConfig } from "./config.js";
 import { verifyCoreDistributionV1 } from "./core-distribution-v1.js";
 import { openProfileGate, type ExclusiveProfileGateLease } from "./profile-gate.js";
+import { checkProfileAncestors, profileLocatorEnvironment, type ProfileRootLocator } from "./profile-layout.js";
 import {
   createDirectoryExclusiveAt, openDirectory, openExistingDirectoryAt,
   openFileAt, rejectAclGrants, listAt,
@@ -36,7 +37,6 @@ const REAP_GRACE_MS = 1_000;
 const HASH = /^[0-9a-f]{64}$/u;
 const HEX32 = /^[0-9a-f]{32}$/u;
 const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
-const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/u;
 const UTC_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
 const BUNDLE_TERMINAL_COMMON = ["version", "type", "cut_id", "worker_id", "profile_id",
   "operation", "artifact_sha256", "schema_sha256", "scope", "registry_version",
@@ -69,10 +69,8 @@ export interface ManagedCoreSnapshotLimits {
   readonly backupPagesPerStep: number;
 }
 
-export interface ManagedCoreSnapshotOptions {
+export interface ManagedCoreSnapshotOptions extends ProfileRootLocator {
   readonly config: FinanceBridgeConfig;
-  readonly applicationSupportRoot: string;
-  readonly profileId: string;
   readonly limits: ManagedCoreSnapshotLimits;
   readonly waitMs?: number;
   readonly maxHoldMs?: number;
@@ -89,10 +87,8 @@ export interface ManagedCoreSnapshotReceipt {
   readonly journalMode: "delete";
 }
 
-export interface ManagedCoreSnapshotBundleOptions {
+export interface ManagedCoreSnapshotBundleOptions extends ProfileRootLocator {
   readonly config: FinanceBridgeConfig;
-  readonly applicationSupportRoot: string;
-  readonly profileId: string;
   readonly waitMs?: number;
   readonly maxHoldMs?: number;
   readonly signal?: AbortSignal;
@@ -699,8 +695,7 @@ async function runFixedChild(context: CutContext, options: CutOptionsBase,
       ["-I", "-B", "-c", BOOTSTRAP, options.config.coreDistributionRoot, module], {
         cwd: options.config.coreDistributionRoot, shell: false, detached: false,
         env: {
-          FINANCE_RUNTIME_ROOT: join(options.applicationSupportRoot, "Finance-Codex", "profiles", options.profileId, "runtime"),
-          FINANCE_CUT_APPLICATION_SUPPORT: options.applicationSupportRoot,
+          ...profileLocatorEnvironment(options),
           FINANCE_CUT_PROFILE_ID: options.profileId,
           FINANCE_CUT_STAGE_PATH: context.stagePath,
           FINANCE_CUT_ARTIFACT_SHA256: options.config.agentProfileV2.coreManifestSha256,
@@ -851,12 +846,8 @@ async function withManagedCut<T>(options: CutOptionsBase, limitsForRun: () => Re
   version: typeof VERSION | typeof BUNDLE_VERSION,
   work: (run: CutRun) => Promise<T>): Promise<T> {
   if (unhealthy) throw new Error("Managed cut coordinator is unhealthy after uncertain child closure.");
-  if (!PROFILE_ID.test(options.profileId) || !isAbsolute(options.applicationSupportRoot) ||
-      resolve(options.applicationSupportRoot) !== options.applicationSupportRoot ||
-      realpathSync(options.applicationSupportRoot) !== options.applicationSupportRoot ||
-      basename(options.applicationSupportRoot) !== "Application Support") {
-    throw new Error("Managed cut requires a canonical synthetic profile locator.");
-  }
+  options = Object.freeze({ ...options });
+  const layout = checkProfileAncestors(options);
   const limits = limitsForRun();
   const waitMs = boundedMs(options.waitMs, 5_000);
   const maxHoldMs = boundedMs(options.maxHoldMs, 30_000);
@@ -865,7 +856,7 @@ async function withManagedCut<T>(options: CutOptionsBase, limitsForRun: () => Re
   assertNotCancelled(options.signal);
   await verifyCoreDistributionV1(options.config);
   assertNotCancelled(options.signal);
-  const profileRoot = join(options.applicationSupportRoot, "Finance-Codex", "profiles", options.profileId);
+  const profileRoot = layout.profileRoot;
   const profileFd = openDirectory(profileRoot);
   let workFd: number | undefined;
   let stageFd: number | undefined;
