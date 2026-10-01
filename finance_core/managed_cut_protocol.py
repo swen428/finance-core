@@ -34,6 +34,51 @@ _HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _ROLE = re.compile(r"core-cut-[0-9a-f]{32}\Z")
+BUNDLE_VERSION = "delegated-cut-bundle-v1"
+BUNDLE_SCOPE = "core_committed_snapshot"
+BUNDLE_REGISTRY_VERSION = "core-attachment-reference-registry-v1"
+BUNDLE_LIMITS_VERSION = "core-snapshot-bundle-limits-v1"
+BUNDLE_LIMITS = {
+    "max_core_db_bytes": 67_108_864,
+    "max_db_stage_bytes": 134_217_728,
+    "max_attachment_bytes": 20_971_520,
+    "max_attachment_members": 4096,
+    "max_references": 65_536,
+    "max_manifest_bytes": 1_048_576,
+    "max_stage_bytes": 268_435_456,
+    "min_free_bytes": 67_108_864,
+    "backup_pages_per_step": 256,
+}
+BUNDLE_STAGED_KEYS = frozenset(
+    {
+        "bundle_stage_dev",
+        "bundle_stage_ino",
+        "db_stage_dev",
+        "db_stage_ino",
+        "db_output_dev",
+        "db_output_ino",
+        "db_bytes",
+        "db_sha256",
+        "db_page_count",
+        "manifest_sha256",
+        "manifest_bytes",
+        "member_count",
+        "member_bytes",
+        "reference_count",
+        "reference_sha256",
+        "snapshot_recorded_at",
+        "package_completed_at",
+        "schema_fingerprint",
+        "migration_ledger_sha256",
+        "migration_ledger_count",
+    }
+)
+_ATTEMPTED_VERSION = "delegated-cut-worker-v1"
+
+
+def failure_version() -> str:
+    """Select a fixed failure vocabulary after a rejected one-use first frame."""
+    return _ATTEMPTED_VERSION
 
 
 class ManagedCutProtocolError(RuntimeError):
@@ -53,6 +98,11 @@ class CutRequest:
     limits: dict[str, int]
     operation: str
     staged: dict[str, Any] | None
+    scope: str | None = None
+    registry_version: str | None = None
+    limits_version: str | None = None
+    core_version: str | None = None
+    core_api_contract_version: str | None = None
 
 
 def _exact_object(value: Any, keys: set[str]) -> dict[str, Any]:
@@ -144,6 +194,14 @@ def _digest_file(path: Path) -> str:
 
 
 def validate_request(frame: dict[str, Any], *, expected_operation: str) -> CutRequest:
+    bundle = expected_operation in {"core_bundle_snapshot", "core_bundle_readback"}
+    if expected_operation not in {
+        "core_snapshot",
+        "core_readback",
+        "core_bundle_snapshot",
+        "core_bundle_readback",
+    }:
+        raise ManagedCutProtocolError("Cut operation is invalid")
     required = {
         "version",
         "cut_id",
@@ -157,11 +215,33 @@ def validate_request(frame: dict[str, Any], *, expected_operation: str) -> CutRe
         "limits",
         "operation",
     }
-    if expected_operation == "core_readback":
+    if bundle:
+        required.update(
+            {
+                "scope",
+                "registry_version",
+                "limits_version",
+                "core_version",
+                "core_api_contract_version",
+            }
+        )
+    if expected_operation in {"core_readback", "core_bundle_readback"}:
         required.add("staged")
     _exact_object(frame, required)
-    if frame["version"] != "delegated-cut-worker-v1" or frame["operation"] != expected_operation:
+    expected_version = BUNDLE_VERSION if bundle else "delegated-cut-worker-v1"
+    if frame["version"] != expected_version or frame["operation"] != expected_operation:
         raise ManagedCutProtocolError("Cut operation is invalid")
+    if bundle:
+        if (
+            frame["scope"] != BUNDLE_SCOPE
+            or frame["registry_version"] != BUNDLE_REGISTRY_VERSION
+            or frame["limits_version"] != BUNDLE_LIMITS_VERSION
+            or type(frame["core_version"]) is not str
+            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", frame["core_version"])
+            or type(frame["core_api_contract_version"]) is not str
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,99}", frame["core_api_contract_version"])
+        ):
+            raise ManagedCutProtocolError("Bundle identity is invalid")
     for field in ("cut_id", "worker_id"):
         if type(frame[field]) is not str or not _HEX32.fullmatch(frame[field]):
             raise ManagedCutProtocolError("Cut identity is invalid")
@@ -174,13 +254,17 @@ def validate_request(frame: dict[str, Any], *, expected_operation: str) -> CutRe
             raise ManagedCutProtocolError("Cut digest is invalid")
     limits = _exact_object(
         frame["limits"],
-        {"max_core_db_bytes", "max_stage_bytes", "min_free_bytes", "backup_pages_per_step"},
+        set(BUNDLE_LIMITS)
+        if bundle
+        else {"max_core_db_bytes", "max_stage_bytes", "min_free_bytes", "backup_pages_per_step"},
     )
     if any(type(value) is not int or value <= 0 or value > 2**63 - 1 for value in limits.values()):
         raise ManagedCutProtocolError("Cut limits are invalid")
     encoded = json.dumps(limits, sort_keys=True, separators=(",", ":")).encode()
     if hashlib.sha256(encoded).hexdigest() != frame["limits_sha256"]:
         raise ManagedCutProtocolError("Cut limits digest differs")
+    if bundle and limits != BUNDLE_LIMITS:
+        raise ManagedCutProtocolError("Bundle limits differ")
     duration = frame["remaining_ms"]
     if type(duration) is not int or not 0 < duration <= 30_000:
         raise ManagedCutProtocolError("Cut duration is invalid")
@@ -209,6 +293,37 @@ def validate_request(frame: dict[str, Any], *, expected_operation: str) -> CutRe
             raise ManagedCutProtocolError("Staged evidence is invalid")
         for key in ("stage_dev", "stage_ino", "output_dev", "output_ino"):
             canonical_decimal(staged[key])
+    elif expected_operation == "core_bundle_readback":
+        staged = _exact_object(staged, set(BUNDLE_STAGED_KEYS))
+        for key in (
+            "bundle_stage_dev",
+            "bundle_stage_ino",
+            "db_stage_dev",
+            "db_stage_ino",
+            "db_output_dev",
+            "db_output_ino",
+        ):
+            canonical_decimal(staged[key])
+        for key in ("db_bytes", "db_page_count", "manifest_bytes", "member_count", "member_bytes"):
+            if type(staged[key]) is not int or staged[key] <= 0:
+                raise ManagedCutProtocolError("Bundle staged count is invalid")
+        for key in ("reference_count", "migration_ledger_count"):
+            if type(staged[key]) is not int or staged[key] < 0:
+                raise ManagedCutProtocolError("Bundle staged count is invalid")
+        for key in (
+            "db_sha256",
+            "manifest_sha256",
+            "reference_sha256",
+            "schema_fingerprint",
+            "migration_ledger_sha256",
+        ):
+            if type(staged[key]) is not str or not _HEX64.fullmatch(staged[key]):
+                raise ManagedCutProtocolError("Bundle staged digest is invalid")
+        for key in ("snapshot_recorded_at", "package_completed_at"):
+            if type(staged[key]) is not str or not re.fullmatch(
+                r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", staged[key]
+            ):
+                raise ManagedCutProtocolError("Bundle staged time is invalid")
     return CutRequest(
         **{key: frame[key] for key in required if key not in {"version", "staged"}}, staged=staged
     )
@@ -235,16 +350,28 @@ def validate_profile(
         raise
 
 
-def initial_handshake(operation: str) -> tuple[CutRequest, ManagedStagingProfile, Path, float]:
+def initial_handshake(
+    operation: str | tuple[str, ...],
+) -> tuple[CutRequest, ManagedStagingProfile, Path, float]:
     # A closed or absent dedicated control channel refuses before any SQLite use.
     first = read_frame(time.monotonic() + 5.0)
-    request = validate_request(first, expected_operation=operation)
+    global _ATTEMPTED_VERSION
+    _ATTEMPTED_VERSION = (
+        BUNDLE_VERSION if first.get("version") == BUNDLE_VERSION else "delegated-cut-worker-v1"
+    )
+    selected = first.get("operation") if isinstance(operation, tuple) else operation
+    if selected not in (operation if isinstance(operation, tuple) else (operation,)):
+        raise ManagedCutProtocolError("Cut operation is invalid")
+    request = validate_request(first, expected_operation=selected)
     deadline = time.monotonic() + request.remaining_ms / 1000
-    profile, stage = validate_profile(request, empty_stage=operation == "core_snapshot")
+    profile, stage = validate_profile(
+        request, empty_stage=selected in {"core_snapshot", "core_bundle_snapshot"}
+    )
+    version = BUNDLE_VERSION if selected.startswith("core_bundle_") else "delegated-cut-worker-v1"
     try:
         write_frame(
             {
-                "version": "delegated-cut-worker-v1",
+                "version": version,
                 "type": "ready",
                 "cut_id": request.cut_id,
                 "worker_id": request.worker_id,
@@ -253,7 +380,7 @@ def initial_handshake(operation: str) -> tuple[CutRequest, ManagedStagingProfile
         go = read_frame(deadline)
         _exact_object(go, {"version", "type", "cut_id", "worker_id"})
         if go != {
-            "version": "delegated-cut-worker-v1",
+            "version": version,
             "type": "go",
             "cut_id": request.cut_id,
             "worker_id": request.worker_id,

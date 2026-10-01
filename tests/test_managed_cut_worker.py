@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.metadata
 import json
 import os
 import select
@@ -19,6 +20,7 @@ from typing import NamedTuple
 
 import pytest
 
+import finance_core
 from finance_core.managed_cut_protocol import (
     ManagedCutProtocolError,
     canonical_decimal,
@@ -37,6 +39,17 @@ _LIMITS = {
     "max_stage_bytes": 192 * 1024 * 1024,
     "min_free_bytes": 1,
     "backup_pages_per_step": 1,
+}
+_BUNDLE_LIMITS = {
+    "max_core_db_bytes": 64 * 1024 * 1024,
+    "max_db_stage_bytes": 128 * 1024 * 1024,
+    "max_attachment_bytes": 20 * 1024 * 1024,
+    "max_attachment_members": 4096,
+    "max_references": 65_536,
+    "max_manifest_bytes": 1024 * 1024,
+    "max_stage_bytes": 256 * 1024 * 1024,
+    "min_free_bytes": 64 * 1024 * 1024,
+    "backup_pages_per_step": 256,
 }
 
 
@@ -74,6 +87,37 @@ def _request(
         "remaining_ms": 20_000,
         "limits": _LIMITS,
         "operation": operation,
+    }
+
+
+def _bundle_request(
+    profile_root: Path,
+    cut_id: str,
+    *,
+    operation: str = "core_bundle_snapshot",
+    limits: dict[str, int] | None = None,
+) -> dict[str, object]:
+    registration = (profile_root / MANAGED_STAGING_FILENAME).read_bytes()
+    registration_value = json.loads(registration)
+    fixed_limits = dict(_BUNDLE_LIMITS if limits is None else limits)
+    limits_bytes = json.dumps(fixed_limits, sort_keys=True, separators=(",", ":")).encode()
+    return {
+        "version": "delegated-cut-bundle-v1",
+        "cut_id": cut_id,
+        "worker_id": uuid.uuid4().hex,
+        "profile_id": "cut-worker",
+        "registration_sha256": hashlib.sha256(registration).hexdigest(),
+        "artifact_sha256": "a" * 64,
+        "schema_sha256": registration_value["migration_contract_sha256"],
+        "limits_sha256": hashlib.sha256(limits_bytes).hexdigest(),
+        "remaining_ms": 20_000,
+        "limits": fixed_limits,
+        "operation": operation,
+        "scope": "core_committed_snapshot",
+        "registry_version": "core-attachment-reference-registry-v1",
+        "limits_version": "core-snapshot-bundle-limits-v1",
+        "core_version": importlib.metadata.version("finance-core"),
+        "core_api_contract_version": finance_core.API_CONTRACT_VERSION,
     }
 
 
@@ -155,6 +199,7 @@ def _start_worker(
     *,
     cut_id: str | None = None,
     hold_after_terminal_ms: int = 0,
+    request: dict[str, object] | None = None,
 ) -> tuple[_WorkerHarness, dict[str, object]]:
     selected_cut = cut_id or uuid.uuid4().hex
     stage = managed.work / f"core-cut-{selected_cut}"
@@ -190,7 +235,7 @@ def _start_worker(
         os.close(fd)
     return _WorkerHarness(
         process, parent_control, stage, gate_fd, profile_fd, stage_fd, child_fds
-    ), _request(profile_root, selected_cut)
+    ), request if request is not None else _request(profile_root, selected_cut)
 
 
 def _read_frame(control: socket.socket, timeout: float = 10.0) -> dict[str, object]:
@@ -272,7 +317,17 @@ def test_pathless_request_and_native_identity_precision() -> None:
     validated = validate_request(request, expected_operation="core_snapshot")
     assert validated.operation == "core_snapshot"
 
-    for forbidden in ("path", "executable", "provider", "descriptor"):
+    for forbidden in (
+        "path",
+        "executable",
+        "provider",
+        "descriptor",
+        "scope",
+        "registry_version",
+        "limits_version",
+        "core_version",
+        "core_api_contract_version",
+    ):
         with pytest.raises(ManagedCutProtocolError, match="Invalid fixed cut frame"):
             validate_request(
                 {**request, forbidden: "synthetic-value"},
@@ -353,6 +408,7 @@ def test_fd3_eof_during_backup_aborts_real_worker_and_child_holds_ex_until_close
         while not output.exists() and time.monotonic() < deadline:
             if harness.process.poll() is not None:
                 terminal = _read_frame(harness.control)
+                assert harness.process.stderr is not None
                 stderr = harness.process.stderr.read().decode("utf-8", errors="replace")
                 pytest.fail(
                     "worker exited before backup output appeared: "
@@ -469,3 +525,148 @@ def test_parent_death_keeps_inherited_ex_until_real_worker_close(
                 os.kill(worker_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+def test_real_bundle_worker_writes_fixed_empty_reference_manifest_and_holds_ex_until_close(
+    synthetic_profile: tuple[Path, Path, ManagedStagingProfile],
+) -> None:
+    support, profile_root, managed = synthetic_profile
+    cut_id = uuid.uuid4().hex
+    harness, request = _start_worker(
+        support,
+        profile_root,
+        managed,
+        cut_id=cut_id,
+        hold_after_terminal_ms=500,
+        request=_bundle_request(profile_root, cut_id),
+    )
+    try:
+        harness.control.sendall(_request_line(request))
+        ready = _read_frame(harness.control)
+        assert ready == {
+            "version": "delegated-cut-bundle-v1",
+            "type": "ready",
+            "cut_id": request["cut_id"],
+            "worker_id": request["worker_id"],
+        }
+        harness.control.sendall(
+            _request_line(
+                {
+                    "version": "delegated-cut-bundle-v1",
+                    "type": "go",
+                    "cut_id": request["cut_id"],
+                    "worker_id": request["worker_id"],
+                }
+            )
+        )
+        staged = _read_frame(harness.control)
+        assert staged["type"] == "bundle_staged"
+        assert staged["scope"] == "core_committed_snapshot"
+        assert staged["registry_version"] == "core-attachment-reference-registry-v1"
+        assert staged["limits_version"] == "core-snapshot-bundle-limits-v1"
+        assert staged["source_closed"] is True
+        assert staged["backup_complete"] is True
+        assert staged["member_count"] == 1
+        assert staged["reference_count"] == 0
+        assert harness.process.poll() is None, "worker wrapper should still hold after terminal"
+
+        manifest = json.loads((harness.stage / "manifest.json").read_bytes())
+        assert manifest["format"] == "core-committed-snapshot-manifest-v1"
+        assert manifest["scope"] == "core_committed_snapshot"
+        assert manifest["cut_id"] == cut_id
+        assert manifest["reference_count"] == 0
+        assert manifest["members"] == [
+            {
+                "path": "db/core.sqlite",
+                "role": "database",
+                "bytes": staged["db_bytes"],
+                "sha256": staged["db_sha256"],
+            }
+        ]
+        assert (harness.stage / "attachments").is_dir()
+        assert (harness.stage / "db" / "core.sqlite").is_file()
+        assert not (harness.stage / "core.sqlite").exists()
+
+        # Close the coordinator's copy: only the still-running fixed worker
+        # should retain EX until the wrapper observes real process close.
+        os.close(harness.gate_fd)
+        assert _assert_shared_lock_contends(profile_root)
+        assert harness.process.wait(timeout=5) == 0
+        assert not _assert_shared_lock_contends(profile_root)
+    finally:
+        _close_harness(harness)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("registry_version", "unknown-reference-registry"),
+        ("limits_version", "unknown-limits"),
+        ("core_version", "0.0.0"),
+    ),
+)
+def test_real_bundle_worker_rejects_unknown_fixed_versions_before_success(
+    synthetic_profile: tuple[Path, Path, ManagedStagingProfile],
+    field: str,
+    replacement: str,
+) -> None:
+    support, profile_root, managed = synthetic_profile
+    cut_id = uuid.uuid4().hex
+    request = _bundle_request(profile_root, cut_id)
+    request[field] = replacement
+    harness, _ = _start_worker(support, profile_root, managed, cut_id=cut_id, request=request)
+    try:
+        harness.control.sendall(_request_line(request))
+        first = _read_frame(harness.control)
+        assert first["type"] in {"ready", "failed"}
+        if first["type"] == "ready":
+            harness.control.sendall(
+                _request_line(
+                    {
+                        "version": "delegated-cut-bundle-v1",
+                        "type": "go",
+                        "cut_id": request["cut_id"],
+                        "worker_id": request["worker_id"],
+                    }
+                )
+            )
+            first = _read_frame(harness.control)
+        assert first["type"] == "failed"
+        assert harness.process.wait(timeout=5) != 0
+        assert not (harness.stage / "manifest.json").exists()
+    finally:
+        _close_harness(harness)
+
+
+def test_real_bundle_worker_rejects_caller_reduced_budget_before_success(
+    synthetic_profile: tuple[Path, Path, ManagedStagingProfile],
+) -> None:
+    support, profile_root, managed = synthetic_profile
+    cut_id = uuid.uuid4().hex
+    limits = dict(_BUNDLE_LIMITS)
+    limits["max_attachment_bytes"] -= 1
+    request = _bundle_request(profile_root, cut_id, limits=limits)
+    harness, _ = _start_worker(support, profile_root, managed, cut_id=cut_id, request=request)
+    try:
+        harness.control.sendall(_request_line(request))
+        terminal = _read_frame(harness.control)
+        if terminal["type"] == "ready":
+            harness.control.sendall(
+                _request_line(
+                    {
+                        "version": "delegated-cut-bundle-v1",
+                        "type": "go",
+                        "cut_id": request["cut_id"],
+                        "worker_id": request["worker_id"],
+                    }
+                )
+            )
+            terminal = _read_frame(harness.control)
+        assert terminal == {
+            "version": "delegated-cut-bundle-v1",
+            "type": "failed",
+        }
+        assert harness.process.wait(timeout=5) != 0
+        assert not (harness.stage / "manifest.json").exists()
+    finally:
+        _close_harness(harness)
