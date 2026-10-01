@@ -20,6 +20,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -693,6 +694,7 @@ def _persist(
 ) -> ReceiptTotalProposalIngestionResult:
     try:
         conn.execute("BEGIN IMMEDIATE")
+        locked_binding = binding
         if command.parser_version == PARSER_VERSION_TSV_HIERARCHY:
             # Recheck complete evidence under the same write lock as replay/insert.
             _revalidate_extraction(conn, extraction)
@@ -713,6 +715,9 @@ def _persist(
                 proposal_input_hash=proposal_input_hash,
                 proposal_result_hash=proposal_result_hash,
                 parse=parse,
+                binding=locked_binding,
+                payload=payload,
+                payload_json=payload_json,
             )
             if before_commit is not None:
                 before_commit(conn)
@@ -760,6 +765,11 @@ def _persist(
             parser_output_id=parser_output_id,
             proposal_result_hash=proposal_result_hash,
             payload_json=payload_json,
+            extraction=extraction,
+            binding=locked_binding,
+            proposal_input_hash=proposal_input_hash,
+            payload=payload,
+            confidence=parse.overall_confidence,
         )
 
         _inject_failure("before_commit")
@@ -825,6 +835,9 @@ def _verify_idempotent_replay(
     proposal_input_hash: str,
     proposal_result_hash: str,
     parse: ReceiptTotalParseResult,
+    binding: _SourceBinding,
+    payload: dict[str, object],
+    payload_json: str,
 ) -> ReceiptTotalProposalIngestionResult:
     matches = (
         existing["extraction_id"] == extraction.id
@@ -846,7 +859,14 @@ def _verify_idempotent_replay(
         command=command,
         parser_output_id=parser_output_id,
         proposal_result_hash=proposal_result_hash,
-        payload_json=None,
+        payload_json=(
+            payload_json if command.parser_version == PARSER_VERSION_TSV_HIERARCHY else None
+        ),
+        extraction=extraction,
+        binding=binding,
+        proposal_input_hash=proposal_input_hash,
+        payload=payload,
+        confidence=parse.overall_confidence,
     )
     return _result(
         command=command,
@@ -1033,10 +1053,17 @@ def _verify_persisted(
     parser_output_id: int,
     proposal_result_hash: str,
     payload_json: str | None,
+    extraction: _Extraction,
+    binding: _SourceBinding,
+    proposal_input_hash: str,
+    payload: dict[str, object],
+    confidence: float | None,
 ) -> None:
     row = conn.execute(
         """
-        SELECT public_id, source_type, parser_name, parser_version, parse_status, parsed_payload
+        SELECT public_id, source_type, parser_name, parser_version, parse_status, parsed_payload,
+               source_public_id, attachment_id, parent_parser_output_id, statement_batch_id,
+               ai_provider, ai_model, prompt_version, raw_text, normalized_payload, confidence_score
         FROM parser_outputs WHERE id = ?
         """,
         (parser_output_id,),
@@ -1059,6 +1086,79 @@ def _verify_persisted(
     if _sha256_hex(stored_payload) != proposal_result_hash:
         raise ProposalPersistenceConflictError(
             "Persisted proposal payload hash does not match the recorded result hash."
+        )
+
+    if command.parser_version != PARSER_VERSION_TSV_HIERARCHY:
+        return
+
+    # Verify only the original deterministic pending insert, never a descendant
+    # or a claimed AI identity. The lock-bound source cannot be adopted/repaired.
+    if (
+        row["source_public_id"] != binding.raw_intake_public_id
+        or row["attachment_id"] != binding.attachment_id
+        or any(
+            row[field] is not None
+            for field in (
+                "parent_parser_output_id",
+                "statement_batch_id",
+                "ai_provider",
+                "ai_model",
+                "prompt_version",
+                "raw_text",
+            )
+        )
+        or row["normalized_payload"] != payload_json
+        or row["confidence_score"] != confidence
+    ):
+        raise ProposalPersistenceConflictError(
+            "Persisted proposal source or original insert material does not match."
+        )
+
+    link = conn.execute(
+        """
+        SELECT public_id, extraction_id, parser_output_id, parser_contract_version,
+               link_role, proposal_input_hash, proposal_result_hash
+        FROM receipt_ocr_proposal_links WHERE parser_output_id = ?
+        """,
+        (parser_output_id,),
+    ).fetchone()
+    if link is None or tuple(link) != (
+        command.link_public_id,
+        extraction.id,
+        parser_output_id,
+        command.parser_contract_version,
+        LINK_ROLE_INITIAL,
+        proposal_input_hash,
+        proposal_result_hash,
+    ):
+        raise ProposalPersistenceConflictError("Persisted OCR link identity does not match.")
+
+    raw = conn.execute(
+        "SELECT public_id, parser_output_id FROM raw_intake_records WHERE id = ?",
+        (binding.raw_intake_record_id,),
+    ).fetchone()
+    if raw is None or tuple(raw) != (binding.raw_intake_public_id, parser_output_id):
+        raise ProposalPersistenceConflictError(
+            "The bound raw-intake pointer does not name this pending proposal."
+        )
+
+    evidence = payload["field_evidence"]
+    assert isinstance(evidence, list)
+    expected = Counter(_field_evidence_rows(parser_output_id, evidence))
+    stored = Counter(
+        tuple(item)
+        for item in conn.execute(
+            """
+            SELECT parser_output_id, field_name, proposed_value, confidence_score,
+                   evidence_source_type, evidence_reference, notes
+            FROM parser_proposal_field_evidence WHERE parser_output_id = ?
+            """,
+            (parser_output_id,),
+        )
+    )
+    if stored != expected:
+        raise ProposalPersistenceConflictError(
+            "Persisted OCR field-evidence material does not match."
         )
 
 

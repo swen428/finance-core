@@ -141,6 +141,7 @@ def test_frozen_old_code_persisted_records_replay_exactly(
     )
     conn.commit()
     before = counts(conn)
+    database_before = _source_state(conn)
     stored_before = {
         table: [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")]
         for table in case["stored"]
@@ -162,7 +163,7 @@ def test_frozen_old_code_persisted_records_replay_exactly(
     ):
         assert getattr(result, name) == case["result"][name]
     assert list(result.ambiguity_flags) == case["result"]["ambiguity_flags"]
-    assert counts(conn) == before
+    assert counts(conn) == before and _source_state(conn) == database_before
     for table, rows in stored_before.items():
         assert [dict(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY id")] == rows
     with pytest.raises(ProposalIdempotencyConflictError):
@@ -645,3 +646,384 @@ def test_v2_locked_resolver_conflict_rolls_back_before_link_lookup(
     with pytest.raises(ProposalSourceBindingConflictError, match=failure):
         call(conn, suffix, **V2)
     assert not conn.in_transaction and _source_state(conn) == before
+
+
+_AGGREGATE_MUTATIONS = (
+    "source_public_id",
+    "attachment_null",
+    "attachment_other",
+    "parent_parser_output_id",
+    "statement_batch_id",
+    "ai_provider",
+    "ai_model",
+    "prompt_version",
+    "raw_text",
+    "normalized_payload",
+    "parsed_payload",
+    "confidence_score",
+    "evidence_missing",
+    "evidence_extra",
+    "evidence_field_name",
+    "evidence_proposed_value",
+    "evidence_confidence_score",
+    "evidence_source_type",
+    "evidence_reference",
+    "evidence_notes",
+    "evidence_parser_output_id",
+    "pointer_child",
+)
+
+
+def _prepare_aggregate(conn, tmp_path):
+    suffix = "aggregate"
+    legacy._prepare_extraction(conn, tmp_path, suffix=suffix, blocks=legacy._sgd_blocks())
+    other_attachment = legacy._persist_attachment(conn, tmp_path, suffix="aggregate_other")
+    other_id = conn.execute(
+        "INSERT INTO parser_outputs (public_id, source_type, parse_status) "
+        "VALUES ('prop_aggregate_other', 'telegram_image', 'parsed_pending_confirmation')"
+    ).lastrowid
+    conn.commit()
+    return suffix, other_attachment, other_id
+
+
+def _mutate_pending_aggregate(conn, mutation, proposal_id, other_attachment, other_id):
+    """Legal single-surface changes; retain every original trigger and FK."""
+    if mutation == "pointer_child":
+        child_id = conn.execute(
+            "INSERT INTO parser_outputs (public_id, source_type, source_public_id, "
+            "parent_parser_output_id, parse_status) VALUES "
+            "('prop_aggregate_child', 'telegram_image', 'raw_ocr_aggregate', ?, "
+            "'parsed_pending_confirmation')",
+            (proposal_id,),
+        ).lastrowid
+        conn.execute(
+            "UPDATE raw_intake_records SET parser_output_id = ? WHERE public_id = ?",
+            (child_id, "raw_ocr_aggregate"),
+        )
+        assert (
+            conn.execute(
+                "SELECT parse_status FROM parser_outputs WHERE id = ?", (proposal_id,)
+            ).fetchone()[0]
+            == "parsed_pending_confirmation"
+        )
+    elif mutation == "statement_batch_id":
+        batch_id = conn.execute(
+            "INSERT INTO statement_batches (public_id, statement_source) "
+            "VALUES ('batch_aggregate_other', 'synthetic')"
+        ).lastrowid
+        conn.execute(
+            "UPDATE parser_outputs SET statement_batch_id = ? WHERE id = ?",
+            (batch_id, proposal_id),
+        )
+    elif mutation == "evidence_missing":
+        conn.execute(
+            "DELETE FROM parser_proposal_field_evidence WHERE id = "
+            "(SELECT MIN(id) FROM parser_proposal_field_evidence WHERE parser_output_id = ?)",
+            (proposal_id,),
+        )
+    elif mutation == "evidence_extra":
+        # A duplicate material row must be counted, not collapsed into a set.
+        conn.execute(
+            "INSERT INTO parser_proposal_field_evidence (parser_output_id, field_name, "
+            "proposed_value, confidence_score, evidence_source_type, evidence_reference, notes) "
+            "SELECT parser_output_id, field_name, proposed_value, confidence_score, "
+            "evidence_source_type, evidence_reference, notes "
+            "FROM parser_proposal_field_evidence WHERE parser_output_id = ? LIMIT 1",
+            (proposal_id,),
+        )
+    elif mutation.startswith("evidence_"):
+        field = (
+            mutation
+            if mutation in {"evidence_source_type", "evidence_reference"}
+            else mutation.removeprefix("evidence_")
+        )
+        value = {
+            "parser_output_id": other_id,
+            "field_name": "description",
+            "proposed_value": "changed",
+            "confidence_score": 0.01,
+            "evidence_source_type": "user_message",
+            "evidence_reference": '{"extraction_public_id":"rocr_other"}',
+            "notes": "changed excerpt",
+        }[field]
+        conn.execute(
+            f"UPDATE parser_proposal_field_evidence SET {field} = ? WHERE id = "
+            "(SELECT MIN(id) FROM parser_proposal_field_evidence WHERE parser_output_id = ?)",
+            (value, proposal_id),
+        )
+    else:
+        field, value = {
+            "source_public_id": ("source_public_id", "raw_ocr_aggregate_other"),
+            "attachment_null": ("attachment_id", None),
+            "attachment_other": ("attachment_id", other_attachment),
+            "parent_parser_output_id": ("parent_parser_output_id", other_id),
+            "ai_provider": ("ai_provider", "synthetic-provider"),
+            "ai_model": ("ai_model", "synthetic-model"),
+            "prompt_version": ("prompt_version", "synthetic-prompt"),
+            "raw_text": ("raw_text", "synthetic-text"),
+            "normalized_payload": ("normalized_payload", "{}"),
+            "parsed_payload": ("parsed_payload", "{}"),
+            "confidence_score": ("confidence_score", 0.01),
+        }[mutation]
+        conn.execute(f"UPDATE parser_outputs SET {field} = ? WHERE id = ?", (value, proposal_id))
+    assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+@pytest.mark.parametrize("mutation", _AGGREGATE_MUTATIONS)
+@pytest.mark.parametrize("prelock_commit", [False, True], ids=["committed", "a-preload-b-commit"])
+def test_v2_pending_aggregate_refuses_legal_drift_without_a_writes(
+    migrated_temp_db_connection,
+    migrated_temp_db_path,
+    tmp_path,
+    monkeypatch,
+    mutation,
+    prelock_commit,
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+    from tests.conftest import connect_temp_db
+
+    conn = migrated_temp_db_connection
+    suffix, other_attachment, other_id = _prepare_aggregate(conn, tmp_path)
+    first = call(conn, suffix, **V2)
+    schema = tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name"))
+    baseline = None
+    baseline_counts = None
+
+    def mutate_and_snapshot(connection):
+        nonlocal baseline, baseline_counts
+        _mutate_pending_aggregate(
+            connection, mutation, first.parser_output_id, other_attachment, other_id
+        )
+        connection.commit()
+        baseline, baseline_counts = _source_state(connection), counts(connection)
+
+    if prelock_commit:
+        original = proposal._persist
+
+        def b_commit_then_a_lock(connection, **kwargs):
+            assert not connection.in_transaction
+            with closing(connect_temp_db(migrated_temp_db_path)) as other:
+                mutate_and_snapshot(other)
+            return original(connection, **kwargs)
+
+        monkeypatch.setattr(proposal, "_persist", b_commit_then_a_lock)
+    else:
+        mutate_and_snapshot(conn)
+    with pytest.raises(proposal.ProposalPersistenceConflictError):
+        call(conn, suffix, **V2)
+    assert baseline is not None and _source_state(conn) == baseline
+    assert counts(conn) == baseline_counts and all(value == 0 for value in counts(conn)[3:])
+    assert tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")) == schema
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("mutation", _AGGREGATE_MUTATIONS)
+def test_v2_initial_after_write_aggregate_drift_rolls_back_every_write(
+    migrated_temp_db_connection, tmp_path, monkeypatch, mutation
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+
+    conn = migrated_temp_db_connection
+    suffix, other_attachment, other_id = _prepare_aggregate(conn, tmp_path)
+    baseline, baseline_counts = _source_state(conn), counts(conn)
+
+    def drift(stage):
+        if stage == "before_persisted_verification":
+            proposal_id = conn.execute(
+                "SELECT id FROM parser_outputs WHERE public_id = 'prop_aggregate'"
+            ).fetchone()[0]
+            _mutate_pending_aggregate(conn, mutation, proposal_id, other_attachment, other_id)
+
+    monkeypatch.setattr(proposal, "_failure_injection_hook", drift)
+    with pytest.raises(proposal.ProposalPersistenceConflictError):
+        call(conn, suffix, **V2)
+    assert _source_state(conn) == baseline and counts(conn) == baseline_counts
+    assert not conn.in_transaction and all(value == 0 for value in counts(conn)[3:])
+
+
+@pytest.mark.parametrize("pointer", [None, "unrelated"])
+def test_v2_original_pointer_trigger_refuses_detach_or_unrelated(
+    migrated_temp_db_connection, tmp_path, pointer
+):
+    conn = migrated_temp_db_connection
+    suffix, _attachment, other_id = _prepare_aggregate(conn, tmp_path)
+    call(conn, suffix, **V2)
+    baseline = _source_state(conn)
+    with pytest.raises(sqlite3.IntegrityError, match="cannot be detached or retargeted"):
+        conn.execute(
+            "UPDATE raw_intake_records SET parser_output_id = ? WHERE public_id = ?",
+            (None if pointer is None else other_id, "raw_ocr_aggregate"),
+        )
+    conn.rollback()
+    assert _source_state(conn) == baseline
+    assert call(conn, suffix, **V2).idempotent
+
+
+@pytest.mark.parametrize(
+    "link_field",
+    [
+        "public_id",
+        "extraction_id",
+        "parser_output_id",
+        "parser_contract_version",
+        "link_role",
+        "proposal_input_hash",
+        "proposal_result_hash",
+    ],
+)
+def test_v2_complete_initial_link_identity_checked_without_trigger_removal(
+    migrated_temp_db_connection, tmp_path, monkeypatch, link_field
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+
+    conn = migrated_temp_db_connection
+    suffix, _attachment, other_id = _prepare_aggregate(conn, tmp_path)
+    legacy._prepare_extraction(
+        conn,
+        tmp_path,
+        suffix="link_other",
+        blocks=legacy._sgd_blocks(),
+        content=legacy.JPEG + b"-link-other",
+    )
+    other_extraction = conn.execute(
+        "SELECT id FROM receipt_ocr_extractions WHERE public_id = 'rocr_link_other'"
+    ).fetchone()[0]
+    baseline = _source_state(conn)
+    original = proposal._insert_link
+
+    def insert_wrong_link(connection, **kwargs):
+        command = kwargs["command"]
+        if link_field in ("public_id", "parser_contract_version"):
+            key = "link_public_id" if link_field == "public_id" else link_field
+            kwargs["command"] = replace(command, **{key: "ropl_other_identity"})
+        elif link_field == "extraction_id":
+            kwargs["extraction"] = replace(kwargs["extraction"], id=other_extraction)
+        elif link_field == "parser_output_id":
+            kwargs["parser_output_id"] = other_id
+        elif link_field == "link_role":
+            # Use the existing schema-legal reserved correction role directly.
+            connection.execute(
+                "INSERT INTO receipt_ocr_proposal_links (public_id, extraction_id, "
+                "parser_output_id, proposal_input_hash, proposal_result_hash, "
+                "parser_contract_version, link_role) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    command.link_public_id,
+                    kwargs["extraction"].id,
+                    kwargs["parser_output_id"],
+                    kwargs["proposal_input_hash"],
+                    kwargs["proposal_result_hash"],
+                    command.parser_contract_version,
+                    "superseding_correction",
+                ),
+            )
+            return
+        else:
+            kwargs[link_field] = "a" * 64
+        original(connection, **kwargs)
+
+    monkeypatch.setattr(proposal, "_insert_link", insert_wrong_link)
+    with pytest.raises(proposal.ProposalPersistenceConflictError):
+        call(conn, suffix, **V2)
+    assert _source_state(conn) == baseline and not conn.in_transaction
+
+
+def test_v2_evidence_nonmaterial_id_time_order_changes_replay_exactly(
+    migrated_temp_db_connection, tmp_path
+):
+    conn = migrated_temp_db_connection
+    suffix, _attachment, _other_id = _prepare_aggregate(conn, tmp_path)
+    first = call(conn, suffix, **V2)
+    conn.execute(
+        "UPDATE parser_proposal_field_evidence SET id = id + 100, created_at = '2000-01-01' "
+        "WHERE parser_output_id = ?",
+        (first.parser_output_id,),
+    )
+    conn.commit()
+    baseline = _source_state(conn)
+    replay = call(conn, suffix, **V2)
+    assert replace(replay, idempotent=False) == first and replay.idempotent
+    assert _source_state(conn) == baseline
+
+
+@pytest.mark.parametrize("status", ["edited_pending_confirmation", "superseded"])
+def test_v2_existing_nonoriginal_pending_status_refusal_is_preserved(
+    migrated_temp_db_connection, tmp_path, status
+):
+    from finance_core.intake.receipt_ocr_proposal import ProposalPersistenceConflictError
+
+    conn = migrated_temp_db_connection
+    suffix, _attachment, _other_id = _prepare_aggregate(conn, tmp_path)
+    first = call(conn, suffix, **V2)
+    conn.execute(
+        "UPDATE parser_outputs SET parse_status = ? WHERE id = ?", (status, first.parser_output_id)
+    )
+    conn.commit()
+    baseline = _source_state(conn)
+    with pytest.raises(ProposalPersistenceConflictError):
+        call(conn, suffix, **V2)
+    assert _source_state(conn) == baseline and not conn.in_transaction
+
+
+def test_v2_guarded_human_revision_retains_parent_replay_refusal(
+    migrated_temp_db_connection, tmp_path
+):
+    from finance_core.intake.receipt_ocr_proposal import ProposalPersistenceConflictError
+    from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
+    from finance_core.parser_proposals.receipt_supersession import supersede_receipt_total_proposal
+
+    conn = migrated_temp_db_connection
+    suffix, _attachment, _other_id = _prepare_aggregate(conn, tmp_path)
+    first = call(conn, suffix, **V2)
+    parent = dict(
+        conn.execute(
+            "SELECT * FROM parser_outputs WHERE id = ?", (first.parser_output_id,)
+        ).fetchone()
+    )
+    supersede_receipt_total_proposal(
+        conn,
+        first.parser_output_id,
+        actor="synthetic-human",
+        expected_content_hash=compute_effective_proposal_content_hash(conn, parent),
+        field_updates={"amount": "13.00", "currency": "SGD"},
+        correction_public_id="rcor_aggregate_human",
+    )
+    assert (
+        conn.execute(
+            "SELECT parse_status FROM parser_outputs WHERE id = ?", (first.parser_output_id,)
+        ).fetchone()[0]
+        == "superseded"
+    )
+    pointer = conn.execute(
+        "SELECT parser_output_id FROM raw_intake_records WHERE public_id = 'raw_ocr_aggregate'"
+    ).fetchone()[0]
+    assert pointer != first.parser_output_id
+    assert (
+        conn.execute(
+            "SELECT parent_parser_output_id FROM parser_outputs WHERE id = ?", (pointer,)
+        ).fetchone()[0]
+        == first.parser_output_id
+    )
+    baseline = _source_state(conn)
+    with pytest.raises(ProposalPersistenceConflictError):
+        call(conn, suffix, **V2)
+    assert _source_state(conn) == baseline and all(value == 0 for value in counts(conn)[3:])
+
+
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_v2_original_ocr_link_append_only_triggers_retained(
+    migrated_temp_db_connection, tmp_path, operation
+):
+    conn = migrated_temp_db_connection
+    suffix, _attachment, _other_id = _prepare_aggregate(conn, tmp_path)
+    call(conn, suffix, **V2)
+    baseline = _source_state(conn)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        if operation == "update":
+            conn.execute(
+                "UPDATE receipt_ocr_proposal_links SET proposal_result_hash = ?", ("a" * 64,)
+            )
+        else:
+            conn.execute("DELETE FROM receipt_ocr_proposal_links")
+    conn.rollback()
+    assert _source_state(conn) == baseline and call(conn, suffix, **V2).idempotent

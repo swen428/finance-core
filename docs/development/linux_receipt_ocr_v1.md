@@ -109,6 +109,36 @@ it does not adopt another source. Normal replay preserves exact IDs, hashes,
 payload and evidence counts. Legal source changes committed by another
 connection before lock acquisition are retained when the proposal rolls back.
 
+
+The same explicit-v2 verification point checks the complete persisted aggregate
+on the initial write and exact replay. Stored source/attachment IDs must match
+that locked binding. The original deterministic root has no parent, statement
+batch, AI provider/model/prompt or raw text metadata. Its normalized payload and
+confidence must equal the original insert material, alongside the existing
+pending status, parser identity and parsed payload/hash checks. The complete OCR
+link ID, extraction/proposal IDs, contract, initial role and input/result hashes
+must match the command. The bound raw row's current pointer must name this exact
+pending proposal; replay does not follow a child or restore a pointer to its parent.
+
+All saved field-evidence material is compared as a multiset, including duplicate
+counts, field/value/confidence, source type, canonical extraction/hash/block
+references and excerpts. Only row IDs, timestamps and row order are ignored.
+A mismatch produces a typed persistence refusal and transaction rollback; it
+never repairs old records, adopts changed source/hash material or overwrites a
+pointer. The initial NULL-to-current pointer rule remains. Original FK and
+append-only/lineage triggers stay active. A legal direct-child pointer move with
+the parent still pending is refused by v2; normal guarded human revision leaves
+the parent superseded and retains the existing replay refusal. This is limited
+to original pending replay, not a new descendant lifecycle or whole-database audit.
+
+Synthetic tests retain the original triggers for independent source/attachment,
+metadata, payload/confidence, evidence and pointer changes. Both prior committed
+changes and A-preload/B-commit/A-lock races must preserve B's complete committed
+database state with zero A writes or final facts. Initial after-write faults
+must roll back every inserted row and pointer. The five frozen default/explicit
+v1 cases, including the legacy custom token that later names v2, retain their
+original IDs, hashes, payload, evidence, pointer and counts; v1 behavior is unchanged.
+
 Parser version is bound into the proposal input hash, persisted parser identity,
 link contract and replay verification. Existing Bridge proposals are returned
 before engine resolution; they are never automatically reparsed, upgraded or
