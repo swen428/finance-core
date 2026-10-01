@@ -1,9 +1,12 @@
+import importlib.metadata
 import os
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Iterator, Sequence, cast
 
 import pytest
+from core_package_metadata_v1 import build_candidate_core_metadata
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("FINANCE_RUNTIME_ROOT", str(REPO_ROOT))
@@ -23,6 +26,40 @@ from finance_core.staging_guard import create_staging_database  # noqa: E402
 LIVE_DB_PATH = REPO_ROOT / "database" / "finance.db"
 MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS
 TC001_SEED_PATH = REPO_ROOT / "database" / "seed" / "002_test_case_001_receipt_split.sql"
+
+
+@pytest.fixture(scope="session")
+def _candidate_core_metadata_root_v1(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Path, str]:
+    """Build one genuine candidate wheel per pytest process, outside the checkout."""
+    return build_candidate_core_metadata(
+        REPO_ROOT, tmp_path_factory.mktemp("candidate-core-wheel-metadata")
+    )
+
+
+@pytest.fixture(scope="module")
+def core_package_metadata_v1(
+    _candidate_core_metadata_root_v1: tuple[Path, str],
+) -> Iterator[None]:
+    """Expose real wheel metadata only to the affected module and its children."""
+    metadata_root, version = _candidate_core_metadata_root_v1
+    path = str(metadata_root)
+    old_pythonpath = os.environ.get("PYTHONPATH")
+    sys.path.insert(0, path)
+    os.environ["PYTHONPATH"] = (
+        path if old_pythonpath is None else path + os.pathsep + old_pythonpath
+    )
+    try:
+        if importlib.metadata.version("finance-core") != version:
+            raise AssertionError("Built candidate wheel metadata was not selected")
+        yield
+    finally:
+        sys.path.remove(path)
+        if old_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = old_pythonpath
 
 
 @pytest.fixture()
