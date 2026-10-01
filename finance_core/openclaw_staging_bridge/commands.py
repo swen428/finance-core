@@ -249,6 +249,10 @@ from finance_core.receipt_finalization.stage_read import (
 from finance_core.receipt_staging_runner import workspace as runner_workspace
 from finance_core.receipt_staging_runner.models import CallbackKeyMissingError, RunnerWorkspaceError
 from finance_core.receipt_staging_runner.participants import read_participants
+from finance_core.sqlite_connection import (
+    DEFAULT_BUSY_TIMEOUT_MILLISECONDS,
+    configure_sqlite_connection,
+)
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     TelegramSourceContextError,
@@ -1520,6 +1524,42 @@ def handle_capture(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     )
 
 
+def _capture_uses_managed_workspace(arguments: dict[str, Any]) -> bool:
+    """Recognize a reserved profile for stricter capture admission only."""
+    raw_workspace = arguments.get("workspace_path")
+    if not isinstance(raw_workspace, str) or not raw_workspace:
+        return False
+    candidate = Path(raw_workspace)
+    if workspace_access.is_fixed_profile_workspace_path(candidate):
+        return True
+    try:
+        return workspace_access.is_fixed_profile_workspace_path(candidate.resolve())
+    except (OSError, RuntimeError):
+        return False
+
+
+def _cap_capture_busy_wait(conn: sqlite3.Connection, deadline: Deadline, phase: str) -> bool:
+    """Keep a managed capture's next SQLite write wait inside its remaining budget."""
+    deadline.check(phase)
+    remaining_ms = int(deadline.remaining_seconds() * 1_000)
+    if remaining_ms < 1:
+        raise errors.bridge_error(
+            errors.DEADLINE_EXCEEDED,
+            f"Bridge command deadline expired during {phase}.",
+            errors.EXIT_DEADLINE_EXCEEDED,
+        )
+    budget_ms = min(DEFAULT_BUSY_TIMEOUT_MILLISECONDS, remaining_ms)
+    configure_sqlite_connection(conn, timeout_seconds=budget_ms / 1_000)
+    return budget_ms < DEFAULT_BUSY_TIMEOUT_MILLISECONDS
+
+
+def _capture_busy_budget_exhausted(exc: sqlite3.OperationalError, budget_capped: bool) -> bool:
+    return budget_capped and getattr(exc, "sqlite_errorcode", None) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }
+
+
 def _expected_text_fingerprint(validated: Any) -> str:
     return canonical_fingerprint(
         schema_version="raw-intake-v1",
@@ -1603,6 +1643,13 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
         source_context=source_context,
         update_id=validated.update_id,
     )
+    managed_capture = _capture_uses_managed_workspace(request.arguments)
+    if managed_capture and (source_context is None or ingress_digest is None):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Managed text capture requires authenticated source and ingress identity.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
 
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
@@ -1615,8 +1662,7 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
     if source_context is not None and ingress_digest is not None:
         # An already committed pre-route capture may be read as an exact
         # replay. It cannot acquire a fresh route from a later session.
-        _workspace, historical_conn = _open_context(request.arguments, deadline)
-        try:
+        def historical_replay(historical_conn: sqlite3.Connection) -> HandlerResult | None:
             historical = get_raw_intake_record_by_idempotency_key(
                 historical_conn,
                 f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}",
@@ -1642,8 +1688,19 @@ def _capture_text(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
                         )
                     _require_replay_source_context(historical_conn, historical, source_context)
                     return _text_capture_result(historical_conn, historical), True
-        finally:
-            historical_conn.close()
+            return None
+
+        if managed_capture:
+            with _operation_context(request, deadline) as (_workspace, historical_conn):
+                prior = historical_replay(historical_conn)
+        else:
+            _workspace, historical_conn = _open_context(request.arguments, deadline)
+            try:
+                prior = historical_replay(historical_conn)
+            finally:
+                historical_conn.close()
+        if prior is not None:
+            return prior
         forwarded = BridgeRequest(
             envelope_version=request.envelope_version,
             command="capture_interaction",
@@ -1798,9 +1855,15 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
         binding_id=source_context.binding_id,
     )
     with _operation_context(request, deadline) as (_workspace, conn):
+        managed_capture = workspace_access.is_fixed_profile_workspace_path(_workspace)
+        busy_budget_capped = False
         try:
             _require_durable_capture_connection(conn)
             deadline.check("interaction capture")
+            if managed_capture:
+                busy_budget_capped = _cap_capture_busy_wait(
+                    conn, deadline, "interaction capture persistence"
+                )
             begin_interaction_capture(conn)
             try:
                 key = f"raw-intake:telegram:{validated.chat_id}:{validated.message_id}"
@@ -1874,6 +1937,14 @@ def handle_capture_interaction(request: BridgeRequest, deadline: Deadline) -> Ha
                 "Interaction capture conflicts with frozen evidence.",
                 errors.EXIT_AUTHORITY_REFUSED,
             ) from exc
+        except sqlite3.OperationalError as exc:
+            if managed_capture and _capture_busy_budget_exhausted(exc, busy_budget_capped):
+                raise errors.bridge_error(
+                    errors.DEADLINE_EXCEEDED,
+                    "Managed interaction capture exhausted its SQLite wait budget.",
+                    errors.EXIT_DEADLINE_EXCEEDED,
+                ) from exc
+            raise
 
 
 def handle_get_interaction_route(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
@@ -2115,6 +2186,13 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
         source_context=source_context,
         update_id=update_id,
     )
+    managed_capture = _capture_uses_managed_workspace(arguments)
+    if managed_capture and (source_context is None or ingress_digest is None):
+        raise errors.bridge_error(
+            errors.ARGUMENTS_REFUSED,
+            "Managed receipt capture requires authenticated source and ingress identity.",
+            errors.EXIT_AUTHORITY_REFUSED,
+        )
     # The idempotency key must bind the durable Telegram message identity.
     _require_canonical_idempotency_key(
         request, canonical_capture_key(chat_id=chat_id, message_id=message_id)
@@ -2181,8 +2259,7 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
     identities = identity.capture_identities(request.idempotency_key)
     derived_intake_key = f"raw-intake:telegram:{chat_id}:{message_id}"
 
-    workspace, conn = _open_context(arguments, deadline)
-    try:
+    with _operation_context(request, deadline) as (workspace, conn):
         _require_durable_capture_connection(conn)
         deadline.check("receipt capture replay inspection")
         existing = get_raw_intake_record_by_idempotency_key(conn, derived_intake_key)
@@ -2204,7 +2281,11 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
             )
 
         deadline.check("receipt handoff publication")
-        handoff_dir = workspace_access.ensure_handoff_directory(workspace)
+        handoff_dir = (
+            workspace / workspace_access.HANDOFF_DIRNAME
+            if managed_capture
+            else workspace_access.ensure_handoff_directory(workspace)
+        )
         handoff_path = handoff_dir / handoff_filename
         preloaded_content: bytes | None = None
         if existing is None:
@@ -2223,6 +2304,14 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 original_filename=original_filename,
                 declared_mime_type=declared_mime_type,
             )
+            if (
+                managed_capture
+                and expected_attachment_hash is not None
+                and hashlib.sha256(content).hexdigest() != expected_attachment_hash
+            ):
+                raise _capture_job_conflict(
+                    CaptureJobConflictError("Finance ingress image hash differs from original")
+                )
             deadline.check("receipt intake persistence")
             raw_input = caption
             source_metadata: dict[str, Any] = {
@@ -2241,6 +2330,11 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 source_metadata["source_received_at"] = message_received_at
             if sender_id is not None:
                 source_metadata["sender_id"] = str(sender_id)
+            busy_budget_capped = False
+            if managed_capture:
+                busy_budget_capped = _cap_capture_busy_wait(
+                    conn, deadline, "receipt intake persistence"
+                )
             try:
                 with conn:
                     existing = create_raw_intake_record(
@@ -2279,10 +2373,33 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 existing = winner
                 is_replay = True
                 _require_replay_source_context(conn, winner, source_context)
+            except sqlite3.OperationalError as exc:
+                if managed_capture and _capture_busy_budget_exhausted(exc, busy_budget_capped):
+                    raise errors.bridge_error(
+                        errors.DEADLINE_EXCEEDED,
+                        "Managed receipt intake exhausted its SQLite wait budget.",
+                        errors.EXIT_DEADLINE_EXCEEDED,
+                    ) from exc
+                raise
         else:
             preloaded_content = _require_replay_content_matches(
                 conn, existing, handoff_path, descriptor_content
             )
+
+        if managed_capture and is_replay and expected_attachment_hash is not None:
+            if preloaded_content is not None:
+                replay_hash = hashlib.sha256(preloaded_content).hexdigest()
+            else:
+                assert existing is not None
+                replay_evidence = get_telegram_source_evidence_for_raw_intake(
+                    conn, int(existing["id"])
+                )
+                assert replay_evidence is not None
+                replay_hash = str(replay_evidence["content_hash"])
+            if replay_hash != expected_attachment_hash:
+                raise _capture_job_conflict(
+                    CaptureJobConflictError("Finance ingress image hash differs from original")
+                )
 
         assert existing is not None
         deadline.check("receipt handoff publication")
@@ -2312,6 +2429,9 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
                 declared_mime_type=declared_mime_type,
                 preloaded_content=preloaded_content,
                 persistence_effect=persist_job,
+                owner_deadline_monotonic=(
+                    time.monotonic() + deadline.remaining_seconds() if managed_capture else None
+                ),
             )
         except CaptureJobConflictError as exc:
             raise _capture_job_conflict(exc) from exc
@@ -2327,8 +2447,6 @@ def _capture_receipt_image(request: BridgeRequest, deadline: Deadline) -> Handle
             "final_transaction_created": False,
             "capture_job": get_capture_job(conn, intake_public_id=str(existing["public_id"])),
         }, is_replay or handoff.persistence_idempotent
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -7704,6 +7822,7 @@ def dispatch(request: BridgeRequest, deadline: Deadline) -> HandlerResult:
             envelope.COMMAND_RESUME_CAPTURE_RECOVERY,
             envelope.COMMAND_GET_GUIDED_EDIT_SESSION,
             envelope.COMMAND_GET_HUMAN_DRAFT_CARD,
+            envelope.COMMAND_CAPTURE,
             envelope.COMMAND_CAPTURE_INTERACTION,
             envelope.COMMAND_GET_REVIEW,
             envelope.COMMAND_CONFIRM,

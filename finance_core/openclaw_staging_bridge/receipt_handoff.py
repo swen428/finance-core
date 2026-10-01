@@ -30,6 +30,10 @@ from finance_core.intake.attachment_evidence import (
     persist_attachment_evidence,
 )
 from finance_core.openclaw_staging_bridge import errors
+from finance_core.sqlite_connection import (
+    DEFAULT_BUSY_TIMEOUT_MILLISECONDS,
+    configure_sqlite_connection,
+)
 
 MAX_HANDOFF_BYTES = 10_000_000
 _HANDOFF_READ_CHUNK = 1_048_576
@@ -138,6 +142,52 @@ def _deadline_error(phase: str) -> errors.BridgeError:
     )
 
 
+def _persist_with_owner_budget(
+    conn: sqlite3.Connection,
+    final_path: str,
+    *,
+    public_id: str,
+    raw_intake_id: int,
+    original_filename: str | None,
+    declared_mime_type: str | None,
+    expected_file_size: int,
+    expected_content_hash: str,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None,
+    deadline: float,
+    owner_deadline_monotonic: float | None,
+    clock: Callable[[], float],
+    phase: str,
+) -> dict[str, Any]:
+    """Use the enclosing managed budget for either evidence write transaction."""
+    busy_budget_capped = False
+    if owner_deadline_monotonic is not None:
+        remaining_ms = int((deadline - clock()) * 1_000)
+        if remaining_ms < 1:
+            raise _deadline_error(phase)
+        budget_ms = min(DEFAULT_BUSY_TIMEOUT_MILLISECONDS, remaining_ms)
+        configure_sqlite_connection(conn, timeout_seconds=budget_ms / 1_000)
+        busy_budget_capped = budget_ms < DEFAULT_BUSY_TIMEOUT_MILLISECONDS
+    try:
+        return persist_attachment_evidence(
+            conn,
+            final_path,
+            public_id=public_id,
+            raw_intake_id=raw_intake_id,
+            original_filename=original_filename,
+            declared_mime_type=declared_mime_type,
+            expected_file_size=expected_file_size,
+            expected_content_hash=expected_content_hash,
+            persistence_effect=persistence_effect,
+        )
+    except sqlite3.OperationalError as exc:
+        if busy_budget_capped and getattr(exc, "sqlite_errorcode", None) in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+        }:
+            raise _deadline_error(phase) from exc
+        raise
+
+
 def _translate_publication_error(exc: publication.AttachmentPublicationError) -> errors.BridgeError:
     if isinstance(exc, publication.DurableFileIntegrityConflictError):
         return errors.bridge_error(
@@ -212,6 +262,7 @@ def publish_receipt_handoff(
     declared_mime_type: str | None,
     preloaded_content: bytes | None = None,
     persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
+    owner_deadline_monotonic: float | None = None,
 ) -> HandoffResult:
     """Validate, durably publish, and persist one receipt handoff file.
 
@@ -226,13 +277,36 @@ def publish_receipt_handoff(
     so the bound hash and the published bytes always come from one read.
     """
     storage_root = workspace / "attachments"
-    deadline = time.monotonic() + _PUBLICATION_DEADLINE_SECONDS
     clock = time.monotonic
+    deadline = clock() + _PUBLICATION_DEADLINE_SECONDS
+    if owner_deadline_monotonic is not None:
+        deadline = min(deadline, owner_deadline_monotonic)
+
+    def check_owner_deadline(phase: str) -> None:
+        if owner_deadline_monotonic is not None and clock() >= deadline:
+            raise _deadline_error(phase)
 
     root: publication.StorageRootHandle | None = None
     root_locked = False
     temp_name: str | None = None
+
+    def release_managed_replay_lock() -> None:
+        nonlocal root, root_locked
+        check_owner_deadline("attachment evidence replay")
+        if owner_deadline_monotonic is not None:
+            assert root is not None and root_locked
+            replay_root = root
+            root = None
+            root_locked = False
+            try:
+                publication.release_storage_root_lock(replay_root)
+            finally:
+                # A failed explicit unlock still releases the advisory lock
+                # before the service reopens and verifies the durable file.
+                replay_root.close()
+
     try:
+        check_owner_deadline("storage-root open")
         root = publication.open_storage_root(storage_root)
         publication.acquire_storage_root_lock(
             root,
@@ -241,6 +315,7 @@ def publish_receipt_handoff(
             deadline_error_factory=_deadline_error,
         )
         root_locked = True
+        check_owner_deadline("handoff verification")
 
         # Replay path first: an already-persisted evidence row replays from
         # durable truth and never requires the handoff file again.
@@ -255,13 +330,19 @@ def publish_receipt_handoff(
                 original_filename=original_filename,
                 declared_mime_type=declared_mime_type,
                 persistence_effect=persistence_effect,
+                deadline=deadline,
+                owner_deadline_monotonic=owner_deadline_monotonic,
+                clock=clock,
+                before_persist=release_managed_replay_lock,
             )
 
         if preloaded_content is not None:
             content = preloaded_content
             observed_size = len(content)
         else:
+            check_owner_deadline("handoff read")
             content, observed_size = read_handoff_file(handoff_path)
+            check_owner_deadline("handoff read")
         content_hash = hashlib.sha256(content).hexdigest()
 
         detected = validate_receipt_handoff_metadata(
@@ -270,19 +351,28 @@ def publish_receipt_handoff(
             declared_mime_type=declared_mime_type,
         )
 
+        check_owner_deadline("temporary publication")
         temp_name, temp_fd = publication.create_private_temp(root)
         try:
             offset = 0
             while offset < len(content):
-                written = os.write(temp_fd, content[offset:])
+                check_owner_deadline("temporary publication")
+                chunk_end = (
+                    min(offset + 1_048_576, len(content))
+                    if owner_deadline_monotonic is not None
+                    else len(content)
+                )
+                written = os.write(temp_fd, content[offset:chunk_end])
                 if written <= 0:
                     raise publication.TemporaryFileError(
                         "Handoff temporary write returned no progress."
                     )
                 offset += written
+            check_owner_deadline("temporary sync")
             os.fsync(temp_fd)
             os.fchmod(temp_fd, 0o400)
             os.fsync(temp_fd)
+            check_owner_deadline("durable publication")
         except OSError as exc:
             raise publication.TemporaryFileError(f"Handoff temporary write failed: {exc}") from exc
         finally:
@@ -315,7 +405,7 @@ def publish_receipt_handoff(
             root.close()
 
     try:
-        persistence_result = persist_attachment_evidence(
+        persistence_result = _persist_with_owner_budget(
             conn,
             final_path,
             public_id=attachment_evidence_public_id,
@@ -325,6 +415,10 @@ def publish_receipt_handoff(
             expected_file_size=observed_size,
             expected_content_hash=content_hash,
             persistence_effect=persistence_effect,
+            deadline=deadline,
+            owner_deadline_monotonic=owner_deadline_monotonic,
+            clock=clock,
+            phase="attachment evidence persistence",
         )
     except AttachmentEvidenceConflictError as exc:
         raise errors.bridge_error(
@@ -338,7 +432,6 @@ def publish_receipt_handoff(
             f"Attachment evidence persistence failed: {exc}",
             errors.EXIT_INTERNAL,
         ) from exc
-
     return HandoffResult(
         final_path=final_path,
         observed_file_size=observed_size,
@@ -361,6 +454,10 @@ def _replay_persisted_handoff(
     original_filename: str | None,
     declared_mime_type: str | None,
     persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None,
+    deadline: float,
+    owner_deadline_monotonic: float | None,
+    clock: Callable[[], float],
+    before_persist: Callable[[], None],
 ) -> HandoffResult:
     """Replay through the persisted-row seam: verify durable bytes, re-persist."""
     expected_fields = {
@@ -393,8 +490,9 @@ def _replay_persisted_handoff(
             errors.EXIT_AUTHORITY_REFUSED,
         ) from exc
 
+    before_persist()
     try:
-        result = persist_attachment_evidence(
+        result = _persist_with_owner_budget(
             conn,
             stored_path,
             public_id=attachment_evidence_public_id,
@@ -406,6 +504,10 @@ def _replay_persisted_handoff(
             expected_file_size=observed_size,
             expected_content_hash=content_hash,
             persistence_effect=persistence_effect,
+            deadline=deadline,
+            owner_deadline_monotonic=owner_deadline_monotonic,
+            clock=clock,
+            phase="attachment evidence replay",
         )
     except AttachmentEvidenceConflictError as exc:
         raise errors.bridge_error(

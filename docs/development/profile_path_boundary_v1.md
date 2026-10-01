@@ -102,8 +102,8 @@ Nine posting/finalization commands also use short managed sessions:
 `prepare_posting_review`, `issue_posting_review_actions`, `confirm_and_post`,
 `resume_posting`, `finalize`, `prepare_receipt_completion`,
 `get_finalization_snapshot_review`, `authorize_finalization`, and `apply_fact_set`.
-Together with the seven AI bookkeeping entries and three recovery/status entries
-below, this makes 39 admitted and 3 refused database commands, plus the unchanged
+Together with managed capture, the seven AI bookkeeping entries and the three
+recovery/status entries below, this makes 40 admitted and 2 refused database commands, plus the unchanged
 workspace-free compatibility verifier. Each retains its existing identity,
 signature, replay and financial authority
 checks and service-owned transactions. The session remains held through query
@@ -186,22 +186,23 @@ unverified; the caller must query or replay its durable operation identity,
 not infer that no change was written. The same rule applies to a receipt
 consumer error after its existing posting authority commits: inspect or replay
 the receipt token.
-This partial integration does not admit the `capture`, `propose`, or
-`process_capture_job` attachment/OCR paths, migration, or any full backup cut.
+Managed capture now admits bounded local text/image publication as described
+below. This integration still does not admit `propose`, `process_capture_job`,
+or recovery OCR branches, migration, or any full backup cut.
 The separate controlled correction CLI has its own managed factory and human
 wait contract; correction is not a new Bridge dispatcher command.
 
-The enrolled database component's resource inventory is `profile.json`, the
+The original enrolled-database foundation component's resource inventory is `profile.json`, the
 fixed profile gate, the managed registration and pending name,
 `workspace/database/staging.sqlite`, and its three fixed SQLite sidecar roles.
 The admitted `get_status` path may also read a canonical receipt original to
 report its existing integrity state; it does not acquire, publish, or back up
 attachments. This slice has no cut-worker protocol or Host state. Synthetic
 tests use child processes for crash/reopen and gate-overlap fixtures.
-The managed receipt test proves session routing with a synthetic authority
-stub; the existing D2 authority tests cover authenticated commit directly.
-An end-to-end managed receipt commit/replay fixture is not established by this
-slice.
+The original foundation receipt test proves session routing with a synthetic
+authority stub; later posting/correction components separately exercise real
+signed receipt commit/replay. Neither foundation routing nor local capture
+publication alone completes the installed receipt or full backup chain.
 `receipt_staging_runner`, the
 remaining Bridge commands, correction adapters, and migration or
 restored-profile entry points are not integrated with this managed API. Those
@@ -355,3 +356,22 @@ components and explicitly decide whether any stage may be finalized.
 D4 Bridge tests use only synthetic profiles and temporary files. They verify
 the successful frozen manifest and fail-closed cases without opening live
 profiles, live databases, or real owner data.
+
+## Managed capture and local attachment publication
+
+The managed `capture` entry accepts existing text capture or a receipt image
+already supplied through the fixed trusted local handoff. Core verifies source
+and original image/caption identity before new durable capture effects, retains
+the existing immutable publication and evidence/job transactions, and releases
+its short session only after actual close. Published-orphan and lost-response
+replay retain the original source and bytes; filesystem publication and SQLite
+commit are distinct durable phases.
+
+The generic connection-taking Telegram downloader and manual receipt/OCR runner
+remain refused for the managed layout before external hooks. The actual download
+owner is the Host; Core receives its fixed local handoff through the Bridge.
+`propose`, `process_capture_job` and recovery processing branches remain refused
+until the separately delivered OCR wait boundary. A image review/edit consumption
+remains a later component. See
+[`managed_capture_publication_v1.md`](managed_capture_publication_v1.md) for this
+local source/publication boundary. This is not complete cut or restore proof.

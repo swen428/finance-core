@@ -58,9 +58,9 @@ transaction or blanket commit.
 
 `capture_processing_required` explicitly refuses before processing claim,
 attachment access/publication, engine construction, OCR or provider work. Its
-pending state remains readable. `capture`, `propose` and `process_capture_job`
-remain refused in the managed dispatcher. Existing A review/edit receipt
-restrictions are unchanged; supported local B receipt facts can be checked
+pending state remains readable. Managed `capture` has a separately scoped local
+publication entry; `propose` and `process_capture_job` remain refused in the
+managed dispatcher. Existing A review/edit receipt restrictions are unchanged; supported local B receipt facts can be checked
 without acquiring original image bytes.
 
 ## Evidence and completion boundary
@@ -73,7 +73,7 @@ recovery/status behavior remains covered. An error after an original service
 commit leaves the returned result unverified; query or replay the durable
 identity rather than infer that no write occurred.
 
-Dispatcher inventory is 39 admitted and 3 refused database commands, plus the
+Dispatcher inventory is 40 admitted and 2 refused database commands, plus the
 unchanged pure compatibility verifier. These counts do not establish installed
 Bridge/Host integration, attachment completeness, migration or full-cut
 acceptance. Complete backup acceptance requires all enabled owners and the
