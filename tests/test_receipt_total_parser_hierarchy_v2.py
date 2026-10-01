@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -484,3 +485,163 @@ def test_bridge_selected_identity_and_existing_proposal_replay(
     with support.open_database(workspace) as conn:
         assert counts(conn) == before and before[0] == 1 and all(value == 0 for value in before[3:])
     assert fake.calls == 1
+
+
+def _source_state(conn: sqlite3.Connection) -> tuple[str, ...]:
+    """Include B's committed source rows, pointers and every A-owned table."""
+    return tuple(conn.iterdump())
+
+
+@pytest.mark.parametrize("race", ["public-id", "second-source", "replay-second-source"])
+def test_v2_locked_source_races_refuse_without_any_a_writes(
+    migrated_temp_db_connection, migrated_temp_db_path, tmp_path, monkeypatch, race
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+    from tests.conftest import connect_temp_db
+
+    conn = migrated_temp_db_connection
+    suffix = "locked_source"
+    legacy._prepare_extraction(conn, tmp_path, suffix=suffix, blocks=legacy._sgd_blocks())
+    if race == "replay-second-source":
+        first = call(conn, suffix, **V2)
+        before_replay = _source_state(conn)
+        replay = call(conn, suffix, **V2)
+        assert replay.idempotent and replace(replay, idempotent=False) == first
+        assert _source_state(conn) == before_replay
+    schema = tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name"))
+    original_persist = proposal._persist
+    baseline = None
+    baseline_counts = None
+
+    def commit_b_then_persist(connection, **kwargs):
+        nonlocal baseline, baseline_counts
+        with closing(connect_temp_db(migrated_temp_db_path)) as other:
+            assert other.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            if race == "public-id":
+                other.execute(
+                    "UPDATE raw_intake_records SET public_id = 'raw_committed_change' "
+                    "WHERE public_id = ?",
+                    (f"raw_ocr_{suffix}",),
+                )
+                other.commit()
+            else:
+                if race == "replay-second-source":
+                    # The existing lineage trigger legitimately freezes this identity.
+                    with pytest.raises(sqlite3.IntegrityError):
+                        other.execute(
+                            "UPDATE raw_intake_records SET public_id = 'raw_blocked_change' "
+                            "WHERE public_id = ?",
+                            (f"raw_ocr_{suffix}",),
+                        )
+                    other.rollback()
+                second_raw = legacy._insert_raw_intake(other, "locked_second")
+                source = other.execute("SELECT * FROM telegram_attachment_source").fetchone()
+                other.execute(
+                    "INSERT INTO telegram_attachment_source (public_id, attachment_id, "
+                    "raw_intake_record_id, original_attachment_path, observed_file_size, "
+                    "content_hash, source_evidence_payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "tgae_locked_second",
+                        source["attachment_id"],
+                        second_raw,
+                        source["original_attachment_path"],
+                        source["observed_file_size"],
+                        source["content_hash"],
+                        source["source_evidence_payload"],
+                    ),
+                )
+                other.commit()
+            assert other.execute("PRAGMA foreign_key_check").fetchall() == []
+            # Snapshot after B commits, before A acquires its lock or writes.
+            baseline = _source_state(other)
+            baseline_counts = counts(other)
+        return original_persist(connection, **kwargs)
+
+    monkeypatch.setattr(proposal, "_persist", commit_b_then_persist)
+    with pytest.raises(ProposalSourceBindingConflictError):
+        call(conn, suffix, **V2)
+    assert baseline is not None and _source_state(conn) == baseline
+    assert counts(conn) == baseline_counts
+    assert tuple(conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name")) == schema
+    assert not conn.in_transaction
+    assert all(value == 0 for value in counts(conn)[3:])
+    if race == "public-id":
+        raw = conn.execute("SELECT public_id, parser_output_id FROM raw_intake_records").fetchone()
+        assert tuple(raw) == ("raw_committed_change", None)
+    else:
+        assert conn.execute("SELECT COUNT(*) FROM telegram_attachment_source").fetchone()[0] == 2
+        assert (
+            conn.execute(
+                "SELECT parser_output_id FROM raw_intake_records "
+                "WHERE public_id = 'raw_ocr_locked_second'"
+            ).fetchone()[0]
+            is None
+        )
+    if race != "replay-second-source":
+        assert counts(conn)[:3] == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["attachment_id", "attachment_public_id", "raw_intake_record_id", "raw_intake_public_id"],
+)
+def test_v2_locked_resolver_compares_every_prefetched_binding_field(
+    migrated_temp_db_connection, tmp_path, monkeypatch, field
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+
+    conn = migrated_temp_db_connection
+    suffix = "binding_field"
+    legacy._prepare_extraction(conn, tmp_path, suffix=suffix, blocks=legacy._sgd_blocks())
+    before = _source_state(conn)
+    resolver = proposal._resolve_source_binding
+    calls = 0
+
+    def changed_binding(connection, extraction):
+        nonlocal calls
+        calls += 1
+        binding = resolver(connection, extraction)
+        if calls == 2:
+            assert connection.in_transaction
+            value = getattr(binding, field)
+            return replace(
+                binding, **{field: value + 1 if isinstance(value, int) else value + "_drift"}
+            )
+        assert not connection.in_transaction
+        return binding
+
+    def no_link_lookup(*args, **kwargs):
+        pytest.fail("source guard must precede link lookup")
+
+    monkeypatch.setattr(proposal, "_resolve_source_binding", changed_binding)
+    monkeypatch.setattr(proposal, "_lookup_link_by_public_id", no_link_lookup)
+    with pytest.raises(ProposalSourceBindingConflictError, match="changed before persistence"):
+        call(conn, suffix, **V2)
+    assert calls == 2 and not conn.in_transaction and _source_state(conn) == before
+
+
+@pytest.mark.parametrize("failure", ["missing", "dual source", "hash mismatch"])
+def test_v2_locked_resolver_conflict_rolls_back_before_link_lookup(
+    migrated_temp_db_connection, tmp_path, monkeypatch, failure
+):
+    from finance_core.intake import receipt_ocr_proposal as proposal
+
+    conn = migrated_temp_db_connection
+    suffix = "locked_conflict"
+    legacy._prepare_extraction(conn, tmp_path, suffix=suffix, blocks=legacy._sgd_blocks())
+    before = _source_state(conn)
+    resolver = proposal._resolve_source_binding
+
+    def conflicted_binding(connection, extraction):
+        if connection.in_transaction:
+            raise ProposalSourceBindingConflictError(failure)
+        return resolver(connection, extraction)
+
+    def no_link_lookup(*args, **kwargs):
+        pytest.fail("source conflict must precede link lookup")
+
+    monkeypatch.setattr(proposal, "_resolve_source_binding", conflicted_binding)
+    monkeypatch.setattr(proposal, "_lookup_link_by_public_id", no_link_lookup)
+    with pytest.raises(ProposalSourceBindingConflictError, match=failure):
+        call(conn, suffix, **V2)
+    assert not conn.in_transaction and _source_state(conn) == before

@@ -100,6 +100,15 @@ keeps its existing incomplete status. Amount, currency, date, conflict and human
 confirmation rules are unchanged. The original image, OCR rows and normalized
 hash are retained.
 
+For explicit v2, the same write lock protecting replay and proposal insertion
+also reruns the existing source resolver. It must still prove a unique source,
+no Telegram/local ambiguity and the original attachment hash, and match all four
+prefetched attachment/raw-intake IDs and public IDs. A changed, missing or
+ambiguous binding refuses the operation before link lookup or any proposal write;
+it does not adopt another source. Normal replay preserves exact IDs, hashes,
+payload and evidence counts. Legal source changes committed by another
+connection before lock acquisition are retained when the proposal rolls back.
+
 Parser version is bound into the proposal input hash, persisted parser identity,
 link contract and replay verification. Existing Bridge proposals are returned
 before engine resolution; they are never automatically reparsed, upgraded or
@@ -124,6 +133,13 @@ assets and copies the trusted distro executable outside Git. No model binaries
 or generation fonts are committed. Production extraction performs no download.
 The checked-in JPEG/PNG fixtures contain fictional mixed Chinese/English text;
 the incomplete fixture has no amount. Fixture provenance records visible text.
+
+Both the workflow and independent candidate verifier require the Bridge lane
+for changes to the OCR ingestion, total parser, v2 test and complete
+`tests/fixtures/receipt_total_parser_v2/` subtree, as well as all existing
+Bridge inputs. Modification, deletion and rename into or out of those paths
+retain the requirement; skipped or missing Bridge proof is refused. README-only
+changes retain the existing optional behavior.
 
 The existing `bridge (ubuntu-latest)` identity maps explicitly to Ubuntu 24.04
 x86_64 and requires actual Tesseract acceptance. The mandatory environment

@@ -408,6 +408,25 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
 @pytest.mark.parametrize(
     "path",
     [
+        "finance_core/intake/receipt_ocr_proposal.py",
+        "finance_core/parser_proposals/receipt_total_parser.py",
+        "tests/test_receipt_total_parser_hierarchy_v2.py",
+        "tests/fixtures/receipt_total_parser_v2/actual_synthetic_vectors.json",
+        "tests/fixtures/receipt_total_parser_v2/legacy_persisted_v1.json",
+        "tests/fixtures/receipt_total_parser_v2/nested/future-vector.json",
+        ".github/workflows/example.yml",
+        "scripts/example.py",
+        "pyproject.toml",
+        "requirements-dev.txt",
+        "MANIFEST.in",
+        "plugins/finance-bridge/src/controller.ts",
+        "native/example.swift",
+        "finance_core/openclaw_staging_bridge/commands.py",
+        "finance_core/application/example.py",
+        "finance_core/intake/__init__.py",
+        "finance_core/intake/macos_vision_receipt_ocr.py",
+        "finance_core/parser_proposals/__init__.py",
+        "finance_core/parser_proposals/ai_example.py",
         "finance_core/intake/receipt_ocr_evidence.py",
         "finance_core/intake/tesseract_resources.py",
         "finance_core/openclaw_staging_bridge/ocr_boundary.py",
@@ -425,9 +444,10 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
 )
 def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(path: str) -> None:
     for item in (
-        {"filename": path},
+        {"filename": path, "status": "modified"},
         {"filename": path, "status": "removed"},
-        {"filename": "archived/example.txt", "previous_filename": path},
+        {"filename": "archived/example.txt", "previous_filename": path, "status": "renamed"},
+        {"filename": path, "previous_filename": "archived/example.txt", "status": "renamed"},
     ):
         evidence = sample(bridge=True)
         evidence["comparison"]["files"] = [item]
@@ -436,3 +456,17 @@ def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(path:
         refused["comparison"]["files"] = [item]
         with pytest.raises(ValueError):
             verify(refused)
+
+        missing = sample(bridge=True)
+        missing["comparison"]["files"] = [item]
+        del missing["proof"]["results"]["bridge"]
+        with pytest.raises(ValueError, match="proof lacks successful required results"):
+            verify(missing)
+        missing = sample(bridge=True)
+        missing["comparison"]["files"] = [item]
+        missing["jobs"]["jobs"] = [
+            job for job in missing["jobs"]["jobs"] if job["name"] not in VERIFIER.BRIDGE_JOBS
+        ]
+        missing["jobs"]["total_count"] = len(missing["jobs"]["jobs"])
+        with pytest.raises(ValueError, match="required job inventory mismatch"):
+            verify(missing)

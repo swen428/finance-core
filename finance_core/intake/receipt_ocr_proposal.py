@@ -697,6 +697,11 @@ def _persist(
             # Recheck complete evidence under the same write lock as replay/insert.
             _revalidate_extraction(conn, extraction)
             _load_tsv_hierarchy_blocks(conn, extraction)
+            locked_binding = _resolve_source_binding(conn, extraction)
+            if locked_binding != binding:
+                raise ProposalSourceBindingConflictError(
+                    "The OCR source binding changed before persistence."
+                )
 
         existing = _lookup_link_by_public_id(conn, command.link_public_id)
         if existing is not None:

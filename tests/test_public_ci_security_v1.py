@@ -224,20 +224,71 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
     assert (completed.returncode == 0) is accepted, completed.stderr
 
 
-def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operation", ["modify", "delete", "rename-in", "rename-out"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "finance_core/intake/receipt_ocr_proposal.py",
+        "finance_core/parser_proposals/receipt_total_parser.py",
+        "tests/test_receipt_total_parser_hierarchy_v2.py",
+        "tests/fixtures/receipt_total_parser_v2/actual_synthetic_vectors.json",
+        "tests/fixtures/receipt_total_parser_v2/legacy_persisted_v1.json",
+        "tests/fixtures/receipt_total_parser_v2/nested/future-vector.json",
+        ".github/workflows/example.yml",
+        "scripts/example.py",
+        "pyproject.toml",
+        "requirements-dev.txt",
+        "MANIFEST.in",
+        "plugins/finance-bridge/src/controller.ts",
+        "native/example.swift",
+        "finance_core/openclaw_staging_bridge/commands.py",
+        "finance_core/application/example.py",
+        "finance_core/intake/__init__.py",
+        "finance_core/intake/macos_vision_receipt_ocr.py",
+        "finance_core/parser_proposals/__init__.py",
+        "finance_core/parser_proposals/ai_example.py",
+        "finance_core/intake/receipt_ocr_evidence.py",
+        "finance_core/intake/tesseract_resources.py",
+        "finance_core/openclaw_staging_bridge/ocr_boundary.py",
+        "tests/test_tesseract_pinned_resources_v1.py",
+        "tests/test_linux_receipt_ocr_acceptance_v1.py",
+        "tests/test_receipt_ocr_evidence.py",
+        "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg",
+        "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/provenance.json",
+        "scripts/linux_ocr_assets_v1.json",
+        "scripts/prepare_linux_ocr.py",
+        "README.md",
+    ],
+)
+def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(
+    tmp_path: Path, path: str, operation: str
+) -> None:
     def git(*args: str) -> str:
         return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
 
     git("init", "-q")
-    old = tmp_path / "plugins/finance-bridge/src/controller.ts"
-    old.parent.mkdir(parents=True)
-    old.write_text("export const marker = 1;\n", encoding="utf-8")
+    scoped = tmp_path / path
+    archived = tmp_path / "archived-example.txt"
+    original = archived if operation == "rename-in" else scoped
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text("synthetic classifier witness\n", encoding="utf-8")
     git("add", ".")
     git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
     base = git("rev-parse", "HEAD")
-    old.rename(tmp_path / "archived-controller.ts")
+    if operation == "modify":
+        scoped.write_text("changed synthetic classifier witness\n", encoding="utf-8")
+    elif operation == "delete":
+        scoped.unlink()
+    elif operation == "rename-in":
+        scoped.parent.mkdir(parents=True, exist_ok=True)
+        archived.rename(scoped)
+    else:
+        scoped.rename(archived)
     git("add", "-A")
-    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "rename")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", operation)
     output = tmp_path / "output"
     completed = subprocess.run(
         ["bash", "-c", _step_script("Classify Bridge scope")],
@@ -254,7 +305,8 @@ def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path)
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    assert output.read_text(encoding="utf-8") == "bridge=true\n"
+    expected = "false" if path == "README.md" else "true"
+    assert output.read_text(encoding="utf-8") == f"bridge={expected}\n"
 
 
 def test_linux_ocr_is_mandatory_in_existing_bridge_lane() -> None:
