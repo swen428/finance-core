@@ -1,7 +1,6 @@
+import { type ProfileRootLocator } from "./profile-layout.js";
 import { type DescriptorIdentity } from "./posix.js";
-export interface BridgeProfileLocator {
-    readonly applicationSupportRoot: string;
-    readonly profileId: string;
+export interface BridgeProfileLocator extends ProfileRootLocator {
     readonly runtimeRoot: string;
 }
 export interface BridgeCutContext {

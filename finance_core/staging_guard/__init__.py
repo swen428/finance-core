@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from finance_core.profile_layout import is_fixed_staging_path, is_linux_managed_namespace
 from finance_core.runtime_paths import RuntimePathConfigurationError, live_database_path
 from finance_core.sqlite_connection import configure_sqlite_connection
 
@@ -371,8 +372,33 @@ def create_staging_database(
         If the path is the live database, already exists, is a symlink,
         or cannot be created exclusively.
     """
+    return _create_staging_database(path, migration_paths=migration_paths, managed_bootstrap=False)
+
+
+def _create_managed_staging_database(
+    path: str | Path, *, migration_paths: Sequence[Path]
+) -> sqlite3.Connection:
+    """Internal bootstrap entry used only after the validated profile gate."""
+    if not _is_fixed_profile_staging_path(Path(path)):
+        raise StagingDatabaseError("Managed bootstrap requires a fixed profile staging path")
+    return _create_staging_database(path, migration_paths=migration_paths, managed_bootstrap=True)
+
+
+def _create_staging_database(
+    path: str | Path,
+    *,
+    migration_paths: Sequence[Path] | None,
+    managed_bootstrap: bool,
+) -> sqlite3.Connection:
     db_path = Path(path).resolve()
     configured_live_database = _configured_live_database_path()
+
+    if (
+        is_linux_managed_namespace(Path(path).absolute()) or is_linux_managed_namespace(db_path)
+    ) and not managed_bootstrap:
+        raise StagingDatabaseError(
+            "Fixed profile staging requires the managed profile gate and enrollment"
+        )
 
     if _is_live_database_file(db_path, configured_live_database):
         raise StagingDatabaseError(
@@ -564,16 +590,7 @@ def _apply_migrations(
 
 def _is_fixed_profile_staging_path(path: Path) -> bool:
     """Recognize the reserved managed layout without reading a profile file."""
-    parents = path.parents
-    return (
-        len(parents) >= 5
-        and path.name == "staging.sqlite"
-        and parents[0].name == "database"
-        and parents[1].name == "workspace"
-        and parents[3].name == "profiles"
-        and parents[4].name == "Finance-Codex"
-        and parents[4].parent.name == "Application Support"
-    )
+    return is_fixed_staging_path(path)
 
 
 def require_unmanaged_staging_database(conn: sqlite3.Connection) -> None:
@@ -584,7 +601,10 @@ def require_unmanaged_staging_database(conn: sqlite3.Connection) -> None:
     """
     require_staging_database(conn)
     db_file = _get_db_file_path(conn)
-    if db_file and _is_fixed_profile_staging_path(Path(db_file).resolve()):
+    if db_file and (
+        _is_fixed_profile_staging_path(Path(db_file).resolve())
+        or is_linux_managed_namespace(Path(db_file).resolve())
+    ):
         raise StagingDatabaseError("A managed staging profile requires its fixed operation owner.")
 
 
@@ -653,7 +673,11 @@ def _open_staging_database(
     db_path = Path(path).resolve()
     configured_live_database = _configured_live_database_path()
 
-    if _is_fixed_profile_staging_path(db_path) and not managed:
+    if (
+        _is_fixed_profile_staging_path(db_path)
+        or is_linux_managed_namespace(Path(path).absolute())
+        or is_linux_managed_namespace(db_path)
+    ) and not managed:
         raise StagingDatabaseError(
             "Fixed profile staging requires the managed profile gate and enrollment"
         )

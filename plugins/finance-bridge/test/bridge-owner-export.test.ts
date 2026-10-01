@@ -43,6 +43,7 @@ const RECORD_SUFFIX = ".handoff.json";
 
 interface SyntheticProfile {
   applicationSupportRoot: string;
+  linuxDataRoot?: string;
   profileId: string;
   profileRoot: string;
   runtimeRoot: string;
@@ -52,13 +53,14 @@ interface SyntheticProfile {
   backupRoot: string;
 }
 
-async function syntheticProfile(t: TestContext): Promise<SyntheticProfile> {
+async function syntheticProfile(t: TestContext, linux = false): Promise<SyntheticProfile> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "finance-owner-export-")));
   t.after(async () => rm(root, { recursive: true, force: true }));
 
-  const applicationSupportRoot = join(root, "Application Support");
+  const applicationSupportRoot = join(root, linux ? "finance-codex" : "Application Support");
+  const productRoot = linux ? applicationSupportRoot : join(applicationSupportRoot, "Finance-Codex");
   const profileId = "synthetic";
-  const profileRoot = join(applicationSupportRoot, "Finance-Codex", "profiles", profileId);
+  const profileRoot = join(productRoot, "profiles", profileId);
   const runtimeRoot = join(profileRoot, "runtime");
   const workspaceRoot = join(profileRoot, "workspace");
   const handoffRoot = join(workspaceRoot, "handoff");
@@ -66,8 +68,8 @@ async function syntheticProfile(t: TestContext): Promise<SyntheticProfile> {
   const backupRoot = join(profileRoot, "backups");
   for (const directory of [
     applicationSupportRoot,
-    join(applicationSupportRoot, "Finance-Codex"),
-    join(applicationSupportRoot, "Finance-Codex", "profiles"),
+    ...(linux ? [] : [productRoot]),
+    join(productRoot, "profiles"),
     profileRoot,
     runtimeRoot,
     join(runtimeRoot, "database"),
@@ -89,6 +91,7 @@ async function syntheticProfile(t: TestContext): Promise<SyntheticProfile> {
   initializeProfileGate(profileRoot);
   return {
     applicationSupportRoot,
+    linuxDataRoot: linux ? applicationSupportRoot : undefined,
     profileId,
     profileRoot,
     runtimeRoot,
@@ -121,11 +124,27 @@ function reclaimClaim(key: string, rawIntakePublicId: string): ReclaimClaim {
 
 async function exportProfile(profile: SyntheticProfile) {
   return await exportBridgeOwnerState({
-    applicationSupportRoot: profile.applicationSupportRoot,
+    applicationSupportRoot: profile.linuxDataRoot === undefined ? profile.applicationSupportRoot : undefined,
+    linuxDataRoot: profile.linuxDataRoot,
     profileId: profile.profileId,
     runtimeRoot: profile.runtimeRoot,
   }, { waitMs: 1_000, maxHoldMs: 10_000 });
 }
+
+test("Linux owner export preserves retained source bytes through its explicit profile locator", {
+  skip: process.platform !== "linux", concurrency: false,
+}, async (t) => {
+  const profile = await syntheticProfile(t, true);
+  const { key, rawIntakePublicId } = captureKey("1901");
+  const published = await new HandoffPublisher(profile.workspaceRoot).publish(key, rawIntakePublicId, MEDIA);
+  const receipt = await exportProfile(profile);
+  assert.equal(receipt.profileId, profile.profileId);
+  assert.equal(receipt.handoff.slots.length, 1);
+  assert.equal(receipt.handoff.slots[0]?.state, "retained");
+  assert.deepEqual(await readFile(published.payloadPath), MEDIA.bytes);
+  await assertManifestMatchesStage(receipt);
+  await assertStageFilesMatch(profile, receipt);
+});
 
 async function exportProfileWithHook(profile: SyntheticProfile, hook: HandoffHook) {
   return await withExclusiveBridgeCut({

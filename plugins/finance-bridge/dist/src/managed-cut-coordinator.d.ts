@@ -1,14 +1,13 @@
 import { type FinanceBridgeConfig } from "./config.js";
+import { type ProfileRootLocator } from "./profile-layout.js";
 export interface ManagedCoreSnapshotLimits {
     readonly maxCoreDbBytes: number;
     readonly maxStageBytes: number;
     readonly minFreeBytes: number;
     readonly backupPagesPerStep: number;
 }
-export interface ManagedCoreSnapshotOptions {
+export interface ManagedCoreSnapshotOptions extends ProfileRootLocator {
     readonly config: FinanceBridgeConfig;
-    readonly applicationSupportRoot: string;
-    readonly profileId: string;
     readonly limits: ManagedCoreSnapshotLimits;
     readonly waitMs?: number;
     readonly maxHoldMs?: number;
@@ -23,10 +22,8 @@ export interface ManagedCoreSnapshotReceipt {
     readonly schemaObjectCount: number;
     readonly journalMode: "delete";
 }
-export interface ManagedCoreSnapshotBundleOptions {
+export interface ManagedCoreSnapshotBundleOptions extends ProfileRootLocator {
     readonly config: FinanceBridgeConfig;
-    readonly applicationSupportRoot: string;
-    readonly profileId: string;
     readonly waitMs?: number;
     readonly maxHoldMs?: number;
     readonly signal?: AbortSignal;

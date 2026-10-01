@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
+from finance_core.profile_layout import is_managed_namespace
 from finance_core.reconciliation.migrations import (
     FINANCE_APPLICATION_ID,
     LIVE_DB_PATH,
@@ -519,11 +520,7 @@ def _is_managed_profile_namespace(path: Path) -> bool:
     except (OSError, RuntimeError):
         return True
     for candidate in candidates:
-        parts = candidate.parts
-        if any(
-            parts[index : index + 3] == ("Application Support", "Finance-Codex", "profiles")
-            for index in range(len(parts) - 2)
-        ):
+        if is_managed_namespace(candidate):
             return True
         try:
             if any(

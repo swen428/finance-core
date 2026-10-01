@@ -22,6 +22,7 @@ from finance_core.profile_paths import (
     MANAGED_STAGING_FILENAME,
     ManagedStagingProfile,
     _reject_acl_grants,
+    validate_registered_linux_staging_profile,
     validate_registered_staging_profile,
 )
 
@@ -333,11 +334,16 @@ def validate_profile(
     request: CutRequest, *, empty_stage: bool
 ) -> tuple[ManagedStagingProfile, Path]:
     support = os.environ.get("FINANCE_CUT_APPLICATION_SUPPORT")
+    linux_root = os.environ.get("FINANCE_CUT_LINUX_DATA_ROOT")
     profile_id = os.environ.get("FINANCE_CUT_PROFILE_ID")
     stage_path = os.environ.get("FINANCE_CUT_STAGE_PATH")
-    if not support or request.profile_id != profile_id or not stage_path:
+    if bool(support) == bool(linux_root) or request.profile_id != profile_id or not stage_path:
         raise ManagedCutProtocolError("Cut trusted locator is missing")
-    profile = validate_registered_staging_profile(support, profile_id)
+    if linux_root:
+        profile = validate_registered_linux_staging_profile(linux_root, profile_id)
+    else:
+        assert support is not None
+        profile = validate_registered_staging_profile(support, profile_id)
     stage = Path(stage_path)
     try:
         profile.revalidate()

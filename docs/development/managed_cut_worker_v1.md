@@ -14,7 +14,8 @@ authorize real-profile operations. Full D4-3 acceptance remains separate.
 ## Coordinator input and receipt
 
 The coordinator accepts a previously validated `FinanceBridgeConfig`, an
-explicit Application Support root and registered profile ID, finite snapshot
+explicit Mac Application Support root or Linux data root (exactly one), a
+registered profile ID, finite snapshot
 limits, and optional bounded gate-wait and hold durations. The limits are the
 existing `DiskSnapshotLimits` subset: maximum Core database bytes, maximum
 stage bytes, minimum free bytes, and pages per backup step. Invalid or
@@ -25,6 +26,15 @@ SHA-256, page count, schema-object count, and `DELETE` journal mode. The
 coordinator selects the profile and fixed `core.sqlite` output from trusted
 configuration. Request JSON cannot supply a path, executable, descriptor
 number, Python option, SQL, or arbitrary operation.
+
+The trusted coordinator uses `applicationSupportRoot` for the existing Mac
+layout or `linuxDataRoot` for the Linux layout. Both at once, neither, an unsafe
+root or a mismatched profile/runtime binding are refused before SQLite access.
+The fixed child receives `FINANCE_CUT_APPLICATION_SUPPORT` or
+`FINANCE_CUT_LINUX_DATA_ROOT`, exclusively, alongside the same fixed profile ID
+and descriptor roles. These are trusted launch inputs; request JSON cannot
+select the root. Linux profiles retain registered managed opening and the
+exclusive inherited gate, not the ordinary staging factory.
 
 ## Worker handoff
 

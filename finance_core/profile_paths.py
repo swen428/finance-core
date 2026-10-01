@@ -11,6 +11,7 @@ using a path. Pinned descriptors keep validated profile identities alive.
 from __future__ import annotations
 
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -24,11 +25,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Self
 
+from finance_core.profile_layout import ProfileLayout, product_root, profile_root
 from finance_core.runtime_paths import RUNTIME_ROOT_ENV
 
 _PROFILE_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _DIRECTORIES = (
-    "Finance-Codex",
+    "layout_root",
+    "product_root",
     "profiles",
     "profile",
     "runtime",
@@ -108,14 +111,16 @@ def _darwin_acl_library() -> ctypes.CDLL:
 
 
 def _reject_acl_grants(fd: int, path: Path) -> None:
-    """Reject Darwin extended ACL allow entries, including inherited grants.
+    """Reject unsafe ACLs through the pinned descriptor on supported hosts.
 
-    An absent ACL is reported as ENOENT. Deny-only ACLs, including the usual
-    ``everyone deny delete`` ACE on macOS home directories, are acceptable.
-    Other ACL inspection errors are never interpreted as an empty ACL.
+    Darwin accepts deny-only extended ACLs; Linux requires both POSIX ACL
+    attributes to be absent. Inspection errors never mean an empty ACL.
     """
-    if sys.platform != "darwin":
+    if sys.platform == "linux":
+        _reject_linux_acl(fd, path)
         return
+    if sys.platform != "darwin":
+        raise ProfilePathError(f"Unsupported platform for ACL inspection: {sys.platform}")
     import errno
 
     try:
@@ -133,8 +138,11 @@ def _reject_acl_grants(fd: int, path: Path) -> None:
 
 def _reject_path_acl_grants(path: Path) -> None:
     """Inspect SQLite file ACL by path without closing a second main FD."""
-    if sys.platform != "darwin":
+    if sys.platform == "linux":
+        _reject_linux_acl(path, path, by_path=True)
         return
+    if sys.platform != "darwin":
+        raise ProfilePathError(f"Unsupported platform for ACL inspection: {sys.platform}")
     import errno
 
     try:
@@ -148,6 +156,26 @@ def _reject_path_acl_grants(path: Path) -> None:
         _validate_extended_acl(library, acl, path)
     except (AttributeError, OSError) as exc:
         raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}") from exc
+
+
+def _reject_linux_acl(fd_or_path: int | Path, path: Path, *, by_path: bool = False) -> None:
+    """Any POSIX ACL xattr is forbidden, including masked and default ACLs."""
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}")
+    for name in ("system.posix_acl_access", "system.posix_acl_default"):
+        try:
+            if by_path:
+                getxattr(path, name, follow_symlinks=False)
+            else:
+                getxattr(fd_or_path, name)
+        except OSError as exc:
+            if exc.errno == errno.ENODATA:
+                continue
+            raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}") from exc
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ProfilePathError(f"Cannot inspect ACL for profile path: {path}") from exc
+        raise ProfilePathError(f"ACL grants access to profile path: {path}")
 
 
 def _validate_extended_acl(library: ctypes.CDLL, acl: int, path: Path) -> None:
@@ -270,12 +298,15 @@ def _check_pinned_manifest(path: Path, fd: int) -> None:
 class ProfilePaths:
     """Pinned, context-managed path identities; never a database authorization."""
 
-    __slots__ = ("_profile_id", "_paths", "_pins")
+    __slots__ = ("_profile_id", "_paths", "_pins", "_layout")
 
-    def __init__(self, profile_id: str, paths: dict[str, Path], pins: dict[str, int]) -> None:
+    def __init__(
+        self, profile_id: str, paths: dict[str, Path], pins: dict[str, int], layout: ProfileLayout
+    ) -> None:
         self._profile_id = profile_id
         self._paths: Mapping[str, Path] = MappingProxyType(dict(paths))
         self._pins = pins
+        self._layout = layout
 
     @property
     def profile_id(self) -> str:
@@ -283,7 +314,19 @@ class ProfilePaths:
 
     @property
     def application_support(self) -> Path:
+        if self._layout != "mac":
+            raise ProfilePathError("Linux profile has no Application Support locator")
         return self._paths["application_support"]
+
+    @property
+    def linux_data_root(self) -> Path:
+        if self._layout != "linux":
+            raise ProfilePathError("Mac profile has no Linux data root locator")
+        return self._paths["layout_root"]
+
+    @property
+    def layout(self) -> ProfileLayout:
+        return self._layout
 
     @property
     def profile(self) -> Path:
@@ -330,7 +373,7 @@ class ProfilePaths:
     def _revalidate_common(self) -> None:
         if not self._pins:
             raise ProfilePathError("Closed profile path witness")
-        _trusted_ancestor(self.application_support)
+        _trusted_ancestor(self._paths["layout_root"])
         for name, fd in self._pins.items():
             if name in {"profile_json", "managed_registration"}:
                 continue
@@ -441,23 +484,23 @@ class ManagedStagingProfile(ProfilePaths):
         profile_id: str,
         paths: dict[str, Path],
         pins: dict[str, int],
+        layout: ProfileLayout,
         *,
         _constructor_token: object | None = None,
     ) -> None:
         if _constructor_token is not _MANAGED_CONSTRUCTOR_TOKEN:
             raise ProfilePathError("Managed staging profiles must be validated from registration")
-        super().__init__(profile_id, paths, pins)
+        super().__init__(profile_id, paths, pins, layout)
 
     @property
     def registration(self) -> Path:
         return self.profile / MANAGED_STAGING_FILENAME
 
     def revalidate(self) -> None:
-        """Check enrollment, deferring main ACL checks during an active handle.
+        """Check enrollment and main ACL without disturbing SQLite locks.
 
-        The macOS ACL path API is not certified to preserve SQLite's POSIX
-        locks if invoked while this process has an active main connection.
-        The process lock keeps other threads from overlapping the full check.
+        Darwin defers main ACL checks during an active handle. Linux checks
+        path xattrs without opening and closing another main descriptor.
         """
         with _MANAGED_SQLITE_LIFETIME_LOCK:
             self._revalidate_enrollment()
@@ -512,7 +555,7 @@ class ManagedStagingProfile(ProfilePaths):
             raise ProfilePathError("Managed staging profile has a reserved live database")
         main = _check_regular_role(
             self.staging_database,
-            check_acl=not _MANAGED_SQLITE_LIFETIME_LOCK.sqlite_active,
+            check_acl=sys.platform == "linux" or not _MANAGED_SQLITE_LIFETIME_LOCK.sqlite_active,
         )
         if (main.st_dev, main.st_ino) != (data["main_device"], data["main_inode"]):
             raise ProfilePathError("Managed staging main database identity changed")
@@ -522,7 +565,8 @@ class ManagedStagingProfile(ProfilePaths):
             if os.path.lexists(sidecar):
                 _check_regular_role(
                     sidecar,
-                    check_acl=not _MANAGED_SQLITE_LIFETIME_LOCK.sqlite_active,
+                    check_acl=sys.platform == "linux"
+                    or not _MANAGED_SQLITE_LIFETIME_LOCK.sqlite_active,
                 )
 
 
@@ -533,7 +577,12 @@ def validate_profile_paths(application_support_root: str | Path, profile_id: str
     ``Application Support``. This accepts temporary synthetic trees in tests;
     the macOS owner must separately choose the real user's Library directory.
     """
-    return _open_profile_paths(application_support_root, profile_id, managed=False)
+    return _open_profile_paths(application_support_root, profile_id, managed=False, layout="mac")
+
+
+def validate_linux_profile_paths(linux_data_root: str | Path, profile_id: str) -> ProfilePaths:
+    """Validate a blank profile under an explicit canonical ``finance-codex`` root."""
+    return _open_profile_paths(linux_data_root, profile_id, managed=False, layout="linux")
 
 
 def validate_registered_staging_profile(
@@ -541,36 +590,50 @@ def validate_registered_staging_profile(
     profile_id: str,
 ) -> ManagedStagingProfile:
     """Validate a previously enrolled synthetic staging profile, without opening SQLite."""
-    result = _open_profile_paths(application_support_root, profile_id, managed=True)
+    result = _open_profile_paths(application_support_root, profile_id, managed=True, layout="mac")
+    assert isinstance(result, ManagedStagingProfile)
+    return result
+
+
+def validate_registered_linux_staging_profile(
+    linux_data_root: str | Path, profile_id: str
+) -> ManagedStagingProfile:
+    """Validate an enrolled Linux synthetic profile without opening SQLite."""
+    result = _open_profile_paths(linux_data_root, profile_id, managed=True, layout="linux")
     assert isinstance(result, ManagedStagingProfile)
     return result
 
 
 def _open_profile_paths(
-    application_support_root: str | Path,
+    locator_root: str | Path,
     profile_id: str,
     *,
     managed: bool,
+    layout: ProfileLayout,
 ) -> ProfilePaths:
     if not isinstance(profile_id, str) or not _PROFILE_ID.fullmatch(profile_id):
         raise ProfilePathError("Invalid profile ID")
-    root = Path(application_support_root)
-    if not root.is_absolute() or root.name != "Application Support":
-        raise ProfilePathError("An absolute Application Support root is required")
+    if layout == "linux" and sys.platform != "linux":
+        raise ProfilePathError("Linux profile locator requires Linux")
+    root = Path(locator_root)
+    expected_name = "Application Support" if layout == "mac" else "finance-codex"
+    if not root.is_absolute() or root.name != expected_name:
+        raise ProfilePathError(f"An absolute {expected_name} root is required")
     try:
         _trusted_ancestor(root)
         if root.resolve(strict=True) != root:
-            raise ProfilePathError("Application Support path must be canonical")
+            raise ProfilePathError("Profile locator path must be canonical")
         repository = Path(__file__).resolve().parents[1]
         if root == repository or root.is_relative_to(repository):
             raise ProfilePathError("A repository path cannot be a profile")
         if any(os.path.lexists(parent / ".git") for parent in (root, *root.parents)):
             raise ProfilePathError("A repository path cannot be a profile")
-        base = root / "Finance-Codex" / "profiles" / profile_id
+        product = product_root(root, layout)
+        base = profile_root(root, profile_id, layout)
         paths = {
-            "application_support": root,
-            "Finance-Codex": root / "Finance-Codex",
-            "profiles": root / "Finance-Codex" / "profiles",
+            "layout_root": root,
+            "product_root": product,
+            "profiles": product / "profiles",
             "profile": base,
             "runtime": base / "runtime",
             "runtime/database": base / "runtime" / "database",
@@ -583,6 +646,8 @@ def _open_profile_paths(
             "live_database": base / "runtime" / "database" / "finance.db",
             "staging_database": base / "workspace" / "database" / "staging.sqlite",
         }
+        if layout == "mac":
+            paths["application_support"] = root
         pins: dict[str, int] = {}
         try:
             for name in _DIRECTORIES:
@@ -598,10 +663,10 @@ def _open_profile_paths(
                     base / MANAGED_STAGING_FILENAME, directory=False
                 )
                 result = ManagedStagingProfile(
-                    profile_id, paths, pins, _constructor_token=_MANAGED_CONSTRUCTOR_TOKEN
+                    profile_id, paths, pins, layout, _constructor_token=_MANAGED_CONSTRUCTOR_TOKEN
                 )
             else:
-                result = ProfilePaths(profile_id, paths, pins)
+                result = ProfilePaths(profile_id, paths, pins, layout)
             result.revalidate()
             return result
         except BaseException:
@@ -617,5 +682,7 @@ __all__ = [
     "ProfilePathError",
     "ProfilePaths",
     "validate_profile_paths",
+    "validate_linux_profile_paths",
     "validate_registered_staging_profile",
+    "validate_registered_linux_staging_profile",
 ]

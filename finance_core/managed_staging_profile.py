@@ -31,12 +31,13 @@ from finance_core.profile_paths import (
     _check_regular_role,
     _migration_contract_digest,
     _reject_unexpected_staging_roles,
+    validate_registered_linux_staging_profile,
     validate_registered_staging_profile,
 )
 from finance_core.staging_guard import (
+    _create_managed_staging_database,
     _open_managed_staging_database,
     _StagingCloseUncertain,
-    create_staging_database,
 )
 
 _PENDING_FILENAME = ".managed-staging.v1.pending"
@@ -174,6 +175,10 @@ def bootstrap_registered_staging(blank_profile: ProfilePaths) -> ManagedStagingP
             lease.close()
     # Verification opens its own managed connection. Do not acquire its second
     # shared gate while the first gate and process lifetime lock are held.
+    if blank_profile.layout == "linux":
+        return verify_registered_linux_staging(
+            blank_profile.linux_data_root, blank_profile.profile_id
+        )
     return verify_registered_staging(blank_profile.application_support, blank_profile.profile_id)
 
 
@@ -189,7 +194,7 @@ def _bootstrap_registered_staging_locked(blank_profile: ProfilePaths, lease: Gat
         _require_fresh_names(blank_profile)
         _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
         sqlite_started = True
-        conn = create_staging_database(
+        conn = _create_managed_staging_database(
             blank_profile.staging_database, migration_paths=TEMP_DB_MIGRATION_PATHS
         )
         _close_sqlite_then_gate(conn, lease, release=False)
@@ -355,6 +360,18 @@ def verify_registered_staging(
 ) -> ManagedStagingProfile:
     """Reopen and check the fixed enrolled DB; return a managed path witness."""
     profile = validate_registered_staging_profile(application_support_root, profile_id)
+    return _verify_registered_profile(profile)
+
+
+def verify_registered_linux_staging(
+    linux_data_root: str | Path, profile_id: str
+) -> ManagedStagingProfile:
+    """Reopen an enrolled Linux profile under its trusted explicit root."""
+    profile = validate_registered_linux_staging_profile(linux_data_root, profile_id)
+    return _verify_registered_profile(profile)
+
+
+def _verify_registered_profile(profile: ManagedStagingProfile) -> ManagedStagingProfile:
     try:
         with _managed_staging_connection(profile) as conn:
             result = conn.execute("PRAGMA quick_check").fetchone()
@@ -371,4 +388,5 @@ __all__ = [
     "bootstrap_registered_staging",
     "managed_staging_operation",
     "verify_registered_staging",
+    "verify_registered_linux_staging",
 ]

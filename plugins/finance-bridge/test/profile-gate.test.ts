@@ -172,6 +172,46 @@ test("pinned native ACL probe rejects grants and accepts deny-only ACLs on macOS
   }
 });
 
+test("Linux native ACL inspection rejects masked access and inherited default ACLs", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  const root = await privateRoot(t);
+  initializeProfileGate(root);
+  const path = join(root, PROFILE_GATE_BASENAME);
+  const setAcl = (target: string, attribute: string): void => {
+    execFileSync(process.env.PYTHON_EXECUTABLE ?? "/usr/bin/python3", ["-c", [
+      "import os,struct,sys",
+      "entries=[(1,7,0xffffffff),(2,7,os.getuid()+1),(4,0,0xffffffff),(16,0,0xffffffff),(32,0,0xffffffff)]",
+      "value=struct.pack('<I',2)+b''.join(struct.pack('<HHI',*entry) for entry in entries)",
+      "os.setxattr(sys.argv[1],sys.argv[2],value)",
+    ].join(";"), target, attribute]);
+  };
+  const removeAcl = (target: string, attribute: string): void => {
+    execFileSync(process.env.PYTHON_EXECUTABLE ?? "/usr/bin/python3", ["-c",
+      "import os,sys;os.removexattr(sys.argv[1],sys.argv[2])", target, attribute]);
+  };
+  const fd = openSync(path, constants.O_RDONLY);
+  try {
+    assert.doesNotThrow(() => rejectAclGrants(fd));
+    assert.throws(() => rejectAclGrants(-1), /ACL/u);
+    setAcl(path, "system.posix_acl_access");
+    await chmod(path, 0o600); // The named entry survives, but the mask hides its grant.
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    assert.throws(() => rejectAclGrants(fd), /Linux POSIX ACL/u);
+    assert.throws(() => openProfileGate(root), /Linux POSIX ACL/u);
+    removeAcl(path, "system.posix_acl_access");
+    const gate = openProfileGate(root);
+    try {
+      setAcl(root, "system.posix_acl_default");
+      assert.equal((await stat(root)).mode & 0o777, 0o700);
+      await assert.rejects(gate.acquireExclusive(100), /Linux POSIX ACL/u);
+      assert.throws(() => openProfileGate(root), /Linux POSIX ACL/u);
+      removeAcl(root, "system.posix_acl_default");
+    } finally { gate.close(); }
+    openProfileGate(root).close();
+  } finally { closeSync(fd); }
+});
+
 test("profile gate shared and exclusive locks contend across processes without upgrades", async (t) => {
   const root = await privateRoot(t);
   initializeProfileGate(root);

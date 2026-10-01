@@ -4,11 +4,10 @@ The original `validate_profile_paths()` boundary validates an **existing**
 profile layout and permits only blank reserved database paths. It does not
 create or activate a real profile, open a database, authorize a restored file,
 or produce a backup. A separate P1 managed synthetic-staging component is
-described below; it does not change the original witness contract. The private
-macOS owner is responsible for provisioning the profile tree and selecting the
-user's Application Support directory. Core receives that directory and a
-bounded profile ID explicitly; it never infers them from the checkout or an
-inbound message.
+described below; it does not change the original witness contract. The trusted owner provisions the profile tree and explicitly selects either
+the existing Mac Application Support directory or the Linux data root described
+below, plus a bounded profile ID. Core never infers these from the checkout,
+current working directory, an inbound message or profile manifest.
 
 The expected layout is
 `<Application Support>/Finance-Codex/profiles/<id>/` containing `profile.json`,
@@ -50,6 +49,34 @@ descriptors around actual I/O and apply the existing staging/restore authority
 checks.
 
 D4 tests construct only disposable synthetic trees under temporary paths.
+
+## Additive Linux profile boundary
+
+The original Mac entry and `Application Support/Finance-Codex/profiles/<id>`
+layout stay unchanged. `validate_linux_profile_paths(linux_data_root, profile_id)`
+adds an explicitly selected absolute canonical root ending in `finance-codex`,
+with `profiles/<id>` below it. The owner supplies the root through trusted
+configuration; a manifest or request cannot select it. The application does not
+choose a production location or grant production write authority.
+
+Both layouts enforce the same fixed runtime/workspace/database names, ancestor
+ownership, symlink/Git exclusion, descriptor identity, single-link files,
+0700 directories, 0600 manifests, blank reserved database paths and ongoing
+revalidation. Linux includes the data-root directory in private permission
+checks. Generic staging access and legacy backup/migration recognize both managed
+namespaces before opening SQLite, including unregistered, pending, copied or
+corrupt profiles; a new spelling cannot escape managed registration and gate
+requirements. Linux enrolled reopening uses `verify_registered_linux_staging()`
+and the same source, migration, identity and SQLite/gate lifetime contracts.
+
+On Linux, descriptor-bound inspection rejects any `system.posix_acl_access` or
+`system.posix_acl_default` attribute, including masked grants and default ACLs.
+Only ENODATA is absence; unavailable inspection and other errors fail closed.
+SQLite main-file revalidation uses the existing identity checks and path ACL
+inspection without opening/closing another main-file descriptor that could
+release POSIX locks. Darwin still rejects allow entries and accepts deny-only
+ACLs; unsupported platforms fail closed. See the
+[platform identity and acceptance contract](linux_platform_boundary_v1.md).
 
 ## Managed synthetic staging component (D4-3 P1)
 
