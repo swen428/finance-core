@@ -103,7 +103,10 @@ from finance_core.openclaw_staging_bridge.managed_proposal_source import (
     ManagedSourceUnavailable,
     require_managed_proposal_source,
 )
-from finance_core.openclaw_staging_bridge.ocr_boundary import build_ocr_engine
+from finance_core.openclaw_staging_bridge.ocr_boundary import (
+    build_ocr_engine,
+    receipt_parser_identity,
+)
 from finance_core.openclaw_staging_bridge.receipt_handoff import (
     publish_receipt_handoff,
     read_handoff_descriptor,
@@ -2542,6 +2545,7 @@ def _propose_receipt(
 
     deadline.check("propose OCR engine construction")
     engine = build_ocr_engine(workspace)
+    parser_version, parser_contract_version = receipt_parser_identity(engine)
 
     deadline.check("propose OCR evidence extraction")
     try:
@@ -2566,6 +2570,8 @@ def _propose_receipt(
             extraction_public_id=extraction.public_id,
             proposal_public_id=identities["proposal_public_id"],
             link_public_id=identities["link_public_id"],
+            parser_version=parser_version,
+            parser_contract_version=parser_contract_version,
         )
     except ReceiptOcrProposalError as exc:
         raise errors.bridge_error(

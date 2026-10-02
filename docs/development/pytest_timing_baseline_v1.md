@@ -25,3 +25,11 @@ unchanged. Run the production `plan` command locally before requesting full
 hosted validation; focused pytest alone does not prove that the hosted planner
 can admit the candidate's current inventory. A passing baseline regression
 uses a fixed sample date; the production planner still enforces current age.
+
+The September 22 provenance above is retained as refresh history. The October 1, 2026
+refresh uses the three newest successful first-attempt `validate.yml` runs from push
+events on the public `main` branch. The run, job, and artifact records were checked; all
+ten jobs completed successfully. Each unexpired aggregate ZIP matched GitHub’s reported
+SHA-256 digest, and its extracted JSON was validated and hashed separately. The
+refreshed run, artifact, commit, and extracted JSON identities are recorded in the
+manifest. Downloaded artifacts and API evidence remain outside the repository.

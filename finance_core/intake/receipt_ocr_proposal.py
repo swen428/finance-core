@@ -20,6 +20,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -27,8 +28,10 @@ from datetime import UTC, datetime
 from finance_core.parser_proposals.lifecycle import PARSED_PENDING_CONFIRMATION
 from finance_core.parser_proposals.receipt_total_parser import (
     PARSER_CONTRACT_VERSION_DEFAULT,
+    PARSER_CONTRACT_VERSION_TSV_HIERARCHY,
     PARSER_NAME,
     PARSER_VERSION,
+    PARSER_VERSION_TSV_HIERARCHY,
     PROPOSAL_INTENT,
     PROPOSAL_TRANSACTION_TYPE,
     ParserOcrBlock,
@@ -150,6 +153,7 @@ class _Command:
     proposal_public_id: str
     link_public_id: str
     parser_contract_version: str
+    parser_version: str
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +181,7 @@ def ingest_receipt_ocr_evidence_as_total_expense_proposal(
     proposal_public_id: str,
     link_public_id: str,
     parser_contract_version: str = PARSER_CONTRACT_VERSION_DEFAULT,
+    parser_version: str = PARSER_VERSION,
     before_commit: Callable[[sqlite3.Connection], None] | None = None,
 ) -> ReceiptTotalProposalIngestionResult:
     """Ingest one verified OCR extraction into a total-level expense proposal.
@@ -191,6 +196,7 @@ def ingest_receipt_ocr_evidence_as_total_expense_proposal(
         proposal_public_id=proposal_public_id,
         link_public_id=link_public_id,
         parser_contract_version=parser_contract_version,
+        parser_version=parser_version,
     )
 
     try:
@@ -206,9 +212,24 @@ def ingest_receipt_ocr_evidence_as_total_expense_proposal(
 
     extraction = _load_extraction(conn, command.extraction_public_id)
     binding = _resolve_source_binding(conn, extraction)
-    blocks = _load_blocks(conn, extraction)
+    if command.parser_version == PARSER_VERSION_TSV_HIERARCHY:
+        _reject_other_parser_identity(conn, command)
+    blocks = (
+        _load_tsv_hierarchy_blocks(conn, extraction)
+        if command.parser_version == PARSER_VERSION_TSV_HIERARCHY
+        else _load_blocks(conn, extraction)
+    )
 
-    parse = parse_receipt_total(blocks, extraction_status=extraction.extraction_status)
+    try:
+        parse = parse_receipt_total(
+            blocks,
+            extraction_status=extraction.extraction_status,
+            parser_version=command.parser_version,
+        )
+    except ValueError as exc:
+        raise UnusableOcrEvidenceError(
+            "Persisted TSV hierarchy cannot prove complete lines."
+        ) from exc
     payload = _build_proposal_payload(parse, extraction)
     payload_json = _canonical_json(payload)
     proposal_result_hash = _sha256_hex(payload_json)
@@ -239,6 +260,7 @@ def _validate_public_arguments(
     proposal_public_id: object,
     link_public_id: object,
     parser_contract_version: object,
+    parser_version: object,
 ) -> _Command:
     if not isinstance(extraction_public_id, str) or not _SAFE_PUBLIC_ID_RE.match(
         extraction_public_id
@@ -258,11 +280,19 @@ def _validate_public_arguments(
         parser_contract_version
     ):
         raise InvalidProposalCommandError("parser_contract_version is not a valid contract token.")
+    if parser_version not in (PARSER_VERSION, PARSER_VERSION_TSV_HIERARCHY):
+        raise InvalidProposalCommandError("Unknown receipt total parser version.")
+    if (
+        parser_version == PARSER_VERSION_TSV_HIERARCHY
+        and parser_contract_version != PARSER_CONTRACT_VERSION_TSV_HIERARCHY
+    ):
+        raise InvalidProposalCommandError("Receipt parser version and contract are inconsistent.")
     return _Command(
         extraction_public_id=extraction_public_id,
         proposal_public_id=proposal_public_id,
         link_public_id=link_public_id,
         parser_contract_version=parser_contract_version,
+        parser_version=parser_version,
     )
 
 
@@ -416,6 +446,96 @@ def _load_blocks(conn: sqlite3.Connection, extraction: _Extraction) -> tuple[Par
         raise UnusableOcrEvidenceError("Persisted OCR blocks are malformed.") from exc
 
 
+def _reject_other_parser_identity(conn: sqlite3.Connection, command: _Command) -> None:
+    """Reject existing IDs across versions before requesting new TSV geometry."""
+    try:
+        row = conn.execute(
+            "SELECT po.parser_version, ropl.parser_contract_version "
+            "FROM receipt_ocr_proposal_links ropl "
+            "JOIN parser_outputs po ON po.id = ropl.parser_output_id "
+            "WHERE ropl.public_id = ? OR po.public_id = ?",
+            (command.link_public_id, command.proposal_public_id),
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise ProposalUnexpectedPersistenceError(
+            "Unable to check selected parser identity."
+        ) from exc
+    if row is not None and (
+        row["parser_version"] != command.parser_version
+        or row["parser_contract_version"] != command.parser_contract_version
+    ):
+        raise ProposalIdempotencyConflictError("Existing IDs are bound to another parser identity.")
+
+
+def _load_tsv_hierarchy_blocks(
+    conn: sqlite3.Connection, extraction: _Extraction
+) -> tuple[ParserOcrBlock, ...]:
+    """Verify the original full normalized hash before trusting TSV geometry."""
+    from finance_core.intake.receipt_ocr_evidence import (
+        ReceiptOcrBlock,
+        ReceiptOcrError,
+        ReceiptOcrExtractionStatus,
+        ReceiptOcrLimits,
+        _normalized_outcome,
+    )
+
+    try:
+        outcome = conn.execute(
+            "SELECT sanitized_outcome_code FROM receipt_ocr_extractions WHERE id = ?",
+            (extraction.id,),
+        ).fetchone()
+        cursor = conn.execute(
+            "SELECT sequence_index, page_index, engine_block_index, engine_paragraph_index, "
+            "engine_line_index, engine_word_index, normalized_text AS text, "
+            "coordinate_left AS left, coordinate_top AS top, coordinate_width AS width, "
+            "coordinate_height AS height, page_width, page_height, confidence_scaled "
+            "FROM receipt_ocr_blocks WHERE extraction_id = ? ORDER BY sequence_index",
+            (extraction.id,),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error as exc:
+        raise ProposalUnexpectedPersistenceError("Unable to read complete TSV evidence.") from exc
+    if outcome is None or len(rows) != extraction.block_count:
+        raise UnusableOcrEvidenceError("Complete TSV evidence is missing or has a wrong count.")
+    # Audit sealed evidence within the existing absolute OCR contract ceilings;
+    # extraction resource limits and normalization/hash contracts are unchanged.
+    audit_limits = ReceiptOcrLimits(
+        max_block_count=100_000,
+        max_text_characters_per_block=65_536,
+        max_total_normalized_text_characters=2_000_000,
+        max_page_count=100,
+        max_coordinate_value=1_000_000,
+        max_image_width=100_000,
+        max_image_height=100_000,
+    )
+    try:
+        normalized = _normalized_outcome(
+            ReceiptOcrExtractionStatus(extraction.extraction_status),
+            tuple(ReceiptOcrBlock(**dict(row)) for row in rows),
+            outcome["sanitized_outcome_code"],
+            limits=audit_limits,
+        )
+    except (ReceiptOcrError, TypeError, ValueError) as exc:
+        raise UnusableOcrEvidenceError("Complete TSV evidence is malformed.") from exc
+    if normalized.result_hash != extraction.normalized_result_hash:
+        raise UnusableOcrEvidenceError("Complete TSV normalized hash does not match.")
+    return tuple(
+        ParserOcrBlock(
+            sequence_index=b.sequence_index,
+            page_index=b.page_index,
+            text=b.text,
+            left=b.left,
+            top=b.top,
+            engine_line_index=b.engine_line_index,
+            confidence_scaled=b.confidence_scaled,
+            engine_block_index=b.engine_block_index,
+            engine_paragraph_index=b.engine_paragraph_index,
+            height=b.height,
+        )
+        for b in normalized.blocks
+    )
+
+
 # ---------------------------------------------------------------------------
 # Proposal payload and evidence
 # ---------------------------------------------------------------------------
@@ -525,7 +645,7 @@ def _compute_input_hash(command: _Command, extraction: _Extraction, binding: _So
         "attachment_hash": extraction.source_attachment_hash,
         "source_public_id": binding.raw_intake_public_id,
         "parser_name": PARSER_NAME,
-        "parser_version": PARSER_VERSION,
+        "parser_version": command.parser_version,
         "parser_contract_version": command.parser_contract_version,
         "proposal_public_id": command.proposal_public_id,
         "link_public_id": command.link_public_id,
@@ -574,6 +694,16 @@ def _persist(
 ) -> ReceiptTotalProposalIngestionResult:
     try:
         conn.execute("BEGIN IMMEDIATE")
+        locked_binding = binding
+        if command.parser_version == PARSER_VERSION_TSV_HIERARCHY:
+            # Recheck complete evidence under the same write lock as replay/insert.
+            _revalidate_extraction(conn, extraction)
+            _load_tsv_hierarchy_blocks(conn, extraction)
+            locked_binding = _resolve_source_binding(conn, extraction)
+            if locked_binding != binding:
+                raise ProposalSourceBindingConflictError(
+                    "The OCR source binding changed before persistence."
+                )
 
         existing = _lookup_link_by_public_id(conn, command.link_public_id)
         if existing is not None:
@@ -585,6 +715,9 @@ def _persist(
                 proposal_input_hash=proposal_input_hash,
                 proposal_result_hash=proposal_result_hash,
                 parse=parse,
+                binding=locked_binding,
+                payload=payload,
+                payload_json=payload_json,
             )
             if before_commit is not None:
                 before_commit(conn)
@@ -632,6 +765,11 @@ def _persist(
             parser_output_id=parser_output_id,
             proposal_result_hash=proposal_result_hash,
             payload_json=payload_json,
+            extraction=extraction,
+            binding=locked_binding,
+            proposal_input_hash=proposal_input_hash,
+            payload=payload,
+            confidence=parse.overall_confidence,
         )
 
         _inject_failure("before_commit")
@@ -697,6 +835,9 @@ def _verify_idempotent_replay(
     proposal_input_hash: str,
     proposal_result_hash: str,
     parse: ReceiptTotalParseResult,
+    binding: _SourceBinding,
+    payload: dict[str, object],
+    payload_json: str,
 ) -> ReceiptTotalProposalIngestionResult:
     matches = (
         existing["extraction_id"] == extraction.id
@@ -718,7 +859,14 @@ def _verify_idempotent_replay(
         command=command,
         parser_output_id=parser_output_id,
         proposal_result_hash=proposal_result_hash,
-        payload_json=None,
+        payload_json=(
+            payload_json if command.parser_version == PARSER_VERSION_TSV_HIERARCHY else None
+        ),
+        extraction=extraction,
+        binding=binding,
+        proposal_input_hash=proposal_input_hash,
+        payload=payload,
+        confidence=parse.overall_confidence,
     )
     return _result(
         command=command,
@@ -804,7 +952,7 @@ def _insert_proposal(
             binding.raw_intake_public_id,
             binding.attachment_id,
             PARSER_NAME,
-            PARSER_VERSION,
+            command.parser_version,
             None,
             payload_json,
             payload_json,
@@ -905,10 +1053,17 @@ def _verify_persisted(
     parser_output_id: int,
     proposal_result_hash: str,
     payload_json: str | None,
+    extraction: _Extraction,
+    binding: _SourceBinding,
+    proposal_input_hash: str,
+    payload: dict[str, object],
+    confidence: float | None,
 ) -> None:
     row = conn.execute(
         """
-        SELECT public_id, source_type, parse_status, parsed_payload
+        SELECT public_id, source_type, parser_name, parser_version, parse_status, parsed_payload,
+               source_public_id, attachment_id, parent_parser_output_id, statement_batch_id,
+               ai_provider, ai_model, prompt_version, raw_text, normalized_payload, confidence_score
         FROM parser_outputs WHERE id = ?
         """,
         (parser_output_id,),
@@ -919,6 +1074,8 @@ def _verify_persisted(
         row["public_id"] != command.proposal_public_id
         or row["source_type"] != "telegram_image"
         or row["parse_status"] != PARSED_PENDING_CONFIRMATION
+        or row["parser_name"] != PARSER_NAME
+        or row["parser_version"] != command.parser_version
     ):
         raise ProposalPersistenceConflictError(
             "Persisted proposal identity does not match the ingestion command."
@@ -929,6 +1086,79 @@ def _verify_persisted(
     if _sha256_hex(stored_payload) != proposal_result_hash:
         raise ProposalPersistenceConflictError(
             "Persisted proposal payload hash does not match the recorded result hash."
+        )
+
+    if command.parser_version != PARSER_VERSION_TSV_HIERARCHY:
+        return
+
+    # Verify only the original deterministic pending insert, never a descendant
+    # or a claimed AI identity. The lock-bound source cannot be adopted/repaired.
+    if (
+        row["source_public_id"] != binding.raw_intake_public_id
+        or row["attachment_id"] != binding.attachment_id
+        or any(
+            row[field] is not None
+            for field in (
+                "parent_parser_output_id",
+                "statement_batch_id",
+                "ai_provider",
+                "ai_model",
+                "prompt_version",
+                "raw_text",
+            )
+        )
+        or row["normalized_payload"] != payload_json
+        or row["confidence_score"] != confidence
+    ):
+        raise ProposalPersistenceConflictError(
+            "Persisted proposal source or original insert material does not match."
+        )
+
+    link = conn.execute(
+        """
+        SELECT public_id, extraction_id, parser_output_id, parser_contract_version,
+               link_role, proposal_input_hash, proposal_result_hash
+        FROM receipt_ocr_proposal_links WHERE parser_output_id = ?
+        """,
+        (parser_output_id,),
+    ).fetchone()
+    if link is None or tuple(link) != (
+        command.link_public_id,
+        extraction.id,
+        parser_output_id,
+        command.parser_contract_version,
+        LINK_ROLE_INITIAL,
+        proposal_input_hash,
+        proposal_result_hash,
+    ):
+        raise ProposalPersistenceConflictError("Persisted OCR link identity does not match.")
+
+    raw = conn.execute(
+        "SELECT public_id, parser_output_id FROM raw_intake_records WHERE id = ?",
+        (binding.raw_intake_record_id,),
+    ).fetchone()
+    if raw is None or tuple(raw) != (binding.raw_intake_public_id, parser_output_id):
+        raise ProposalPersistenceConflictError(
+            "The bound raw-intake pointer does not name this pending proposal."
+        )
+
+    evidence = payload["field_evidence"]
+    assert isinstance(evidence, list)
+    expected = Counter(_field_evidence_rows(parser_output_id, evidence))
+    stored = Counter(
+        tuple(item)
+        for item in conn.execute(
+            """
+            SELECT parser_output_id, field_name, proposed_value, confidence_score,
+                   evidence_source_type, evidence_reference, notes
+            FROM parser_proposal_field_evidence WHERE parser_output_id = ?
+            """,
+            (parser_output_id,),
+        )
+    )
+    if stored != expected:
+        raise ProposalPersistenceConflictError(
+            "Persisted OCR field-evidence material does not match."
         )
 
 

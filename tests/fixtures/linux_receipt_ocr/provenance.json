@@ -1,0 +1,36 @@
+{
+  "synthetic_only": true,
+  "generation": "Rasterized fictional mixed Chinese and English receipts; no personal or real financial data",
+  "font": "Hiragino Sans GB system font used only for raster generation; font not distributed",
+  "complete_visible_text": [
+    "合成收据 SYNTHETIC RECEIPT",
+    "测试商店 TEST SHOP",
+    "日期 DATE 2026-10-01",
+    "商品 ITEM TEST MEAL",
+    "数量 QTY 1",
+    "金额 HKD 12.34",
+    "总计 TOTAL HKD 12.34",
+    "仅用于测试 FICTIONAL DATA"
+  ],
+  "incomplete_visible_text": [
+    "合成收据 SYNTHETIC RECEIPT",
+    "测试商店 TEST SHOP",
+    "商品 ITEM TEST MEAL",
+    "金额待填写 AMOUNT MISSING",
+    "仅用于测试 FICTIONAL DATA"
+  ],
+  "files": {
+    "synthetic_incomplete_receipt.png": {
+      "size_bytes": 58052,
+      "sha256": "69f6d080d7039cecbd179d339be4783cb284febdbe50f3c80c5aac8e76fc6634"
+    },
+    "synthetic_mixed_receipt.jpg": {
+      "size_bytes": 132702,
+      "sha256": "d7d1e62acc006b67d6a44e4c55459348a3fae5d25bb0dd94f1d99d57bef728bb"
+    },
+    "synthetic_mixed_receipt.png": {
+      "size_bytes": 78572,
+      "sha256": "3d0f2b20ce2713babc596e27cb2d484704a717aa9ecb4df9a5773d3e557dd0db"
+    }
+  }
+}

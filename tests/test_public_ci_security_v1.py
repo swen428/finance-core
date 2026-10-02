@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -133,6 +134,27 @@ def _step_script(name: str) -> str:
         ("pull_request", "finance_core/money.py", "false"),
         ("pull_request", "finance_core/application/review.py", "true"),
         ("pull_request", "finance_core/intake/__init__.py", "true"),
+        ("pull_request", "finance_core/intake/receipt_ocr_evidence.py", "true"),
+        ("pull_request", "finance_core/intake/tesseract_resources.py", "true"),
+        ("pull_request", "finance_core/openclaw_staging_bridge/ocr_boundary.py", "true"),
+        ("pull_request", "tests/test_tesseract_pinned_resources_v1.py", "true"),
+        ("pull_request", "tests/test_linux_receipt_ocr_acceptance_v1.py", "true"),
+        ("pull_request", "tests/test_receipt_ocr_evidence.py", "true"),
+        (
+            "pull_request",
+            "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",
+            "true",
+        ),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png", "true"),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg", "true"),
+        (
+            "pull_request",
+            "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png",
+            "true",
+        ),
+        ("pull_request", "tests/fixtures/linux_receipt_ocr/provenance.json", "true"),
+        ("pull_request", "scripts/linux_ocr_assets_v1.json", "true"),
+        ("pull_request", "scripts/prepare_linux_ocr.py", "true"),
         ("pull_request", "finance_core/parser_proposals/__init__.py", "true"),
         ("pull_request", "plugins/finance-bridge/src/index.ts", "true"),
         ("pull_request", "requirements-dev.txt", "true"),
@@ -202,20 +224,71 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
     assert (completed.returncode == 0) is accepted, completed.stderr
 
 
-def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("operation", ["modify", "delete", "rename-in", "rename-out"])
+@pytest.mark.parametrize(
+    "path",
+    [
+        "finance_core/intake/receipt_ocr_proposal.py",
+        "finance_core/parser_proposals/receipt_total_parser.py",
+        "tests/test_receipt_total_parser_hierarchy_v2.py",
+        "tests/fixtures/receipt_total_parser_v2/actual_synthetic_vectors.json",
+        "tests/fixtures/receipt_total_parser_v2/legacy_persisted_v1.json",
+        "tests/fixtures/receipt_total_parser_v2/nested/future-vector.json",
+        ".github/workflows/example.yml",
+        "scripts/example.py",
+        "pyproject.toml",
+        "requirements-dev.txt",
+        "MANIFEST.in",
+        "plugins/finance-bridge/src/controller.ts",
+        "native/example.swift",
+        "finance_core/openclaw_staging_bridge/commands.py",
+        "finance_core/application/example.py",
+        "finance_core/intake/__init__.py",
+        "finance_core/intake/macos_vision_receipt_ocr.py",
+        "finance_core/parser_proposals/__init__.py",
+        "finance_core/parser_proposals/ai_example.py",
+        "finance_core/intake/receipt_ocr_evidence.py",
+        "finance_core/intake/tesseract_resources.py",
+        "finance_core/openclaw_staging_bridge/ocr_boundary.py",
+        "tests/test_tesseract_pinned_resources_v1.py",
+        "tests/test_linux_receipt_ocr_acceptance_v1.py",
+        "tests/test_receipt_ocr_evidence.py",
+        "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/synthetic_mixed_receipt.jpg",
+        "tests/fixtures/linux_receipt_ocr/synthetic_incomplete_receipt.png",
+        "tests/fixtures/linux_receipt_ocr/provenance.json",
+        "scripts/linux_ocr_assets_v1.json",
+        "scripts/prepare_linux_ocr.py",
+        "README.md",
+    ],
+)
+def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(
+    tmp_path: Path, path: str, operation: str
+) -> None:
     def git(*args: str) -> str:
         return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
 
     git("init", "-q")
-    old = tmp_path / "plugins/finance-bridge/src/controller.ts"
-    old.parent.mkdir(parents=True)
-    old.write_text("export const marker = 1;\n", encoding="utf-8")
+    scoped = tmp_path / path
+    archived = tmp_path / "archived-example.txt"
+    original = archived if operation == "rename-in" else scoped
+    original.parent.mkdir(parents=True, exist_ok=True)
+    original.write_text("synthetic classifier witness\n", encoding="utf-8")
     git("add", ".")
     git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "base")
     base = git("rev-parse", "HEAD")
-    old.rename(tmp_path / "archived-controller.ts")
+    if operation == "modify":
+        scoped.write_text("changed synthetic classifier witness\n", encoding="utf-8")
+    elif operation == "delete":
+        scoped.unlink()
+    elif operation == "rename-in":
+        scoped.parent.mkdir(parents=True, exist_ok=True)
+        archived.rename(scoped)
+    else:
+        scoped.rename(archived)
     git("add", "-A")
-    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "rename")
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", operation)
     output = tmp_path / "output"
     completed = subprocess.run(
         ["bash", "-c", _step_script("Classify Bridge scope")],
@@ -232,4 +305,42 @@ def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(tmp_path: Path)
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
-    assert output.read_text(encoding="utf-8") == "bridge=true\n"
+    expected = "false" if path == "README.md" else "true"
+    assert output.read_text(encoding="utf-8") == f"bridge={expected}\n"
+
+
+def test_linux_ocr_is_mandatory_in_existing_bridge_lane() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    assert "name: bridge (${{ matrix.os }})" in source
+    assert "runner: ubuntu-24.04" in source
+    assert "runs-on: ${{ matrix.runner }}" in source
+    assert 'FINANCE_LINUX_OCR_REQUIRED: "1"' in source
+    assert "tests/test_linux_receipt_ocr_acceptance_v1.py" in source
+    assert "scripts/prepare_linux_ocr.py" in source
+    assert "sudo apt-get install --no-install-recommends -y tesseract-ocr" in source
+    assert (
+        "continue-on-error"
+        not in source.split("- name: Prepare pinned Linux OCR acceptance assets", 1)[1].split(
+            "- name: Set up exact Node runtime", 1
+        )[0]
+    )
+
+
+def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    workflow_pattern = re.search(r"if grep -Eq '([^']+)' ", source)
+    assert workflow_pattern
+    tree = ast.parse((REPOSITORY_ROOT / "scripts" / "verify_candidate_validation.py").read_text())
+    patterns = [
+        ast.literal_eval(node.args[0])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compile"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and str(node.args[0].value).startswith(r"^(\.github/")
+    ]
+    assert patterns == [workflow_pattern.group(1)]
+    assert 'totals["tests"] < 13' in source
+    assert '("skipped", "failures", "errors")' in source

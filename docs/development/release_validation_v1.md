@@ -109,3 +109,16 @@ installation and the fixed Python/Bridge combination; mismatched release,
 artifact, API or ledger identity must fail before installation or use.
 Publication and a consumer dependency upgrade do not authorize live data,
 provider access, runtime installation or activation.
+
+## Actual Linux receipt OCR acceptance
+
+The existing `bridge (ubuntu-latest)` job selects Ubuntu 24.04 x86_64 explicitly,
+retaining its established job name and all ten expanded validation identities.
+It installs distro Tesseract, prepares hash-locked language resources and a
+service-owned private 0500 executable, and runs the mandatory actual acceptance
+in `tests/test_linux_receipt_ocr_acceptance_v1.py`. Missing platform, resources
+or configuration must fail with `FINANCE_LINUX_OCR_REQUIRED=1`; ordinary test
+skips do not constitute this acceptance. OCR sources, tests, fixtures and asset
+locks require Bridge scope, including their deletion or rename. Workflow and
+independent candidate verification recompute the same complete changed-path
+classification. See [the pinned Linux OCR contract](linux_receipt_ocr_v1.md).

@@ -64,7 +64,7 @@ jobs:
           fi
           changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
           git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
-          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr)|parser_proposals/(__init__\.py$|ai_)))' "$changed_paths"; then
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
@@ -208,7 +208,13 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: ubuntu-latest
+            runner: ubuntu-24.04
+          - os: macos-15
+            runner: macos-15
+    name: bridge (${{ matrix.os }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - name: Check out candidate
@@ -243,6 +249,45 @@ jobs:
         run: |
           python -I -m venv .venv
           .venv/bin/python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt
+
+      - name: Prepare pinned Linux OCR acceptance assets
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y tesseract-ocr
+          .venv/bin/python -I scripts/prepare_linux_ocr.py \
+            --executable /usr/bin/tesseract \
+            --destination "$RUNNER_TEMP/linux-ocr"
+
+      - name: Require actual Linux receipt OCR acceptance
+        if: runner.os == 'Linux'
+        env:
+          FINANCE_LINUX_OCR_REQUIRED: "1"
+          FINANCE_LINUX_OCR_CONFIG: ${{ runner.temp }}/linux-ocr/ocr_engine.json
+        run: |
+          .venv/bin/python -I -m pytest -q tests/test_linux_receipt_ocr_acceptance_v1.py \
+            --junitxml="$RUNNER_TEMP/linux-ocr-acceptance.xml" --durations=15
+          .venv/bin/python -I - "$RUNNER_TEMP/linux-ocr-acceptance.xml" <<'PY_OCR_PROOF'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse(sys.argv[1]).getroot().iter("testsuite"))
+          totals = {key: sum(int(suite.get(key, "0")) for suite in suites) for key in ("tests", "skipped", "failures", "errors")}
+          if totals["tests"] < 13 or any(totals[key] for key in ("skipped", "failures", "errors")):
+              raise SystemExit("Actual Linux OCR requires at least 13 executed tests and zero skips/errors")
+          print("Actual Linux OCR acceptance:", totals)
+          PY_OCR_PROOF
+
+      - name: Preserve actual Linux OCR acceptance evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-ocr-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/linux-ocr/preparation-receipt.json
+            ${{ runner.temp }}/linux-ocr-preparation-failure.json
+            ${{ runner.temp }}/linux-ocr-acceptance.xml
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Set up exact Node runtime
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
