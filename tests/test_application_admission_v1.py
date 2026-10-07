@@ -499,14 +499,14 @@ def test_old_telegram_source_is_still_verifiable_without_relabelling(migrated_te
 def test_cold_admission_import_and_durable_call_with_platform_imports_blocked(durable_synthetic):
     _conn, proposal, path = durable_synthetic
     script = """
+import importlib
 import importlib.abc
 import sqlite3
 import sys
+from scripts.check_application_dependencies import is_platform
 class BlockPlatform(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if (fullname.startswith('finance_core.openclaw_staging_bridge')
-            or fullname.startswith('finance_core.correction_adapters')
-            or fullname == 'finance_core.telegram_source_context'):
+        if is_platform(fullname):
             raise ImportError('Platform import blocked: ' + fullname)
 sys.meta_path.insert(0, BlockPlatform())
 sys.path.insert(0, 'tests')
@@ -518,9 +518,23 @@ before = conn.serialize()
 result = synthetic.check(synthetic.service(conn), sys.argv[2])
 assert result.decision_id == 'synthetic-decision'
 assert conn.total_changes == 0 and conn.serialize() == before
-assert not any(n.startswith('finance_core.openclaw_staging_bridge')
-               or n.startswith('finance_core.correction_adapters')
-               or n == 'finance_core.telegram_source_context' for n in sys.modules)
+for attempted in (
+    'finance_core.receipt_staging_runner.cli',
+    'finance_core.intake.telegram_text_adapter',
+    'finance_core.intake.macos_vision_receipt_ocr',
+):
+    try:
+        importlib.import_module(attempted)
+    except ImportError as error:
+        assert str(error).startswith('Platform import blocked: '), (attempted, error)
+        blocked_name = str(error).removeprefix('Platform import blocked: ')
+        assert is_platform(blocked_name), (attempted, blocked_name)
+        assert attempted == blocked_name or attempted.startswith(blocked_name + '.'), (
+            attempted, blocked_name
+        )
+    else:
+        raise AssertionError('Platform import was not blocked: ' + attempted)
+assert not any(is_platform(name) for name in sys.modules)
 conn.close()
 """
     result = subprocess.run(
