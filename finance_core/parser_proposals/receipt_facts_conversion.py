@@ -1800,6 +1800,7 @@ def _durable_resolution_provenance(
 
     revision_index = _chain_revision_index(conn, path)
     evidence_items = effective.get("field_evidence")
+    verified_leaf_completions: dict[str, tuple[Any, int]] | None = None
     if isinstance(evidence_items, list):
         for item in evidence_items:
             if not isinstance(item, dict):
@@ -1831,10 +1832,33 @@ def _durable_resolution_provenance(
             if not _field_values_equal(
                 field_name, item.get("proposed_value"), effective.get(field_name)
             ):
-                raise ConversionEvidenceLineageError(
-                    f"Human field evidence for {field_name!r} does not match "
-                    "the effective proposal value it claims to support"
-                )
+                if field_name not in {"transaction_date", "merchant", "description", "category"}:
+                    raise ConversionEvidenceLineageError(
+                        f"Human field evidence for {field_name!r} does not match "
+                        "the effective proposal value it claims to support"
+                    )
+                if verified_leaf_completions is None:
+                    try:
+                        verified_leaf_completions = _verified_independent_leaf_completion_values(
+                            conn, proposal, effective
+                        )
+                    except ConversionEvidenceLineageError as exc:
+                        raise ConversionEvidenceLineageError(
+                            f"Human field evidence for {field_name!r} does not match "
+                            "the effective proposal value it claims to support"
+                        ) from exc
+                witness = verified_leaf_completions.get(field_name)
+                if (
+                    witness is None
+                    or not _field_values_equal(field_name, witness[0], effective.get(field_name))
+                    or item.get("source_proposal_public_id") == proposal["public_id"]
+                    and item.get("completion_public_id") is not None
+                    and witness[1] <= item["completion_version"]
+                ):
+                    raise ConversionEvidenceLineageError(
+                        f"Historical human field evidence for {field_name!r} has no "
+                        "verified later independent completion of its current value"
+                    )
 
     if "amount" in corrected:
         durable_amount = _try_money_decimal(last_corrected_value.get("amount"))
@@ -1864,11 +1888,199 @@ def _durable_resolution_provenance(
             )
     elif "transaction_date" in corrected:
         if last_corrected_value.get("transaction_date") != effective.get("transaction_date"):
-            raise ConversionEvidenceLineageError(
-                "The durably corrected transaction date does not match the "
-                "effective proposal transaction date"
-            )
+            try:
+                _require_latest_independent_date(conn, proposal, effective)
+            except ConversionEvidenceLineageError as exc:
+                raise ConversionEvidenceLineageError(
+                    "The durably corrected transaction date does not match the "
+                    "effective proposal transaction date"
+                ) from exc
     return frozenset(corrected), frozenset(completed)
+
+
+def _require_latest_independent_date(
+    conn: sqlite3.Connection, proposal: dict[str, Any], effective: dict[str, Any]
+) -> None:
+    """Bind the latest material date across genuine independent publications.
+
+    Original inherited claims have already been verified by the caller. A
+    later date completion can survive unrelated monetary supersessions only
+    through its exact complete owner history, never through a field-name flag.
+    """
+    from finance_core.parser_proposals.amendment_lineage import (
+        require_independent_source_edit_history,
+        verify_amendment_record,
+        verify_independent_amendment_descendant,
+    )
+
+    try:
+        current, _, version = resolve_effective_payload(conn, proposal)
+        if _canonical_json(current) != _canonical_json(effective):
+            raise ConversionEvidenceLineageError("Current full date payload does not verify")
+        lineage = verify_independent_amendment_descendant(
+            conn,
+            proposal,
+            content_hash=compute_effective_proposal_content_hash(conn, proposal),
+            proposal_version=version,
+        )
+        if lineage is None:
+            raise ConversionEvidenceLineageError("Latest date has no independent ancestry")
+        require_independent_source_edit_history(conn, proposal)
+        path = _supersession_path(conn, int(proposal["id"]))
+        path = path[path.index(int(lineage["root_proposal"]["id"])) :]
+        previous: dict[str, Any] | None = None
+        previous_id: int | None = None
+        latest_date = None
+        for node_id in path:
+            cursor = conn.execute("SELECT * FROM parser_outputs WHERE id=?", (node_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise ConversionEvidenceLineageError("Date ancestry proposal is absent")
+            node = _row_dict(cursor, row)
+            initial = _durable_json_object(node["parsed_payload"], "date ancestry proposal")
+            if previous is not None:
+                rows = conn.execute(
+                    "SELECT * FROM application_amendment_records "
+                    "WHERE resulting_parser_output_id=? "
+                    "AND publication_kind!='completion'",
+                    (node_id,),
+                ).fetchall()
+                if len(rows) != 1:
+                    raise ConversionEvidenceLineageError("Date ancestry has no unique publication")
+                row = rows[0]
+                material = verify_amendment_record(conn, row)
+                if (
+                    row["publication_kind"] != "receipt_supersession"
+                    or row["base_parser_output_id"] != previous_id
+                    or row["resulting_version"] != 0
+                    or material["accepted_proof"]["intake_public_id"]
+                    != proposal["source_public_id"]
+                    or _canonical_json(json.loads(material["base_payload_json"]))
+                    != _canonical_json(previous)
+                    or _canonical_json(json.loads(material["result_payload_json"]))
+                    != _canonical_json(initial)
+                ):
+                    raise ConversionEvidenceLineageError(
+                        "Date publication full owner state changed"
+                    )
+                if "transaction_date" in material["material_patch"]:
+                    value = material["material_patch"]["transaction_date"]
+                    if (
+                        material["canonical_patch"].get("transaction_date") != value
+                        or initial.get("transaction_date") != value
+                    ):
+                        raise ConversionEvidenceLineageError(
+                            "Date correction material does not bind"
+                        )
+                    latest_date = value
+            previous, _, node_version = resolve_effective_payload(conn, node)
+            if node_version:
+                completed = _verified_independent_leaf_completion_values(conn, node, previous)
+                if "transaction_date" in completed:
+                    latest_date = completed["transaction_date"][0]
+            previous_id = node_id
+        if (
+            _canonical_json(previous) != _canonical_json(effective)
+            or latest_date is None
+            or _validate_receipt_date(latest_date) != effective.get("transaction_date")
+        ):
+            raise ConversionEvidenceLineageError(
+                "Latest independent date does not bind current value"
+            )
+    except (ValueError, HumanRevisionLineageError, KeyError, TypeError, sqlite3.Error) as exc:
+        if isinstance(exc, ConversionEvidenceLineageError):
+            raise
+        raise ConversionEvidenceLineageError("Independent date history does not verify") from exc
+
+
+def _verified_independent_leaf_completion_values(
+    conn: sqlite3.Connection,
+    proposal: dict[str, Any],
+    effective: dict[str, Any],
+) -> dict[str, tuple[Any, int]]:
+    """Verify later nonmonetary owners without rewriting inherited evidence.
+
+    The caller has already verified each old claim against its original owner.
+    This helper only recognizes a complete independent current ancestry and
+    actual field-specific leaf completions in that same supplied snapshot.
+    """
+    from finance_core.parser_proposals.amendment_lineage import (
+        require_independent_source_edit_history,
+        verify_amendment_record,
+        verify_independent_amendment_descendant,
+    )
+
+    try:
+        current, completion_id, version = resolve_effective_payload(conn, proposal)
+        if (
+            _canonical_json(current) != _canonical_json(effective)
+            or completion_id is None
+            or version <= 0
+        ):
+            raise ConversionEvidenceLineageError("Current full completion payload does not verify")
+        lineage = verify_independent_amendment_descendant(
+            conn,
+            proposal,
+            content_hash=compute_effective_proposal_content_hash(conn, proposal),
+            proposal_version=version,
+        )
+        if lineage is None:
+            raise ConversionEvidenceLineageError("Later completion has no independent ancestry")
+        require_independent_source_edit_history(conn, proposal)
+        original = conn.execute(
+            "SELECT parsed_payload FROM parser_outputs WHERE id=?", (proposal["id"],)
+        ).fetchone()
+        previous = _durable_json_object(original[0], "original proposal")
+        if _canonical_json(effective.get("field_evidence")) != _canonical_json(
+            previous.get("field_evidence")
+        ):
+            raise ConversionEvidenceLineageError("Completion changed immutable inherited evidence")
+        values: dict[str, tuple[Any, int]] = {}
+        for row in conn.execute(
+            "SELECT * FROM parser_proposal_completions WHERE parser_output_id=? "
+            "ORDER BY version_number",
+            (proposal["id"],),
+        ).fetchall():
+            seal = conn.execute(
+                "SELECT * FROM application_amendment_records WHERE publication_public_id=? "
+                "AND publication_kind='completion'",
+                (row["completion_public_id"],),
+            ).fetchone()
+            if seal is None:
+                raise ConversionEvidenceLineageError("Later completion independent seal is absent")
+            material = verify_amendment_record(conn, seal)
+            updates = _durable_json_object(row["field_updates_json"], "completion field updates")
+            actual = _durable_json_object(row["completed_payload_json"], "completed payload")
+            if (
+                seal["base_parser_output_id"] != proposal["id"]
+                or seal["resulting_parser_output_id"] != proposal["id"]
+                or seal["resulting_version"] != row["version_number"]
+                or row["version_number"] <= 0
+                or row["version_number"] > version
+                or updates != material["material_patch"]
+                or set(updates) - {"transaction_date", "merchant", "description", "category"}
+                or material["accepted_proof"]["intake_public_id"] != proposal["source_public_id"]
+                or _canonical_json(json.loads(material["base_payload_json"]))
+                != _canonical_json(previous)
+                or _canonical_json(json.loads(material["result_payload_json"]))
+                != _canonical_json(actual)
+                or _canonical_json(actual) != _canonical_json({**previous, **updates})
+            ):
+                raise ConversionEvidenceLineageError(
+                    "Later completion owning field binding changed"
+                )
+            for field, value in updates.items():
+                if material["canonical_patch"].get(field) != value:
+                    raise ConversionEvidenceLineageError("Later completion canonical field changed")
+                values[field] = (value, int(row["version_number"]))
+            previous = actual
+        return values
+    except (ValueError, HumanRevisionLineageError, KeyError, TypeError, sqlite3.Error) as exc:
+        if isinstance(exc, ConversionEvidenceLineageError):
+            raise
+        raise ConversionEvidenceLineageError(
+            "Later independent completion does not verify"
+        ) from exc
 
 
 def _is_valid_d1_nonmonetary_publication_edge(
