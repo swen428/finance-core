@@ -99,6 +99,9 @@ jobs:
           ruff format --check --exclude finance_core/resources/preflight/migration_029_preflight.py finance_core tests
           mypy finance_core
 
+      - name: Run focused public CI security guards
+        run: python -I -m pytest -q tests/test_public_ci_security_v1.py
+
       - name: Collect synthetic SQLite baseline inventory
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.d4_sqlite_f0_probe == true }}
         run: |
@@ -118,6 +121,7 @@ jobs:
           if-no-files-found: warn
 
   pytest:
+    needs: quality
     strategy:
       fail-fast: false
       matrix:

@@ -10,7 +10,12 @@ event/workflow identity, not the tested source identity. See the official
 [PR event semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request).
 
 PR validation runs Python quality checks, the complete sharded Python inventory
-and its aggregated inventory/timing proof. The Bridge runs when its inputs or
+and its aggregated inventory/timing proof. The quality job runs the focused
+public CI security guards before the four complete Python shards may start;
+these checks use the host's canonical temporary directory and preserve the
+existing runtime/custody assertions. A failed guard blocks the shards instead
+of waiting for the full inventory to expose a bootstrap-test failure. The
+Bridge runs when its inputs or
 the CI/build/dependency controls change. A PR with no Bridge requirement may
 have a skipped Bridge job; a required Bridge may never be skipped. All Actions
 remain pinned and all fork execution uses read-only permissions without secrets

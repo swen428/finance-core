@@ -25,6 +25,21 @@ def test_public_workflow_has_read_only_top_level_permissions() -> None:
     assert "id-token: write" not in source
 
 
+def test_public_ci_security_guards_run_before_required_pytest_shards() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    quality = source.split("\n  quality:\n", 1)[1].split("\n  pytest:\n", 1)[0]
+    pytest_job = source.split("\n  pytest:\n", 1)[1].split("\n  bridge:\n", 1)[0]
+    guard_step = quality.split("- name: Run focused public CI security guards\n", 1)[1].split(
+        "\n      - name:", 1
+    )[0]
+    pytest_header = pytest_job.split("    steps:\n", 1)[0]
+
+    assert "run: python -I -m pytest -q tests/test_public_ci_security_v1.py" in guard_step
+    assert not re.search(r"^\s*(?:if|continue-on-error):", guard_step, re.MULTILINE)
+    assert re.search(r"^    needs: quality\s*$", pytest_header, re.MULTILINE)
+    assert not re.search(r"^\s*if:\s*.*\balways\(\)", pytest_header, re.MULTILINE)
+
+
 def test_all_actions_are_pinned_and_checkout_does_not_persist_credentials() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
     uses_lines = [line for line in source.splitlines() if line.lstrip().startswith("uses:")]
@@ -1296,7 +1311,7 @@ def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
     tree = ast.parse(script)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and node.value == "/tmp":
-            node.value = "/private/tmp"
+            node.value = str(Path("/tmp").resolve(strict=True))
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -1323,7 +1338,9 @@ def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
     )
     (root / "snapshot.json").write_text(json.dumps({"candidate_sha": "b" * 40}), encoding="utf-8")
     receipt_path = root / "startup.json"
-    core_path = Path("/private/tmp") / f"finance-media-core-{os.getpid()}-{time.time_ns()}"
+    core_path = Path("/tmp").resolve(strict=True) / (
+        f"finance-media-core-{os.getpid()}-{time.time_ns()}"
+    )
     original_popen = subprocess.Popen
     observed_arguments: list[str] = []
 
@@ -1504,7 +1521,7 @@ def _prepare_export_core_runtime(core_path: Path) -> dict[str, Any]:
             definitions.append(node)
     for ast_node in ast.walk(ast.Module(body=definitions, type_ignores=[])):
         if isinstance(ast_node, ast.Constant) and ast_node.value == "/tmp":
-            ast_node.value = "/private/tmp"
+            ast_node.value = str(Path("/tmp").resolve(strict=True))
     namespace: dict[str, object] = {"Path": Path, "os": os, "re": re, "stat": stat}
     module = ast.Module(body=definitions, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), "<PY_MEDIA_CORE_SETUP>", "exec"), namespace)
@@ -1545,7 +1562,9 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
     member = evidence / "original.bin"
     member.write_bytes(raw)
     member.chmod(0o400)
-    core_path = Path("/private/tmp") / f"finance-media-core-{os.getpid()}-{time.time_ns()}"
+    core_path = Path("/tmp").resolve(strict=True) / (
+        f"finance-media-core-{os.getpid()}-{time.time_ns()}"
+    )
     core_runtime = _prepare_export_core_runtime(core_path)
     control_payloads = {
         "snapshot.json": b'{"schema":"finance-media-ci-snapshot-v1","status":"REFUSED"}\n',
@@ -1631,7 +1650,7 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
         if isinstance(node, ast.Constant) and node.value == "/proc":
             node.value = str(proc)
         if isinstance(node, ast.Constant) and node.value == "/tmp":
-            node.value = "/private/tmp"
+            node.value = str(Path("/tmp").resolve(strict=True))
         if not (
             isinstance(node, ast.Compare)
             and isinstance(node.left, ast.Attribute)
