@@ -833,10 +833,16 @@ def test_sdk_acl_adapter_models_gnu_x_and_preserves_other_subjects(
     )
     sdk_root = tmp_path / "opt/hostedtoolcache/Python/3.12.14/x64"
     sdk_root.mkdir(parents=True)
-    ancestors = (sdk_root.parents[2], sdk_root.parents[1], sdk_root.parents[0])
+    workflow_ancestors = tuple(namespace["ANCESTORS"])
+    workflow_sdk_root = namespace["SDK_ROOT"]
+    assert tuple(reversed(workflow_ancestors)) == tuple(
+        path for path in workflow_sdk_root.parents if path != Path("/")
+    )
+    fake_opt = sdk_root.parents[3]
+    ancestors = tuple(fake_opt / path.relative_to(Path("/opt")) for path in workflow_ancestors)
     for path in ancestors:
         path.mkdir(parents=True, exist_ok=True)
-        path.chmod(0o755)
+        path.chmod(0o777 if path == fake_opt else 0o755)
     sdk_root.chmod(0o755)
     binary = sdk_root / "bin/python3.12"
     library = sdk_root / "lib/libpython3.12.so.1.0"
@@ -870,6 +876,9 @@ def test_sdk_acl_adapter_models_gnu_x_and_preserves_other_subjects(
     }
     initial_access = dict(access_acls)
     initial_defaults = dict(default_acls)
+    opt_entries = namespace["decode_acl"](initial_access[fake_opt])
+    assert fake_opt.lstat().st_mode & 0o777 == 0o777
+    assert opt_entries[(16, None)] == 7
     binary_entries = namespace["decode_acl"](initial_access[binary])
     binary_mask = binary_entries[(16, None)]
     mode_needed = 4 | (1 if binary.lstat().st_mode & 0o111 else 0)
@@ -964,6 +973,7 @@ def test_sdk_acl_adapter_models_gnu_x_and_preserves_other_subjects(
                 1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
             )
             assert after_entries[(2, fin_uid)] == required
+            assert after_entries[(2, fin_uid)] & 2 == 0
             assert after == before
             assert default_acls[path] == initial_defaults[path]
         assert namespace["decode_acl"](access_acls[binary])[(2, fin_uid)] == 4

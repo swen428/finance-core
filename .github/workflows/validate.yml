@@ -497,7 +497,7 @@ jobs:
 
           SDK_ROOT = Path("/opt/hostedtoolcache/Python/3.12.14/x64")
           MAX_SDK_ENTRIES = 32768
-          ANCESTORS = (Path("/opt/hostedtoolcache"), Path("/opt/hostedtoolcache/Python"), Path("/opt/hostedtoolcache/Python/3.12.14"))
+          ANCESTORS = (Path("/opt"), Path("/opt/hostedtoolcache"), Path("/opt/hostedtoolcache/Python"), Path("/opt/hostedtoolcache/Python/3.12.14"))
           USER_OBJ, USER, GROUP_OBJ, GROUP, MASK, OTHER = 1, 2, 4, 8, 16, 32
 
           class SdkAclRefusal(ValueError):

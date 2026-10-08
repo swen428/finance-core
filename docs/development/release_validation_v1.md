@@ -201,6 +201,17 @@ required Bridge jobs had failed, the remaining expensive work was cancelled;
 this run supplies failure evidence, not complete validation. A corrected
 candidate still needs actual Linux media acceptance and all required jobs.
 
+Run `37720413872`, attempt 1, used candidate
+`2414d25c54b56a7172643c3fb49440be3da208f6`. The exact-source snapshot, Fin-only
+SDK ACL and hash-locked runtime preparation passed. The startup receipt bound
+the correct interpreter and libpython but refused because `/opt` was writable
+to Fin. It was the only writable checked path and was missing from the ACL
+ancestor inventory. Preparation now includes every intermediate SDK ancestor,
+including `/opt`, while preserving other accounts' permissions and the existing
+mask/default ACL. The filesystem root is checked separately at startup. All
+49 media cases remained unrun; expensive remaining jobs were cancelled after
+the required Linux failure. This receipt is diagnostic evidence, not acceptance.
+
 Media source/worker modules, their unit/vector tests and the whole
 `tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
 modification, deletion and rename. The workflow and independent verifier
