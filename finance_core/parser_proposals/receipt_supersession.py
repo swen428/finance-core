@@ -458,7 +458,7 @@ def supersede_receipt_total_proposal(
         raise SupersessionPersistenceError(
             "Receipt proposal supersession could not be persisted atomically"
         ) from exc
-    except Exception:
+    except BaseException:
         _rollback_if_needed(conn)
         raise
 

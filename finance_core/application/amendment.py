@@ -37,7 +37,7 @@ from finance_core.calculation.authoritative_snapshot import (
     canonical_json_text,
     canonical_json_value,
 )
-from finance_core.money import normalize_currency
+from finance_core.money import money_decimal, normalize_currency
 from finance_core.parser_proposals.amendment_lineage import (
     require_independent_source_edit_history,
     sha,
@@ -104,7 +104,8 @@ def canonicalize_amendment_patch(
             old = payload.get(key, payload.get("date") if key == "transaction_date" else None)
             if key == "amount" and old is not None:
                 try:
-                    old = canonicalize_proposal_money(old, payload.get("currency"))
+                    if money_decimal(old) == money_decimal(value):
+                        continue
                 except ValueError:
                     pass
             if key == "currency" and isinstance(old, str):
@@ -724,6 +725,10 @@ class AmendmentService:
             if isinstance(exc, AmendmentError):
                 raise
             raise AmendmentError("Independent amendment publication refused") from exc
+        except BaseException:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            raise
 
     def get_status(self, amendment_id: str) -> AmendmentResult:
         if not _reference(amendment_id):

@@ -297,7 +297,7 @@ def complete_proposal(
             amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
         conn.commit()
         return result
-    except Exception:
+    except BaseException:
         _rollback_if_needed(conn)
         raise
 

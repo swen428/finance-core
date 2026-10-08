@@ -61,7 +61,11 @@ from finance_core.parser_proposals.content_hash import compute_effective_proposa
 from finance_core.parser_proposals.conversion_state import has_receipt_ocr_proposal_link
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.receipt_facts_conversion import (
+    _AMOUNT_FLAGS,
+    _CURRENCY_FLAGS,
+    _DATE_FLAGS,
     ReceiptFactsConversionCommand,
+    _require_flags_resolved,
     convert_confirmed_receipt_proposal_to_facts,
     resolve_independent_receipt_payload_fields,
 )
@@ -372,7 +376,12 @@ class PostingService:
         route = "text"
         if has_receipt_ocr_proposal_link(self._conn, int(proposal["id"])):
             route = "personal_receipt"
-            if view["ambiguity_indicators"]:
+            # OCR flags remain in the signed display as historical evidence.
+            # Only the genuine owner can verify that monetary/date flags have
+            # durable resolution; all other indicators retain their refusal.
+            _require_flags_resolved(self._conn, proposal, payload)
+            historical_flags = _AMOUNT_FLAGS | _CURRENCY_FLAGS | _DATE_FLAGS
+            if set(view["ambiguity_indicators"]) - historical_flags:
                 raise PostingError("Receipt posting requires resolved complete inputs")
             fields = resolve_independent_receipt_payload_fields(self._conn, payload)
             metadata = (

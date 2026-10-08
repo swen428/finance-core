@@ -43,11 +43,17 @@ ambiguity/inference information. A personal receipt additionally binds the
 unique active self payer and a nonpersistent Python calculation: one total
 item, the entire amount borne by that payer, zero to collect and no settlement
 obligations. Invalid, incomplete, ambiguous or unsupported financial material
-cannot become an eligible review. Existing total-receipt metadata restrictions
-remain: unsupported nonempty description/category fields refuse before approval
-rather than disappearing at conversion. Text financial fields use the owning
-converter's canonical representation; a description is retained as immutable
-proposal/source evidence, not claimed as a new canonical transaction column.
+cannot become an eligible review. Independent receipt posting preserves
+supported description/category fields through the versioned
+`application_bookkeeping_metadata_v1` extension: the accepted review, receipt
+facts, authoritative snapshot and canonical transaction all bind those exact
+values. This extension describes the whole expense and does not change item
+allocation or monetary calculation. Legacy metadata-free identity and hash
+shapes remain unchanged, and legacy receipt conversion retains its existing
+metadata restrictions. Text financial fields use the owning converter's
+canonical representation; independent posting also persists and verifies the
+accepted description in the canonical transaction while retaining its original
+proposal/source evidence.
 
 The posting commitment has its own versioned domain. The existing read-only
 admission observation and its review hash retain their original read-only

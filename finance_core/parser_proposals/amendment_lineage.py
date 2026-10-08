@@ -416,6 +416,101 @@ def _verify_owner_history(
 def verify_independent_amendment_descendant(
     conn: sqlite3.Connection, proposal: Any, *, content_hash: str, proposal_version: int
 ) -> dict[str, Any] | None:
+    result = _verify_revision_ancestry(
+        conn, proposal, content_hash=content_hash, proposal_version=proposal_version
+    )
+    if result is None:
+        return None
+    leaf = _verify_current_source_topology(
+        conn, proposal, independent_root_id=result["root_proposal"]["id"]
+    )
+    if leaf["id"] != proposal["id"]:
+        # Historical replay verifies the legitimate current successor too,
+        # without treating the historical result as the current intake leaf.
+        from finance_core.parser_proposals.content_hash import (
+            compute_effective_proposal_content_hash,
+        )
+        from finance_core.parser_proposals.effective_payload import resolve_effective_payload
+
+        current_lineage = _verify_revision_ancestry(
+            conn,
+            leaf,
+            content_hash=compute_effective_proposal_content_hash(conn, leaf),
+            proposal_version=resolve_effective_payload(conn, leaf)[2],
+        )
+        if current_lineage is None:
+            raise AmendmentLineageError("Current successor has no independent sealed lineage")
+    return result
+
+
+def _verify_current_source_topology(
+    conn: sqlite3.Connection, subject: Any, *, independent_root_id: int
+) -> dict[str, Any]:
+    repository = ParserProposalRepository(conn)
+    intake = conn.execute(
+        "SELECT parser_output_id FROM raw_intake_records WHERE public_id=?",
+        (subject["source_public_id"],),
+    ).fetchone()
+    leaf = repository.get_lineage_row_by_id(intake[0]) if intake is not None else None
+    if leaf is None:
+        raise AmendmentLineageError("Current amendment source leaf is absent")
+    current = leaf
+    successor_id: int | None = None
+    seen: set[int] = set()
+    while True:
+        if current["id"] in seen:
+            raise AmendmentLineageError("Current amendment source topology cycles")
+        seen.add(current["id"])
+        if any(
+            current[key] != subject[key]
+            for key in (
+                "source_type",
+                "source_public_id",
+                "statement_batch_id",
+                "attachment_id",
+                "raw_text",
+            )
+        ):
+            raise AmendmentLineageError("Current amendment source topology changed source")
+        children = conn.execute(
+            "SELECT id FROM parser_outputs WHERE parent_parser_output_id=?", (current["id"],)
+        ).fetchall()
+        expected: list[int] = [] if successor_id is None else [successor_id]
+        if [child[0] for child in children] != expected:
+            raise AmendmentLineageError("Current amendment source has an unsealed child or fork")
+        parent_id = current["parent_parser_output_id"]
+        if parent_id is None:
+            break
+        edges = conn.execute(
+            "SELECT * FROM application_amendment_records WHERE resulting_parser_output_id=? "
+            "AND publication_kind!='completion'",
+            (current["id"],),
+        ).fetchall()
+        if edges:
+            if len(edges) != 1 or edges[0]["base_parser_output_id"] != parent_id:
+                raise AmendmentLineageError("Current amendment successor has no exact sealed edge")
+            verify_amendment_record(conn, edges[0])
+        else:
+            # The supported AI root has its own sealed owning authority, which
+            # its existing admission/custody verifier checks independently.
+            ai = conn.execute(
+                "SELECT 1 FROM ai_fallback_proposal_links WHERE parser_output_id=?",
+                (current["id"],),
+            ).fetchone()
+            if ai is None or current["id"] != independent_root_id:
+                raise AmendmentLineageError("Current amendment successor is unsealed")
+        parent = repository.get_lineage_row_by_id(parent_id)
+        if parent is None:
+            raise AmendmentLineageError("Current amendment source ancestor is absent")
+        successor_id, current = current["id"], parent
+    if subject["id"] not in seen:
+        raise AmendmentLineageError("Historical amendment is outside the current source path")
+    return leaf
+
+
+def _verify_revision_ancestry(
+    conn: sqlite3.Connection, proposal: Any, *, content_hash: str, proposal_version: int
+) -> dict[str, Any] | None:
     if not has_amendment_schema(conn):
         if proposal["parser_name"] == TEXT_AMENDMENT_PARSER:
             raise AmendmentLineageError("Independent text amendment schema is absent")
