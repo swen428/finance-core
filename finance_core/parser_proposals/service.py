@@ -18,6 +18,9 @@ from finance_core.parser_proposals.decision_owner import (
     AlreadyConvertedProposalError as AlreadyConvertedProposalError,
 )
 from finance_core.parser_proposals.decision_owner import (
+    CanonicalTransactionRepository as CanonicalTransactionRepository,
+)
+from finance_core.parser_proposals.decision_owner import (
     DecisionAuthority as DecisionAuthority,
 )
 from finance_core.parser_proposals.decision_owner import (
