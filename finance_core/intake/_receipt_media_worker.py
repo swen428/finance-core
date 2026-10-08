@@ -257,7 +257,10 @@ def normalize(source_fd: int, output_fd: int, declaration: dict) -> dict:
             raise Refused("resource_rejected", "decoded_byte_limit")
         policy = "heif_container_once_metadata_removed"
     else:
-        image = Image.open(io.BytesIO(raw), formats=["JPEG", "PNG"])
+        try:
+            image = Image.open(io.BytesIO(raw), formats=["JPEG", "PNG"])
+        except (Image.DecompressionBombWarning, Image.DecompressionBombError):
+            raise Refused("resource_rejected", "decoded_pixel_limit") from None
         if image.format != {"image/jpeg": "JPEG", "image/png": "PNG"}[detected]:
             raise Refused("unsupported_input", "format_mismatch")
         if getattr(image, "n_frames", 1) != 1:

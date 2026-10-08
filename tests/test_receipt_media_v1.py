@@ -11,6 +11,8 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import warnings
+import zlib
 from dataclasses import replace
 
 import pytest
@@ -626,6 +628,50 @@ def test_local_xmp_only_is_not_synthesized_exif(tmp_path):
             "ambiguous_orientation",
         )
     finally:
+        os.close(source_fd)
+        os.close(output_fd)
+
+
+@pytest.mark.parametrize("height", [5000, 10000], ids=["pixel_warning", "pixel_error"])
+def test_local_over_pixel_png_has_resource_refusal_without_decode(tmp_path, height):
+    """Use a valid pixel stream without allocating an oversized raster; not Linux proof."""
+    from finance_core.intake import _receipt_media_worker as worker
+
+    def png_chunk(tag, payload):
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    width = 6000
+    compressor = zlib.compressobj()
+    row = b"\0" + bytes(width * 3)
+    compressed = b"".join(compressor.compress(row) for _ in range(height)) + compressor.flush()
+    raw = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + png_chunk(b"IDAT", compressed)
+        + png_chunk(b"IEND", b"")
+    )
+    original = tmp_path / "oversized.png"
+    output = tmp_path / "output.png"
+    original.write_bytes(raw)
+    source_fd = os.open(original, os.O_RDONLY)
+    output_fd = os.open(output, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    old_pixel_limit = Image.MAX_IMAGE_PIXELS
+    try:
+        with warnings.catch_warnings(), pytest.raises(worker.Refused) as rejected:
+            worker.normalize(source_fd, output_fd, {})
+        assert (rejected.value.status, rejected.value.code) == (
+            "resource_rejected",
+            "decoded_pixel_limit",
+        )
+        assert original.read_bytes() == raw
+        assert output.stat().st_size == 0
+    finally:
+        Image.MAX_IMAGE_PIXELS = old_pixel_limit
         os.close(source_fd)
         os.close(output_fd)
 
