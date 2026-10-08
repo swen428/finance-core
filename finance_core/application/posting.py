@@ -35,6 +35,7 @@ from finance_core.application.posting_contract import (
 )
 from finance_core.application.review import get_proposal_review, review_snapshot
 from finance_core.calculation.authoritative_snapshot import (
+    AuthoritativeSnapshotRepository,
     canonical_json_text,
     canonical_json_value,
 )
@@ -56,6 +57,7 @@ from finance_core.parser_proposals.receipt_facts_conversion import (
 from finance_core.parser_proposals.receipt_item_allocation_facts import (
     ReceiptItemAllocationFactsCommand,
     persist_receipt_item_allocation_facts,
+    verify_receipt_item_allocation_fact_set_for_review,
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.receipt_finalization import fact_set_bridge
@@ -735,6 +737,7 @@ class PostingService:
 
             def bind_text(connection, result):
                 self._revalidate_pending_write(connection, attempt_id)
+                _inject("before_text_conversion_commit")
 
             result = decision_owner.convert_confirmed_parser_proposal(
                 self._conn,
@@ -799,6 +802,7 @@ class PostingService:
                             "conversion_result_hash": result.conversion_result_hash,
                         },
                     )
+                    _inject("before_conversion_commit")
 
                 converted = convert_confirmed_receipt_proposal_to_facts(
                     self._conn,
@@ -861,6 +865,7 @@ class PostingService:
                         result.fact_set_result_hash,
                         value,
                     )
+                    _inject("before_fact_set_commit")
 
                 facts = persist_receipt_item_allocation_facts(
                     self._conn,
@@ -870,31 +875,30 @@ class PostingService:
                 _inject("after_fact_set_commit")
                 self._advance(attempt_id, "fact_set_persisted", facts.fact_set_public_id)
                 continue
+
+            def bind_snapshot(conn, snapshot):
+                self._revalidate_pending_write(conn, attempt_id)
+                self._evidence(
+                    conn,
+                    attempt_id,
+                    "snapshot",
+                    snapshot.snapshot_public_id,
+                    snapshot.combined_snapshot_hash,
+                    {
+                        "snapshot_id": snapshot.snapshot_public_id,
+                        "snapshot_hash": snapshot.combined_snapshot_hash,
+                    },
+                )
+                _inject("before_snapshot_commit")
+
             prepared = fact_set_bridge.prepare_receipt_calculation(
                 self._conn,
                 conversion["receipt_public_id"],
                 actor_type="system",
                 actor_id="independent-posting-owner",
+                persistence_effect=bind_snapshot,
             )
             if stage == "fact_set_persisted":
-                self._begin()
-                try:
-                    self._accepted(attempt_id)
-                    self._evidence(
-                        self._conn,
-                        attempt_id,
-                        "snapshot",
-                        prepared.calculation_snapshot_id,
-                        prepared.calculation_snapshot_hash,
-                        {
-                            "snapshot_id": prepared.calculation_snapshot_id,
-                            "snapshot_hash": prepared.calculation_snapshot_hash,
-                        },
-                    )
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
                 _inject("after_snapshot_commit")
                 self._advance(attempt_id, "snapshot_persisted", prepared.calculation_snapshot_id)
                 continue
@@ -916,11 +920,19 @@ class PostingService:
                     require_payer=getattr(result, "status", "") != "already_finalized",
                 )
 
+            def bind_authorization(connection, result):
+                revalidate_receipt(connection, result)
+                _inject("before_conditional_authorization_commit")
+
+            def bind_finalization(connection, result):
+                revalidate_receipt(connection, result)
+                _inject("before_receipt_finalization_commit")
+
             authorization = fact_set_bridge.authorize_application_conditional_receipt_finalization(
                 self._conn,
                 prepared,
                 attempt_id=attempt_id,
-                persistence_effect=revalidate_receipt,
+                persistence_effect=bind_authorization,
             )
             if stage == "snapshot_persisted":
                 self._begin()
@@ -950,7 +962,7 @@ class PostingService:
                 continue
             if stage == "conditional_authorization_persisted":
                 final = fact_set_bridge.finalize_prepared_receipt(
-                    self._conn, authorization, persistence_effect=revalidate_receipt
+                    self._conn, authorization, persistence_effect=bind_finalization
                 )
                 _inject("after_receipt_finalization_commit")
                 self._advance(
@@ -969,7 +981,9 @@ class PostingService:
         with review_snapshot(self._conn):
             require_posting_schema(self._conn)
             row, material, decision = self._accepted(attempt_id)
-            transaction = row["transaction_public_id"]
+            # Coordination is a claim; only the complete owning verifier can
+            # establish a successful canonical result.
+            transaction = None
             if material["posting_path"] == "text":
                 proposal_row = self._conn.execute(
                     "SELECT parser_output_id FROM application_posting_reviews WHERE review_id=?",
@@ -992,19 +1006,90 @@ class PostingService:
                         transaction,
                     )
             else:
+                expected_kinds = {
+                    "accepted": (),
+                    "conversion_persisted": ("conversion",),
+                    "fact_set_persisted": ("conversion", "fact_set"),
+                    "snapshot_persisted": ("conversion", "fact_set", "snapshot"),
+                    "conditional_authorization_persisted": (
+                        "conversion",
+                        "fact_set",
+                        "snapshot",
+                        "authorization",
+                    ),
+                    "finalized": ("conversion", "fact_set", "snapshot", "authorization"),
+                    "needs_attention": (),
+                }[row["stage"]]
+                evidence = {
+                    item["evidence_type"]: item
+                    for item in self._conn.execute(
+                        "SELECT * FROM application_posting_receipt_evidence WHERE attempt_id=?",
+                        (attempt_id,),
+                    ).fetchall()
+                }
+                if any(kind not in evidence for kind in expected_kinds):
+                    raise PostingError("Committed receipt stage evidence is unavailable")
+                # An owner's atomic effect may precede coordination catchup.
+                # Its retained evidence also requires the corresponding proof.
+                expected_kinds = tuple(set(expected_kinds) | evidence.keys())
                 conversion_id = "rpfc_application_" + _sha([attempt_id])[:24]
                 receipt = self._conn.execute(
-                    "SELECT receipts.public_id FROM receipt_proposal_conversions JOIN receipts "
+                    "SELECT receipts.public_id,conversion_result_hash FROM "
+                    "receipt_proposal_conversions JOIN receipts "
                     "ON receipts.id=receipt_proposal_conversions.receipt_id "
                     "WHERE command_public_id=?",
                     (conversion_id,),
                 ).fetchone()
+                if "conversion" in expected_kinds and receipt is None:
+                    raise PostingError("Committed receipt conversion proof is unavailable")
+                if "conversion" in expected_kinds and (
+                    evidence["conversion"]["evidence_public_id"] != conversion_id
+                    or evidence["conversion"]["evidence_hash"] != receipt[1]
+                    or _material(evidence["conversion"])
+                    != {
+                        "command_public_id": conversion_id,
+                        "receipt_public_id": receipt[0],
+                        "conversion_result_hash": receipt[1],
+                    }
+                ):
+                    raise PostingError("Committed receipt conversion evidence changed")
+                if "fact_set" in expected_kinds:
+                    verify_receipt_item_allocation_fact_set_for_review(
+                        self._conn, evidence["fact_set"]["evidence_public_id"]
+                    )
+                    fact = self._conn.execute(
+                        "SELECT command_public_id,fact_set_result_hash FROM "
+                        "receipt_item_allocation_fact_sets WHERE fact_set_public_id=?",
+                        (evidence["fact_set"]["evidence_public_id"],),
+                    ).fetchone()
+                    if fact[0] != "riaf_application_" + _sha([attempt_id])[:24] or (
+                        fact[1] != evidence["fact_set"]["evidence_hash"]
+                    ):
+                        raise PostingError("Committed receipt fact-set evidence changed")
+                if "snapshot" in expected_kinds:
+                    snapshot_evidence = evidence["snapshot"]
+                    snapshot = AuthoritativeSnapshotRepository(self._conn).fetch(
+                        snapshot_evidence["evidence_public_id"]
+                    )
+                    if snapshot is None:
+                        raise PostingError("Committed receipt snapshot proof is unavailable")
+                    snapshot.verify()
+                    if snapshot.combined_snapshot_hash != snapshot_evidence["evidence_hash"] or (
+                        _material(snapshot_evidence)
+                        != {
+                            "snapshot_id": snapshot.snapshot_public_id,
+                            "snapshot_hash": snapshot.combined_snapshot_hash,
+                        }
+                    ):
+                        raise PostingError("Committed receipt snapshot evidence changed")
                 if receipt is not None:
                     authorization = self._conn.execute(
                         "SELECT authorization_id FROM application_conditional_authorization_proofs "
                         "WHERE attempt_id=?",
                         (attempt_id,),
                     ).fetchone()
+                    if "authorization" in expected_kinds and authorization is None:
+                        raise PostingError("Committed receipt conditional proof is unavailable")
                     if authorization is not None:
                         version = self._conn.execute(
                             "SELECT authorization_version FROM receipt_finalization_authorizations "
@@ -1041,7 +1126,10 @@ class PostingService:
                 is not None
             ):
                 raise PostingError("Corrected transaction requires its effective correction reader")
-            if row["stage"] == "finalized" and transaction != row["transaction_public_id"]:
+            if (row["stage"] == "finalized" and transaction is None) or (
+                row["transaction_public_id"] is not None
+                and transaction != row["transaction_public_id"]
+            ):
                 raise PostingError("Final posting status lost its verified canonical result")
             state = "finalized" if transaction is not None else row["stage"]
             return PostingStatus(attempt_id, state, transaction, row["attention_reason"])

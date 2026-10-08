@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -650,6 +651,71 @@ def _assert_counts(connection: sqlite3.Connection, expected: dict[str, int]) -> 
         assert _count(connection, table) == count, table
 
 
+def _temporarily_drop_triggers(
+    connection: sqlite3.Connection,
+    trigger_names: tuple[str, ...],
+    mutate,
+) -> None:
+    definitions = []
+    for name in trigger_names:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+        ).fetchone()
+        assert row is not None, name
+        definitions.append(str(row[0]))
+    for name in trigger_names:
+        connection.execute(f'DROP TRIGGER "{name}"')
+    try:
+        mutate()
+    finally:
+        for definition in definitions:
+            connection.execute(definition)
+    connection.commit()
+    for name in trigger_names:
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+            ).fetchone()
+            is not None
+        )
+
+
+def _delete_durable_proof(
+    connection: sqlite3.Connection,
+    table: str,
+    where_sql: str,
+    params: tuple[object, ...],
+    *,
+    trigger_names: tuple[str, ...] = (),
+) -> int:
+    deleted = 0
+
+    def delete() -> None:
+        nonlocal deleted
+        cursor = connection.execute(f"DELETE FROM {table} WHERE {where_sql}", params)
+        deleted = cursor.rowcount
+        assert deleted > 0, (table, where_sql, params)
+
+    _temporarily_drop_triggers(connection, trigger_names, delete)
+    return deleted
+
+
+def _assert_read_refusal_is_write_free(
+    service,
+    connection: sqlite3.Connection,
+    attempt_id: str,
+    expected_counts: dict[str, int],
+) -> None:
+    from finance_core.application.posting import PostingError
+
+    for operation in (service.get_status, service.resume_post):
+        before_changes = connection.total_changes
+        with pytest.raises(PostingError):
+            operation(attempt_id)
+        assert connection.total_changes == before_changes
+        _assert_counts(connection, expected_counts)
+
+
 def test_text_posting_persists_once_and_reopens_to_same_canonical_result(
     migrated_temp_db_connection: sqlite3.Connection,
 ) -> None:
@@ -765,6 +831,62 @@ def test_text_normalizes_displayed_unicode_but_preserves_exact_raw_source(
     assert actual[0] == unicodedata.normalize("NFC", merchant_nfd)
     assert actual[1] == unicodedata.normalize("NFC", category_nfd)
     assert proposal["public_id"] == review.projection["proposal_public_id"]
+
+
+def test_finalized_text_missing_conversion_audit_event_refuses_status_and_resume(
+    migrated_temp_db_connection: sqlite3.Connection,
+) -> None:
+    from finance_core.application.posting import PostingError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix="missing-conversion-audit-event"
+    )
+    posted = service.submit_post(review.review_id, decision_id)
+    assert posted.state == "finalized"
+    conversion = connection.execute(
+        "SELECT event_public_id FROM financial_audit_events "
+        "WHERE aggregate_type='parser_proposal' AND aggregate_public_id=? "
+        "AND event_type='parser_proposal_converted'",
+        (review.projection["proposal_public_id"],),
+    ).fetchone()
+    assert conversion is not None
+
+    _delete_durable_proof(
+        connection,
+        "financial_audit_events",
+        "event_public_id=?",
+        (conversion["event_public_id"],),
+        trigger_names=("trg_financial_audit_events_no_delete",),
+    )
+    assert (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+            "AND name='trg_financial_audit_events_no_delete'"
+        ).fetchone()
+        is not None
+    )
+    expected_counts = {
+        "application_posting_decisions": 1,
+        "application_posting_attempts": 1,
+        "application_posting_events": 2,
+        "application_posting_receipt_evidence": 0,
+        "parser_proposal_authorizations": 1,
+        "parser_proposal_conversion_audit": 1,
+        "financial_audit_events": _count(connection, "financial_audit_events"),
+        "transactions": 1,
+        "receipt_proposal_conversions": 0,
+        "receipt_item_allocation_fact_sets": 0,
+    }
+    before_changes = connection.total_changes
+    with pytest.raises(PostingError):
+        service.get_status(posted.attempt_id)
+    assert connection.total_changes == before_changes
+    _assert_counts(connection, expected_counts)
+    with pytest.raises(PostingError):
+        service.resume_post(posted.attempt_id)
+    assert connection.total_changes == before_changes
+    _assert_counts(connection, expected_counts)
 
 
 def test_canonical_text_transaction_tamper_is_not_reported_as_finalized(
@@ -971,9 +1093,18 @@ def test_duplicate_source_event_cannot_create_a_second_posting_attempt(
         "already_consumed",
         "wrong_display_projection",
         "closed_current_display",
+        "missing_source",
+        "ambiguous_source",
+        "bad_source_signature",
+        "missing_decision",
+        "bad_decision_signature",
+        "missing_display",
+        "missing_reply",
+        "bad_display_signature",
+        "bad_reply_signature",
     ],
 )
-def test_signed_but_wrong_or_stale_confirmation_writes_nothing(
+def test_invalid_durable_posting_evidence_writes_nothing(
     migrated_temp_db_connection: sqlite3.Connection,
     fault: str,
 ) -> None:
@@ -985,6 +1116,59 @@ def test_signed_but_wrong_or_stale_confirmation_writes_nothing(
     )
     if fault == "closed_current_display":
         _supersede_current_display(connection, review, decision_id, display_id)
+    elif fault == "missing_source":
+        connection.execute(
+            "DELETE FROM synthetic_sources WHERE id=?",
+            (f"synthetic-source-refusal-{fault}",),
+        )
+        connection.commit()
+    elif fault == "ambiguous_source":
+        source_id = "synthetic-source-refusal-ambiguous-second"
+        source = _load(
+            connection, "synthetic_sources", "synthetic-source-refusal-ambiguous_source", SOURCE_KEY
+        )
+        source["evidence_id"] = source_id
+        source["source_event_id"] = "synthetic-event-refusal-ambiguous-second"
+        unsigned = {key: value for key, value in source.items() if key != "evidence_digest"}
+        source["evidence_digest"] = _digest(unsigned)
+        _persist(connection, "synthetic_sources", source_id, source, SOURCE_KEY)
+        connection.commit()
+    elif fault == "bad_source_signature":
+        connection.execute(
+            "UPDATE synthetic_sources SET signature=? WHERE id=?",
+            ("0" * 64, f"synthetic-source-refusal-{fault}"),
+        )
+        connection.commit()
+    elif fault == "missing_decision":
+        connection.execute("DELETE FROM synthetic_decisions WHERE id=?", (decision_id,))
+        connection.commit()
+    elif fault == "bad_decision_signature":
+        connection.execute(
+            "UPDATE synthetic_decisions SET signature=? WHERE id=?",
+            ("0" * 64, decision_id),
+        )
+        connection.commit()
+    elif fault == "missing_display":
+        connection.execute("DELETE FROM synthetic_displays WHERE id=?", (display_id,))
+        connection.commit()
+    elif fault == "missing_reply":
+        connection.execute(
+            "DELETE FROM synthetic_replies WHERE id=?",
+            (f"synthetic-reply-{decision_id}",),
+        )
+        connection.commit()
+    elif fault == "bad_display_signature":
+        connection.execute(
+            "UPDATE synthetic_displays SET signature=? WHERE id=?",
+            ("0" * 64, display_id),
+        )
+        connection.commit()
+    elif fault == "bad_reply_signature":
+        connection.execute(
+            "UPDATE synthetic_replies SET signature=? WHERE id=?",
+            ("0" * 64, f"synthetic-reply-{decision_id}"),
+        )
+        connection.commit()
     else:
         decision = _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)
         if fault == "wrong_human":
@@ -1020,6 +1204,13 @@ def test_signed_but_wrong_or_stale_confirmation_writes_nothing(
         _replace(connection, "synthetic_decisions", decision_id, decision, DECISION_KEY)
         connection.commit()
 
+    decision_snapshot = None
+    if fault == "bad_decision_signature":
+        decision_snapshot = tuple(
+            connection.execute(
+                "SELECT material,signature FROM synthetic_decisions WHERE id=?", (decision_id,)
+            ).fetchone()
+        )
     before_changes = connection.total_changes
     with pytest.raises((PostingError, ValueError, sqlite3.IntegrityError)):
         service.submit_post(review.review_id, decision_id)
@@ -1038,9 +1229,357 @@ def test_signed_but_wrong_or_stale_confirmation_writes_nothing(
         "application_conditional_authorization_proofs",
     ):
         assert _count(connection, table) == 0
-    assert _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)["consumed"] is (
-        fault == "already_consumed"
+    if fault == "missing_decision":
+        assert (
+            connection.execute(
+                "SELECT 1 FROM synthetic_decisions WHERE id=?", (decision_id,)
+            ).fetchone()
+            is None
+        )
+    elif fault == "bad_decision_signature":
+        row = connection.execute(
+            "SELECT material,signature FROM synthetic_decisions WHERE id=?", (decision_id,)
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == decision_snapshot
+        assert row[1] == "0" * 64
+        assert json.loads(row[0])["consumed"] is False
+    else:
+        assert _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)["consumed"] is (
+            fault == "already_consumed"
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("schema", "finance-application-other-source-v1"),
+        ("namespace", "wrong-source-namespace"),
+        ("key_id", "wrong-source-key"),
+        ("instance_id", "wrong-source-instance"),
+        ("evidence_id", ""),
+        ("source_content_hash", "bad-digest"),
+        ("evidence_digest", "bad-digest"),
+        ("received_at", NOW + 1),
+    ],
+)
+def test_core_rejects_mutated_verified_source_without_consumption(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: object,
+) -> None:
+    from finance_core.application.admission import AdmissionError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix=f"typed-source-{field}"
     )
+    original = service._source_port.verify_persisted
+    verified_calls = 0
+
+    def mutate_after_real_verification(owner_connection, intake_id):
+        nonlocal verified_calls
+        verified_calls += 1
+        verified = original(owner_connection, intake_id)
+        return dataclasses.replace(verified, **{field: replacement})
+
+    monkeypatch.setattr(service._source_port, "verify_persisted", mutate_after_real_verification)
+    before_changes = connection.total_changes
+    with pytest.raises(AdmissionError):
+        service.submit_post(review.review_id, decision_id)
+    assert verified_calls >= 1
+    assert connection.total_changes == before_changes
+    _assert_counts(
+        connection,
+        {
+            "application_posting_reviews": 1,
+            "application_posting_decisions": 0,
+            "application_posting_attempts": 0,
+            "application_posting_events": 0,
+            "application_posting_receipt_evidence": 0,
+            "parser_proposal_authorizations": 0,
+            "parser_proposal_conversion_audit": 0,
+            "transactions": 0,
+            "receipt_proposal_conversions": 0,
+            "receipt_item_allocation_fact_sets": 0,
+            "authoritative_calculation_snapshots": 0,
+            "receipt_finalization_authorizations": 0,
+            "application_conditional_authorization_proofs": 0,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("fault", "changed_field", "changed_value"),
+    [
+        ("display_nonhuman", "origin", "system"),
+        ("display_not_private", "private", False),
+        ("display_not_direct", "direct", False),
+        ("reply_nonhuman", "origin", "system"),
+        ("reply_not_private", "private", False),
+        ("reply_not_direct", "direct", False),
+    ],
+)
+def test_durable_display_and_reply_semantics_are_refused(
+    migrated_temp_db_connection: sqlite3.Connection,
+    fault: str,
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    from finance_core.application.posting import PostingError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, display_id = _prepare_text_subject(
+        connection, suffix=f"semantic-{fault}"
+    )
+    decision = _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)
+    reply_id = str(decision["reply_id"])
+    if fault.startswith("display_"):
+        display = _load(connection, "synthetic_displays", display_id, DECISION_KEY)
+        display[changed_field] = changed_value
+        _replace(connection, "synthetic_displays", display_id, display, DECISION_KEY)
+        decision["display_evidence_digest"] = _digest(display)
+        unsigned = {key: value for key, value in decision.items() if key != "decision_digest"}
+        decision["decision_digest"] = _digest(unsigned)
+        _replace(connection, "synthetic_decisions", decision_id, decision, DECISION_KEY)
+        reply = _load(connection, "synthetic_replies", reply_id, DECISION_KEY)
+        reply["display_evidence_digest"] = decision["display_evidence_digest"]
+        _replace(connection, "synthetic_replies", reply_id, reply, DECISION_KEY)
+    else:
+        reply = _load(connection, "synthetic_replies", reply_id, DECISION_KEY)
+        reply[changed_field] = changed_value
+        _replace(connection, "synthetic_replies", reply_id, reply, DECISION_KEY)
+    connection.commit()
+
+    before_changes = connection.total_changes
+    with pytest.raises((PostingError, ValueError)):
+        service.submit_post(review.review_id, decision_id)
+    assert connection.total_changes == before_changes
+    _assert_counts(
+        connection,
+        {
+            "application_posting_reviews": 1,
+            "application_posting_decisions": 0,
+            "application_posting_attempts": 0,
+            "application_posting_events": 0,
+            "application_posting_receipt_evidence": 0,
+            "parser_proposal_authorizations": 0,
+            "parser_proposal_conversion_audit": 0,
+            "transactions": 0,
+            "receipt_proposal_conversions": 0,
+            "receipt_item_allocation_fact_sets": 0,
+            "authoritative_calculation_snapshots": 0,
+            "receipt_finalization_authorizations": 0,
+            "application_conditional_authorization_proofs": 0,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("fault", "replacement"),
+    [
+        ("schema", "finance-application-other-human-decision-v1"),
+        ("namespace", "wrong-decision-namespace"),
+        ("key_id", "wrong-decision-key"),
+        ("instance_id", "wrong-service-instance"),
+        ("human_principal_id", "wrong-human"),
+        ("action", "edit"),
+        ("issued_at", NOW + 1),
+        ("source_evidence_id", ""),
+        ("source_evidence_digest", "bad-digest"),
+        ("display_id", ""),
+        ("display_evidence_digest", "bad-digest"),
+        ("decision_digest", ""),
+        ("consumed", True),
+        ("review_id", "another-review"),
+    ],
+)
+def test_core_rejects_mutated_verified_posting_decision_without_consumption(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+    replacement: object,
+) -> None:
+    from finance_core.application.posting import PostingError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix=f"typed-decision-{fault}"
+    )
+    original = service._decision_port.verify_persisted
+    verified_calls = 0
+
+    def mutate_after_real_verification(owner_connection, record_id, expected):
+        nonlocal verified_calls
+        verified_calls += 1
+        verified = original(owner_connection, record_id, expected)
+        return dataclasses.replace(verified, **{fault: replacement})
+
+    monkeypatch.setattr(service._decision_port, "verify_persisted", mutate_after_real_verification)
+    before_changes = connection.total_changes
+    with pytest.raises(PostingError):
+        service.submit_post(review.review_id, decision_id)
+    assert verified_calls == 1
+    assert connection.total_changes == before_changes
+    _assert_counts(
+        connection,
+        {
+            "application_posting_reviews": 1,
+            "application_posting_decisions": 0,
+            "application_posting_attempts": 0,
+            "application_posting_events": 0,
+            "application_posting_receipt_evidence": 0,
+            "parser_proposal_authorizations": 0,
+            "parser_proposal_conversion_audit": 0,
+            "transactions": 0,
+            "receipt_proposal_conversions": 0,
+            "receipt_item_allocation_fact_sets": 0,
+            "authoritative_calculation_snapshots": 0,
+            "receipt_finalization_authorizations": 0,
+            "application_conditional_authorization_proofs": 0,
+        },
+    )
+
+
+def test_core_rejects_untyped_forged_approval_after_durable_verification(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from finance_core.application.posting import PostingError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix="untyped-forged-decision"
+    )
+    original = service._decision_port.verify_persisted
+    verified_calls = 0
+
+    def forge_after_real_verification(owner_connection, record_id, expected):
+        nonlocal verified_calls
+        verified_calls += 1
+        original(owner_connection, record_id, expected)
+        return SimpleNamespace(approved=True, decision_id=record_id)
+
+    monkeypatch.setattr(service._decision_port, "verify_persisted", forge_after_real_verification)
+    before_changes = connection.total_changes
+    with pytest.raises(PostingError):
+        service.submit_post(review.review_id, decision_id)
+    assert verified_calls == 1
+    assert connection.total_changes == before_changes
+    _assert_counts(
+        connection,
+        {
+            "application_posting_reviews": 1,
+            "application_posting_decisions": 0,
+            "application_posting_attempts": 0,
+            "application_posting_events": 0,
+            "application_posting_receipt_evidence": 0,
+            "parser_proposal_authorizations": 0,
+            "transactions": 0,
+        },
+    )
+
+
+def test_completed_status_refuses_historical_typed_return_change_without_writes(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finance_core.application.posting import PostingError
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix="historical-typed-change"
+    )
+    posted = service.submit_post(review.review_id, decision_id)
+    assert posted.state == "finalized"
+    original = service._decision_port.verify_persisted
+    verified_calls = 0
+
+    def change_historical_result(owner_connection, record_id, expected):
+        nonlocal verified_calls
+        verified_calls += 1
+        verified = original(owner_connection, record_id, expected)
+        return dataclasses.replace(verified, decision_digest="f" * 64)
+
+    monkeypatch.setattr(service._decision_port, "verify_persisted", change_historical_result)
+    expected_counts = {
+        "application_posting_decisions": 1,
+        "application_posting_attempts": 1,
+        "application_posting_events": 2,
+        "application_posting_receipt_evidence": 0,
+        "parser_proposal_authorizations": 1,
+        "transactions": 1,
+        "receipt_proposal_conversions": 0,
+        "receipt_item_allocation_fact_sets": 0,
+    }
+    for operation in (service.get_status, service.resume_post):
+        before_changes = connection.total_changes
+        with pytest.raises(PostingError):
+            operation(posted.attempt_id)
+        assert connection.total_changes == before_changes
+        _assert_counts(connection, expected_counts)
+    assert verified_calls == 2
+
+
+@pytest.mark.parametrize("phase", ["fresh", "historical"])
+def test_recomposed_service_with_changed_fixed_binding_refuses_read_or_submit(
+    migrated_temp_db_connection: sqlite3.Connection,
+    phase: str,
+) -> None:
+    from finance_core.application.posting import PostingError, PostingService
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix=f"binding-change-{phase}"
+    )
+    if phase == "historical":
+        posted = service.submit_post(review.review_id, decision_id)
+        assert posted.state == "finalized"
+        attempt_id = posted.attempt_id
+    changed_binding = dataclasses.replace(
+        BINDING, decision_key_id="synthetic-rotated-posting-decision-key"
+    )
+    changed_service = PostingService(
+        connection=connection,
+        source_verifier=_DurableSourceVerifier(),
+        human_decision_authority=_DurablePostingDecisionAuthority(),
+        binding=changed_binding,
+        clock=lambda: NOW + (10_000 if phase == "historical" else 0),
+    )
+    if phase == "fresh":
+        before_changes = connection.total_changes
+        with pytest.raises(PostingError):
+            changed_service.submit_post(review.review_id, decision_id)
+        assert connection.total_changes == before_changes
+        _assert_counts(
+            connection,
+            {
+                "application_posting_reviews": 1,
+                "application_posting_decisions": 0,
+                "application_posting_attempts": 0,
+                "application_posting_events": 0,
+                "parser_proposal_authorizations": 0,
+                "transactions": 0,
+            },
+        )
+    else:
+        expected_counts = {
+            "application_posting_reviews": 1,
+            "application_posting_decisions": 1,
+            "application_posting_attempts": 1,
+            "application_posting_events": 2,
+            "parser_proposal_authorizations": 1,
+            "transactions": 1,
+        }
+        for operation in (changed_service.get_status, changed_service.resume_post):
+            before_changes = connection.total_changes
+            with pytest.raises(PostingError):
+                operation(attempt_id)
+            assert connection.total_changes == before_changes
+            _assert_counts(connection, expected_counts)
 
 
 def test_two_signed_competing_approvals_create_one_posting_and_result(
@@ -1387,6 +1926,617 @@ def test_local_receipt_source_drift_inside_conversion_owner_rolls_back_receipt_f
         connection.close()
 
 
+@pytest.mark.parametrize("drift", ["signed_source", "signed_decision", "payer"])
+def test_snapshot_owner_lock_revalidates_signed_authority_and_payer_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    from finance_core.application.posting import PostingError
+    from finance_core.receipt_finalization import fact_set_bridge
+
+    (
+        connection,
+        _workspace,
+        _manifest,
+        service,
+        review,
+        _proposal,
+        _intake,
+        decision_id,
+        _display_id,
+        _source_verifier,
+        _decision_authority,
+    ) = _prepare_receipt_subject(tmp_path, f"snapshot-lock-{drift}")
+    original_prepare = fact_set_bridge.prepare_receipt_calculation
+    mutation_reached_owner = False
+
+    def run_with_owner_lock_mutation(
+        owner_connection,
+        receipt_public_id,
+        *,
+        actor_type="system",
+        actor_id=None,
+        clock=None,
+        persistence_effect=None,
+    ):
+        def mutate_before_revalidation(inner_connection, snapshot):
+            nonlocal mutation_reached_owner
+            assert inner_connection is connection
+            assert inner_connection.in_transaction
+            mutation_reached_owner = True
+            if drift == "signed_source":
+                source_id = f"synthetic-source-snapshot-lock-{drift}"
+                source = _load(inner_connection, "synthetic_sources", source_id, SOURCE_KEY)
+                source["source_event_id"] = "synthetic-event-drifted-under-snapshot-lock"
+                unsigned = {key: value for key, value in source.items() if key != "evidence_digest"}
+                source["evidence_digest"] = _digest(unsigned)
+                _replace(inner_connection, "synthetic_sources", source_id, source, SOURCE_KEY)
+            elif drift == "signed_decision":
+                decision = _load(inner_connection, "synthetic_decisions", decision_id, DECISION_KEY)
+                decision["issued_at"] = NOW - 3
+                unsigned = {
+                    key: value for key, value in decision.items() if key != "decision_digest"
+                }
+                decision["decision_digest"] = _digest(unsigned)
+                _replace(
+                    inner_connection,
+                    "synthetic_decisions",
+                    decision_id,
+                    decision,
+                    DECISION_KEY,
+                )
+            else:
+                inner_connection.execute(
+                    "UPDATE participants SET is_active=0 WHERE public_id='ptcp_posting_self'"
+                )
+            assert persistence_effect is not None
+            persistence_effect(inner_connection, snapshot)
+
+        return original_prepare(
+            owner_connection,
+            receipt_public_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            clock=clock,
+            persistence_effect=mutate_before_revalidation,
+        )
+
+    monkeypatch.setattr(
+        fact_set_bridge, "prepare_receipt_calculation", run_with_owner_lock_mutation
+    )
+    try:
+        with pytest.raises((PostingError, ValueError)):
+            service.submit_post(review.review_id, decision_id)
+        assert mutation_reached_owner
+        assert not connection.in_transaction
+        receipt_id = str(connection.execute("SELECT public_id FROM receipts").fetchone()[0])
+        assert (
+            connection.execute(
+                "SELECT is_active FROM participants WHERE public_id='ptcp_posting_self'"
+            ).fetchone()[0]
+            == 1
+        )
+        source = _load(
+            connection,
+            "synthetic_sources",
+            f"synthetic-source-snapshot-lock-{drift}",
+            SOURCE_KEY,
+        )
+        assert source["source_event_id"] == f"synthetic-event-snapshot-lock-{drift}"
+        decision = _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)
+        assert decision["issued_at"] == NOW - 1
+        _assert_counts(
+            connection,
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 3,
+                "application_posting_receipt_evidence": 2,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 1,
+                "receipts": 1,
+                "receipt_item_allocation_fact_sets": 1,
+                "authoritative_calculation_snapshots": 0,
+                "receipt_finalization_authorizations": 0,
+                "application_conditional_authorization_proofs": 0,
+                "transactions": 0,
+                "settlement_obligations": 0,
+            },
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM calc_audit_runs WHERE entity_type='receipt' AND entity_id=?",
+                (receipt_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM receipt_fact_set_binding_evidence "
+                "WHERE receipt_public_id=? AND bound_record_type IN "
+                "('calculation_run','calculation_snapshot')",
+                (receipt_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("fault_stage", "attempt_stage", "pre_counts"),
+    [
+        (
+            "before_conversion_commit",
+            "accepted",
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 1,
+                "application_posting_receipt_evidence": 0,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 0,
+                "receipts": 0,
+                "receipt_item_allocation_fact_sets": 0,
+                "authoritative_calculation_snapshots": 0,
+                "receipt_finalization_authorizations": 0,
+                "application_conditional_authorization_proofs": 0,
+                "transactions": 0,
+            },
+        ),
+        (
+            "before_fact_set_commit",
+            "conversion_persisted",
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 2,
+                "application_posting_receipt_evidence": 1,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 1,
+                "receipts": 1,
+                "receipt_item_allocation_fact_sets": 0,
+                "authoritative_calculation_snapshots": 0,
+                "receipt_finalization_authorizations": 0,
+                "application_conditional_authorization_proofs": 0,
+                "transactions": 0,
+            },
+        ),
+        (
+            "before_snapshot_commit",
+            "fact_set_persisted",
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 3,
+                "application_posting_receipt_evidence": 2,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 1,
+                "receipts": 1,
+                "receipt_item_allocation_fact_sets": 1,
+                "authoritative_calculation_snapshots": 0,
+                "receipt_finalization_authorizations": 0,
+                "application_conditional_authorization_proofs": 0,
+                "transactions": 0,
+            },
+        ),
+        (
+            "before_conditional_authorization_commit",
+            "snapshot_persisted",
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 4,
+                "application_posting_receipt_evidence": 3,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 1,
+                "receipts": 1,
+                "receipt_item_allocation_fact_sets": 1,
+                "authoritative_calculation_snapshots": 1,
+                "receipt_finalization_authorizations": 0,
+                "application_conditional_authorization_proofs": 0,
+                "transactions": 0,
+            },
+        ),
+        (
+            "before_receipt_finalization_commit",
+            "conditional_authorization_persisted",
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 5,
+                "application_posting_receipt_evidence": 4,
+                "parser_proposal_authorizations": 1,
+                "receipt_proposal_conversions": 1,
+                "receipts": 1,
+                "receipt_item_allocation_fact_sets": 1,
+                "authoritative_calculation_snapshots": 1,
+                "receipt_finalization_authorizations": 1,
+                "application_conditional_authorization_proofs": 1,
+                "transactions": 0,
+            },
+        ),
+    ],
+)
+def test_receipt_before_owner_commits_rollback_and_recover_same_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_stage: str,
+    attempt_stage: str,
+    pre_counts: dict[str, int],
+) -> None:
+    from finance_core.application import posting
+    from finance_core.application.posting import PostingService
+
+    (
+        connection,
+        workspace,
+        manifest,
+        service,
+        review,
+        _proposal,
+        _intake,
+        decision_id,
+        _display_id,
+        source_verifier,
+        decision_authority,
+    ) = _prepare_receipt_subject(tmp_path, f"before-owner-{fault_stage}")
+
+    def fail_before_owner_commit(stage: str) -> None:
+        if stage == fault_stage:
+            raise RuntimeError(f"injected {fault_stage}")
+
+    monkeypatch.setattr(posting, "_failure_injection_hook", fail_before_owner_commit)
+    try:
+        with pytest.raises(RuntimeError, match=fault_stage):
+            service.submit_post(review.review_id, decision_id)
+        assert not connection.in_transaction
+        _assert_counts(connection, pre_counts)
+        attempt_id = str(
+            connection.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+        )
+        assert (
+            connection.execute(
+                "SELECT stage FROM application_posting_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+            == attempt_stage
+        )
+        assert (
+            _load(connection, "synthetic_decisions", decision_id, DECISION_KEY)["consumed"] is False
+        )
+
+        if fault_stage == "before_snapshot_commit":
+            receipt_id = str(connection.execute("SELECT public_id FROM receipts").fetchone()[0])
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM calc_audit_runs "
+                    "WHERE entity_type='receipt' AND entity_id=?",
+                    (receipt_id,),
+                ).fetchone()[0]
+                == 0
+            )
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM receipt_fact_set_binding_evidence "
+                    "WHERE receipt_public_id=? AND bound_record_type IN "
+                    "('calculation_run','calculation_snapshot')",
+                    (receipt_id,),
+                ).fetchone()[0]
+                == 0
+            )
+
+        database_path = Path(str(connection.execute("PRAGMA database_list").fetchone()[2]))
+        connection.close()
+        reopened = connect_temp_db(database_path)
+        try:
+            monkeypatch.setattr(posting, "_failure_injection_hook", None)
+            recovery_service = PostingService(
+                connection=reopened,
+                source_verifier=type(source_verifier)(workspace=workspace, manifest=manifest),
+                human_decision_authority=type(decision_authority)(),
+                binding=BINDING,
+                clock=lambda: NOW + 10_000,
+            )
+            recovered = recovery_service.resume_post(attempt_id)
+            repeated = recovery_service.resume_post(attempt_id)
+            status = recovery_service.get_status(attempt_id)
+            assert recovered.state == repeated.state == status.state == "finalized"
+            assert recovered.transaction_public_id
+            assert repeated.transaction_public_id == status.transaction_public_id
+            assert recovered.transaction_public_id == status.transaction_public_id
+            assert (
+                _load(reopened, "synthetic_decisions", decision_id, DECISION_KEY)["consumed"]
+                is False
+            )
+            _assert_counts(
+                reopened,
+                {
+                    "application_posting_decisions": 1,
+                    "application_posting_attempts": 1,
+                    "application_posting_events": 6,
+                    "application_posting_receipt_evidence": 4,
+                    "parser_proposal_authorizations": 1,
+                    "receipt_proposal_conversions": 1,
+                    "receipts": 1,
+                    "receipt_item_allocation_fact_sets": 1,
+                    "authoritative_calculation_snapshots": 1,
+                    "receipt_finalization_authorizations": 1,
+                    "application_conditional_authorization_proofs": 1,
+                    "transactions": 1,
+                    "settlement_obligations": 0,
+                },
+            )
+            assert (
+                reopened.execute(
+                    "SELECT stage FROM application_posting_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()[0]
+                == "finalized"
+            )
+        finally:
+            reopened.close()
+    finally:
+        try:
+            connection.close()
+        except sqlite3.Error:
+            pass
+
+
+@pytest.mark.parametrize("missing_proof", ["conditional_authorization", "finalization_idempotency"])
+def test_finalized_receipt_missing_proof_refuses_status_and_resume(
+    tmp_path: Path,
+    missing_proof: str,
+) -> None:
+
+    (
+        connection,
+        _workspace,
+        _manifest,
+        service,
+        review,
+        _proposal,
+        _intake,
+        decision_id,
+        _display_id,
+        _source_verifier,
+        _decision_authority,
+    ) = _prepare_receipt_subject(tmp_path, f"missing-final-proof-{missing_proof}")
+    try:
+        posted = service.submit_post(review.review_id, decision_id)
+        assert posted.state == "finalized"
+        if missing_proof == "conditional_authorization":
+            _delete_durable_proof(
+                connection,
+                "application_conditional_authorization_proofs",
+                "attempt_id=?",
+                (posted.attempt_id,),
+                trigger_names=("application_conditional_proofs_no_delete",),
+            )
+        else:
+            _delete_durable_proof(
+                connection,
+                "receipt_finalization_idempotency",
+                "1=1",
+                (),
+                trigger_names=("trg_receipt_finalization_idempotency_no_delete",),
+            )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='application_conditional_proofs_no_delete'"
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_receipt_finalization_idempotency_no_delete'"
+            ).fetchone()
+            is not None
+        )
+        expected_counts = {
+            "application_posting_decisions": 1,
+            "application_posting_attempts": 1,
+            "application_posting_events": 6,
+            "application_posting_receipt_evidence": 4,
+            "parser_proposal_authorizations": 1,
+            "receipt_proposal_conversions": 1,
+            "receipts": 1,
+            "receipt_item_allocation_fact_sets": 1,
+            "authoritative_calculation_snapshots": 1,
+            "receipt_finalization_authorizations": 1,
+            "application_conditional_authorization_proofs": (
+                0 if missing_proof == "conditional_authorization" else 1
+            ),
+            "receipt_finalization_audit": 1,
+            "receipt_finalization_idempotency": (
+                0 if missing_proof == "finalization_idempotency" else 1
+            ),
+            "transactions": 1,
+            "settlement_obligations": 0,
+        }
+        _assert_read_refusal_is_write_free(service, connection, posted.attempt_id, expected_counts)
+        assert tuple(
+            connection.execute(
+                "SELECT stage,transaction_public_id FROM application_posting_attempts "
+                "WHERE attempt_id=?",
+                (posted.attempt_id,),
+            ).fetchone()
+        ) == ("finalized", posted.transaction_public_id)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("missing_owner", "fault_stage", "attempt_stage"),
+    [
+        ("conversion", "before_fact_set_commit", "conversion_persisted"),
+        ("snapshot", "before_conditional_authorization_commit", "snapshot_persisted"),
+        (
+            "conditional_authorization",
+            "before_receipt_finalization_commit",
+            "conditional_authorization_persisted",
+        ),
+    ],
+)
+def test_pending_receipt_stage_missing_owner_proof_refuses_read_and_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_owner: str,
+    fault_stage: str,
+    attempt_stage: str,
+) -> None:
+    from finance_core.application import posting
+
+    (
+        connection,
+        _workspace,
+        _manifest,
+        service,
+        review,
+        _proposal,
+        _intake,
+        decision_id,
+        _display_id,
+        _source_verifier,
+        _decision_authority,
+    ) = _prepare_receipt_subject(tmp_path, f"pending-missing-{missing_owner}")
+
+    def fail_at_owner_boundary(stage: str) -> None:
+        if stage == fault_stage:
+            raise RuntimeError(f"injected {fault_stage}")
+
+    monkeypatch.setattr(posting, "_failure_injection_hook", fail_at_owner_boundary)
+    try:
+        with pytest.raises(RuntimeError, match=fault_stage):
+            service.submit_post(review.review_id, decision_id)
+        assert not connection.in_transaction
+        attempt_id = str(
+            connection.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+        )
+        assert (
+            connection.execute(
+                "SELECT stage FROM application_posting_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+            == attempt_stage
+        )
+
+        if missing_owner == "conversion":
+            command_id = str(
+                connection.execute(
+                    "SELECT command_public_id FROM receipt_proposal_conversions"
+                ).fetchone()[0]
+            )
+            _delete_durable_proof(
+                connection,
+                "receipt_proposal_conversions",
+                "command_public_id=?",
+                (command_id,),
+                trigger_names=("trg_receipt_proposal_conversions_no_delete",),
+            )
+        elif missing_owner == "snapshot":
+            receipt_id = str(connection.execute("SELECT public_id FROM receipts").fetchone()[0])
+            run = connection.execute(
+                "SELECT run_id FROM calc_audit_runs WHERE entity_type='receipt' AND entity_id=?",
+                (receipt_id,),
+            ).fetchone()
+            snapshot_id = str(
+                connection.execute(
+                    "SELECT snapshot_public_id FROM authoritative_calculation_snapshots"
+                ).fetchone()[0]
+            )
+            assert run is not None
+            _delete_durable_proof(
+                connection,
+                "receipt_fact_set_binding_evidence",
+                "receipt_public_id=? AND bound_record_type IN "
+                "('calculation_run','calculation_snapshot')",
+                (receipt_id,),
+                trigger_names=("trg_fact_set_binding_evidence_no_delete",),
+            )
+            connection.execute("DELETE FROM calc_audit_runs WHERE run_id=?", (run["run_id"],))
+            connection.commit()
+            _delete_durable_proof(
+                connection,
+                "authoritative_calculation_snapshots",
+                "snapshot_public_id=?",
+                (snapshot_id,),
+                trigger_names=("trg_authoritative_snapshots_no_delete",),
+            )
+        else:
+            _delete_durable_proof(
+                connection,
+                "application_conditional_authorization_proofs",
+                "attempt_id=?",
+                (attempt_id,),
+                trigger_names=("application_conditional_proofs_no_delete",),
+            )
+
+        assert (
+            connection.execute(
+                "SELECT stage FROM application_posting_attempts WHERE attempt_id=?",
+                (attempt_id,),
+            ).fetchone()[0]
+            == attempt_stage
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_authoritative_snapshots_no_delete'"
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='trg_fact_set_binding_evidence_no_delete'"
+            ).fetchone()
+            is not None
+        )
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                "AND name='application_conditional_proofs_no_delete'"
+            ).fetchone()
+            is not None
+        )
+        expected_counts = {
+            "application_posting_decisions": 1,
+            "application_posting_attempts": 1,
+            "application_posting_events": {
+                "conversion": 2,
+                "snapshot": 4,
+                "conditional_authorization": 5,
+            }[missing_owner],
+            "application_posting_receipt_evidence": {
+                "conversion": 1,
+                "snapshot": 3,
+                "conditional_authorization": 4,
+            }[missing_owner],
+            "parser_proposal_authorizations": 1,
+            "receipt_proposal_conversions": 0 if missing_owner == "conversion" else 1,
+            "receipts": 1,
+            "receipt_item_allocation_fact_sets": 0 if missing_owner == "conversion" else 1,
+            "authoritative_calculation_snapshots": (
+                1 if missing_owner == "conditional_authorization" else 0
+            ),
+            "receipt_finalization_authorizations": 0
+            if missing_owner != "conditional_authorization"
+            else 1,
+            "application_conditional_authorization_proofs": 0
+            if missing_owner == "conditional_authorization"
+            else 0,
+            "transactions": 0,
+            "settlement_obligations": 0,
+        }
+        _assert_read_refusal_is_write_free(service, connection, attempt_id, expected_counts)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     ("fault_stage", "pre_counts", "pre_attempt_stage"),
     [
@@ -1704,6 +2854,94 @@ def test_receipt_final_commit_return_loss_recovers_after_self_authority_changes(
                 connection.close()
             except sqlite3.Error:
                 pass
+
+
+def test_text_before_conversion_owner_commit_rolls_back_then_recovers_same_attempt(
+    migrated_temp_db_connection: sqlite3.Connection,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from finance_core.application import posting
+    from finance_core.application.posting import PostingService
+
+    connection = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(
+        connection, suffix="text-before-conversion-commit"
+    )
+
+    def fail_before_conversion_commit(stage: str) -> None:
+        if stage == "before_text_conversion_commit":
+            raise RuntimeError("injected before_text_conversion_commit")
+
+    monkeypatch.setattr(posting, "_failure_injection_hook", fail_before_conversion_commit)
+    with pytest.raises(RuntimeError, match="before_text_conversion_commit"):
+        service.submit_post(review.review_id, decision_id)
+    _assert_counts(
+        connection,
+        {
+            "application_posting_decisions": 1,
+            "application_posting_attempts": 1,
+            "application_posting_events": 1,
+            "application_posting_receipt_evidence": 0,
+            "parser_proposal_authorizations": 1,
+            "parser_proposal_conversion_audit": 0,
+            "transactions": 0,
+            "receipt_proposal_conversions": 0,
+            "receipt_item_allocation_fact_sets": 0,
+            "authoritative_calculation_snapshots": 0,
+            "receipt_finalization_authorizations": 0,
+        },
+    )
+    attempt_id = str(
+        connection.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+    )
+    assert (
+        connection.execute(
+            "SELECT stage FROM application_posting_attempts WHERE attempt_id=?",
+            (attempt_id,),
+        ).fetchone()[0]
+        == "accepted"
+    )
+    database_path = Path(str(connection.execute("PRAGMA database_list").fetchone()[2]))
+    connection.close()
+
+    reopened = connect_temp_db(database_path)
+    try:
+        monkeypatch.setattr(posting, "_failure_injection_hook", None)
+        recovered_service = PostingService(
+            connection=reopened,
+            source_verifier=_DurableSourceVerifier(),
+            human_decision_authority=_DurablePostingDecisionAuthority(),
+            binding=BINDING,
+            clock=lambda: NOW + 10_000,
+        )
+        recovered = recovered_service.resume_post(attempt_id)
+        assert recovered.state == "finalized"
+        repeated = recovered_service.resume_post(attempt_id)
+        status = recovered_service.get_status(attempt_id)
+        assert repeated.state == status.state == "finalized"
+        assert recovered.transaction_public_id == repeated.transaction_public_id
+        assert repeated.transaction_public_id == status.transaction_public_id
+        assert (
+            _load(reopened, "synthetic_decisions", decision_id, DECISION_KEY)["consumed"] is False
+        )
+        _assert_counts(
+            reopened,
+            {
+                "application_posting_decisions": 1,
+                "application_posting_attempts": 1,
+                "application_posting_events": 2,
+                "application_posting_receipt_evidence": 0,
+                "parser_proposal_authorizations": 1,
+                "parser_proposal_conversion_audit": 1,
+                "transactions": 1,
+                "receipt_proposal_conversions": 0,
+                "receipt_item_allocation_fact_sets": 0,
+                "authoritative_calculation_snapshots": 0,
+                "receipt_finalization_authorizations": 0,
+            },
+        )
+    finally:
+        reopened.close()
 
 
 @pytest.mark.parametrize(

@@ -274,6 +274,9 @@ def prepare_receipt_calculation(
     actor_type: str = "system",
     actor_id: str | None = None,
     clock: Callable[[], str] | None = None,
+    persistence_effect: (
+        Callable[[sqlite3.Connection, AuthoritativeCalculationSnapshot], None] | None
+    ) = None,
 ) -> PreparedReceiptCalculation:
     """Project, calculate, and persist an authoritative snapshot for a receipt.
 
@@ -287,6 +290,10 @@ def prepare_receipt_calculation(
     both binding evidence rows are written in **one** ``BEGIN IMMEDIATE`` Unit of
     Work, so a failure can never leave a committed snapshot without its run or
     its machine-verifiable four-tuple evidence.
+
+    An optional trusted supplementary effect runs after complete owner
+    verification/write, under that same lock on fresh and replay paths. Its
+    refusal rolls back this stage; it cannot replace financial authority.
     """
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
@@ -348,6 +355,7 @@ def prepare_receipt_calculation(
         actor_type=actor_type,
         actor_id=actor_id,
         created_at=created_at,
+        persistence_effect=persistence_effect,
     )
 
     return PreparedReceiptCalculation(
@@ -490,6 +498,9 @@ def _persist_prepare_authority(
     actor_type: str,
     actor_id: str | None,
     created_at: str,
+    persistence_effect: (
+        Callable[[sqlite3.Connection, AuthoritativeCalculationSnapshot], None] | None
+    ) = None,
 ) -> tuple[str, bool]:
     """Persist the complete prepare-stage authority in one Unit of Work.
 
@@ -518,55 +529,65 @@ def _persist_prepare_authority(
     )
     conn.execute("BEGIN IMMEDIATE")
     try:
-        snapshot_hash, idempotent_replay = _write_prepare_authority(
-            conn,
-            ids=ids,
-            binding=binding,
-            input_payload=input_payload,
-            output_payload=output_payload,
-            currency_contract_version=currency_contract_version,
-            source_references=source_references,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            created_at=created_at,
-            expected_run=expected_run,
-        )
+        try:
+            snapshot_hash, idempotent_replay = _write_prepare_authority(
+                conn,
+                ids=ids,
+                binding=binding,
+                input_payload=input_payload,
+                output_payload=output_payload,
+                currency_contract_version=currency_contract_version,
+                source_references=source_references,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                created_at=created_at,
+                expected_run=expected_run,
+            )
+        except sqlite3.IntegrityError:
+            # Only an owner-write collision may become a replay. Reacquire
+            # the write lock before reading and verifying the winner's complete
+            # authority, and keep any supplementary effect in that same scope.
+            conn.rollback()
+            conn.execute("BEGIN IMMEDIATE")
+            durable_snapshot = AuthoritativeSnapshotRepository(conn).fetch(
+                ids["calculation_snapshot_id"]
+            )
+            if durable_snapshot is not None:
+                expected_run = make_run_record(
+                    run_id=ids["calculation_run_public_id"],
+                    run_type=RECEIPT_CALCULATION_RUN_TYPE,
+                    entity_type="receipt",
+                    entity_id=binding.receipt_public_id,
+                    rule_version=ALGORITHM_VERSION,
+                    status=CALCULATION_RUN_STATUS,
+                    source_type=CALCULATION_RUN_SOURCE_TYPE,
+                    source_reference=binding.fact_set_result_hash,
+                    created_at=durable_snapshot.created_at,
+                )
+            snapshot_hash = _require_durable_prepare_authority(
+                conn,
+                ids=ids,
+                binding=binding,
+                input_payload=input_payload,
+                output_payload=output_payload,
+                currency_contract_version=currency_contract_version,
+                source_references=source_references,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                expected_run=expected_run,
+            )
+            idempotent_replay = True
+        if persistence_effect is not None:
+            snapshot = AuthoritativeSnapshotRepository(conn).fetch(ids["calculation_snapshot_id"])
+            if snapshot is None:
+                raise BridgePreparationError("Prepared authoritative snapshot is missing")
+            snapshot.verify()
+            # Deliberately outside the IntegrityError collision handler:
+            # every callback refusal must propagate and roll back, even when
+            # its own evidence write raises a SQLite integrity error.
+            persistence_effect(conn, snapshot)
         conn.commit()
         return snapshot_hash, idempotent_replay
-    except sqlite3.IntegrityError:
-        # A concurrent identical prepare committed the same durable authority
-        # first: roll back, re-read, and re-verify the complete durable truth.
-        # R3-05: reconstruct expected_run using the durable snapshot's created_at
-        # so the timestamp comparison is consistent with the winner's write.
-        if conn.in_transaction:
-            conn.rollback()
-        durable_snapshot = AuthoritativeSnapshotRepository(conn).fetch(
-            ids["calculation_snapshot_id"]
-        )
-        if durable_snapshot is not None:
-            expected_run = make_run_record(
-                run_id=ids["calculation_run_public_id"],
-                run_type=RECEIPT_CALCULATION_RUN_TYPE,
-                entity_type="receipt",
-                entity_id=binding.receipt_public_id,
-                rule_version=ALGORITHM_VERSION,
-                status=CALCULATION_RUN_STATUS,
-                source_type=CALCULATION_RUN_SOURCE_TYPE,
-                source_reference=binding.fact_set_result_hash,
-                created_at=durable_snapshot.created_at,
-            )
-        return _require_durable_prepare_authority(
-            conn,
-            ids=ids,
-            binding=binding,
-            input_payload=input_payload,
-            output_payload=output_payload,
-            currency_contract_version=currency_contract_version,
-            source_references=source_references,
-            actor_type=actor_type,
-            actor_id=actor_id,
-            expected_run=expected_run,
-        ), True
     except Exception:
         if conn.in_transaction:
             conn.rollback()

@@ -5,6 +5,64 @@ from __future__ import annotations
 import importlib
 import importlib.util
 
+import pytest
+
+
+def test_completed_text_missing_owner_proof_refuses_status_and_resume(
+    migrated_temp_db_connection,
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.application.posting import PostingError
+
+    conn = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(conn)
+    posted = service.submit_post(review.review_id, decision_id)
+    conn.execute("DELETE FROM parser_proposal_conversion_audit")
+    conn.commit()
+    before = conn.total_changes
+    for operation in (service.get_status, service.resume_post):
+        with pytest.raises(PostingError, match="verified canonical result"):
+            operation(posted.attempt_id)
+        assert conn.total_changes == before
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("stage", ["accepted", "finalized"])
+def test_text_coordination_result_contradiction_refuses_even_before_finalized(
+    migrated_temp_db_connection,
+    stage,
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.application.posting import PostingError
+
+    conn = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display_id = _prepare_text_subject(conn)
+    posted = service.submit_post(review.review_id, decision_id)
+    other_service, other_review, *_rest, other_decision, _display = _prepare_text_subject(
+        conn, "other"
+    )
+    other = other_service.submit_post(other_review.review_id, other_decision)
+    trigger = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='application_posting_attempts_guard_update'"
+    ).fetchone()[0]
+    conn.execute("DROP TRIGGER application_posting_attempts_guard_update")
+    conn.execute(
+        "UPDATE application_posting_attempts SET stage=?,transaction_public_id=? "
+        "WHERE attempt_id=?",
+        (stage, other.transaction_public_id, posted.attempt_id),
+    )
+    conn.execute(trigger)
+    conn.commit()
+    before = conn.total_changes
+    for operation in (service.get_status, service.resume_post):
+        with pytest.raises(PostingError, match="verified canonical result"):
+            operation(posted.attempt_id)
+        assert conn.total_changes == before
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 2
+
 
 def test_neutral_owner_preserves_legacy_exception_identity():
     assert importlib.util.find_spec("finance_core.parser_proposals.decision_owner") is not None, (

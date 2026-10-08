@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import finance_core.receipt_finalization.fact_set_bridge as fact_set_bridge
+from finance_core.calculation.authoritative_snapshot import AuthoritativeCalculationSnapshot
 from finance_core.receipt_finalization import (
     FinalizationAuthorizationError,
     FinalizationIdempotencyError,
@@ -28,7 +30,183 @@ from finance_core.receipt_finalization.fact_set_bridge import (
     load_persisted_receipt_finalization_authorization,
     verify_finalized_prepared_receipt,
 )
+from tests.conftest import connect_temp_db
 from tests.test_receipt_fact_set_calculation_bridge_v1 import _setup_active_fact_set
+
+_PREPARE_AUTHORITY_TABLES = (
+    "authoritative_calculation_snapshots",
+    "financial_audit_events",
+    "calc_audit_runs",
+    "receipt_fact_set_binding_evidence",
+)
+
+
+def _prepare_authority_rows(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
+    return {
+        table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+        for table in _PREPARE_AUTHORITY_TABLES
+    }
+
+
+@pytest.mark.parametrize("mode", ["fresh", "replay", "integrity_fallback"])
+def test_snapshot_persistence_effect_observes_complete_authority_under_write_lock(
+    migrated_temp_db_connection: sqlite3.Connection,
+    migrated_temp_db_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    conn = migrated_temp_db_connection
+    ctx, _ = _setup_active_fact_set(conn, tmp_path, f"snapshot_effect_{mode}")
+    prior = None
+    if mode != "fresh":
+        prior = prepare_receipt_calculation(conn, ctx.receipt_public_id)
+    if mode == "integrity_fallback":
+
+        def lose_prepare_race(*args, **kwargs):
+            raise sqlite3.IntegrityError("concurrent identical prepare")
+
+        monkeypatch.setattr(fact_set_bridge, "_write_prepare_authority", lose_prepare_race)
+    observed = []
+
+    def verify_locked_authority(connection, snapshot):
+        assert connection is conn and connection.in_transaction
+        assert isinstance(snapshot, AuthoritativeCalculationSnapshot)
+        snapshot.verify()
+        rows = _prepare_authority_rows(connection)
+        assert len(rows["authoritative_calculation_snapshots"]) == 1
+        assert len(rows["calc_audit_runs"]) == 1
+        assert len(rows["receipt_fact_set_binding_evidence"]) == 2
+        competitor = connect_temp_db(migrated_temp_db_path)
+        try:
+            competitor.execute("PRAGMA busy_timeout = 0")
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                competitor.execute("BEGIN IMMEDIATE")
+        finally:
+            competitor.close()
+        observed.append(snapshot)
+
+    prepared = prepare_receipt_calculation(
+        conn, ctx.receipt_public_id, persistence_effect=verify_locked_authority
+    )
+    assert len(observed) == 1
+    assert observed[0].snapshot_public_id == prepared.calculation_snapshot_id
+    assert observed[0].combined_snapshot_hash == prepared.calculation_snapshot_hash
+    assert prepared.idempotent_replay == (mode != "fresh")
+    if prior is not None:
+        assert prepared == prior
+    assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("mode", ["fresh", "replay", "integrity_fallback"])
+@pytest.mark.parametrize("error_type", [ValueError, sqlite3.IntegrityError])
+def test_snapshot_persistence_effect_refusal_rolls_back_its_owned_stage(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    error_type: type[Exception],
+) -> None:
+    conn = migrated_temp_db_connection
+    ctx, _ = _setup_active_fact_set(conn, tmp_path, f"snapshot_refusal_{mode}")
+    if mode != "fresh":
+        prepare_receipt_calculation(conn, ctx.receipt_public_id)
+    if mode == "integrity_fallback":
+
+        def lose_prepare_race(*args, **kwargs):
+            raise sqlite3.IntegrityError("concurrent identical prepare")
+
+        monkeypatch.setattr(fact_set_bridge, "_write_prepare_authority", lose_prepare_race)
+    conn.execute("CREATE TABLE snapshot_effect_probe (value TEXT)")
+    conn.commit()
+    prior_authority = _prepare_authority_rows(conn)
+    prior_facts = [
+        tuple(row)
+        for row in conn.execute("SELECT * FROM receipt_item_allocation_facts ORDER BY rowid")
+    ]
+    observed = []
+
+    def reject_locked_authority(connection, snapshot):
+        assert connection is conn and connection.in_transaction
+        observed.append(snapshot.snapshot_public_id)
+        connection.execute("INSERT INTO snapshot_effect_probe VALUES ('uncommitted')")
+        raise error_type("independent source/decision evidence changed")
+
+    with pytest.raises(error_type, match="source/decision evidence changed"):
+        prepare_receipt_calculation(
+            conn, ctx.receipt_public_id, persistence_effect=reject_locked_authority
+        )
+    assert len(observed) == 1
+    assert not conn.in_transaction
+    assert _prepare_authority_rows(conn) == prior_authority
+    assert [
+        tuple(row)
+        for row in conn.execute("SELECT * FROM receipt_item_allocation_facts ORDER BY rowid")
+    ] == prior_facts
+    assert conn.execute("SELECT count(*) FROM snapshot_effect_probe").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+
+
+def test_snapshot_persistence_effect_preserves_caller_owned_transaction(
+    migrated_temp_db_connection: sqlite3.Connection, tmp_path: Path
+) -> None:
+    conn = migrated_temp_db_connection
+    ctx, _ = _setup_active_fact_set(conn, tmp_path, "snapshot_caller_owner")
+    conn.execute("CREATE TABLE snapshot_effect_probe (value TEXT)")
+    conn.commit()
+    prior_authority = _prepare_authority_rows(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("INSERT INTO snapshot_effect_probe VALUES ('caller-owned')")
+    observed = []
+    with pytest.raises(sqlite3.OperationalError, match="within a transaction"):
+        prepare_receipt_calculation(
+            conn,
+            ctx.receipt_public_id,
+            persistence_effect=lambda connection, snapshot: observed.append(snapshot),
+        )
+    assert conn.in_transaction
+    assert observed == []
+    assert conn.execute("SELECT value FROM snapshot_effect_probe").fetchone()[0] == "caller-owned"
+    assert _prepare_authority_rows(conn) == prior_authority
+    conn.rollback()
+
+
+@pytest.mark.parametrize("integrity_fallback", [False, True])
+def test_snapshot_persistence_effect_cannot_replace_canonical_owner_verification(
+    migrated_temp_db_connection: sqlite3.Connection,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    integrity_fallback: bool,
+) -> None:
+    conn = migrated_temp_db_connection
+    ctx, _ = _setup_active_fact_set(conn, tmp_path, "snapshot_owner_refusal")
+    prepared = prepare_receipt_calculation(conn, ctx.receipt_public_id)
+    # Disposable corruption: supplementary application evidence must never
+    # bless a snapshot whose owning calculation-run authority contradicts it.
+    conn.execute(
+        "UPDATE calc_audit_runs SET entity_id = 'wrong-receipt' WHERE run_id = ?",
+        (prepared.calculation_run_public_id,),
+    )
+    conn.commit()
+    prior_authority = _prepare_authority_rows(conn)
+    if integrity_fallback:
+
+        def lose_prepare_race(*args, **kwargs):
+            raise sqlite3.IntegrityError("concurrent identical prepare")
+
+        monkeypatch.setattr(fact_set_bridge, "_write_prepare_authority", lose_prepare_race)
+    observed = []
+    with pytest.raises(
+        fact_set_bridge.BridgeCalculationRunConflictError, match="different material"
+    ):
+        prepare_receipt_calculation(
+            conn,
+            ctx.receipt_public_id,
+            persistence_effect=lambda connection, snapshot: observed.append(snapshot),
+        )
+    assert observed == []
+    assert not conn.in_transaction
+    assert _prepare_authority_rows(conn) == prior_authority
 
 
 @pytest.mark.parametrize("reader", ["fresh", "replay", "recovery"])

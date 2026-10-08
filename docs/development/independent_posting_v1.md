@@ -104,6 +104,12 @@ remain owned by their existing guarded financial services. The Application
 uses deterministic command identities and binds their results to the same
 accepted attempt. Original source evidence is preserved.
 
+Each unfinished owning write rechecks accepted source, decision and current
+payer authority while holding its SQLite write lock. Snapshot preparation
+also binds the Application's snapshot evidence inside that same transaction;
+a refusal rolls back the new snapshot, calculation run and binding evidence.
+Previously committed accepted decisions and receipt facts remain recoverable.
+
 After the actual fact set and snapshot exist, Python rebuilds their financial
 projection and requires exact equality with the approved receipt calculation.
 The independent conditional-finalization proof binds the accepted review and
@@ -134,7 +140,10 @@ the canonical result to a reply owner cannot produce another transaction.
 
 Completed result readback verifies its historical accepted proof and canonical
 financial result. Missing, damaged or conflicting evidence refuses rather
-than reporting a successful posting. Correction-aware effective results are
+than reporting a successful posting. The coordination row's transaction
+reference cannot substitute for a missing conversion or finalization proof;
+only a verified owning result supplies the returned transaction identity.
+Correction-aware effective results are
 a separate work package; this entry must not claim an original transaction
 is current when unsupported correction material is present.
 
