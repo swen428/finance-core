@@ -36,7 +36,7 @@ from finance_core.telegram_source_context import (
 from tests.test_parser_human_drafts_v1 import _complete_validator
 from tests.test_receipt_facts_conversion_v1 import seed_people, seed_receipt_proposal
 
-LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:54]
 
 ACTOR = "111"
 ACCOUNT = "finance-account"

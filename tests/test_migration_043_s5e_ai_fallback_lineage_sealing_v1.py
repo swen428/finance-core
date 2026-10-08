@@ -20,7 +20,7 @@ from tests.test_migration_042_s5e_ai_fallback_provenance_foundation_v1 import (
 )
 
 PATHS_THROUGH_042 = TEMP_DB_MIGRATION_PATHS[:42]
-PATHS_BEFORE_D3_ROUTE = TEMP_DB_MIGRATION_PATHS[:-1]
+PATHS_BEFORE_D3_ROUTE = TEMP_DB_MIGRATION_PATHS[:54]
 HASH = "a" * 64
 
 

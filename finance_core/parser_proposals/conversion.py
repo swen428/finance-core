@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
-from finance_core.parser_proposals.service import (
+from finance_core.parser_proposals.decision_owner import (
     CONVERTED_TRANSACTION_PUBLIC_ID_PREFIX,
     AlreadyConvertedProposalError,
     InvalidProposalStatusError,
@@ -32,11 +32,11 @@ def validate_confirmed_proposal_for_transaction(
     # This function must not enable a caller to authorize conversion.  The
     # public converter always re-loads state inside its own transaction.
     from finance_core.parser_proposals.content_hash import compute_proposal_content_hash
-    from finance_core.parser_proposals.repository import ParserProposalRepository
-    from finance_core.parser_proposals.service import (
+    from finance_core.parser_proposals.decision_owner import (
         _require_active_authorization,
         resolve_simple_expense_conversion_fields,
     )
+    from finance_core.parser_proposals.repository import ParserProposalRepository
 
     proposal = ParserProposalRepository(conn).get(parser_output_id)
     if proposal is None:

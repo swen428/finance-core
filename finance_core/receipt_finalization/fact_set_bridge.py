@@ -18,9 +18,10 @@ calculation snapshot, the human authorization content hash, and the
 finalization audit, and that the finalizer re-reads the live active fact set
 inside its own ``BEGIN IMMEDIATE`` and fails closed on any drift.
 
-No new business rule, migration, calculator, snapshot, finalizer,
-transaction, or settlement authority is introduced.  See
-``docs/design/receipt_fact_set_calculation_finalization_bridge_v1.md``.
+The monetary calculator and canonical finalizer remain the owning services.
+Independent application posting adds an explicit conditional authority version
+whose immutable proof is verified on fresh writes and historical recovery.
+See ``docs/design/receipt_fact_set_calculation_finalization_bridge_v1.md``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from finance_core.application.review import review_snapshot
 from finance_core.calculation.authoritative_snapshot import (
     AuthoritativeCalculationSnapshot,
     AuthoritativeSnapshotRepository,
@@ -50,6 +52,16 @@ from finance_core.calculators.receipt_calculator_input_projection import (
     project_receipt_calculator_input,
 )
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
+from finance_core.receipt_finalization.application_conditional import (
+    APPLICATION_CONDITIONAL_VERSION,
+    ApplicationConditionalAuthorityError,
+    conditional_proof_sha256,
+    material_sha256,
+    participant_authority_sha256,
+    require_application_authorization_version,
+    require_application_conditional_authority,
+    require_application_receipt_acceptance,
+)
 from finance_core.receipt_finalization.d2_conditional import (
     D2ConditionalAuthorityError,
     build_d2_receipt_projection,
@@ -1161,6 +1173,194 @@ def authorize_d2_conditional_receipt_finalization(
     )
 
 
+def authorize_application_conditional_receipt_finalization(
+    conn: sqlite3.Connection,
+    prepared: PreparedReceiptCalculation,
+    *,
+    attempt_id: str,
+    persistence_effect: Callable[[sqlite3.Connection, ReceiptFinalizationAuthorization], None],
+    clock: Callable[[], str] | None = None,
+) -> ReceiptFinalizationAuthorization:
+    """Bind an independent accepted review to exact authoritative receipt truth.
+
+    The owning transaction rechecks acceptance, snapshot and current payer;
+    neither manual v1 nor D2 authorization can satisfy this authority version.
+    Trusted composition must supply supplementary source/decision revalidation
+    through ``persistence_effect``; it runs under the lock after proof checks.
+    """
+    require_staging_database(conn)
+    require_foreign_keys_enabled(conn)
+    created_at = _now(clock)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        acceptance = require_application_receipt_acceptance(conn, attempt_id)
+        review = acceptance["review"]
+        actor_id = str(review["binding"]["human_principal_id"])
+        fin_input = _build_finalization_input(
+            prepared, actor_type=HUMAN_ACTOR_TYPE, actor_id=actor_id
+        )
+        fingerprint = build_finalization_content_fingerprint(fin_input)
+        final_total = str(fin_input.calculation_snapshot.get("total_paid", ""))
+        if not final_total:
+            raise BridgePreparationError("Calculation snapshot has no total_paid")
+        obligations_json = _obligations_json(fin_input)
+        participants_json = json.dumps(sorted(fin_input.participant_public_ids))
+        evidence_json = json.dumps(sorted(prepared.source_evidence_refs))
+        binding = _require_snapshot_bound_authority(
+            conn, prepared, output_payload=fin_input.calculation_snapshot
+        )
+        projection = build_d2_receipt_projection(
+            merchant=prepared.confirmed_receipt_identity.merchant,
+            receipt_date=prepared.confirmed_receipt_identity.receipt_date,
+            currency=prepared.currency,
+            payer_participant_public_id=prepared.payer_participant_public_id,
+            calculation=prepared.calculation_result,
+        )
+        if projection != review["financial_projection"]:
+            raise BridgeAuthorizationConflictError(
+                "Accepted independent receipt projection differs from authoritative snapshot"
+            )
+        proof = {
+            "authorization_id": prepared.authorization_id,
+            "attempt_id": attempt_id,
+            "review_id": acceptance["review_id"],
+            "confirmation_public_id": acceptance["confirmation_public_id"],
+            "fact_set_public_id": binding.fact_set_public_id,
+            "fact_set_version": binding.fact_set_version,
+            "fact_set_input_hash": binding.fact_set_input_hash,
+            "fact_set_result_hash": binding.fact_set_result_hash,
+            "calculation_snapshot_id": prepared.calculation_snapshot_id,
+            "calculation_snapshot_hash": prepared.calculation_snapshot_hash,
+            "reviewed_projection_hash": material_sha256(review["financial_projection"]),
+            "snapshot_projection_hash": material_sha256(projection),
+            "payer_participant_public_id": prepared.payer_participant_public_id,
+            "payer_was_active_self": 1,
+            "active_self_count": 1,
+            "proof_version": APPLICATION_CONDITIONAL_VERSION,
+        }
+        proof["participant_authority_hash"] = participant_authority_sha256(proof)
+        proof["equality_proof_hash"] = conditional_proof_sha256(proof, acceptance)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO receipt_finalization_confirmations (
+                confirmation_id, receipt_group_public_id, calculation_run_public_id,
+                calculation_snapshot_id, content_hash, currency, final_total,
+                payer_participant_public_id, participant_public_ids_json,
+                settlement_obligations_json, actor_type, actor_id,
+                confirmation_state, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'human', ?, 'confirmed', ?)
+            """,
+            (
+                prepared.confirmation_id,
+                prepared.receipt_group_public_id,
+                prepared.calculation_run_public_id,
+                prepared.calculation_snapshot_id,
+                fingerprint,
+                prepared.currency,
+                final_total,
+                prepared.payer_participant_public_id,
+                participants_json,
+                obligations_json,
+                actor_id,
+                created_at,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO receipt_finalization_authorizations (
+                authorization_id, receipt_group_public_id, calculation_run_public_id,
+                calculation_snapshot_id, confirmation_id, content_hash,
+                currency, final_total, payer_participant_public_id,
+                participant_public_ids_json, settlement_obligations_json,
+                source_evidence_refs_json, actor_type, actor_id,
+                authorization_state, authorization_version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'human', ?,
+                      'authorized', 'application_conditional_v1', ?)
+            """,
+            (
+                prepared.authorization_id,
+                prepared.receipt_group_public_id,
+                prepared.calculation_run_public_id,
+                prepared.calculation_snapshot_id,
+                prepared.confirmation_id,
+                fingerprint,
+                prepared.currency,
+                final_total,
+                prepared.payer_participant_public_id,
+                participants_json,
+                obligations_json,
+                evidence_json,
+                actor_id,
+                created_at,
+            ),
+        )
+        append_fact_set_binding_evidence(
+            conn,
+            binding=binding,
+            bound_record_type="finalization_authorization",
+            bound_record_public_id=prepared.authorization_id,
+            created_at=created_at,
+        )
+        existing = conn.execute(
+            "SELECT * FROM application_conditional_authorization_proofs WHERE authorization_id = ?",
+            (prepared.authorization_id,),
+        ).fetchone()
+        if existing is None:
+            columns = tuple(proof)
+            placeholders = ", ".join("?" for _ in columns)
+            conn.execute(
+                "INSERT INTO application_conditional_authorization_proofs ("
+                + ", ".join(columns)
+                + ", created_at) VALUES ("
+                + placeholders
+                + ", ?)",
+                (*proof.values(), created_at),
+            )
+        elif any(existing[key] != value for key, value in proof.items()):
+            raise BridgeAuthorizationConflictError("Independent conditional proof conflict")
+        _require_persisted_authorization_truth(
+            conn,
+            prepared=prepared,
+            fingerprint=fingerprint,
+            final_total=final_total,
+            participants_json=participants_json,
+            obligations_json=obligations_json,
+            evidence_json=evidence_json,
+            actor_type=HUMAN_ACTOR_TYPE,
+            actor_id=actor_id,
+            expected_authorization_version=APPLICATION_CONDITIONAL_VERSION,
+        )
+        require_application_conditional_authority(
+            conn,
+            {
+                "authorization_id": prepared.authorization_id,
+                "calculation_snapshot_id": prepared.calculation_snapshot_id,
+                "actor_id": actor_id,
+            },
+            require_current_payer=True,
+        )
+        result = ReceiptFinalizationAuthorization(
+            authorization_id=prepared.authorization_id,
+            confirmation_id=prepared.confirmation_id,
+            content_hash=fingerprint,
+            actor_type=HUMAN_ACTOR_TYPE,
+            actor_id=actor_id,
+            prepared=prepared,
+        )
+
+        persistence_effect(conn, result)
+        conn.commit()
+    except ApplicationConditionalAuthorityError as exc:
+        if conn.in_transaction:
+            conn.rollback()
+        raise BridgeAuthorizationConflictError(str(exc)) from exc
+    except Exception:
+        if conn.in_transaction:
+            conn.rollback()
+        raise
+    return result
+
+
 def _require_snapshot_bound_authority(
     conn: sqlite3.Connection,
     prepared: PreparedReceiptCalculation,
@@ -1353,6 +1553,7 @@ def finalize_prepared_receipt(
     authorization: ReceiptFinalizationAuthorization,
     *,
     clock: Callable[[], str] | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
 ) -> FinalizationOutput:
     """Run the guarded finalizer for an authorized prepared receipt.
 
@@ -1370,7 +1571,9 @@ def finalize_prepared_receipt(
         actor_type=authorization.actor_type,
         actor_id=authorization.actor_id,
     )
-    return finalize_receipt_split(conn, fin_input, clock=clock)
+    return finalize_receipt_split(
+        conn, fin_input, clock=clock, persistence_effect=persistence_effect
+    )
 
 
 def verify_finalized_prepared_receipt(
@@ -1450,6 +1653,19 @@ def load_persisted_receipt_finalization_authorization(
     conn: sqlite3.Connection,
     authorization_id: str,
 ) -> ReceiptFinalizationAuthorization:
+    """Recover durable authority on one coherent read snapshot.
+
+    A caller-owned transaction is preserved; only a read transaction opened
+    here is ended. Existing authorization versions retain their validators.
+    """
+    with review_snapshot(conn):
+        return _load_persisted_receipt_finalization_authorization(conn, authorization_id)
+
+
+def _load_persisted_receipt_finalization_authorization(
+    conn: sqlite3.Connection,
+    authorization_id: str,
+) -> ReceiptFinalizationAuthorization:
     """Recover a persisted authorization from durable truth (read-only).
 
     Reconstructs the complete :class:`ReceiptFinalizationAuthorization` from
@@ -1458,7 +1674,7 @@ def load_persisted_receipt_finalization_authorization(
     cross-verified; any missing, malformed, stale, or contradictory durable
     truth fails closed with a typed error.
 
-    This function is strictly zero-write: it does not commit, roll back,
+    This helper is strictly zero-write: it does not commit, roll back,
     consume the authorization, or call the finalizer.  It exists to let the
     B5.1a staging runner verify that a previously authorized state can be
     safely rehydrated across process boundaries.
@@ -1505,11 +1721,17 @@ def load_persisted_receipt_finalization_authorization(
             f"Authorization {authorization_id!r} is in state {auth_state!r}; "
             "only 'authorized' or 'consumed' can be recovered"
         )
+    try:
+        require_application_authorization_version(
+            conn, {"authorization_id": authorization_id, **dict(auth)}
+        )
+    except ApplicationConditionalAuthorityError as exc:
+        raise BridgeRecoveryError(str(exc)) from exc
     auth_version = str(auth["authorization_version"])
-    if auth_version not in {"v1", "d2_conditional_v1"}:
+    if auth_version not in {"v1", "d2_conditional_v1", APPLICATION_CONDITIONAL_VERSION}:
         raise BridgeRecoveryError(
             f"Authorization {authorization_id!r} uses version {auth_version!r}; "
-            "only 'v1' and 'd2_conditional_v1' are supported"
+            "only v1, d2_conditional_v1 and application_conditional_v1 are supported"
         )
     if auth_version == "d2_conditional_v1":
         try:
@@ -1517,6 +1739,16 @@ def load_persisted_receipt_finalization_authorization(
                 conn, {"authorization_id": authorization_id, **dict(auth)}
             )
         except D2ConditionalAuthorityError as exc:
+            raise BridgeRecoveryError(str(exc)) from exc
+
+    if auth_version == APPLICATION_CONDITIONAL_VERSION:
+        try:
+            require_application_conditional_authority(
+                conn,
+                {"authorization_id": authorization_id, **dict(auth)},
+                require_current_payer=auth_state == "authorized",
+            )
+        except ApplicationConditionalAuthorityError as exc:
             raise BridgeRecoveryError(str(exc)) from exc
 
     receipt_group_public_id = str(auth["receipt_group_public_id"])
@@ -1850,6 +2082,7 @@ __all__ = [
     "PreparedReceiptCalculation",
     "ReceiptFactSetBridgeError",
     "ReceiptFinalizationAuthorization",
+    "authorize_application_conditional_receipt_finalization",
     "authorize_d2_conditional_receipt_finalization",
     "authorize_receipt_finalization",
     "finalize_prepared_receipt",

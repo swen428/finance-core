@@ -35,7 +35,7 @@ from tests.test_ai_fallback_service_v1 import (
 )
 from tests.test_parser_human_drafts_v1 import _connection, _start, _validation_payload
 
-LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:54]
 
 
 def _capture_current_d1_reply(workspace: object, text: str) -> str:

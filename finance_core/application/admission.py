@@ -187,6 +187,33 @@ def review_projection_sha256(projection: Mapping[str, object]) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def validate_verified_source(
+    source: VerifiedSource,
+    *,
+    binding: TrustedBinding,
+    intake_public_id: str,
+    now: int,
+) -> VerifiedSource:
+    """Validate typed source evidence in the fixed composition domain."""
+    if type(source) is not VerifiedSource or (
+        source.schema != SOURCE_SCHEMA
+        or source.namespace != binding.source_namespace
+        or source.key_id != binding.source_key_id
+        or source.instance_id != binding.instance_id
+        or source.submission_client_id != binding.submission_client_id
+        or source.intake_public_id != intake_public_id
+        or not _reference(source.evidence_id)
+        or not _reference(source.source_event_id)
+        or not _digest(source.source_content_hash)
+        or not _digest(source.evidence_digest)
+        or not _positive_int(source.source_occurred_at)
+        or not _positive_int(source.received_at)
+        or not source.source_occurred_at <= source.received_at <= now
+    ):
+        raise AdmissionError("Source evidence does not match trusted admission")
+    return source
+
+
 class AdmissionService:
     def __init__(
         self,
@@ -215,24 +242,12 @@ class AdmissionService:
 
     def _source(self, intake_public_id: str, now: int) -> VerifiedSource:
         source = self._source_verifier.verify_persisted(self._connection, intake_public_id)
-        binding = self._binding
-        if type(source) is not VerifiedSource or (
-            source.schema != SOURCE_SCHEMA
-            or source.namespace != binding.source_namespace
-            or source.key_id != binding.source_key_id
-            or source.instance_id != binding.instance_id
-            or source.submission_client_id != binding.submission_client_id
-            or source.intake_public_id != intake_public_id
-            or not _reference(source.evidence_id)
-            or not _reference(source.source_event_id)
-            or not _digest(source.source_content_hash)
-            or not _digest(source.evidence_digest)
-            or not _positive_int(source.source_occurred_at)
-            or not _positive_int(source.received_at)
-            or not source.source_occurred_at <= source.received_at <= now
-        ):
-            raise AdmissionError("Source evidence does not match trusted admission")
-        return source
+        return validate_verified_source(
+            source,
+            binding=self._binding,
+            intake_public_id=intake_public_id,
+            now=now,
+        )
 
     def admit_source(self, intake_public_id: str) -> SourceInspection:
         if not _reference(intake_public_id):

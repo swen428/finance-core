@@ -77,7 +77,10 @@ The returned observation can become stale immediately after the read snapshot.
 It is not a transferable capability or a promise of future posting. A future
 posting service must revalidate all bindings and atomically link decision
 consumption with its recoverable result inside its own guarded write unit of
-work. This entry does not implement that transaction.
+work. This entry does not implement that transaction. The additive
+[independent posting owner](independent_posting_v1.md) supplies its own complete
+posting commitment and guarded consumption/result transaction; it does not
+redefine this read-only observation or promote it into a transferable capability.
 
 ## Historical compatibility
 

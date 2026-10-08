@@ -25,7 +25,7 @@ from finance_core.openclaw_staging_bridge import ocr_boundary, workspace_access
 from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
 from finance_core.staging_guard import open_staging_database
 
-LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:54]
 
 
 @pytest.fixture()
