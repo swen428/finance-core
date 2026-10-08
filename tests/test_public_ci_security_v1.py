@@ -136,6 +136,12 @@ def _step_script(name: str) -> str:
         ("pull_request", "finance_core/intake/__init__.py", "true"),
         ("pull_request", "finance_core/intake/receipt_ocr_evidence.py", "true"),
         ("pull_request", "finance_core/intake/tesseract_resources.py", "true"),
+        ("pull_request", "finance_core/intake/receipt_media.py", "true"),
+        ("pull_request", "finance_core/intake/_receipt_media_worker.py", "true"),
+        ("pull_request", "tests/test_receipt_media_v1.py", "true"),
+        ("pull_request", "tests/test_receipt_media_vectors_v1.py", "true"),
+        ("pull_request", "tests/fixtures/receipt_media_v1/vectors.zip", "true"),
+        ("pull_request", "tests/fixtures/receipt_media_v1/nested/future-vector.json", "true"),
         ("pull_request", "finance_core/openclaw_staging_bridge/ocr_boundary.py", "true"),
         ("pull_request", "tests/test_tesseract_pinned_resources_v1.py", "true"),
         ("pull_request", "tests/test_linux_receipt_ocr_acceptance_v1.py", "true"),
@@ -249,6 +255,12 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "finance_core/parser_proposals/ai_example.py",
         "finance_core/intake/receipt_ocr_evidence.py",
         "finance_core/intake/tesseract_resources.py",
+        "finance_core/intake/receipt_media.py",
+        "finance_core/intake/_receipt_media_worker.py",
+        "tests/test_receipt_media_v1.py",
+        "tests/test_receipt_media_vectors_v1.py",
+        "tests/fixtures/receipt_media_v1/vectors.zip",
+        "tests/fixtures/receipt_media_v1/nested/future-vector.json",
         "finance_core/openclaw_staging_bridge/ocr_boundary.py",
         "tests/test_tesseract_pinned_resources_v1.py",
         "tests/test_linux_receipt_ocr_acceptance_v1.py",
@@ -344,3 +356,219 @@ def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> 
     assert patterns == [workflow_pattern.group(1)]
     assert 'totals["tests"] < 13' in source
     assert '("skipped", "failures", "errors")' in source
+
+
+def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    section = source.split("- name: Prepare isolated media acceptance account", 1)[1].split(
+        "- name: Set up exact Node runtime", 1
+    )[0]
+    assert "if: runner.os == 'Linux'" in section
+    assert "sudo -u financemedia -- env -i" in section
+    assert "FINANCE_LINUX_MEDIA_REQUIRED=1" in section
+    assert 'FINANCE_LINUX_OCR_CONFIG="$media_root/work/ocr/ocr_engine.json"' in section
+    assert "tests/test_receipt_media_vectors_v1.py" in section
+    assert 'totals["tests"] != 50' in section
+    assert "continue-on-error" not in section
+    assert "always() && runner.os == 'Linux'" in section
+    assert "${{ runner.temp }}/linux-media/" in section
+    assert "resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))" in section
+    assert "code_read_only" in section
+    assert '"CapEff", "CapPrm"' in section
+    assert 'item["current"] >= 16' in section
+    assert "remaining_uid_processes" in section
+    assert "os.O_NOFOLLOW" in section
+    assert "visited > 4096" in section
+    for label in ("PY_MEDIA_LAUNCH", "PY_MEDIA_PROOF", "PY_MEDIA_EXPORT"):
+        step = (
+            "Preserve actual Linux receipt media acceptance evidence"
+            if label.endswith("EXPORT")
+            else "Require actual Linux receipt media acceptance"
+        )
+        script = _step_script(step)
+        ast.parse(script.split("<<'" + label + "'\n", 1)[1].rsplit(label, 1)[0])
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def _media_proof_script() -> str:
+    script = _step_script("Require actual Linux receipt media acceptance")
+    return script.split("<<'PY_MEDIA_PROOF'\n", 1)[1].rsplit("PY_MEDIA_PROOF", 1)[0]
+
+
+def _media_report(path: Path, *, totals: tuple[int, int, int, int], variation: str = "") -> None:
+    import xml.etree.ElementTree as ET
+
+    tree = ast.parse(_media_proof_script())
+    ids = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "required_ids" for target in node.targets
+        )
+    )
+    names = ["test_vector_archive_is_bounded_synthetic_and_hash_verified"] + [
+        f"test_actual_linux_receipt_media_vector[{case}]" for case in ids
+    ]
+    assert len(names) == len(set(names)) == 50
+    if variation == "duplicate":
+        names[-1] = names[-2]
+    elif variation == "missing":
+        names.pop()
+    elif variation == "unknown":
+        names[-1] = "unrelated_padding_test"
+    report = ET.Element("testsuites")
+    suite = ET.SubElement(
+        report,
+        "testsuite",
+        dict(zip(("tests", "skipped", "failures", "errors"), map(str, totals), strict=True)),
+    )
+    for name in names:
+        case = ET.SubElement(suite, "testcase", name=name)
+        if variation == "hidden_skip" and name == names[-1]:
+            ET.SubElement(case, "skipped")
+    ET.ElementTree(report).write(path, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("totals", "variation", "expected_exit"),
+    [
+        ((49, 0, 0, 0), "", 1),
+        ((50, 1, 0, 0), "", 1),
+        ((50, 0, 1, 0), "", 1),
+        ((50, 0, 0, 1), "", 1),
+        ((50, 0, 0, 0), "duplicate", 1),
+        ((50, 0, 0, 0), "missing", 1),
+        ((50, 0, 0, 0), "unknown", 1),
+        ((50, 0, 0, 0), "hidden_skip", 1),
+        ((50, 0, 0, 0), "", 0),
+    ],
+)
+def test_actual_media_proof_rejects_incomplete_or_skipped_inventory(
+    tmp_path: Path, totals: tuple[int, int, int, int], variation: str, expected_exit: int
+) -> None:
+    import sys
+
+    report = tmp_path / "proof.xml"
+    _media_report(report, totals=totals, variation=variation)
+    result = subprocess.run(
+        [sys.executable, "-I", "-", str(report), str(os.getuid())],
+        input=_media_proof_script(),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == expected_exit, result.stderr
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "hardlink", "oversize", "entity", "owner"])
+def test_actual_media_report_refuses_unsafe_files(tmp_path: Path, unsafe: str) -> None:
+    import sys
+
+    report = tmp_path / "proof.xml"
+    _media_report(report, totals=(50, 0, 0, 0))
+    owner = os.getuid()
+    if unsafe == "symlink":
+        original = tmp_path / "original.xml"
+        report.rename(original)
+        report.symlink_to(original)
+    elif unsafe == "hardlink":
+        os.link(report, tmp_path / "alias.xml")
+    elif unsafe == "oversize":
+        report.write_bytes(b"x" * 2_097_153)
+    elif unsafe == "entity":
+        report.write_bytes(
+            b'<!DOCTYPE testsuites [<!ENTITY injected "unsafe">]>' + report.read_bytes()
+        )
+    else:
+        owner += 1
+    result = subprocess.run(
+        [sys.executable, "-I", "-", str(report), str(owner)],
+        input=_media_proof_script(),
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "variant", ["regular", "file_link", "directory_link", "hardlink", "oversize", "survivor"]
+)
+def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant: str) -> None:
+    """Exercise export bytes with a synthetic UID/proc adapter, never native Linux admission."""
+    import hashlib
+    import sys
+
+    source = tmp_path / "work"
+    source.mkdir(mode=0o700)
+    evidence = source / "evidence"
+    evidence.mkdir(mode=0o700)
+    raw = b"immutable synthetic original\x00"
+    member = evidence / "original.bin"
+    member.write_bytes(raw)
+    member.chmod(0o400)
+    proc = tmp_path / "synthetic-proc"
+    proc.mkdir()
+    if variant == "survivor":
+        process = proc / "123"
+        process.mkdir()
+        (process / "status").write_text(
+            f"Uid:\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\t{os.getuid()}\n"
+        )
+    elif variant == "file_link":
+        member.unlink()
+        member.symlink_to(tmp_path / "unrelated")
+    elif variant == "directory_link":
+        member.unlink()
+        evidence.rmdir()
+        evidence.symlink_to(proc, target_is_directory=True)
+    elif variant == "hardlink":
+        os.link(member, evidence / "alias.bin")
+    elif variant == "oversize":
+        member.chmod(0o600)
+        with member.open("wb") as output:
+            output.truncate(20_000_001)
+        member.chmod(0o400)
+
+    shell = _step_script("Preserve actual Linux receipt media acceptance evidence")
+    export = shell.split("<<'PY_MEDIA_EXPORT'\n", 1)[1].rsplit("PY_MEDIA_EXPORT", 1)[0]
+    tree = ast.parse(export)
+    # Adapt only OS admission observations to an unprivileged synthetic test host.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "/proc":
+            node.value = str(proc)
+        if (
+            isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Attribute)
+            and isinstance(node.left.value, ast.Name)
+            and node.left.value.id == "parent_info"
+            and node.left.attr == "st_uid"
+        ):
+            node.comparators = [ast.Constant(value=os.getuid())]
+    adapter = (
+        "import pwd, types, os\n"
+        "pwd.getpwnam = lambda _: types.SimpleNamespace(pw_uid=os.getuid())\n"
+    )
+    destination = tmp_path / "export"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-",
+            str(source),
+            str(destination),
+            str(os.getuid()),
+            str(os.getgid()),
+        ],
+        input=adapter + ast.unparse(ast.fix_missing_locations(tree)),
+        text=True,
+        capture_output=True,
+    )
+    if variant == "regular":
+        assert result.returncode == 0, result.stderr
+        copied = destination / "evidence/original.bin"
+        assert copied.read_bytes() == member.read_bytes() == raw
+        assert hashlib.sha256(copied.read_bytes()).digest() == hashlib.sha256(raw).digest()
+        assert copied.stat().st_mode & 0o777 == member.stat().st_mode & 0o777 == 0o400
+    else:
+        assert result.returncode != 0
+        assert not (destination / "evidence/original.bin").exists()

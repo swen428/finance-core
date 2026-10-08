@@ -122,3 +122,29 @@ skips do not constitute this acceptance. OCR sources, tests, fixtures and asset
 locks require Bridge scope, including their deletion or rename. Workflow and
 independent candidate verification recompute the same complete changed-path
 classification. See [the pinned Linux OCR contract](linux_receipt_ocr_v1.md).
+
+
+## Actual Linux receipt media acceptance
+
+The existing mandatory Ubuntu 24.04 Bridge lane also runs the actual bounded
+receipt-media worker through `tests/test_receipt_media_vectors_v1.py`. It uses
+the exact hash-locked optional `media` dependencies and the separately pinned
+local Tesseract preparation. `FINANCE_LINUX_MEDIA_REQUIRED=1` makes a missing
+platform, decoder or OCR configuration fail; the JUnit inventory must contain
+exactly 50 named tests (the archive check and all 49 media cases), each executed
+with zero skips/errors/failures. A fresh non-root account owns separate pinned
+OCR assets, with no effective/permitted capabilities and verified UID/cgroup
+process headroom before the bounded worker starts. The test account cannot
+write the checkout or dependency environment. The lane preserves
+its admission receipt, JUnit and bounded synthetic original/PNG/result evidence, including failure
+records, as `linux-media-acceptance-<run>-<attempt>`.
+
+Media source/worker modules, their unit/vector tests and the whole
+`tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
+modification, deletion and rename. The workflow and independent verifier
+recompute identical path scope. Neither an ordinary skipped test nor the older
+JPEG/PNG staging OCR lane establishes this new worker's actual acceptance.
+See [the receipt-media contract](receipt_media_v1.md) for exact received-original,
+normalization, actual OCR fingerprint, orientation and refusal semantics. This
+is a standalone verified media evidence component; existing financial posting,
+transport and managed backup do not automatically consume its records.

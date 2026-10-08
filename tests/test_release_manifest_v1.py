@@ -5,6 +5,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -148,7 +149,13 @@ def _write_bridge_source(source_root: Path) -> dict[str, bytes]:
     return package_files
 
 
-def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
+def _write_valid_release_fixture(
+    tmp_path: Path,
+    *,
+    media: bool = True,
+    extra_name: str = "media",
+    media_dependencies: tuple[str, ...] = ("Pillow==12.3.0", "pillow-heif==1.8.0"),
+) -> tuple[Path, Path, str]:
     source_root = tmp_path / "source"
     shutil.copytree(REPOSITORY_ROOT / "finance_core", source_root / "finance_core")
     (source_root / "scripts").mkdir(parents=True)
@@ -163,6 +170,20 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     }
     for name in release_source_names:
         shutil.copy2(REPOSITORY_ROOT / name, source_root / name)
+    project = source_root / "pyproject.toml"
+    project_source = re.sub(
+        r"\n\[project.optional-dependencies\]\n.*?(?=\n\[)",
+        "",
+        project.read_text(),
+        flags=re.DOTALL,
+    )
+    if media:
+        extra = "\n[project.optional-dependencies]\n" + json.dumps(extra_name)
+        extra += " = " + json.dumps(list(media_dependencies)) + "\n"
+        project_source = project_source.replace(
+            "\n[tool.setuptools", extra + "\n[tool.setuptools", 1
+        )
+    project.write_text(project_source)
     bridge_files = _write_bridge_source(source_root)
     subprocess.run(["git", "init", "--quiet"], cwd=source_root, check=True)
     subprocess.run(
@@ -214,8 +235,18 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
         "License-File: THIRD_PARTY_NOTICES.md\n"
         "Requires-Dist: pypdf==6.16.1\n"
         "Requires-Dist: typing-extensions==4.16.0\n"
-        "Dynamic: license-file\n\n"
-    ).encode() + (source_root / "README.md").read_bytes()
+    )
+    if media:
+        metadata += f"Provides-Extra: {extra_name}\n"
+        metadata += "".join(
+            f'Requires-Dist: {item}; extra == "{extra_name}"\n' for item in media_dependencies
+        )
+    metadata = (metadata + "Dynamic: license-file\n\n").encode()
+    metadata += (source_root / "README.md").read_bytes()
+    requires = b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"
+    if media:
+        requires += f"\n[{extra_name}]\n".encode()
+        requires += "".join(f"{item}\n" for item in media_dependencies).encode()
     wheel_metadata = (
         b"Wheel-Version: 1.0\nGenerator: setuptools (84.0.0)\n"
         b"Root-Is-Purelib: true\nTag: py3-none-any\n\n"
@@ -255,7 +286,7 @@ def _write_valid_release_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
             "PKG-INFO": metadata,
             "finance_core.egg-info/PKG-INFO": metadata,
             "finance_core.egg-info/dependency_links.txt": b"\n",
-            "finance_core.egg-info/requires.txt": (b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"),
+            "finance_core.egg-info/requires.txt": requires,
             "finance_core.egg-info/top_level.txt": b"finance_core\n",
         }
     )
@@ -737,3 +768,175 @@ def test_release_manifest_rejects_version_or_artifact_ambiguity(tmp_path: Path) 
 
     assert completed.returncode != 0
     assert "expected exactly one Bridge package for version 0.1.6" in completed.stderr
+
+
+def _rewrite_sdist(sdist: Path, updates: dict[str, bytes]) -> None:
+    with tarfile.open(sdist, "r:gz") as archive:
+        members = archive.getmembers()
+        payloads = {
+            member.name: archive.extractfile(member).read() for member in members if member.isfile()
+        }
+    assert set(updates) <= set(payloads)
+    payloads.update(updates)
+    with tarfile.open(sdist, "w:gz") as archive:
+        for member in members:
+            if member.isdir():
+                _add_tar_directory(archive, member.name)
+            else:
+                _add_tar_file(archive, member.name, payloads[member.name])
+
+
+def _refused_media_fixture(artifacts: Path, source_root: Path, core_commit: str) -> str:
+    result = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+    return result.stderr
+
+
+def test_release_manifest_preserves_historical_no_extra_metadata(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path, media=False)
+    result = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(artifacts / "finance_core-0.1.6-py3-none-any.whl") as archive:
+        metadata = archive.read("finance_core-0.1.6.dist-info/METADATA")
+    assert b"Provides-Extra:" not in metadata
+    with tarfile.open(artifacts / "finance_core-0.1.6.tar.gz") as archive:
+        requires = archive.extractfile(
+            "finance_core-0.1.6/finance_core.egg-info/requires.txt"
+        ).read()
+    assert requires == b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"
+
+
+@pytest.mark.parametrize(
+    ("extra_name", "dependencies"),
+    [
+        ("unknown", ("Pillow==12.3.0", "pillow-heif==1.8.0")),
+        ("media", ("Pillow==12.2.0", "pillow-heif==1.8.0")),
+        ("media", ("Pillow>=12.3.0", "pillow-heif==1.8.0")),
+        ("media", ("Pillow @ https://example.invalid/pillow.whl", "pillow-heif==1.8.0")),
+        ("media", ("Pillow==12.3.0", "pillow-heif>=1.8.0")),
+        ("media", ("Pillow==12.3.0",)),
+        ("media", ("Pillow==12.3.0", "pillow-heif==1.8.0", "unknown==1.0")),
+    ],
+)
+def test_release_rejects_consistent_unapproved_optional_dependencies(
+    tmp_path: Path, extra_name: str, dependencies: tuple[str, ...]
+) -> None:
+    # The source is committed and all three metadata records plus requires.txt
+    # agree; only the independent approved profile may reject this fixture.
+    artifacts, source_root, core_commit = _write_valid_release_fixture(
+        tmp_path, extra_name=extra_name, media_dependencies=dependencies
+    )
+    error = _refused_media_fixture(artifacts, source_root, core_commit)
+    assert "optional dependencies are not the approved contract" in error
+    assert "source root must be clean" not in error
+
+
+@pytest.mark.parametrize("media", [False, True])
+def test_release_rejects_source_wheel_optional_profile_mismatch(
+    tmp_path: Path, media: bool
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path, media=media)
+    wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
+    name = "finance_core-0.1.6.dist-info/METADATA"
+    with zipfile.ZipFile(wheel) as archive:
+        metadata = archive.read(name)
+    extra = (
+        b"Provides-Extra: media\n"
+        b'Requires-Dist: Pillow==12.3.0; extra == "media"\n'
+        b'Requires-Dist: pillow-heif==1.8.0; extra == "media"\n'
+    )
+    if media:
+        assert extra in metadata
+        metadata = metadata.replace(extra, b"")
+    else:
+        metadata = metadata.replace(b"Dynamic: license-file\n", extra + b"Dynamic: license-file\n")
+    _rewrite_wheel(wheel, {name: metadata})
+    assert "metadata" in _refused_media_fixture(artifacts, source_root, core_commit)
+
+
+@pytest.mark.parametrize("location", ["wheel", "PKG-INFO", "finance_core.egg-info/PKG-INFO"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-extra",
+        "duplicate-extra",
+        "unknown-extra",
+        "missing-condition",
+        "other-condition",
+        "true-condition",
+    ],
+)
+def test_release_rejects_each_unapproved_optional_metadata_record(
+    tmp_path: Path, location: str, mutation: str
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
+    sdist = artifacts / "finance_core-0.1.6.tar.gz"
+    if location == "wheel":
+        name = "finance_core-0.1.6.dist-info/METADATA"
+        with zipfile.ZipFile(wheel) as archive:
+            metadata = archive.read(name)
+    else:
+        name = "finance_core-0.1.6/" + location
+        with tarfile.open(sdist) as archive:
+            metadata = archive.extractfile(name).read()
+    replacements = {
+        "missing-extra": (b"Provides-Extra: media\n", b""),
+        "duplicate-extra": (
+            b"Provides-Extra: media\n",
+            b"Provides-Extra: media\nProvides-Extra: media\n",
+        ),
+        "unknown-extra": (b"Provides-Extra: media\n", b"Provides-Extra: unknown\n"),
+        "missing-condition": (b'Pillow==12.3.0; extra == "media"', b"Pillow==12.3.0"),
+        "other-condition": (
+            b'Pillow==12.3.0; extra == "media"',
+            b'Pillow==12.3.0; extra == "other"',
+        ),
+        "true-condition": (
+            b'Pillow==12.3.0; extra == "media"',
+            b'Pillow==12.3.0; python_version >= "3.0"',
+        ),
+    }
+    before, after = replacements[mutation]
+    assert before in metadata
+    metadata = metadata.replace(before, after)
+    if location == "wheel":
+        _rewrite_wheel(wheel, {name: metadata})
+    else:
+        _rewrite_sdist(sdist, {name: metadata})
+    assert "metadata" in _refused_media_fixture(artifacts, source_root, core_commit)
+
+
+@pytest.mark.parametrize(
+    "requires",
+    [
+        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n",
+        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n\n[other]\nPillow==12.3.0\npillow-heif==1.8.0\n",
+        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n\n[media]\nPillow>=12.3.0\npillow-heif==1.8.0\n",
+    ],
+)
+def test_release_rejects_sdist_optional_requires_inventory(tmp_path: Path, requires: bytes) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    sdist = artifacts / "finance_core-0.1.6.tar.gz"
+    _rewrite_sdist(sdist, {"finance_core-0.1.6/finance_core.egg-info/requires.txt": requires})
+    assert "dependency metadata" in _refused_media_fixture(artifacts, source_root, core_commit)

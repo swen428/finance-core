@@ -105,8 +105,8 @@ def verify(
     pattern = re.compile(
         r"^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|"
         r"plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|"
-        r"application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|"
-        r"parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))"
+        r"application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|"
+        r"parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))"
     )
     actual_scope = any(
         pattern.search(path)

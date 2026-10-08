@@ -15,6 +15,12 @@ dependencies = [
     "typing-extensions==4.16.0",
 ]
 
+[project.optional-dependencies]
+media = [
+    "Pillow==12.3.0",
+    "pillow-heif==1.8.0",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["finance_core*"]

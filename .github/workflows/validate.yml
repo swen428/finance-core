@@ -64,7 +64,7 @@ jobs:
           fi
           changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
           git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
-          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
@@ -286,6 +286,222 @@ jobs:
             ${{ runner.temp }}/linux-ocr/preparation-receipt.json
             ${{ runner.temp }}/linux-ocr-preparation-failure.json
             ${{ runner.temp }}/linux-ocr-acceptance.xml
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Prepare isolated media acceptance account and OCR assets
+        if: runner.os == 'Linux'
+        run: |
+          if getent passwd financemedia; then
+            echo "The synthetic media account must be fresh" >&2
+            exit 1
+          fi
+          case "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" in
+            *[!0-9:]*|:*) exit 1 ;;
+          esac
+          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$media_root"
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin financemedia
+          sudo install -d -m 0755 -o root -g root "$media_root"
+          sudo install -d -m 0700 -o financemedia -g financemedia "$media_root/work"
+          sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
+            TMPDIR="$media_root/work" "$GITHUB_WORKSPACE/.venv/bin/python" -I -B \
+            "$GITHUB_WORKSPACE/scripts/prepare_linux_ocr.py" \
+            --executable /usr/bin/tesseract --destination "$media_root/work/ocr"
+
+      - name: Require actual Linux receipt media acceptance
+        if: runner.os == 'Linux'
+        run: |
+          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
+            TMPDIR="$media_root/work" FINANCE_LINUX_MEDIA_REQUIRED=1 \
+            FINANCE_LINUX_OCR_CONFIG="$media_root/work/ocr/ocr_engine.json" \
+            FINANCE_LINUX_MEDIA_EVIDENCE="$media_root/work/evidence" \
+            "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$GITHUB_WORKSPACE" "$media_root/work" <<'PY_MEDIA_LAUNCH'
+          import json
+          import os
+          import platform
+          import pwd
+          import resource
+          import sys
+          from pathlib import Path
+          repository, work = map(Path, sys.argv[1:])
+          uid = pwd.getpwnam("financemedia").pw_uid
+          status = Path("/proc/self/status").read_text()
+          caps = {key: next(line.split()[1] for line in status.splitlines() if line.startswith(key + ":")) for key in ("CapEff", "CapPrm")}
+          identities = (os.getuid(), os.geteuid(), os.getgid(), os.getegid())
+          resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
+          tasks = []
+          for process in Path("/proc").iterdir():
+              if not process.name.isdecimal():
+                  continue
+              try:
+                  lines = (process / "status").read_text().splitlines()
+                  real_uid = int(next(line.split()[1] for line in lines if line.startswith("Uid:")))
+                  if real_uid == uid:
+                      tasks.append({"pid": int(process.name), "threads": len(list((process / "task").iterdir()))})
+              except FileNotFoundError:
+                  continue
+          cgroups = []
+          control = next(line.split(":", 2)[2] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
+          group = Path("/sys/fs/cgroup") / control.lstrip("/")
+          while group.is_relative_to(Path("/sys/fs/cgroup")):
+              # Cgroup-v2 root has no configurable pids.max on some kernels.
+              if group == Path("/sys/fs/cgroup") and not (group / "pids.max").exists():
+                  cgroups.append({"group": str(group), "current": 0, "max": "max", "root_has_no_limit": True})
+              else:
+                  current = (group / "pids.current").read_text().strip()
+                  maximum = (group / "pids.max").read_text().strip()
+                  cgroups.append({"group": str(group), "current": int(current), "max": maximum})
+              if group == Path("/sys/fs/cgroup"):
+                  break
+              group = group.parent
+          code_read_only = all(not os.access(path, os.W_OK) for path in (repository, repository / ".venv", repository / "finance_core/intake/receipt_media.py", repository / "finance_core/intake/_receipt_media_worker.py"))
+          receipt = {"schema": "finance-media-ci-admission-v1", "platform": [sys.platform, platform.machine(), platform.freedesktop_os_release().get("ID"), platform.freedesktop_os_release().get("VERSION_ID")], "uid_gid": identities, "capabilities": caps, "uid_tasks": tasks, "nproc": resource.getrlimit(resource.RLIMIT_NPROC), "caller_os_threads": len(list(Path("/proc/self/task").iterdir())), "cgroup_pids": cgroups, "code_read_only": code_read_only, "interpreter": sys.executable, "python_prefix": sys.prefix}
+          admitted = receipt["platform"] == ["linux", "x86_64", "ubuntu", "24.04"] and identities[0] == identities[1] == uid != 0 and identities[2] == identities[3] and all(int(value, 16) == 0 for value in caps.values()) and tasks == [{"pid": os.getpid(), "threads": 1}] and code_read_only and all(item["max"] == "max" or int(item["max"]) - item["current"] >= 16 for item in cgroups)
+          receipt["admission"] = "PASS" if admitted else "REFUSED"
+          target = work / "preflight.json"
+          target.write_text(json.dumps(receipt, sort_keys=True) + "\n")
+          target.chmod(0o400)
+          if not admitted:
+              raise SystemExit("Dedicated non-root media worker admission refused")
+          os.chdir(repository)
+          # Preserve the .venv executable spelling; resolving its symlink loses the environment.
+          os.execv(sys.executable, [sys.executable, "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests/test_receipt_media_vectors_v1.py", "--basetemp=" + str(work / "tests"), "--junitxml=" + str(work / "acceptance.xml"), "--durations=15"])
+          PY_MEDIA_LAUNCH
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work/acceptance.xml" "$(id -u financemedia)" <<'PY_MEDIA_PROOF'
+          import os
+          import stat
+          import sys
+          import xml.etree.ElementTree as ET
+          fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+          with os.fdopen(fd, "rb") as report:
+              info = os.fstat(report.fileno())
+              if not stat.S_ISREG(info.st_mode) or info.st_uid != int(sys.argv[2]) or info.st_nlink != 1 or info.st_size > 2_097_152:
+                  raise SystemExit("Unsafe media acceptance report")
+              data = report.read(2_097_153)
+          if len(data) > 2_097_152 or b"<!DOCTYPE" in data.upper() or b"<!ENTITY" in data.upper():
+              raise SystemExit("Unsafe media acceptance XML")
+          root = ET.fromstring(data)
+          suites = list(root.iter("testsuite"))
+          totals = {key: sum(int(suite.get(key, "0")) for suite in suites) for key in ("tests", "skipped", "failures", "errors")}
+          required_ids = ('apng_two_frames', 'heif_10bit_receipt', 'heif_12mp', 'heif_24mp', 'heif_48mp', 'heif_8bit_receipt', 'heif_conflict_exif_xmp', 'heif_corrupt', 'heif_declared_type_mismatch', 'heif_duplicate_event_first', 'heif_duplicate_event_second', 'heif_exact_replay', 'heif_filename_with_periods', 'heif_imir_0', 'heif_imir_1', 'heif_invalid_orientation_9', 'heif_irot_1', 'heif_irot_3', 'heif_metadata_orientation_6', 'heif_multi', 'heif_pattern', 'heif_pattern_generic', 'heif_sequence_brand', 'heif_truncated', 'heif_xmp_metadata_orientation_6', 'jpeg_conflict_exif_xmp', 'jpeg_exif_1', 'jpeg_exif_2', 'jpeg_exif_3', 'jpeg_exif_4', 'jpeg_exif_5', 'jpeg_exif_6', 'jpeg_exif_7', 'jpeg_exif_8', 'jpeg_invalid_orientation', 'jpeg_xmp_only', 'png_alpha_white_matte', 'png_disguised_as_heic', 'png_exif_1', 'png_exif_2', 'png_exif_3', 'png_exif_4', 'png_exif_5', 'png_exif_6', 'png_exif_7', 'png_exif_8', 'png_exif_post_idat_orientation_6', 'png_filename_type_mismatch', 'unsupported_gif')
+          required = {"test_vector_archive_is_bounded_synthetic_and_hash_verified"} | {"test_actual_linux_receipt_media_vector[" + case + "]" for case in required_ids}
+          cases = list(root.iter("testcase"))
+          names = [case.get("name") for case in cases]
+          if totals["tests"] != 50 or any(totals[key] for key in ("skipped", "failures", "errors")) or len(names) != 50 or set(names) != required or any(list(case) for case in cases):
+              raise SystemExit("Actual Linux media requires exactly 50 named tests and zero skips/errors")
+          print("Actual Linux media acceptance:", totals)
+          PY_MEDIA_PROOF
+
+      - name: Preserve actual Linux receipt media acceptance evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        run: |
+          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work" "$RUNNER_TEMP/linux-media" "$(id -u)" "$(id -g)" <<'PY_MEDIA_EXPORT'
+          import json
+          import os
+          import pwd
+          import stat
+          import sys
+          from pathlib import Path
+          source, destination = map(Path, sys.argv[1:3])
+          owner, group = map(int, sys.argv[3:])
+          uid = pwd.getpwnam("financemedia").pw_uid
+          root_info = source.lstat()
+          if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != uid or stat.S_IMODE(root_info.st_mode) != 0o700:
+              raise SystemExit("Unsafe media export workspace")
+          # The root-owned task parent must not allow source substitution.
+          parent_info = source.parent.lstat()
+          if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
+              raise SystemExit("Unsafe media export parent")
+          survivors = []
+          for process in Path("/proc").iterdir():
+              if not process.name.isdecimal():
+                  continue
+              try:
+                  lines = (process / "status").read_text().splitlines()
+                  if int(next(line.split()[1] for line in lines if line.startswith("Uid:"))) == uid:
+                      survivors.append(int(process.name))
+              except FileNotFoundError:
+                  continue
+          destination.mkdir(mode=0o700)
+          os.chown(destination, owner, group)
+          cleanup = destination / "export-state.json"
+          cleanup.write_text(json.dumps({"schema": "finance-media-ci-export-v1", "remaining_uid_processes": survivors}) + "\n")
+          os.chown(cleanup, owner, group)
+          cleanup.chmod(0o400)
+          if survivors:
+              raise SystemExit("Media processes remain; no mutable bundle export permitted")
+          def identity(info):
+              return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+          def owned_directory(path):
+              info = path.lstat()
+              if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+                  raise SystemExit("Unsafe media export directory")
+              return identity(info)
+          # No process owns this UID now; still reject links and verify held-file identities.
+          visited = total = 0
+          def copy_member(path):
+              global visited, total
+              visited += 1
+              if visited > 4096:
+                  raise SystemExit("Media evidence export exceeds member bound")
+              before = path.lstat()
+              if stat.S_ISDIR(before.st_mode):
+                  directory_id = owned_directory(path)
+                  with os.scandir(path) as children:
+                      for child in children:
+                          copy_member(Path(child.path))
+                  if owned_directory(path) != directory_id:
+                      raise SystemExit("Media export directory changed")
+                  return
+              if not stat.S_ISREG(before.st_mode) or before.st_uid != uid or before.st_nlink != 1 or before.st_size > 20_000_000:
+                  raise SystemExit("Unsafe media evidence export member")
+              total += before.st_size
+              if total > 536_870_912:
+                  raise SystemExit("Media evidence export exceeds 512 MiB")
+              target = destination / path.relative_to(source)
+              target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+              for directory in (target.parent, *target.parent.parents):
+                  if not directory.is_relative_to(destination):
+                      break
+                  os.chown(directory, owner, group)
+                  directory.chmod(0o700)
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as incoming, target.open("xb") as output:
+                  if identity(os.fstat(incoming.fileno())) != identity(before):
+                      raise SystemExit("Media evidence substituted before export")
+                  remaining = before.st_size
+                  while remaining:
+                      chunk = incoming.read(min(65536, remaining))
+                      if not chunk:
+                          raise SystemExit("Truncated media export")
+                      output.write(chunk)
+                      remaining -= len(chunk)
+                  if incoming.read(1) or identity(os.fstat(incoming.fileno())) != identity(before) or identity(path.lstat()) != identity(before):
+                      raise SystemExit("Media evidence changed during export")
+              os.chown(target, owner, group)
+              target.chmod(0o400)
+          for name in ("preflight.json", "acceptance.xml", "evidence", "ocr/preparation-receipt.json", "ocr-preparation-failure.json"):
+              selected = source / name
+              try:
+                  selected.lstat()
+              except FileNotFoundError:
+                  continue
+              for parent in selected.parents:
+                  if parent == source:
+                      break
+                  owned_directory(parent)
+              copy_member(selected)
+          PY_MEDIA_EXPORT
+
+      - name: Upload actual Linux receipt media acceptance evidence
+        if: ${{ always() && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: linux-media-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-media/
           retention-days: 30
           if-no-files-found: warn
 
