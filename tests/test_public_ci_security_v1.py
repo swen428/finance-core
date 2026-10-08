@@ -6,7 +6,7 @@ import re
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -40,6 +40,7 @@ def test_bridge_lane_is_conditional_and_uses_exact_runtime() -> None:
     assert "needs.classify.outputs.bridge == 'true'" in source
     assert 'node-version: "24.15.0"' in source
     assert "matrix:\n        os: [ubuntu-latest, macos-15]" in source
+    assert "python-version: \"${{ runner.os == 'Linux' && '3.12.14' || '3.12.10' }}\"" in source
     assert "PYTHON_EXECUTABLE: ${{ github.workspace }}/.venv/bin/python" in source
     assert "Require exact reviewed Bridge build output" in source
     assert (
@@ -430,7 +431,18 @@ def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
     assert '"system.posix_acl_access"' in section
     assert '"system.posix_acl_default"' in section
     assert '"--no-mask"' in section
-    assert ":r-X" in section
+    assert ":r-X" not in section
+    assert "for permissions in (4, 5)" in section
+    assert "record[-1] == permissions" in section
+    assert "for start in range(0, len(group), 128)" in section
+    assert 'f"u:{fin_uid}:{permissions}"' in section
+    assert "class SdkAclRefusal(ValueError)" in section
+    assert "error.detail" in section
+    assert 'result["failure_detail"] = error.detail' in section
+    assert '"path_truncated"' in section
+    assert "before_access_sha256=acl_digest(access)" in section
+    assert "after_default_sha256=acl_digest(actual_default)" in section
+    assert '"other_subjects_raw_effective_and_mask_unchanged"' in section
     assert "Existing ACL mask cannot admit read/execute without expansion" in section
     assert '"other_subjects_effective_permissions_and_default_acl": "UNCHANGED"' in section
     assert '"mask_recalculation": False' in section
@@ -733,6 +745,19 @@ def _synthetic_acl_for_mode(mode: int) -> bytes:
     return _encode_synthetic_acl(entries)
 
 
+def _synthetic_masked_raw_execute_acl() -> bytes:
+    return _encode_synthetic_acl(
+        {
+            (1, None): 6,
+            (2, 12345): 4,
+            (4, None): 7,
+            (8, 23456): 4,
+            (16, None): 6,
+            (32, None): 6,
+        }
+    )
+
+
 def test_selected_sdk_validator_binds_fixed_path_version_and_hashes(tmp_path: Path) -> None:
     """Validate selected SDK checks against tiny synthetic files, not the hosted SDK."""
     import hashlib
@@ -794,8 +819,11 @@ def test_selected_sdk_validator_binds_fixed_path_version_and_hashes(tmp_path: Pa
         validate(sdk_root, binary, os.getuid())
 
 
-def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -> None:
-    """Use synthetic xattr/setfacl adapters; native Linux POSIX ACL execution is NOT_RUN."""
+@pytest.mark.parametrize("mutation", ["none", "other_raw_only", "fin_write"])
+def test_sdk_acl_adapter_models_gnu_x_and_preserves_other_subjects(
+    tmp_path: Path, mutation: str
+) -> None:
+    """Model GNU raw-entry X with fake ACL adapters; native Linux ACL execution is NOT_RUN."""
     import os
     import stat
     from types import SimpleNamespace
@@ -815,7 +843,7 @@ def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -
     binary.parent.mkdir()
     library.parent.mkdir()
     binary.write_bytes(b"synthetic SDK binary")
-    binary.chmod(0o755)
+    binary.chmod(0o666)
     library.write_bytes(b"synthetic SDK library")
     library.chmod(0o644)
     (binary.parent / "python").symlink_to(binary.name)
@@ -827,7 +855,12 @@ def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -
     nodes = list(namespace["sdk_acl_nodes"](sdk_root, fin_uid, source_owner))
     paths = [*ancestors, *nodes]
     access_acls = {
-        path: _synthetic_acl_for_mode(stat.S_IMODE(path.lstat().st_mode)) for path in paths
+        path: (
+            _synthetic_masked_raw_execute_acl()
+            if path == binary
+            else _synthetic_acl_for_mode(stat.S_IMODE(path.lstat().st_mode))
+        )
+        for path in paths
     }
     default_acls = {
         path: _synthetic_acl_for_mode(stat.S_IMODE(path.lstat().st_mode))
@@ -837,6 +870,17 @@ def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -
     }
     initial_access = dict(access_acls)
     initial_defaults = dict(default_acls)
+    binary_entries = namespace["decode_acl"](initial_access[binary])
+    binary_mask = binary_entries[(16, None)]
+    mode_needed = 4 | (1 if binary.lstat().st_mode & 0o111 else 0)
+    gnu_x_permissions = 4 | int(any(permissions & 1 for permissions in binary_entries.values()))
+    assert binary.lstat().st_mode & 0o777 == 0o666
+    assert binary_entries[(4, None)] == 7 and binary_mask == 6
+    assert mode_needed == 4
+    # Frozen D's r-X selects from raw ACL bits, even when the mask hides execute.
+    assert gnu_x_permissions == 5
+    assert gnu_x_permissions & binary_mask == mode_needed
+    assert gnu_x_permissions != mode_needed
 
     def read_synthetic_acl(path: Path, name: str) -> bytes | None:
         if name == "system.posix_acl_access":
@@ -849,38 +893,103 @@ def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -
     def apply_synthetic_acl(arguments: list[str], *, check: bool, timeout: int) -> None:
         assert check is True and timeout == 15
         assert arguments[:3] == ["/usr/bin/setfacl", "--no-mask", "-m"]
-        assert arguments[3] == f"u:{fin_uid}:r-X"
+        selector = arguments[3].rsplit(":", maxsplit=1)[1]
+        assert arguments[3] == f"u:{fin_uid}:{selector}"
+        if selector == "r-X":
+            # GNU X scans raw ACL entries, including execute masked off in st_mode.
+            permissions = 4 | int(
+                any(value & 1 for value in namespace["decode_acl"](access_acls[binary]).values())
+            )
+            assert permissions == gnu_x_permissions
+        else:
+            permissions = int(selector)
+            assert selector == str(permissions)
+        assert permissions in {4, 5}
         calls.append(arguments)
-        for raw_path in arguments[arguments.index("--") + 1 :]:
+        batch_paths = arguments[arguments.index("--") + 1 :]
+        assert len(batch_paths) <= 128
+        for raw_path in batch_paths:
             path = Path(raw_path)
             entries = namespace["decode_acl"](access_acls[path])
             needed = 4 | (
                 1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
             )
-            entries[(2, fin_uid)] = needed
+            if selector == "r-X":
+                assert path == binary
+                assert permissions & entries[(16, None)] == needed
+            else:
+                assert permissions == needed
+            applied = (
+                permissions | 2
+                if mutation == "fin_write" and path == binary and selector != "r-X"
+                else permissions
+            )
+            entries[(2, fin_uid)] = applied
+            if mutation == "other_raw_only" and path == binary and selector != "r-X":
+                entries[(4, None)] = 6
             access_acls[path] = _encode_synthetic_acl(entries)
 
     namespace["read_acl"] = read_synthetic_acl
     namespace["subprocess"] = SimpleNamespace(run=apply_synthetic_acl)
-    result = namespace["restrict_fin_sdk"](sdk_root, fin_uid, source_owner)
 
+    # Exercise D's former r-X command against the same masked raw-execute ACL.
+    # GNU resolves it to raw fin=5 (effective 4); D's exact raw equality expected 4.
+    binary_before_legacy = access_acls[binary]
+    apply_synthetic_acl(
+        ["/usr/bin/setfacl", "--no-mask", "-m", f"u:{fin_uid}:r-X", "--", str(binary)],
+        check=True,
+        timeout=15,
+    )
+    legacy_entries = namespace["decode_acl"](access_acls[binary])
+    assert legacy_entries[(2, fin_uid)] == 5
+    assert legacy_entries[(2, fin_uid)] & binary_mask == mode_needed == 4
+    assert legacy_entries[(2, fin_uid)] != mode_needed
+    access_acls[binary] = binary_before_legacy
+    calls.clear()
+
+    if mutation == "none":
+        result = namespace["restrict_fin_sdk"](sdk_root, fin_uid, source_owner)
+        assert calls
+        assert result["sdk_acl_entries"] == len(paths)
+        assert result["fin_uid"] == fin_uid
+        assert result["before_acl_sha256"] != result["after_acl_sha256"]
+        assert result["other_subjects_effective_permissions_and_default_acl"] == "UNCHANGED"
+        assert result["mask_recalculation"] is False
+        for path in paths:
+            before_info = path.lstat()
+            before = namespace["acl_subjects"](initial_access[path], before_info, fin_uid)
+            after_entries = namespace["decode_acl"](access_acls[path])
+            after = namespace["acl_subjects"](access_acls[path], path.lstat(), fin_uid)
+            required = 4 | (
+                1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
+            )
+            assert after_entries[(2, fin_uid)] == required
+            assert after == before
+            assert default_acls[path] == initial_defaults[path]
+        assert namespace["decode_acl"](access_acls[binary])[(2, fin_uid)] == 4
+        return
+
+    with pytest.raises(ValueError) as refusal:
+        namespace["restrict_fin_sdk"](sdk_root, fin_uid, source_owner)
     assert calls
-    assert result["sdk_acl_entries"] == len(paths)
-    assert result["fin_uid"] == fin_uid
-    assert result["before_acl_sha256"] != result["after_acl_sha256"]
-    assert result["other_subjects_effective_permissions_and_default_acl"] == "UNCHANGED"
-    assert result["mask_recalculation"] is False
-    for path in paths:
-        before_info = path.lstat()
-        before = namespace["acl_subjects"](initial_access[path], before_info, fin_uid)
-        after_entries = namespace["decode_acl"](access_acls[path])
-        after = namespace["acl_subjects"](access_acls[path], path.lstat(), fin_uid)
-        required = 4 | (
-            1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
-        )
-        assert after_entries[(2, fin_uid)] == required
-        assert after == before
-        assert default_acls[path] == initial_defaults[path]
+    detail = cast(Any, refusal.value).detail
+    assert detail["stage"] == "post_acl"
+    assert detail["path"] == str(binary)
+    assert len(detail["path"]) <= 4096
+    assert detail["path_truncated"] is False
+    assert len(detail["before_access_sha256"]) == 64
+    assert len(detail["after_access_sha256"]) == 64
+    if mutation == "other_raw_only":
+        changed = namespace["decode_acl"](access_acls[binary])
+        assert changed[(4, None)] == 6
+        assert changed[(4, None)] != binary_entries[(4, None)]
+        assert changed[(4, None)] & binary_mask == binary_entries[(4, None)] & binary_mask == 6
+        assert detail["comparisons"]["other_subjects_raw_effective_and_mask_unchanged"] is False
+    else:
+        actual_fin = namespace["decode_acl"](access_acls[binary])[(2, fin_uid)]
+        assert actual_fin & 2
+        assert detail["actual_fin_permissions"] == actual_fin
+        assert detail["comparisons"]["fin_raw_permissions_match"] is False
 
 
 @pytest.mark.parametrize("unsafe", ["fin_owned", "external_link"])
@@ -983,8 +1092,17 @@ def test_sdk_acl_refusal_writes_bounded_failure_receipt(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["schema"] == "finance-media-ci-sdk-acl-v1"
     assert receipt["status"] == "REFUSED"
-    assert receipt["failure_type"] == "ValueError"
+    assert receipt["failure_type"] == "SdkAclRefusal"
     assert "without expansion" in receipt["failure_reason"]
+    assert len(receipt["failure_reason"]) <= 1024
+    detail = receipt["failure_detail"]
+    assert set(detail) == {"path", "path_truncated", "stage", "needed", "existing_mask"}
+    assert detail["path"] == str(sdk_root)
+    assert len(detail["path"]) <= 4096
+    assert detail["path_truncated"] is False
+    assert detail["stage"] == "preflight_mask"
+    assert detail["needed"] == 5
+    assert detail["existing_mask"] == 0
     assert receipt_path.stat().st_mode & 0o777 == 0o400
     assert receipt_path.stat().st_size <= 65_536
 

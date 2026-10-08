@@ -227,7 +227,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12.14"
+          python-version: "${{ runner.os == 'Linux' && '3.12.14' || '3.12.10' }}"
 
       - name: Verify Linux validation platform
         if: runner.os == 'Linux'
@@ -500,6 +500,14 @@ jobs:
           ANCESTORS = (Path("/opt/hostedtoolcache"), Path("/opt/hostedtoolcache/Python"), Path("/opt/hostedtoolcache/Python/3.12.14"))
           USER_OBJ, USER, GROUP_OBJ, GROUP, MASK, OTHER = 1, 2, 4, 8, 16, 32
 
+          class SdkAclRefusal(ValueError):
+              def __init__(self, message, path, stage, **details):
+                  super().__init__(message)
+                  self.detail = {"path": str(path)[:4096], "path_truncated": len(str(path)) > 4096, "stage": stage, **details}
+
+          def acl_digest(raw):
+              return None if raw is None else hashlib.sha256(raw).hexdigest()
+
           def read_acl(path, name):
               try:
                   return os.getxattr(path, name, follow_symlinks=False)
@@ -577,29 +585,46 @@ jobs:
               for path in (*ANCESTORS, *sdk_acl_nodes(root, fin_uid, source_owner)):
                   info = path.lstat()
                   if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode) or info.st_uid == fin_uid or info.st_uid not in {0, source_owner}:
-                      raise ValueError("SDK ACL scope must retain trusted non-fin ownership")
-                  access = read_acl(path, "system.posix_acl_access")
-                  default = read_acl(path, "system.posix_acl_default")
-                  decode_acl(default)
-                  subjects = acl_subjects(access, info, fin_uid)
+                      raise SdkAclRefusal("SDK ACL scope must retain trusted non-fin ownership", path, "preflight_ownership", actual_uid=info.st_uid, fin_uid=fin_uid, trusted_owners=sorted({0, source_owner}))
+                  try:
+                      access = read_acl(path, "system.posix_acl_access")
+                      default = read_acl(path, "system.posix_acl_default")
+                      decode_acl(default)
+                      subjects = acl_subjects(access, info, fin_uid)
+                  except (OSError, ValueError) as error:
+                      raise SdkAclRefusal("SDK ACL preflight read/validation failed", path, "preflight_acl", cause_type=type(error).__name__, cause_reason=str(error)[:1024]) from error
                   needed = 4 | (1 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o111 else 0)
                   if needed & subjects["mask"] != needed:
-                      raise ValueError("Existing ACL mask cannot admit read/execute without expansion")
+                      raise SdkAclRefusal("Existing ACL mask cannot admit read/execute without expansion", path, "preflight_mask", needed=needed, existing_mask=subjects["mask"])
                   records.append((path, info, access, default, subjects, needed))
                   before_hash.update(json.dumps([str(path), info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), None if access is None else access.hex(), None if default is None else default.hex()], separators=(",", ":")).encode() + b"\n")
               # No mask recomputation. A new mask must remain exactly the old group bits.
-              for start in range(0, len(records), 128):
-                  chunk = records[start:start + 128]
-                  subprocess.run(["/usr/bin/setfacl", "--no-mask", "-m", f"u:{fin_uid}:r-X", "--", *(str(record[0]) for record in chunk)], check=True, timeout=15)
+              # GNU X inspects raw ACL execute bits, which may be masked off in st_mode.
+              # Use the exact preflight permissions instead of re-evaluating X in setfacl.
+              for permissions in (4, 5):
+                  group = [record for record in records if record[-1] == permissions]
+                  for start in range(0, len(group), 128):
+                      chunk = group[start:start + 128]
+                      try:
+                          subprocess.run(["/usr/bin/setfacl", "--no-mask", "-m", f"u:{fin_uid}:{permissions}", "--", *(str(record[0]) for record in chunk)], check=True, timeout=15)
+                      except (OSError, subprocess.SubprocessError) as error:
+                          raise SdkAclRefusal("SDK ACL update failed", chunk[0][0], "setfacl_chunk", permissions=permissions, chunk_entries=len(chunk), cause_type=type(error).__name__) from error
               for path, before, access, default, subjects, needed in records:
                   after = path.lstat()
-                  if (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_size) != (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_size):
-                      raise ValueError("SDK ownership, mode or path custody changed during ACL restriction")
-                  actual_access = read_acl(path, "system.posix_acl_access")
-                  actual_default = read_acl(path, "system.posix_acl_default")
-                  entries = decode_acl(actual_access)
-                  if actual_default != default or acl_subjects(actual_access, after, fin_uid) != subjects or entries is None or entries.get((USER, fin_uid)) != needed:
-                      raise ValueError("SDK ACL changed a different subject, mask or default ACL")
+                  expected_identity = (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_size)
+                  actual_identity = (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_size)
+                  if actual_identity != expected_identity:
+                      raise SdkAclRefusal("SDK ownership, mode or path custody changed during ACL restriction", path, "post_custody", expected_identity=expected_identity, actual_identity=actual_identity)
+                  try:
+                      actual_access = read_acl(path, "system.posix_acl_access")
+                      actual_default = read_acl(path, "system.posix_acl_default")
+                      entries = decode_acl(actual_access)
+                      actual_subjects = acl_subjects(actual_access, after, fin_uid)
+                  except (OSError, ValueError) as error:
+                      raise SdkAclRefusal("SDK ACL post-update read/validation failed", path, "post_acl_read", cause_type=type(error).__name__, cause_reason=str(error)[:1024]) from error
+                  comparisons = {"default_acl_unchanged": actual_default == default, "other_subjects_raw_effective_and_mask_unchanged": actual_subjects == subjects, "access_acl_present": entries is not None, "fin_raw_permissions_match": entries is not None and entries.get((USER, fin_uid)) == needed}
+                  if not all(comparisons.values()):
+                      raise SdkAclRefusal("SDK ACL changed a different subject, mask or default ACL", path, "post_acl", comparisons=comparisons, needed=needed, actual_fin_permissions=None if entries is None else entries.get((USER, fin_uid)), expected_mask=subjects["mask"], actual_mask=actual_subjects["mask"], before_access_sha256=acl_digest(access), after_access_sha256=acl_digest(actual_access), before_default_sha256=acl_digest(default), after_default_sha256=acl_digest(actual_default))
                   after_hash.update(json.dumps([str(path), after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode), actual_access.hex(), None if actual_default is None else actual_default.hex()], separators=(",", ":")).encode() + b"\n")
               return {"sdk_acl_entries": len(records), "fin_uid": fin_uid, "before_acl_sha256": before_hash.hexdigest(), "after_acl_sha256": after_hash.hexdigest(), "other_subjects_effective_permissions_and_default_acl": "UNCHANGED", "mask_recalculation": False}
 
@@ -625,6 +650,8 @@ jobs:
               except Exception as error:
                   result["failure_type"] = type(error).__name__
                   result["failure_reason"] = str(error)[:1024]
+                  if isinstance(error, SdkAclRefusal):
+                      result["failure_detail"] = error.detail
               write_receipt(Path(sys.argv[1]), result)
               if result["status"] != "PASS":
                   raise SystemExit("Fin-specific SDK ACL restriction refused; no mask/global-permission fallback")

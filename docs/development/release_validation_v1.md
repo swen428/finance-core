@@ -158,15 +158,18 @@ from name matching.
 
 The recovery bootstrap takes a root-owned, read-only snapshot from the exact
 candidate commit archive and Git tree/blob/mode inventory. The Bridge selects
-Python 3.12.14; Linux binds the original canonical setup-python SDK, including
+Python 3.12.14 on Linux and 3.12.10 on macOS, whose supported arm64 installer
+was used by the first run. Linux binds the original canonical setup-python SDK, including
 its official interpreter and libpython digests, and creates a fresh hash-locked
 venv in `/opt/finance-media-<run>-<attempt>/runtime`. It neither relocates the
 SDK nor rewrites its binary or dynamic-loader search path.
 
 Toolcache paths cannot be assumed read-only. A bounded SDK/path preparation
 adds only the media account's numeric-UID access ACL with `setfacl --no-mask`:
-read/search permissions without write, preserving every other principal's
-effective rights and default ACL. An insufficient existing mask or mismatched
+explicit precomputed numeric read or read/search permissions (`4` or `5`)
+without write, preserving every other principal's raw and effective rights,
+the existing mask and default ACL. Conditional `X` is not used: GNU ACL checks
+raw execute bits, which can differ from the effective file mode. An insufficient existing mask or mismatched
 ACL state refuses preparation; it is never widened to produce a pass. The
 `financemedia` account then checks effective source/runtime/SDK permissions,
 exact Python version and prefixes, interpreter and actual mapped libpython
@@ -185,6 +188,18 @@ media account does not open them. This bootstrap change resolves the setup
 failure only. It does not convert the unrun media cases into a pass. Preserve
 the failed run's evidence and validate the corrected, reviewed candidate
 against the unchanged media acceptance requirements.
+
+Run `37717084251`, attempt 1, used candidate
+`9c9144bb76958253007431001a6bf73921450e2e`. The old Linux OCR's 13 tests and
+the exact-commit source snapshot passed. SDK ACL preparation then refused
+before startup, leaving all 49 media cases unrun. Its generic receipt did not
+identify the offending node; a source-semantics counterexample independently
+demonstrated the conditional-`X` mismatch described above. The corrected
+preparation retains the same checks and bounded path/comparison diagnostics.
+The macOS job also refused the unavailable 3.12.14 arm64 installer. Once both
+required Bridge jobs had failed, the remaining expensive work was cancelled;
+this run supplies failure evidence, not complete validation. A corrected
+candidate still needs actual Linux media acceptance and all required jobs.
 
 Media source/worker modules, their unit/vector tests and the whole
 `tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
