@@ -415,17 +415,30 @@ def _assert_bounds(normalization: dict[str, Any]) -> None:
         "temporary_bytes": 268_435_456,
         "address_space_bytes": 536_870_912,
         "cpu_seconds": 30,
+        "process_count": 16,
+        "open_file_count": 64,
+        "stdout_bytes": 262_144,
+        "stderr_bytes": 65_536,
+        "termination_grace_seconds": 0.25,
         "normalization_wall_seconds": 30.0,
         "concurrency": 1,
     }
     parameters = normalization["parameters"]
-    assert parameters["Pillow"] == "12.3.0"
-    assert parameters["pillow-heif"] == "1.8.0"
-    assert parameters["allowed_heif_bit_depths"] == [8, 10]
-    assert parameters["convert_hdr_to_8bit"] is True
-    assert parameters["output_mode"] == "RGB"
-    assert parameters["alpha_policy"] == "white_matte"
-    assert parameters["resize"] is False
+    assert parameters == {
+        "Pillow": "12.3.0",
+        "pillow-heif": "1.8.0",
+        "hevc_decoder": "libde265",
+        "decode_threads": 1,
+        "security_limits_disabled": False,
+        "convert_hdr_to_8bit": True,
+        "allowed_heif_bit_depths": [8, 10],
+        "output_mode": "RGB",
+        "alpha_policy": "white_matte",
+        "png_compression_level": 6,
+        "png_optimize": False,
+        "resize": False,
+        "orientation_policy": "container_once_exif_metadata_only_refused",
+    }
 
 
 def _assert_corner_oracle(
@@ -713,6 +726,8 @@ def _execute_operation(
 def test_vector_archive_is_bounded_synthetic_and_hash_verified(
     vector_archive: VectorArchive,
 ) -> None:
+    from finance_core.intake import receipt_media
+
     assert len(CASE_IDS) == 49
     assert len(vector_archive.manifest["cases"]) == 49
     assert len(vector_archive.payloads) == 44
@@ -723,6 +738,29 @@ def test_vector_archive_is_bounded_synthetic_and_hash_verified(
     for image_format in ("jpeg_exif", "png_exif"):
         expected = {f"{image_format}_{value}" for value in range(1, 9)}
         assert {case_id for case_id in CASE_IDS if case_id in expected} == expected
+
+    actual_policy = {
+        "bounds": receipt_media._BOUNDS,
+        "parameters": receipt_media._DECODER_PARAMETERS,
+    }
+    _assert_bounds(actual_policy)
+
+    extra_bound = {**receipt_media._BOUNDS, "unexpected": 1}
+    with pytest.raises(AssertionError):
+        _assert_bounds({**actual_policy, "bounds": extra_bound})
+
+    missing_bound = {
+        key: value for key, value in receipt_media._BOUNDS.items() if key != "stdout_bytes"
+    }
+    with pytest.raises(AssertionError):
+        _assert_bounds({**actual_policy, "bounds": missing_bound})
+
+    looser_bound = {
+        **receipt_media._BOUNDS,
+        "source_bytes": receipt_media._BOUNDS["source_bytes"] + 1,
+    }
+    with pytest.raises(AssertionError):
+        _assert_bounds({**actual_policy, "bounds": looser_bound})
 
 
 @pytest.mark.parametrize("case_id", CASE_IDS, ids=CASE_IDS)

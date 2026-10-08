@@ -201,7 +201,7 @@ def _read_member(directory: int, name: str, maximum: int) -> tuple[bytes, dict[s
         os.close(fd)
 
 
-def _write_member(directory: int, name: str, raw: bytes) -> dict[str, Any]:
+def _write_member(directory: int, name: str, raw: bytes, *, claim: bool = False) -> dict[str, Any]:
     """Exclusive write: incomplete files are retained and never promoted on replay."""
     if len(raw) > _MAX_JSON:
         raise MediaIntegrityError("Evidence JSON exceeded its bounded size")
@@ -209,35 +209,129 @@ def _write_member(directory: int, name: str, raw: bytes) -> dict[str, Any]:
         name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
     )
     try:
+        if claim:
+            _inject("after_claim_create")
         view = memoryview(raw)
         while view:
             written = os.write(fd, view)
             if written <= 0:
                 raise OSError("Evidence write made no progress")
             view = view[written:]
+        if claim:
+            _inject("after_claim_write")
         os.fsync(fd)
         os.fchmod(fd, 0o400)
         os.fsync(fd)
     finally:
         os.close(fd)
     os.fsync(directory)
+    if claim:
+        _inject("after_claim_seal")
     return {"name": name, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def _open_operation(root: publication.StorageRootHandle, operation: str) -> int:
     fd = os.open(operation, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root.fd)
-    value = os.fstat(fd)
-    current = os.stat(operation, dir_fd=root.fd, follow_symlinks=False)
-    if (
-        not stat.S_ISDIR(value.st_mode)
-        or stat.S_IMODE(value.st_mode) != 0o700
-        or value.st_uid != os.getuid()
-        or value.st_dev != root.device
-        or _identity(value) != _identity(current)
-    ):
+    try:
+        _assert_operation(root, operation, fd)
+    except BaseException:
         os.close(fd)
-        raise MediaIntegrityError("Operation directory custody is unsafe")
+        raise
     return fd
+
+
+def _assert_operation(root: publication.StorageRootHandle, operation: str, fd: int) -> None:
+    """A held descriptor is usable only while its canonical directory is held."""
+    try:
+        publication.assert_storage_root_identity(root)
+        value = os.fstat(fd)
+        current = os.stat(operation, dir_fd=root.fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(value.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or stat.S_IMODE(value.st_mode) != 0o700
+            or value.st_uid != os.getuid()
+            or value.st_dev != root.device
+            or value.st_nlink < 2
+            or value.st_nlink != current.st_nlink
+            or _identity(value) != _identity(current)
+        ):
+            raise MediaIntegrityError("Operation directory custody was lost")
+    except (OSError, publication.UnsafeStorageRootError) as exc:
+        raise MediaIntegrityError("Operation directory custody is unavailable") from exc
+
+
+@dataclass(frozen=True)
+class _OperationClaim:
+    fd: int
+    identity: tuple[int, ...]
+    raw: bytes
+
+
+def _claim_name(operation: str) -> str:
+    return operation + ".claim.json"
+
+
+def _open_claim(
+    root: publication.StorageRootHandle, operation: str, intent_hash: str
+) -> _OperationClaim:
+    fd = -1
+    try:
+        fd = os.open(
+            _claim_name(operation),
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=root.fd,
+        )
+        value = _regular(fd, mode=0o400, maximum=4096)
+        raw, _ = _read_member(root.fd, _claim_name(operation), 4096)
+        parsed = _checked_json(raw)
+        if (
+            set(parsed) != {"contract", "operation_id", "intent_sha256"}
+            or parsed.get("contract") != "receipt-media-operation-claim-v1"
+            or parsed.get("operation_id") != operation
+            or not isinstance(parsed.get("intent_sha256"), str)
+            or _HASH.fullmatch(parsed["intent_sha256"]) is None
+        ):
+            raise MediaIntegrityError("Operation claim is malformed")
+        if parsed["intent_sha256"] != intent_hash:
+            raise MediaOperationConflictError("Operation claim binds a different intent")
+        claim = _OperationClaim(fd, _identity(value), raw)
+        _assert_claim(root, operation, claim)
+        return claim
+    except BaseException as exc:
+        if fd >= 0:
+            os.close(fd)
+        if isinstance(exc, OSError):
+            raise MediaIntegrityError("Operation claim is missing or unsafe") from exc
+        raise
+
+
+def _assert_claim(
+    root: publication.StorageRootHandle, operation: str, claim: _OperationClaim
+) -> None:
+    try:
+        publication.assert_storage_root_identity(root)
+        value = _regular(claim.fd, mode=0o400, maximum=4096)
+        raw, _ = _read_member(root.fd, _claim_name(operation), 4096)
+        current = os.stat(_claim_name(operation), dir_fd=root.fd, follow_symlinks=False)
+        if (
+            value.st_dev != root.device
+            or value.st_nlink != 1
+            or current.st_nlink != 1
+            or _identity(value) != claim.identity
+            or _identity(current) != claim.identity
+            or raw != claim.raw
+        ):
+            raise MediaIntegrityError("Operation claim custody or contents changed")
+    except (OSError, publication.UnsafeStorageRootError) as exc:
+        raise MediaIntegrityError("Operation claim custody is unavailable") from exc
+
+
+def _assert_processing(
+    root: publication.StorageRootHandle, operation: str, fd: int, claim: _OperationClaim
+) -> None:
+    _assert_claim(root, operation, claim)
+    _assert_operation(root, operation, fd)
 
 
 def _platform() -> None:
@@ -537,6 +631,7 @@ class ReceiptMediaProcessor:
             source_root.close()
             raise
         source_fd, operation_fd = -1, -1
+        claim: _OperationClaim | None = None
         parents: list[int] = []
         reference: MediaOcrReference | None
         try:
@@ -549,12 +644,54 @@ class ReceiptMediaProcessor:
                 evidence_root, deadline=deadline, clock=time.monotonic
             )
             try:
-                os.mkdir(operation_id, 0o700, dir_fd=evidence_root.fd)
-                os.fsync(evidence_root.fd)
-                new = True
-            except FileExistsError:
+                os.stat(_claim_name(operation_id), dir_fd=evidence_root.fd, follow_symlinks=False)
                 new = False
-            operation_fd = _open_operation(evidence_root, operation_id)
+            except FileNotFoundError:
+                try:
+                    os.stat(operation_id, dir_fd=evidence_root.fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise MediaIntegrityError("Existing operation lacks its processing claim")
+                _write_member(
+                    evidence_root.fd,
+                    _claim_name(operation_id),
+                    _canonical(
+                        {
+                            "contract": "receipt-media-operation-claim-v1",
+                            "operation_id": operation_id,
+                            "intent_sha256": _digest(intent),
+                        }
+                    ),
+                    claim=True,
+                )
+                new = True
+            claim = _open_claim(evidence_root, operation_id, _digest(intent))
+            if new:
+                _assert_claim(evidence_root, operation_id, claim)
+                try:
+                    os.mkdir(operation_id, 0o700, dir_fd=evidence_root.fd)
+                except FileExistsError as exc:
+                    raise MediaIntegrityError(
+                        "Operation appeared after its claim was reserved"
+                    ) from exc
+                os.fsync(evidence_root.fd)
+            try:
+                operation_fd = _open_operation(evidence_root, operation_id)
+            except FileNotFoundError:
+                _assert_claim(evidence_root, operation_id, claim)
+                self._verify_source(
+                    source_fd,
+                    parents[-1],
+                    Path(source_relative_path).name,
+                    source_identity,
+                    expected_source_sha256,
+                )
+                self._verify_source_tree(source_root, source_relative_path, parents)
+                _assert_claim(evidence_root, operation_id, claim)
+                return MediaProcessingResult(
+                    operation_id, "unknown", "incomplete_operation", None, True
+                )
             if not new:
                 raw, _ = _read_member(operation_fd, "intent.json", _MAX_JSON)
                 if raw != _canonical(intent):
@@ -562,6 +699,7 @@ class ReceiptMediaProcessor:
                 try:
                     terminal, _ = _read_member(operation_fd, "result.json", _MAX_JSON)
                 except FileNotFoundError:
+                    _assert_processing(evidence_root, operation_id, operation_fd, claim)
                     return MediaProcessingResult(
                         operation_id, "unknown", "incomplete_operation", None, True
                     )
@@ -580,13 +718,16 @@ class ReceiptMediaProcessor:
                         intent, result, hashlib.sha256(terminal).hexdigest()
                     )
                     self._read_verified(operation_fd, reference)
+                    _assert_processing(evidence_root, operation_id, operation_fd, claim)
                     return MediaProcessingResult(operation_id, "succeeded", "ok", reference, True)
                 self._verify_terminal_failure(operation_fd, intent, result)
+                _assert_processing(evidence_root, operation_id, operation_fd, claim)
                 return MediaProcessingResult(
                     operation_id, result["status"], result["outcome_code"], None, True
                 )
             _write_member(operation_fd, "intent.json", _canonical(intent))
             _inject("after_intent")
+            _assert_processing(evidence_root, operation_id, operation_fd, claim)
             original_fd = os.open(
                 "original.bin",
                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -624,12 +765,15 @@ class ReceiptMediaProcessor:
                     "sha256": expected_source_sha256,
                 }
                 _inject("after_original")
+                _assert_processing(evidence_root, operation_id, operation_fd, claim)
                 os.close(original_fd)
                 original_fd = -1
                 original_fd = os.open(
                     "original.bin", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=operation_fd
                 )
-                result = self._execute(operation_fd, intent, original, original_fd, deadline)
+                result = self._execute(
+                    evidence_root, claim, operation_fd, intent, original, original_fd, deadline
+                )
                 self._verify_source(
                     source_fd,
                     parents[-1],
@@ -641,6 +785,7 @@ class ReceiptMediaProcessor:
                 publication.assert_storage_root_identity(source_root)
                 publication.assert_storage_root_identity(evidence_root)
                 _inject("before_terminal")
+                _assert_processing(evidence_root, operation_id, operation_fd, claim)
                 terminal = _canonical(result)
                 _write_member(operation_fd, "result.json", terminal)
                 _inject("after_terminal")
@@ -651,6 +796,7 @@ class ReceiptMediaProcessor:
                     self._read_verified(operation_fd, reference)
                 else:
                     reference = None
+                _assert_processing(evidence_root, operation_id, operation_fd, claim)
                 return MediaProcessingResult(
                     operation_id, result["status"], result["outcome_code"], reference, False
                 )
@@ -658,6 +804,8 @@ class ReceiptMediaProcessor:
                 if original_fd >= 0:
                     os.close(original_fd)
         finally:
+            if claim is not None:
+                os.close(claim.fd)
             if operation_fd >= 0:
                 os.close(operation_fd)
             if source_fd >= 0:
@@ -670,6 +818,8 @@ class ReceiptMediaProcessor:
 
     def _execute(
         self,
+        root: publication.StorageRootHandle,
+        claim: _OperationClaim,
         directory: int,
         intent: dict[str, Any],
         original: dict[str, Any],
@@ -702,6 +852,7 @@ class ReceiptMediaProcessor:
             )
             if self._code != self._code_identity():
                 raise MediaIntegrityError("Trusted worker code identity changed")
+            _assert_processing(root, intent["operation_id"], directory, claim)
             observed = _worker_run(
                 [
                     str(self._python),
@@ -722,6 +873,7 @@ class ReceiptMediaProcessor:
             self._verify_source(
                 original_fd, directory, "original.bin", original_identity, original["sha256"]
             )
+            _assert_processing(root, intent["operation_id"], directory, claim)
             if "usage" in observed:
                 base["decoder_process_usage"] = observed["usage"]
             if "uid_tasks" in observed:
@@ -772,6 +924,7 @@ class ReceiptMediaProcessor:
                 }
             )
             _inject("after_normalization")
+            _assert_processing(root, intent["operation_id"], directory, claim)
             if (
                 asdict(
                     ocr._validate_engine_identity(self._engine.identity, limits=self._ocr_limits)
@@ -788,6 +941,7 @@ class ReceiptMediaProcessor:
             )
             os.lseek(png_fd, 0, os.SEEK_SET)
             ocr_deadline = time.monotonic() + self._ocr_limits.total_timeout_seconds
+            _assert_processing(root, intent["operation_id"], directory, claim)
             try:
                 actual = self._engine.extract(
                     source, limits=self._ocr_limits, deadline=ocr_deadline
@@ -801,6 +955,7 @@ class ReceiptMediaProcessor:
                 return self._failure(base, "resource_rejected", "ocr_resource_limit")
             except Exception:
                 return self._failure(base, "engine_failed", "ocr_failed")
+            _assert_processing(root, intent["operation_id"], directory, claim)
             if (
                 asdict(
                     ocr._validate_engine_identity(self._engine.identity, limits=self._ocr_limits)
@@ -851,6 +1006,7 @@ class ReceiptMediaProcessor:
                 }
             )
             _inject("after_ocr")
+            _assert_processing(root, intent["operation_id"], directory, claim)
             if outcome.status not in {
                 ReceiptOcrExtractionStatus.SUCCEEDED,
                 ReceiptOcrExtractionStatus.NO_TEXT,
@@ -977,6 +1133,97 @@ class ReceiptMediaProcessor:
         except (KeyError, TypeError) as exc:
             raise MediaIntegrityError("Successful terminal reference is incomplete") from exc
 
+    def _verify_completed_normalization(
+        self,
+        directory: int,
+        intent: dict[str, Any],
+        result: dict[str, Any],
+        original: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if (
+            intent.get("decoder_parameters") != _DECODER_PARAMETERS
+            or intent.get("bounds") != _BOUNDS
+        ):
+            raise MediaIntegrityError("Media reference uses an unknown normalization policy")
+        declaration_raw, declaration_member = _read_member(directory, "declaration.json", 4096)
+        if _checked_json(declaration_raw) != {
+            key: intent["source"][key] for key in ("declared_mime_type", "original_filename")
+        }:
+            raise MediaIntegrityError("Decoder declaration differs from received-source evidence")
+        png_raw, png = _read_member(directory, "normalized.png", PNG_BYTES)
+        normalization = result["normalization"]
+        if not isinstance(normalization, dict):
+            raise MediaIntegrityError("Recorded normalization stage is malformed")
+        self._validate_normalization(normalization.get("metadata"))
+        self._verify_png_header(png_raw, normalization["metadata"])
+        if (
+            original != result["original"]
+            or original != normalization["original"]
+            or png != normalization["png"]
+            or _digest(normalization) != result["normalization_fingerprint"]
+            or original["sha256"] != intent["source"]["sha256"]
+            or original["size_bytes"] != intent["source"]["size_bytes"]
+        ):
+            raise MediaIntegrityError("Original or exact normalized PNG binding differs")
+        if (
+            normalization.get("decoder") != intent["decoder"]
+            or normalization.get("parameters") != intent["decoder_parameters"]
+            or normalization.get("bounds") != intent["bounds"]
+            or normalization.get("code") != intent["code"]
+        ):
+            raise MediaIntegrityError("Normalization identity differs from admitted operation")
+        return declaration_member, png
+
+    def _verify_completed_ocr(
+        self,
+        directory: int,
+        intent: dict[str, Any],
+        result: dict[str, Any],
+        original: dict[str, Any],
+        png: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], tuple[ReceiptOcrBlock, ...]]:
+        ocr_raw, ocr_member = _read_member(directory, "ocr.json", _MAX_JSON)
+        payload = _checked_json(ocr_raw)
+        info = result["ocr"]
+        if not isinstance(info, dict):
+            raise MediaIntegrityError("Recorded OCR stage is malformed")
+        fingerprint = _digest(
+            {
+                "contract": CONTRACT,
+                "normalization_fingerprint": result["normalization_fingerprint"],
+                "original": original,
+                "png": png,
+                "engine": intent["ocr_identity"],
+                "limits": intent["ocr_limits"],
+                "result_sha256": _digest(payload),
+                "status": payload["status"],
+            }
+        )
+        if (
+            info["fingerprint"] != fingerprint
+            or info["identity"] != intent["ocr_identity"]
+            or info["limits"] != intent["ocr_limits"]
+            or info["member"] != ocr_member
+            or info["result_sha256"] != _digest(payload)
+        ):
+            raise MediaIntegrityError("OCR input, engine, result or fingerprint differs")
+        try:
+            limits = ReceiptOcrLimits(**intent["ocr_limits"])
+            blocks = tuple(ReceiptOcrBlock(**block) for block in payload["blocks"])
+            actual = ocr.ReceiptOcrEngineResult(
+                ReceiptOcrExtractionStatus(payload["status"]), blocks, payload["outcome_code"]
+            )
+            outcome = ocr._normalize_engine_result(actual, limits=limits)
+            if payload != {
+                "status": outcome.status.value,
+                "outcome_code": outcome.outcome_code,
+                "blocks": [asdict(block) for block in outcome.blocks],
+            }:
+                raise MediaIntegrityError("OCR evidence has contradictory canonical payload")
+        except (KeyError, ValueError, TypeError, ocr.ReceiptOcrError) as exc:
+            raise MediaIntegrityError("Canonical OCR evidence is invalid") from exc
+        return payload, ocr_member, blocks
+
     def _verify_terminal_failure(
         self, directory: int, intent: dict[str, Any], result: dict[str, Any]
     ) -> None:
@@ -997,6 +1244,20 @@ class ReceiptMediaProcessor:
             or member["size_bytes"] != intent["source"]["size_bytes"]
         ):
             raise MediaIntegrityError("Failed operation original integrity differs")
+        try:
+            if ("normalization" in result) != ("normalization_fingerprint" in result):
+                raise MediaIntegrityError("Failed operation normalization stage is incomplete")
+            if "normalization" in result:
+                _, png = self._verify_completed_normalization(directory, intent, result, member)
+                if "ocr" in result:
+                    self._verify_completed_ocr(directory, intent, result, member, png)
+            elif "ocr" in result:
+                raise MediaIntegrityError("Failed operation OCR stage lacks normalization")
+            self._temporary_bound(directory)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise MediaIntegrityError(
+                "Recorded failed-operation stage is missing or malformed"
+            ) from exc
 
     def read_verified(self, reference: MediaOcrReference) -> VerifiedMediaOcrEvidence:
         if (
@@ -1017,7 +1278,7 @@ class ReceiptMediaProcessor:
             )
             directory = _open_operation(root, reference.operation_id)
             result = self._read_verified(directory, reference)
-            publication.assert_storage_root_identity(root)
+            _assert_operation(root, reference.operation_id, directory)
             return result
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise MediaIntegrityError(
@@ -1047,78 +1308,18 @@ class ReceiptMediaProcessor:
             raise MediaIntegrityError(
                 "Media reference does not bind the exact successful operation"
             )
-        if (
-            intent.get("decoder_parameters") != _DECODER_PARAMETERS
-            or intent.get("bounds") != _BOUNDS
-        ):
-            raise MediaIntegrityError("Media reference uses an unknown normalization policy")
-        declaration_raw, declaration_member = _read_member(directory, "declaration.json", 4096)
-        if _checked_json(declaration_raw) != {
-            key: intent["source"][key] for key in ("declared_mime_type", "original_filename")
-        }:
-            raise MediaIntegrityError("Decoder declaration differs from received-source evidence")
         original_raw, original = _read_member(directory, "original.bin", SOURCE_BYTES)
-        png_raw, png = _read_member(directory, "normalized.png", PNG_BYTES)
-        normalization = result["normalization"]
-        self._validate_normalization(normalization.get("metadata"))
-        self._verify_png_header(png_raw, normalization["metadata"])
-        if (
-            original != result["original"]
-            or original != normalization["original"]
-            or png != normalization["png"]
-            or _digest(normalization) != reference.normalization_fingerprint
-            or original["sha256"] != intent["source"]["sha256"]
-            or original["size_bytes"] != intent["source"]["size_bytes"]
-        ):
-            raise MediaIntegrityError("Original or exact normalized PNG binding differs")
-        if (
-            normalization.get("decoder") != intent["decoder"]
-            or normalization.get("parameters") != intent["decoder_parameters"]
-            or normalization.get("bounds") != intent["bounds"]
-            or normalization.get("code") != intent["code"]
-        ):
-            raise MediaIntegrityError("Normalization identity differs from admitted operation")
-        ocr_raw, ocr_member = _read_member(directory, "ocr.json", _MAX_JSON)
-        payload = _checked_json(ocr_raw)
-        info = result["ocr"]
-        fingerprint = _digest(
-            {
-                "contract": CONTRACT,
-                "normalization_fingerprint": reference.normalization_fingerprint,
-                "original": original,
-                "png": png,
-                "engine": intent["ocr_identity"],
-                "limits": intent["ocr_limits"],
-                "result_sha256": _digest(payload),
-                "status": payload["status"],
-            }
+        declaration_member, png = self._verify_completed_normalization(
+            directory, intent, result, original
         )
-        if (
-            info["fingerprint"] != fingerprint
-            or info["identity"] != intent["ocr_identity"]
-            or info["limits"] != intent["ocr_limits"]
-            or info["member"] != ocr_member
-            or info["result_sha256"] != _digest(payload)
-            or info["result_sha256"] != reference.ocr_result_sha256
-        ):
-            raise MediaIntegrityError("OCR input, engine, result or fingerprint differs")
-        try:
-            limits = ReceiptOcrLimits(**intent["ocr_limits"])
-            blocks = tuple(ReceiptOcrBlock(**block) for block in payload["blocks"])
-            actual = ocr.ReceiptOcrEngineResult(
-                ReceiptOcrExtractionStatus(payload["status"]), blocks, payload["outcome_code"]
-            )
-            outcome = ocr._normalize_engine_result(actual, limits=limits)
-            if (
-                outcome.status
-                not in {ReceiptOcrExtractionStatus.SUCCEEDED, ReceiptOcrExtractionStatus.NO_TEXT}
-                or [asdict(block) for block in outcome.blocks] != payload["blocks"]
-            ):
-                raise MediaIntegrityError(
-                    "Successful OCR evidence has contradictory canonical blocks"
-                )
-        except (KeyError, ValueError, TypeError, ocr.ReceiptOcrError) as exc:
-            raise MediaIntegrityError("Canonical OCR evidence is invalid") from exc
+        payload, ocr_member, blocks = self._verify_completed_ocr(
+            directory, intent, result, original, png
+        )
+        if payload["status"] not in {
+            ReceiptOcrExtractionStatus.SUCCEEDED.value,
+            ReceiptOcrExtractionStatus.NO_TEXT.value,
+        }:
+            raise MediaIntegrityError("Successful terminal claims a failed OCR stage")
         if hashlib.sha256(original_raw).hexdigest() != reference.original_sha256:
             raise MediaIntegrityError("Original hash differs from requested reference")
         inventory = (intent_member, original, declaration_member, png, ocr_member, terminal_member)

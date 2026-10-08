@@ -136,12 +136,33 @@ that a receipt proposal can be constructed.
 ## Durable operation and terminal states
 
 A root owner lock serializes operation processing. Each `media_` operation ID
-gets a new private 0700 directory with an exclusive immutable `intent.json`.
+first reserves an exclusive root-level `<operation_id>.claim.json`. Its
+canonical `receipt-media-operation-claim-v1` payload contains only the operation
+ID and intent SHA-256, without absolute paths or filesystem inode numbers.
+Creation uses `O_EXCL`/`O_NOFOLLOW`, 0600 writing, file fsync, 0400 sealing,
+another file fsync and root fsync before creating the operation directory.
+The claim is read with a 4096-byte bound. Its held descriptor, canonical
+pathname, immutable bytes, owner/mode, device/inode and single link are
+reverified at processing custody checkpoints and before returns.
+The operation then gets a new private 0700 directory with an exclusive immutable `intent.json`.
 The intent binds actual source identity/declarations, decoder/code identity,
 normalization parameters/bounds and OCR identity/limits. Original bytes are
 copied and fsynced at `original.bin`, mode 0400, before native work begins.
 Complete evidence members use exclusive no-overwrite creation, file fsync,
 0400 sealing and directory fsync. No source or existing member is overwritten.
+The held operation directory must continue to match its canonical root/name,
+device, inode, private owner/mode and directory link count. Custody is
+checked before native/OCR path use, terminal publication and every return,
+including replay and fresh reference reads. A moved, replaced or symlinked
+operation refuses; its existing evidence remains available for inspection.
+An existing claim with a missing operation directory returns UNKNOWN without
+creating a directory or invoking decoder/OCR. An existing directory without
+its claim refuses processing; there is no automatic adoption or repair.
+Partial, malformed, mismatched, unsafe or changed claims are retained and
+refused. A claim-only interrupted reservation also prevents a fresh instance
+from silently retrying the operation ID. The trusted OS owner can intentionally
+delete both reservation and operation state; this contract does not claim
+protection against that deliberate deletion.
 
 Successful completion includes `normalized.png`, canonical `ocr.json` and a
 terminal `result.json`. The result records exact normalization metadata,
@@ -162,7 +183,11 @@ Changed source/declarations/engine/limits/parameters cannot reuse that operation
 Decoder refusals, resource rejection and OCR errors publish terminal
 `unsupported_input`, `resource_rejected` or `engine_failed` results with a
 sanitized reason and retained original. Identical replay returns that terminal
-failure and does not retry. A durable intent without a completed terminal
+failure and does not retry. Replay verifies every completed stage explicitly
+recorded by the failure, including its exact PNG, normalization parameters and
+fingerprint, and actual canonical OCR result/status/member/fingerprint when
+present. Missing or contradictory recorded stages refuse. Unrecorded partial
+work files do not gain a completeness claim. A durable intent without a completed terminal
 result returns `unknown / incomplete_operation`; partial/malformed publication
 or an integrity conflict refuses. Work files, original and intent remain
 available for inspection. No missing terminal automatically reruns OCR or
@@ -178,6 +203,11 @@ checks the reference, canonical manifests, immutable modes, member hashes,
 normalization policy/metadata, precise OCR links and canonical blocks. A
 caller-created DTO is a request to verify evidence, never a verified
 capability by itself. Missing, wrong or tampered references/members refuse.
+Reference reads do not require the processing claim: the six-member evidence
+bundle remains portable and can be copied into a trusted reader-only root.
+Resuming processing after a root copy/restore requires preserving all claims
+and operation directories, including claim-only UNKNOWN reservations. A
+six-member-only copy can verify references but cannot be adopted for processing.
 The returned manifest and inventory are ordinary projection dictionaries;
 changing them does not modify durable evidence or authorize an effect. A
 consumer must reopen the frozen reference before making an evidence-bound

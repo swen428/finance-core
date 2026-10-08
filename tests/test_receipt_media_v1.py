@@ -265,7 +265,7 @@ def test_operation_symlink_cannot_be_replayed(seam):
     processor, _, request, _, evidence, _, _ = seam
     (evidence / "outside").mkdir(mode=0o700)
     (evidence / "media_unit").symlink_to(evidence / "outside")
-    with pytest.raises(OSError):
+    with pytest.raises(media.MediaIntegrityError):
         processor.process(**request)
     assert not list((evidence / "outside").iterdir())
 
@@ -462,6 +462,7 @@ def test_exact_copy_to_new_trusted_root_reopens_reference(seam):
     verified = reopened.read_verified(reference)
     assert verified.reference == reference
     assert verified.blocks[0].text == "TOTAL 12.50"
+    assert reopened.process(**request).persistence_idempotent
     # Projections are ordinary copies; the reference must be reopened.
     verified.manifest["normalization"]["png"]["sha256"] = "0" * 64
     assert reopened.read_verified(reference).manifest["normalization"]["png"]["sha256"] != "0" * 64
@@ -719,3 +720,367 @@ def test_second_root_admission_failure_closes_first_root(seam, monkeypatch):
     assert len(opened) == 1
     with pytest.raises(OSError):
         os.fstat(opened[0])
+
+
+def _replace_operation(evidence, replacement):
+    operation = evidence / "media_unit"
+    moved = evidence / "moved-operation"
+    operation.rename(moved)
+    if replacement == "empty":
+        operation.mkdir(mode=0o700)
+    elif replacement == "symlink":
+        operation.symlink_to(moved, target_is_directory=True)
+    return moved
+
+
+@pytest.mark.parametrize("replacement", ["missing", "empty", "symlink"])
+@pytest.mark.parametrize(
+    "stage",
+    ["after_original", "after_normalization", "after_ocr", "before_terminal", "after_terminal"],
+)
+def test_operation_custody_loss_never_returns_consumable_success(
+    seam, monkeypatch, stage, replacement
+):
+    processor, engine, request, _, evidence, raw, worker_calls = seam
+
+    def replace_operation(observed):
+        if observed == stage:
+            _replace_operation(evidence, replacement)
+
+    monkeypatch.setattr(media, "_failure_injection_hook", replace_operation)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert (evidence / "moved-operation" / "original.bin").read_bytes() == raw
+    if stage in {"after_original", "after_normalization"}:
+        assert engine.calls == 0
+    assert len(worker_calls) == (0 if stage == "after_original" else 1)
+    assert not (evidence / "media_unit" / "result.json").exists() or replacement == "symlink"
+
+
+@pytest.mark.parametrize("replacement", ["missing", "empty", "symlink"])
+def test_reader_rechecks_operation_custody_before_return(seam, monkeypatch, replacement):
+    processor, _, request, _, evidence, _, _ = seam
+    reference = processor.process(**request).reference
+    ordinary = processor._read_verified
+
+    def moved(directory, requested):
+        projection = ordinary(directory, requested)
+        _replace_operation(evidence, replacement)
+        return projection
+
+    monkeypatch.setattr(processor, "_read_verified", moved)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.read_verified(reference)
+
+
+@pytest.mark.parametrize("missing", ["declaration.json", "normalized.png", "ocr.json"])
+def test_failed_terminal_replay_requires_recorded_completed_stages(seam, monkeypatch, missing):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+
+    def failed(source, *, limits, deadline):
+        engine.calls += 1
+        return ReceiptOcrEngineResult(
+            ReceiptOcrExtractionStatus.ENGINE_FAILED, (), "actual_failure"
+        )
+
+    monkeypatch.setattr(engine, "extract", failed)
+    terminal = processor.process(**request)
+    assert terminal.status == "engine_failed"
+    assert processor.process(**request).status == "engine_failed"
+    assert engine.calls == len(worker_calls) == 1
+    (evidence / "media_unit" / missing).unlink()
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert engine.calls == len(worker_calls) == 1
+
+
+@pytest.mark.parametrize("replacement", ["missing", "empty", "symlink"])
+@pytest.mark.parametrize("state", ["unknown", "succeeded", "engine_failed"])
+def test_every_replay_return_rechecks_operation_custody(seam, monkeypatch, state, replacement):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+    if state == "unknown":
+
+        def interrupt(stage):
+            if stage == "after_intent":
+                raise KeyboardInterrupt("Synthetic interrupted intent")
+
+        monkeypatch.setattr(media, "_failure_injection_hook", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            processor.process(**request)
+        monkeypatch.setattr(media, "_failure_injection_hook", None)
+        ordinary = media._read_member
+
+        def read(directory, name, maximum):
+            if name == "result.json":
+                _replace_operation(evidence, replacement)
+            return ordinary(directory, name, maximum)
+
+        monkeypatch.setattr(media, "_read_member", read)
+    else:
+        engine.fail = state == "engine_failed"
+        processor.process(**request)
+        name = "_read_verified" if state == "succeeded" else "_verify_terminal_failure"
+        ordinary = getattr(processor, name)
+
+        def verify(*args):
+            value = ordinary(*args)
+            _replace_operation(evidence, replacement)
+            return value
+
+        monkeypatch.setattr(processor, name, verify)
+    prior = (engine.calls, len(worker_calls))
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert prior == (engine.calls, len(worker_calls))
+
+
+@pytest.mark.parametrize("replacement", ["missing", "empty", "symlink"])
+def test_operation_moved_during_engine_call_refuses_publication(seam, monkeypatch, replacement):
+    processor, engine, request, _, evidence, _, _ = seam
+    ordinary = engine.extract
+
+    def moved(source, *, limits, deadline):
+        result = ordinary(source, limits=limits, deadline=deadline)
+        _replace_operation(evidence, replacement)
+        return result
+
+    monkeypatch.setattr(engine, "extract", moved)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert not (evidence / "moved-operation" / "ocr.json").exists()
+    assert not (evidence / "moved-operation" / "result.json").exists()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "png_bytes",
+        "ocr_bytes",
+        "normalization_fingerprint",
+        "parameters",
+        "ocr_fingerprint",
+        "ocr_status",
+    ],
+)
+def test_failed_replay_checks_recorded_stage_integrity_and_links(seam, monkeypatch, damage):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+
+    def failed(source, *, limits, deadline):
+        engine.calls += 1
+        return ReceiptOcrEngineResult(
+            ReceiptOcrExtractionStatus.ENGINE_FAILED, (), "actual_failure"
+        )
+
+    monkeypatch.setattr(engine, "extract", failed)
+    processor.process(**request)
+    directory = evidence / "media_unit"
+    terminal = directory / "result.json"
+    record = json.loads(terminal.read_bytes())
+    if damage in {"png_bytes", "ocr_bytes"}:
+        path = directory / ("normalized.png" if damage == "png_bytes" else "ocr.json")
+        path.chmod(0o600)
+        path.write_bytes(b"corrupt recorded bytes")
+        path.chmod(0o400)
+    else:
+        if damage == "normalization_fingerprint":
+            record[damage] = "d" * 64
+        elif damage == "parameters":
+            record["normalization"]["parameters"]["alpha_policy"] = "changed"
+            record["normalization_fingerprint"] = media._digest(record["normalization"])
+        elif damage == "ocr_fingerprint":
+            record["ocr"]["fingerprint"] = "d" * 64
+        else:
+            path = directory / "ocr.json"
+            payload = json.loads(path.read_bytes())
+            payload["status"] = "succeeded"
+            path.chmod(0o600)
+            path.write_bytes(media._canonical(payload))
+            path.chmod(0o400)
+            directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                _, member = media._read_member(directory_fd, "ocr.json", media._MAX_JSON)
+            finally:
+                os.close(directory_fd)
+            intent = json.loads((directory / "intent.json").read_bytes())
+            record["ocr"]["member"] = member
+            record["ocr"]["result_sha256"] = media._digest(payload)
+            record["ocr"]["fingerprint"] = media._digest(
+                {
+                    "contract": media.CONTRACT,
+                    "normalization_fingerprint": record["normalization_fingerprint"],
+                    "original": record["original"],
+                    "png": record["normalization"]["png"],
+                    "engine": intent["ocr_identity"],
+                    "limits": intent["ocr_limits"],
+                    "result_sha256": media._digest(payload),
+                    "status": payload["status"],
+                }
+            )
+        terminal.chmod(0o600)
+        terminal.write_bytes(media._canonical(record))
+        terminal.chmod(0o400)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert engine.calls == len(worker_calls) == 1
+
+
+def test_unrecorded_partial_decoder_residue_has_no_completeness_claim_or_retry(seam, monkeypatch):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+    ordinary = media._worker_run
+
+    def partial(*args, **kwargs):
+        ordinary(*args, **kwargs)  # Unit decoder writes a partial work member.
+        return {"status": "engine_failed", "outcome_code": "decoder_exit_nonzero"}
+
+    monkeypatch.setattr(media, "_worker_run", partial)
+    first = processor.process(**request)
+    assert first.status == "engine_failed"
+    manifest = json.loads((evidence / "media_unit" / "result.json").read_bytes())
+    assert "normalization" not in manifest and "ocr" not in manifest
+    assert processor.process(**request).persistence_idempotent
+    (evidence / "media_unit" / "normalized.png").unlink()
+    assert processor.process(**request).persistence_idempotent
+    assert engine.calls == 0 and len(worker_calls) == 1
+
+
+@pytest.mark.parametrize("stage", ["after_claim_create", "after_claim_write", "after_claim_seal"])
+def test_interrupted_claim_never_creates_directory_or_reruns(seam, monkeypatch, stage):
+    processor, engine, request, source, evidence, _, worker_calls = seam
+
+    def interrupt(observed):
+        if observed == stage:
+            raise KeyboardInterrupt("Synthetic claim publication crash")
+
+    monkeypatch.setattr(media, "_failure_injection_hook", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        processor.process(**request)
+    claim = evidence / "media_unit.claim.json"
+    assert claim.exists() and not (evidence / "media_unit").exists()
+    retained = claim.read_bytes()
+    monkeypatch.setattr(media, "_failure_injection_hook", None)
+    fresh = media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    if stage == "after_claim_seal":
+        assert fresh.process(**request).status == "unknown"
+    else:
+        with pytest.raises(media.MediaIntegrityError):
+            fresh.process(**request)
+    assert claim.read_bytes() == retained
+    assert not (evidence / "media_unit").exists()
+    assert engine.calls == len(worker_calls) == 0
+
+
+def test_fresh_instance_cannot_recreate_moved_claimed_operation(seam):
+    processor, engine, request, source, evidence, _, worker_calls = seam
+    reference = processor.process(**request).reference
+    _replace_operation(evidence, "missing")
+    fresh = media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    result = fresh.process(**request)
+    assert result.status == "unknown" and result.reference is None
+    assert not (evidence / "media_unit").exists()
+    assert engine.calls == len(worker_calls) == 1
+    with pytest.raises(media.MediaIntegrityError):
+        fresh.read_verified(reference)
+
+
+@pytest.mark.parametrize("damage", ["missing", "symlink", "tampered", "unsafe_mode"])
+def test_processing_claim_missing_or_changed_refuses_without_retry(seam, damage):
+    processor, engine, request, source, evidence, _, worker_calls = seam
+    processor.process(**request)
+    claim = evidence / "media_unit.claim.json"
+    if damage in {"missing", "symlink"}:
+        claim.unlink()
+        if damage == "symlink":
+            claim.symlink_to(evidence / "media_unit" / "intent.json")
+    elif damage == "tampered":
+        claim.chmod(0o600)
+        claim.write_bytes(b"tampered claim")
+        claim.chmod(0o400)
+    else:
+        claim.chmod(0o600)
+    fresh = media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    with pytest.raises(media.MediaIntegrityError):
+        fresh.process(**request)
+    assert engine.calls == len(worker_calls) == 1
+
+
+def test_bundle_copy_without_claim_is_reader_only(seam):
+    processor, engine, request, source, evidence, _, worker_calls = seam
+    reference = processor.process(**request).reference
+    copied = evidence.with_name("six-member-copy")
+    copied.mkdir(mode=0o700)
+    shutil.copytree(evidence / "media_unit", copied / "media_unit")
+    fresh = media.ReceiptMediaProcessor(source, copied, ocr_engine=engine)
+    assert fresh.read_verified(reference).reference == reference
+    with pytest.raises(media.MediaIntegrityError):
+        fresh.process(**request)
+    assert not (copied / "media_unit.claim.json").exists()
+    assert engine.calls == len(worker_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "stage",
+    ["after_intent", "after_normalization", "after_ocr", "before_terminal", "after_terminal"],
+)
+@pytest.mark.parametrize("damage", ["missing", "symlink", "bytes", "same_bytes_new_inode"])
+def test_held_processing_claim_is_rechecked_at_boundaries(seam, monkeypatch, stage, damage):
+    processor, engine, request, _, evidence, _, _ = seam
+
+    def alter(observed):
+        if observed != stage:
+            return
+        claim = evidence / "media_unit.claim.json"
+        if damage == "same_bytes_new_inode":
+            retained = claim.read_bytes()
+            claim.rename(evidence / "old-claim.json")
+            claim.write_bytes(retained)
+            claim.chmod(0o400)
+        elif damage in {"missing", "symlink"}:
+            claim.unlink()
+            if damage == "symlink":
+                claim.symlink_to(evidence / "media_unit" / "intent.json")
+        else:
+            claim.chmod(0o600)
+            claim.write_bytes(b"changed during operation")
+            claim.chmod(0o400)
+
+    monkeypatch.setattr(media, "_failure_injection_hook", alter)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    if stage in {"after_intent", "after_normalization"}:
+        assert engine.calls == 0
+
+
+def test_claim_only_unknown_binds_same_intent_and_refuses_changed_request(seam, monkeypatch):
+    processor, engine, request, source, evidence, _, worker_calls = seam
+
+    def interrupted(stage):
+        if stage == "after_claim_seal":
+            raise KeyboardInterrupt("Synthetic durable reservation only")
+
+    monkeypatch.setattr(media, "_failure_injection_hook", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        processor.process(**request)
+    claim = evidence / "media_unit.claim.json"
+    assert json.loads(claim.read_bytes()) == {
+        "contract": "receipt-media-operation-claim-v1",
+        "operation_id": "media_unit",
+        "intent_sha256": media._digest(
+            processor._intent(
+                request["operation_id"],
+                request["source_relative_path"],
+                request["expected_source_size"],
+                request["expected_source_sha256"],
+                request["declared_mime_type"],
+                request["original_filename"],
+                request["received_via"],
+            )
+        ),
+    }
+    retained = claim.read_bytes()
+    monkeypatch.setattr(media, "_failure_injection_hook", None)
+    fresh = media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    assert fresh.process(**request).status == "unknown"
+    with pytest.raises(media.MediaOperationConflictError):
+        fresh.process(**{**request, "original_filename": "changed.png"})
+    assert claim.read_bytes() == retained
+    assert engine.calls == len(worker_calls) == 0
