@@ -1549,6 +1549,7 @@ def _verify_public_receipt_revision_edge(
     *,
     expected_hash: str,
     expected_version: int,
+    _creation_revision: bool = False,
 ) -> dict[str, Any] | None:
     """Verify one public monetary edge that follows a D1 receipt child."""
     child_id = child.get("id")
@@ -1576,6 +1577,15 @@ def _verify_public_receipt_revision_edge(
         conn, dict(child)
     )
     child_hash = compute_effective_proposal_content_hash(conn, {"id": child_id})
+    if _creation_revision:
+        from finance_core.parser_proposals.content_hash import compute_proposal_content_hash
+
+        original_payload = child["parsed_payload"]
+        if not isinstance(original_payload, str):
+            raise HumanRevisionLineageError("Independent receipt original payload is not JSON text")
+        child_payload = json.loads(original_payload)
+        child_version = 0
+        child_hash = compute_proposal_content_hash(conn, dict(child))
     parent_hash = compute_effective_proposal_content_hash(conn, parent)
     try:
         field_updates = json.loads(revision["field_updates_json"])
@@ -1827,6 +1837,27 @@ def verify_public_receipt_revision_edge(
         child,
         expected_hash=content_hash,
         expected_version=proposal_version,
+    )
+
+
+def verify_independent_receipt_revision_creation_edge(
+    conn: sqlite3.Connection, child: Mapping[str, Any], *, content_hash: str
+) -> dict[str, Any] | None:
+    """Verify actual 034/033 publication before separately sealed completions.
+
+    Only a persisted independent publication may request its creation-time
+    revision. All owner evidence and root/source checks are shared unchanged.
+    """
+    seal = conn.execute(
+        "SELECT resulting_content_hash FROM application_amendment_records WHERE "
+        "resulting_parser_output_id=? AND publication_kind='receipt_supersession' "
+        "AND resulting_version=0",
+        (child["id"],),
+    ).fetchone()
+    if seal is None or seal[0] != content_hash:
+        raise HumanRevisionLineageError("Independent receipt creation context has no exact seal")
+    return _verify_public_receipt_revision_edge(
+        conn, child, expected_hash=content_hash, expected_version=0, _creation_revision=True
     )
 
 

@@ -4458,6 +4458,37 @@ def verify_ai_fallback_child(
 ) -> dict[str, Any] | None:
     """Verify the immutable AI edge before a human or conversion reader proceeds."""
     if not _skip_human:
+        from finance_core.parser_proposals.amendment_lineage import (
+            AmendmentLineageError,
+            verify_independent_amendment_descendant,
+        )
+
+        try:
+            independent = verify_independent_amendment_descendant(
+                conn, proposal, content_hash=content_hash, proposal_version=proposal_version
+            )
+        except AmendmentLineageError as exc:
+            raise AiFallbackServiceError(
+                "AI_FALLBACK_CONFLICT", "Independent amendment ancestry does not verify"
+            ) from exc
+        if independent is not None:
+            root = independent["root_proposal"]
+            from finance_core.parser_proposals.content_hash import compute_proposal_content_hash
+
+            root_version = 0
+            root_hash = compute_proposal_content_hash(conn, root)
+            if requires_deterministic_intent_policy(root):
+                verify_deterministic_intent_policy(root)
+            return verify_ai_fallback_child(
+                conn,
+                root,
+                content_hash=root_hash,
+                proposal_version=root_version,
+                require_resolved=require_resolved,
+                _skip_human=True,
+                _human_descendant_parser_output_id=independent["subject_parser_output_id"],
+            )
+    if not _skip_human:
         from finance_core.parser_proposals.human_revision import (
             HumanRevisionLineageError,
             verify_human_revision_descendant,

@@ -153,6 +153,15 @@ financial result for that owner; it does not claim to have delivered a reply.
 Release publication, consumer dependency upgrade and real runtime admission
 remain separate operations.
 
+## Pre-confirmation amendments
+
+The additive [independent amendment owner](independent_amendments_v1.md) supplies
+verified six-field edits and fresh review/confirmation for the same source event.
+An edited state alone is insufficient: posting requires its complete independent
+lineage, and a changed current leaf/version/content invalidates an old review.
+Confirmed or already accepted posting cannot be edited through this boundary;
+posted correction remains a separate work package.
+
 ## Compatibility and validation
 
 The independent path is additive. Historical D1/D2 source and approval proofs,

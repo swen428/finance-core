@@ -23,6 +23,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from finance_core.bookkeeping_metadata import metadata_from_payload
 from finance_core.calculation.authoritative_snapshot import (
     AuthoritativeCalculationSnapshot,
     AuthoritativeSnapshotRepository,
@@ -236,7 +237,12 @@ def _receipt_identity_from_payload(
 ) -> ConfirmedReceiptIdentity:
     values = _require_exact_object(
         payload,
-        expected_keys=_RECEIPT_IDENTITY_KEYS,
+        expected_keys=_RECEIPT_IDENTITY_KEYS
+        | (
+            {"bookkeeping_metadata"}
+            if isinstance(payload, dict) and "bookkeeping_metadata" in payload
+            else set()
+        ),
         label=f"snapshot {snapshot_public_id!r} {RECEIPT_IDENTITY_INPUT_KEY}",
         reason=FinalizationBlockReason.RECEIPT_IDENTITY_MISMATCH.value,
     )
@@ -247,6 +253,7 @@ def _receipt_identity_from_payload(
             receipt_date=_require_str(values["receipt_date"]),
             source_channel=_require_str(values["source_channel"]),
             currency=_require_str(values["currency"]),
+            bookkeeping_metadata=metadata_from_payload(values.get("bookkeeping_metadata")),
         )
     except (FinalizationValidationError, TypeError) as exc:
         raise SnapshotAuthorityError(

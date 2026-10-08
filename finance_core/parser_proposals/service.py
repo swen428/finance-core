@@ -114,7 +114,7 @@ from finance_core.parser_proposals.decision_owner import (
     _verify_persisted_transaction_money as _verify_persisted_transaction_money,
 )
 from finance_core.parser_proposals.decision_owner import (
-    convert_confirmed_parser_proposal as convert_confirmed_parser_proposal,
+    convert_confirmed_parser_proposal as _convert_confirmed_parser_proposal_owner,
 )
 from finance_core.parser_proposals.decision_owner import (
     resolve_simple_expense_conversion_fields as resolve_simple_expense_conversion_fields,
@@ -296,6 +296,15 @@ class _LegacyDecisionAuthority:
         decision,
         decision_epoch,
     ):
+        from finance_core.parser_proposals.amendment_lineage import (
+            AmendmentLineageError,
+            refuse_legacy_amendment,
+        )
+
+        try:
+            refuse_legacy_amendment(connection, proposal)
+        except AmendmentLineageError as exc:
+            raise ParserConfirmationError(str(exc)) from exc
         self.decision_epoch = decision_epoch
         if self.d1_binding is not None and self.initial_binding is not None:
             raise ParserConfirmationError("proposal decision has conflicting authority sources")
@@ -388,3 +397,16 @@ def confirm_parser_proposal(
         )
     except HumanDraftError as exc:
         raise ParserConfirmationError(str(exc)) from exc
+
+
+def convert_confirmed_parser_proposal(
+    conn: sqlite3.Connection,
+    parser_output_id: int,
+    *,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Compatibility facade retains legacy authority isolation."""
+    decision_owner._require_legacy_conversion_target(conn, parser_output_id)
+    return _convert_confirmed_parser_proposal_owner(
+        conn, parser_output_id, persistence_effect=persistence_effect
+    )

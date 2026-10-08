@@ -10,6 +10,10 @@ import uuid
 from datetime import date, datetime, timezone
 from typing import Any, Callable, Protocol
 
+from finance_core.calculation.authoritative_snapshot import (
+    canonical_json_text,
+    canonical_json_value,
+)
 from finance_core.financial_audit import (
     AuditEventCommand,
     append_financial_audit_event,
@@ -28,6 +32,11 @@ from finance_core.parser_proposals.ai_fallback import (
     requires_deterministic_intent_policy,
     verify_ai_fallback_child,
     verify_deterministic_intent_policy,
+)
+from finance_core.parser_proposals.amendment_lineage import (
+    AmendmentLineageError,
+    refuse_legacy_amendment,
+    verify_independent_amendment_descendant,
 )
 from finance_core.parser_proposals.content_hash import (
     compute_effective_proposal_content_hash,
@@ -101,6 +110,16 @@ class ProposalConversionError(ParserConfirmationError):
     """Base error for deterministic proposal-to-transaction conversion."""
 
 
+def _require_legacy_conversion_target(conn: sqlite3.Connection, parser_output_id: int) -> None:
+    """Keep compatibility callers on their original authority without platform imports."""
+    proposal = ParserProposalRepository(conn).get(parser_output_id)
+    if proposal is not None:
+        try:
+            refuse_legacy_amendment(conn, proposal)
+        except AmendmentLineageError as exc:
+            raise ProposalConversionError(str(exc)) from exc
+
+
 SIMPLE_EXPENSE_TYPES = frozenset({"personal_expense", "simple_expense", "expense"})
 CONVERTED_TRANSACTION_PUBLIC_ID_PREFIX = "txn_parser_proposal"
 
@@ -165,6 +184,27 @@ def confirm_parser_proposal(
         authorizations = ParserAuthorizationRepository(conn)
         proposal = _require_proposal(proposals, parser_output_id)
         content_hash = compute_effective_proposal_content_hash(conn, proposal)
+        proposal_version = resolve_effective_payload(conn, proposal)[2]
+        amendment = verify_independent_amendment_descendant(
+            conn, proposal, content_hash=content_hash, proposal_version=proposal_version
+        )
+        if amendment is not None:
+            review = _read_accepted_posting_review(
+                conn,
+                proposal=proposal,
+                content_hash=content_hash,
+                proposal_version=proposal_version,
+                confirmation_public_id=confirmation_public_id,
+            )
+            if (
+                review is None
+                or decision != "confirmed"
+                or confirmation_channel != "independent_application"
+                or authenticated_actor_id != review["binding"]["human_principal_id"]
+            ):
+                raise ParserConfirmationError(
+                    "Independent amendments require their exact accepted posting decision"
+                )
         decided_at = _now(clock)
         decision_epoch = _epoch_from_iso(decided_at)
         try:
@@ -392,6 +432,11 @@ def convert_confirmed_parser_proposal(
                 "currency": fields["currency"],
                 "merchant": fields["merchant"],
                 "category": fields["category"],
+                **(
+                    {"description": fields["description"]}
+                    if _has_independent_posting_proof(conn, proposal, authorization, fields)
+                    else {}
+                ),
                 "notes": notes,
                 "raw_input": proposal["raw_text"],
                 "statement_batch_id": proposal["statement_batch_id"],
@@ -491,6 +536,15 @@ def _require_existing_conversion_truth(
     fields = _independent_conversion_fields(
         resolve_simple_expense_conversion_fields(conn, proposal), authorization
     )
+    independent = _has_independent_posting_proof(conn, proposal, authorization, fields)
+    if independent:
+        metadata_row = conn.execute(
+            "SELECT description FROM transactions WHERE id=?", (conversion["transaction_id"],)
+        ).fetchone()
+        if metadata_row is None or metadata_row[0] != fields["description"]:
+            raise ProposalConversionError(
+                "Canonical parser transaction approved description drifted"
+            )
     expected_public_id = _converted_transaction_public_id(proposal, authorization, fields)
     row = conn.execute(
         "SELECT public_id, intent, intent_type, source_channel, transaction_date, status, "
@@ -523,6 +577,155 @@ def _require_existing_conversion_truth(
         raise ProposalConversionError(
             "Canonical parser transaction drifted from its confirmed proposal"
         )
+
+
+def _read_accepted_posting_review(
+    conn: sqlite3.Connection,
+    *,
+    proposal: dict[str, Any],
+    content_hash: str,
+    proposal_version: int,
+    confirmation_public_id: str | None,
+) -> dict[str, Any] | None:
+    """Check owner-record identity; the composition port still authenticates it.
+
+    A channel or injected authority alone cannot stand in for the immutable
+    accepted Application record on an independently amended proposal.
+    """
+    if (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='application_posting_decisions'"
+        ).fetchone()
+        is None
+    ):
+        return None
+    row = conn.execute(
+        "SELECT reviews.material_json,reviews.review_hash,reviews.review_id,"
+        "reviews.parser_output_id,decisions.material_json AS decision_json,"
+        "decisions.decision_namespace,decisions.decision_id,decisions.decision_digest,"
+        "decisions.accepted_at,attempts.attempt_id,attempts.intake_public_id,"
+        "attempts.source_event_key FROM application_posting_decisions AS decisions "
+        "JOIN application_posting_attempts AS attempts USING(attempt_id) "
+        "JOIN application_posting_reviews AS reviews USING(review_id) "
+        "WHERE decisions.confirmation_public_id=?",
+        (confirmation_public_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    from finance_core.application.posting_contract import (
+        POSTING_DECISION_SCHEMA,
+        POSTING_REVIEW_SCHEMA,
+        posting_review_sha256,
+        require_posting_schema,
+    )
+
+    try:
+        require_posting_schema(conn)
+        review = canonical_json_value(row["material_json"], label="accepted posting review")
+        decision = canonical_json_value(row["decision_json"], label="accepted posting decision")
+        if not isinstance(review, dict) or not isinstance(decision, dict):
+            raise ParserConfirmationError("Accepted posting material is not an object")
+        binding, source, frozen = review["binding"], review["source"], review["proposal_review"]
+        event_key = hashlib.sha256(
+            canonical_json_text(
+                [source["namespace"], source["instance_id"], source["source_event_id"]]
+            ).encode()
+        ).hexdigest()
+        attempt_id = (
+            "apa_"
+            + hashlib.sha256(
+                canonical_json_text(
+                    [binding["instance_id"], row["decision_namespace"], row["decision_id"]]
+                ).encode()
+            ).hexdigest()
+        )
+        expected_confirmation = (
+            "pca_application_"
+            + hashlib.sha256(canonical_json_text([attempt_id]).encode()).hexdigest()
+        )
+        if (
+            canonical_json_text(review) != row["material_json"]
+            or canonical_json_text(decision) != row["decision_json"]
+            or review["schema"] != POSTING_REVIEW_SCHEMA
+            or posting_review_sha256(review) != row["review_hash"]
+            or row["review_id"] != "apr_" + row["review_hash"]
+            or row["parser_output_id"] != proposal["id"]
+            or row["attempt_id"] != attempt_id
+            or confirmation_public_id != expected_confirmation
+            or row["source_event_key"] != event_key
+            or row["intake_public_id"] != source["intake_public_id"]
+            or source["intake_public_id"] != proposal["source_public_id"]
+            or review["proposal_public_id"] != proposal["public_id"]
+            or review["proposal_version"] != proposal_version
+            or review["effective_content_hash"] != content_hash
+            or frozen["proposal_public_id"] != proposal["public_id"]
+            or frozen["proposal_version"] != proposal_version
+            or frozen["effective_content_hash"] != content_hash
+            or not review["prepared_at"] <= row["accepted_at"] < review["expires_at"]
+            or decision["schema"] != POSTING_DECISION_SCHEMA
+            or decision["namespace"] != row["decision_namespace"]
+            or decision["namespace"] != binding["decision_namespace"]
+            or decision["key_id"] != binding["decision_key_id"]
+            or decision["instance_id"] != binding["instance_id"]
+            or decision["human_principal_id"] != binding["human_principal_id"]
+            or decision["decision_id"] != row["decision_id"]
+            or decision["decision_digest"] != row["decision_digest"]
+            or decision["review_id"] != row["review_id"]
+            or decision["review_projection_hash"] != row["review_hash"]
+            or decision["source_evidence_id"] != source["evidence_id"]
+            or decision["source_evidence_digest"] != source["evidence_digest"]
+            or decision["proposal_public_id"] != proposal["public_id"]
+            or decision["proposal_version"] != proposal_version
+            or decision["proposal_content_hash"] != content_hash
+            or decision["action"] != "confirm"
+            or not decision["issued_at"] <= row["accepted_at"] < decision["expires_at"]
+        ):
+            raise ParserConfirmationError("Accepted independent decision binding changed")
+        return review
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, ParserConfirmationError):
+            raise
+        raise ParserConfirmationError("Accepted independent decision is invalid") from exc
+
+
+def _has_independent_posting_proof(
+    conn: sqlite3.Connection,
+    proposal: dict[str, Any],
+    authorization: dict[str, Any],
+    fields: dict[str, Any],
+) -> bool:
+    _, _, version = resolve_effective_payload(conn, proposal)
+    amendment = verify_independent_amendment_descendant(
+        conn,
+        proposal,
+        content_hash=authorization["proposal_content_hash"],
+        proposal_version=version,
+    )
+    review = _read_accepted_posting_review(
+        conn,
+        proposal=proposal,
+        content_hash=authorization["proposal_content_hash"],
+        proposal_version=version,
+        confirmation_public_id=authorization["confirmation_public_id"],
+    )
+    if review is None:
+        if (
+            amendment is not None
+            or authorization["confirmation_channel"] == "independent_application"
+        ):
+            raise ProposalConversionError("Independent conversion lacks its accepted posting proof")
+        return False
+    if (
+        authorization["confirmation_channel"] != "independent_application"
+        or authorization["authenticated_actor_id"] != review["binding"]["human_principal_id"]
+        or review["posting_path"] != "text"
+        or review["financial_projection"] != {**fields, "account": "unspecified"}
+    ):
+        raise ProposalConversionError(
+            "Independent text conversion does not match its exact accepted projection"
+        )
+    return True
 
 
 def _independent_conversion_fields(

@@ -173,7 +173,13 @@ class CanonicalTransactionRepository:
                 values["confidence_score"],
             ),
         )
-        return _last_insert_id(cursor)
+        transaction_id = _last_insert_id(cursor)
+        if "description" in values:
+            self._conn.execute(
+                "UPDATE transactions SET description=? WHERE id=?",
+                (values["description"], transaction_id),
+            )
+        return transaction_id
 
 
 class ParserConversionRepository:

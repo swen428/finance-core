@@ -15,6 +15,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
+from finance_core.bookkeeping_metadata import ReceiptBookkeepingMetadata
 from finance_core.money import (
     SUPPORTED_CURRENCIES,
     ZERO,
@@ -348,6 +349,7 @@ class ConfirmedReceiptIdentity:
     receipt_date: str
     source_channel: str
     currency: str
+    bookkeeping_metadata: ReceiptBookkeepingMetadata | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -366,13 +368,16 @@ class ConfirmedReceiptIdentity:
             )
 
     def as_fingerprint_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "receipt_public_id": self.receipt_public_id,
             "merchant": self.merchant,
             "receipt_date": self.receipt_date,
             "source_channel": self.source_channel,
             "currency": self.currency,
         }
+        if self.bookkeeping_metadata is not None:
+            payload["bookkeeping_metadata"] = self.bookkeeping_metadata.as_payload()
+        return payload
 
 
 # ---------------------------------------------------------------------------
