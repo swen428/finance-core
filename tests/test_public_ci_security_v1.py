@@ -6,6 +6,7 @@ import re
 import subprocess
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -121,6 +122,21 @@ def _step_script(name: str) -> str:
     match = re.search(r"^        run: \|\n((?:          .*\n|[ \t]*\n)+)", section, re.MULTILINE)
     assert match is not None
     return textwrap.dedent(match.group(1))
+
+
+def _inline_python(step: str, label: str) -> str:
+    script = _step_script(step)
+    opening = f"<<'{label}'\n"
+    assert opening in script
+    body = script.split(opening, 1)[1]
+    return body.split(f"\n{label}\n", 1)[0]
+
+
+def _inline_namespace(step: str, label: str) -> dict[str, Any]:
+    namespace: dict[str, Any] = {"__name__": f"workflow_{label.lower()}_test"}
+    script = _inline_python(step, label)
+    exec(compile(script, f"<{label}>", "exec"), namespace)
+    return namespace
 
 
 @pytest.mark.parametrize(
@@ -360,9 +376,11 @@ def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> 
 
 def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
-    section = source.split("- name: Prepare isolated media acceptance account", 1)[1].split(
-        "- name: Set up exact Node runtime", 1
-    )[0]
+    assert 'media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in source
+    assert "sudo apt-get install --no-install-recommends -y tesseract-ocr acl" in source
+    section = source.split("- name: Prepare isolated media candidate snapshot and runtime", 1)[
+        1
+    ].split("- name: Set up exact Node runtime", 1)[0]
     assert "if: runner.os == 'Linux'" in section
     assert "sudo -u financemedia -- env -i" in section
     assert "FINANCE_LINUX_MEDIA_REQUIRED=1" in section
@@ -373,21 +391,677 @@ def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
     assert "always() && runner.os == 'Linux'" in section
     assert "${{ runner.temp }}/linux-media/" in section
     assert "resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))" in section
-    assert "code_read_only" in section
+    assert "code_runtime_read_only" in section
+    assert "Path(sys.prefix) == expected_prefix" in section
+    assert "Path(sys.base_prefix) == expected_base" in section
+    assert "binary_hash == expected_hash" in section
+    assert "sys.version_info[:3] == (3, 12, 14)" in section
+    assert 'expected_base == Path("/opt/hostedtoolcache/Python/3.12.14/x64")' in section
+    assert "mapped_libpython" in section
+    assert "libpython_hash == expected_libpython_hash" in section
+    assert 'config.get("include-system-site-packages") == "false"' in section
+    assert 'result.get("status") == "identity"' in section
+    assert '"--identity"' in section
     assert '"CapEff", "CapPrm"' in section
     assert 'item["current"] >= 16' in section
     assert "remaining_uid_processes" in section
     assert "os.O_NOFOLLOW" in section
-    assert "visited > 4096" in section
-    for label in ("PY_MEDIA_LAUNCH", "PY_MEDIA_PROOF", "PY_MEDIA_EXPORT"):
+    assert "visited > MAX_SDK_ENTRIES" in section
+    assert "git ls-tree -r -z --full-tree" in section
+    assert "git cat-file commit" in section
+    assert "committed_tree_hash(expected) != tree_sha" in section
+    assert 'member.mode != (0o755 if mode == "100755" else 0o644)' in section
+    assert "def read_bounded(path, maximum)" in section
+    assert "os.O_NOFOLLOW | os.O_NONBLOCK" in section
+    assert "before.st_nlink != 1" in section
+    assert "identity(path.lstat()) != identity(before)" in section
+    assert "len(name) > 4096" in section
+    assert "MAX_ARCHIVE = 134_217_728" in section
+    assert "MAX_MEMBERS = 8192" in section
+    assert "MAX_FILE = 20_000_000" in section
+    assert "PY_MEDIA_SDK_ACL" in section
+    assert "MAX_SDK_ENTRIES = 32768" in section
+    assert "MAX_SDK_FILE = 67_108_864" in section
+    assert "info.st_uid not in {0, source_owner}" in section
+    assert 'SDK_ROOT = Path("/opt/hostedtoolcache/Python/3.12.14/x64")' in section
+    assert "SDK_VERSION = (3, 12, 14)" in section
+    assert "bef88f140b625959f8af25c7b75cce2cd5d4b29cc2f2b079befd7f68eda4dba0" in section
+    assert "1fa3c52ba5aa8f6b2852836a4bf6cbb23161f7cf379f6f19248d87124b28b38a" in section
+    assert '"system.posix_acl_access"' in section
+    assert '"system.posix_acl_default"' in section
+    assert '"--no-mask"' in section
+    assert ":r-X" in section
+    assert "Existing ACL mask cannot admit read/execute without expansion" in section
+    assert '"other_subjects_effective_permissions_and_default_acl": "UNCHANGED"' in section
+    assert '"mask_recalculation": False' in section
+    assert "only ephemeral fin named UID" in section
+    assert '"--require-hashes"' in section
+    assert '"PIP_CONFIG_FILE": os.devnull' in section
+    assert '"/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "TZ=UTC"' in section
+    assert '"TMPDIR=" + str(root / "work")' in section
+    assert "LD_LIBRARY_PATH" not in section
+    assert "PYTHONPATH" not in section
+    assert "PYTHONHOME" not in section
+    assert '"bootstrap-" + name' in section
+    assert '("snapshot.json", 65_536)' in section
+    assert '("sdk-acl.json", 65_536)' in section
+    assert '("runtime.json", 65_536)' in section
+    assert '("startup.json", 393_216)' in section
+    assert "target.chmod(0o400)" in section
+    assert '"finance-media-ci-snapshot-v1"' in section
+    assert '"finance-media-ci-sdk-acl-v1"' in section
+    assert '"finance-media-ci-runtime-v1"' in section
+    assert '"finance-media-ci-startup-v1"' in section
+
+    for label in (
+        "PY_MEDIA_SNAPSHOT",
+        "PY_MEDIA_SDK_ACL",
+        "PY_MEDIA_RUNTIME",
+        "PY_MEDIA_STARTUP",
+        "PY_MEDIA_LAUNCH",
+        "PY_MEDIA_PROOF",
+        "PY_MEDIA_EXPORT",
+    ):
         step = (
             "Preserve actual Linux receipt media acceptance evidence"
             if label.endswith("EXPORT")
-            else "Require actual Linux receipt media acceptance"
+            else (
+                "Prepare isolated media candidate snapshot and runtime"
+                if label in {"PY_MEDIA_SNAPSHOT", "PY_MEDIA_SDK_ACL", "PY_MEDIA_RUNTIME"}
+                else (
+                    "Verify isolated media startup and prepare OCR assets"
+                    if label == "PY_MEDIA_STARTUP"
+                    else "Require actual Linux receipt media acceptance"
+                )
+            )
         )
         script = _step_script(step)
-        ast.parse(script.split("<<'" + label + "'\n", 1)[1].rsplit(label, 1)[0])
+        ast.parse(_inline_python(step, label))
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+def test_actual_snapshot_helper_binds_commit_tree_blobs_modes_and_paths(tmp_path: Path) -> None:
+    """Exercise the workflow snapshot helper against a tiny synthetic Git commit."""
+    import io
+    import tarfile
+
+    repository = tmp_path / "repository"
+    (repository / "bin").mkdir(parents=True)
+    (repository / "README.md").write_bytes(b"synthetic snapshot fixture\n")
+    executable = repository / "bin" / "tool"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o755)
+    subprocess.run(["git", "init", "--quiet"], cwd=repository, check=True)
+    subprocess.run(["git", "add", "."], cwd=repository, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Finance Test",
+            "-c",
+            "user.email=finance-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "synthetic snapshot fixture",
+        ],
+        cwd=repository,
+        check=True,
+    )
+
+    def git(*arguments: str) -> bytes:
+        return subprocess.run(
+            ["git", *arguments], cwd=repository, check=True, capture_output=True
+        ).stdout
+
+    candidate = git("rev-parse", "HEAD").decode().strip()
+    tree_sha = git("rev-parse", "HEAD^{tree}").decode().strip()
+    archive = tmp_path / "candidate.tar"
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "tar.umask=0022",
+            "archive",
+            "--format=tar",
+            "--output",
+            str(archive),
+            candidate,
+        ],
+        cwd=repository,
+        check=True,
+    )
+    inventory = tmp_path / "inventory.bin"
+    inventory.write_bytes(git("ls-tree", "-r", "-z", "--full-tree", candidate))
+    commit_object = tmp_path / "commit.bin"
+    commit_object.write_bytes(git("cat-file", "commit", candidate))
+
+    namespace: dict[str, object] = {"__name__": "workflow_snapshot_test"}
+    script = _inline_python(
+        "Prepare isolated media candidate snapshot and runtime", "PY_MEDIA_SNAPSHOT"
+    )
+    exec(compile(script, "<PY_MEDIA_SNAPSHOT>", "exec"), namespace)
+    extract = namespace["extract_candidate"]
+    safe_name = namespace["safe_name"]
+    assert callable(extract) and callable(safe_name)
+    destination = tmp_path / "snapshot"
+    receipt = extract(archive, inventory, destination, candidate, tree_sha, commit_object)
+    assert receipt["candidate_sha"] == candidate
+    assert receipt["candidate_tree_sha"] == tree_sha
+    assert receipt["files"] == 2
+    assert receipt["bytes"] == len(b"synthetic snapshot fixture\n") + len(b"#!/bin/sh\nexit 0\n")
+    assert (destination / "README.md").read_bytes() == b"synthetic snapshot fixture\n"
+    assert (destination / "README.md").stat().st_mode & 0o777 == 0o444
+    assert (destination / "bin/tool").read_bytes() == b"#!/bin/sh\nexit 0\n"
+    assert (destination / "bin/tool").stat().st_mode & 0o777 == 0o555
+    assert safe_name("receipts/page.2.heic").as_posix() == "receipts/page.2.heic"
+    unsafe_names = (
+        "",
+        "../outside",
+        "/absolute",
+        "a//b",
+        "a/./b",
+        "a\\b",
+        ".git/config",
+        ".venv/bin/python",
+    )
+    for unsafe in unsafe_names:
+        with pytest.raises(ValueError):
+            safe_name(unsafe)
+
+    expected_content = {
+        "README.md": b"synthetic snapshot fixture\n",
+        "bin/tool": b"#!/bin/sh\nexit 0\n",
+    }
+
+    def make_archive(
+        path: Path, entries: list[tuple[str, bytes, int, str]], comment: str = candidate
+    ) -> None:
+        with tarfile.open(
+            path, "w", format=tarfile.PAX_FORMAT, pax_headers={"comment": comment}
+        ) as package:
+            for name, content, mode, kind in entries:
+                member = tarfile.TarInfo(name)
+                member.mode = mode
+                if kind == "symlink":
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = "README.md"
+                    package.addfile(member)
+                else:
+                    member.size = len(content)
+                    package.addfile(member, io.BytesIO(content))
+
+    regular_entries = [
+        ("README.md", expected_content["README.md"], 0o644, "file"),
+        ("bin/tool", expected_content["bin/tool"], 0o755, "file"),
+    ]
+    invalid_archives = {
+        "duplicate": regular_entries + [regular_entries[0]],
+        "symlink": [("README.md", b"", 0o777, "symlink"), regular_entries[1]],
+        "traversal": [("../outside", b"bad", 0o644, "file")],
+        "wrong_mode": [
+            regular_entries[0],
+            ("bin/tool", expected_content["bin/tool"], 0o644, "file"),
+        ],
+    }
+    for variant, entries in invalid_archives.items():
+        bad_archive = tmp_path / f"{variant}.tar"
+        make_archive(bad_archive, entries)
+        rejected_destination = tmp_path / f"rejected-{variant}"
+        with pytest.raises(ValueError):
+            extract(
+                bad_archive, inventory, rejected_destination, candidate, tree_sha, commit_object
+            )
+        assert not rejected_destination.exists()
+
+    wrong_comment = tmp_path / "wrong-comment.tar"
+    make_archive(wrong_comment, regular_entries, "0" * 40)
+    with pytest.raises(ValueError, match="does not bind"):
+        extract(
+            wrong_comment,
+            inventory,
+            tmp_path / "rejected-comment",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+
+    with pytest.raises(ValueError, match="root tree"):
+        extract(archive, inventory, tmp_path / "rejected-tree", candidate, "0" * 40, commit_object)
+    changed_inventory = tmp_path / "changed-inventory.bin"
+    changed_inventory.write_bytes(
+        b"\0".join(
+            record.replace(b"100755 blob ", b"100644 blob ", 1)
+            if b"\tbin/tool" in record
+            else record
+            for record in inventory.read_bytes().split(b"\0")
+        )
+    )
+    with pytest.raises(ValueError, match="root tree"):
+        extract(
+            archive,
+            changed_inventory,
+            tmp_path / "rejected-inventory",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+    changed_commit = tmp_path / "changed-commit.bin"
+    changed_commit.write_bytes(commit_object.read_bytes()[:-1] + b"x")
+    with pytest.raises(ValueError, match="candidate object"):
+        extract(
+            archive,
+            inventory,
+            tmp_path / "rejected-commit",
+            candidate,
+            tree_sha,
+            changed_commit,
+        )
+
+    linked_archive = tmp_path / "linked-archive.tar"
+    linked_archive.symlink_to(archive)
+    with pytest.raises(OSError):
+        extract(
+            linked_archive,
+            inventory,
+            tmp_path / "rejected-archive-link",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+    hardlinked_inventory = tmp_path / "hardlinked-inventory.bin"
+    hardlinked_inventory.hardlink_to(inventory)
+    with pytest.raises(ValueError, match="bounded regular file"):
+        extract(
+            archive,
+            hardlinked_inventory,
+            tmp_path / "rejected-inventory-link",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+
+    oversized_inventory = tmp_path / "oversized-inventory.bin"
+    oversized_inventory.write_bytes(b"x" * 2_097_153)
+    with pytest.raises(ValueError, match="bounded regular file"):
+        extract(
+            archive,
+            oversized_inventory,
+            tmp_path / "rejected-inventory-size",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+    oversized_archive = tmp_path / "oversized-archive.tar"
+    oversized_archive.write_bytes(b"x")
+    with oversized_archive.open("r+b") as stream:
+        stream.truncate(134_217_729)
+    with pytest.raises(ValueError, match="bounded regular file"):
+        extract(
+            oversized_archive,
+            inventory,
+            tmp_path / "rejected-archive-size",
+            candidate,
+            tree_sha,
+            commit_object,
+        )
+
+
+def _encode_synthetic_acl(entries: dict[tuple[int, int | None], int]) -> bytes:
+    import struct
+
+    raw = bytearray(struct.pack("<I", 2))
+    for (tag, qualifier), permissions in sorted(
+        entries.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else item[0][1])
+    ):
+        raw.extend(
+            struct.pack("<HHI", tag, permissions, 0xFFFFFFFF if qualifier is None else qualifier)
+        )
+    return bytes(raw)
+
+
+def _synthetic_acl_for_mode(mode: int) -> bytes:
+    group_permissions = (mode >> 3) & 7
+    entries = {
+        (1, None): (mode >> 6) & 7,
+        (2, 12345): 7,
+        (4, None): group_permissions,
+        (8, 23456): 7,
+        (16, None): group_permissions,
+        (32, None): mode & 7,
+    }
+    return _encode_synthetic_acl(entries)
+
+
+def test_selected_sdk_validator_binds_fixed_path_version_and_hashes(tmp_path: Path) -> None:
+    """Validate selected SDK checks against tiny synthetic files, not the hosted SDK."""
+    import hashlib
+    import os
+    from types import SimpleNamespace
+
+    step = "Prepare isolated media candidate snapshot and runtime"
+    namespace = _inline_namespace(step, "PY_MEDIA_RUNTIME")
+    expected_root = Path("/opt/hostedtoolcache/Python/3.12.14/x64")
+    expected_hashes = {
+        "bin/python3.12": "bef88f140b625959f8af25c7b75cce2cd5d4b29cc2f2b079befd7f68eda4dba0",
+        "lib/libpython3.12.so.1.0": (
+            "1fa3c52ba5aa8f6b2852836a4bf6cbb23161f7cf379f6f19248d87124b28b38a"
+        ),
+    }
+    assert namespace["SDK_ROOT"] == expected_root
+    assert namespace["SDK_VERSION"] == (3, 12, 14)
+    assert namespace["SDK_HASHES"] == expected_hashes
+
+    sdk_root = tmp_path / "sdk"
+    binary = sdk_root / "bin/python3.12"
+    libpython = sdk_root / "lib/libpython3.12.so.1.0"
+    binary.parent.mkdir(parents=True)
+    libpython.parent.mkdir(parents=True)
+    binary_bytes = b"synthetic selected Python binary"
+    libpython_bytes = b"synthetic selected libpython"
+    binary.write_bytes(binary_bytes)
+    binary.chmod(0o755)
+    libpython.write_bytes(libpython_bytes)
+    libpython.chmod(0o644)
+
+    namespace["SDK_ROOT"] = sdk_root
+    namespace["SDK_VERSION"] = (3, 12, 14)
+    namespace["SDK_HASHES"] = {
+        "bin/python3.12": hashlib.sha256(binary_bytes).hexdigest(),
+        "lib/libpython3.12.so.1.0": hashlib.sha256(libpython_bytes).hexdigest(),
+    }
+    namespace["sys"] = SimpleNamespace(version_info=(3, 12, 14))
+    validate = namespace["validate_selected_sdk"]
+    assert callable(validate)
+
+    identity = validate(sdk_root, binary, os.getuid())
+    assert identity["selected_base_prefix"] == str(sdk_root)
+    assert identity["selected_binary"] == str(binary)
+    assert identity["selected_python_version"] == [3, 12, 14]
+    assert identity["selected_binary_sha256"] == hashlib.sha256(binary_bytes).hexdigest()
+    assert identity["selected_libpython_sha256"] == hashlib.sha256(libpython_bytes).hexdigest()
+
+    with pytest.raises(ValueError, match="exact canonical SDK"):
+        validate(tmp_path / "other-sdk", binary, os.getuid())
+    with pytest.raises(ValueError, match="exact canonical SDK"):
+        validate(sdk_root, libpython, os.getuid())
+    namespace["sys"].version_info = (3, 12, 13)
+    with pytest.raises(ValueError, match="exact canonical SDK"):
+        validate(sdk_root, binary, os.getuid())
+    namespace["sys"].version_info = (3, 12, 14)
+    namespace["SDK_HASHES"]["bin/python3.12"] = "0" * 64
+    with pytest.raises(ValueError, match="bytes or custody differ"):
+        validate(sdk_root, binary, os.getuid())
+
+
+def test_sdk_acl_adapter_preserves_other_subjects_and_defaults(tmp_path: Path) -> None:
+    """Use synthetic xattr/setfacl adapters; native Linux POSIX ACL execution is NOT_RUN."""
+    import os
+    import stat
+    from types import SimpleNamespace
+
+    namespace = _inline_namespace(
+        "Prepare isolated media candidate snapshot and runtime", "PY_MEDIA_SDK_ACL"
+    )
+    sdk_root = tmp_path / "opt/hostedtoolcache/Python/3.12.14/x64"
+    sdk_root.mkdir(parents=True)
+    ancestors = (sdk_root.parents[2], sdk_root.parents[1], sdk_root.parents[0])
+    for path in ancestors:
+        path.mkdir(parents=True, exist_ok=True)
+        path.chmod(0o755)
+    sdk_root.chmod(0o755)
+    binary = sdk_root / "bin/python3.12"
+    library = sdk_root / "lib/libpython3.12.so.1.0"
+    binary.parent.mkdir()
+    library.parent.mkdir()
+    binary.write_bytes(b"synthetic SDK binary")
+    binary.chmod(0o755)
+    library.write_bytes(b"synthetic SDK library")
+    library.chmod(0o644)
+    (binary.parent / "python").symlink_to(binary.name)
+
+    namespace["SDK_ROOT"] = sdk_root
+    namespace["ANCESTORS"] = ancestors
+    fin_uid = os.getuid() + 100_000
+    source_owner = os.getuid()
+    nodes = list(namespace["sdk_acl_nodes"](sdk_root, fin_uid, source_owner))
+    paths = [*ancestors, *nodes]
+    access_acls = {
+        path: _synthetic_acl_for_mode(stat.S_IMODE(path.lstat().st_mode)) for path in paths
+    }
+    default_acls = {
+        path: _synthetic_acl_for_mode(stat.S_IMODE(path.lstat().st_mode))
+        if stat.S_ISDIR(path.lstat().st_mode)
+        else None
+        for path in paths
+    }
+    initial_access = dict(access_acls)
+    initial_defaults = dict(default_acls)
+
+    def read_synthetic_acl(path: Path, name: str) -> bytes | None:
+        if name == "system.posix_acl_access":
+            return access_acls[Path(path)]
+        assert name == "system.posix_acl_default"
+        return default_acls[Path(path)]
+
+    calls: list[list[str]] = []
+
+    def apply_synthetic_acl(arguments: list[str], *, check: bool, timeout: int) -> None:
+        assert check is True and timeout == 15
+        assert arguments[:3] == ["/usr/bin/setfacl", "--no-mask", "-m"]
+        assert arguments[3] == f"u:{fin_uid}:r-X"
+        calls.append(arguments)
+        for raw_path in arguments[arguments.index("--") + 1 :]:
+            path = Path(raw_path)
+            entries = namespace["decode_acl"](access_acls[path])
+            needed = 4 | (
+                1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
+            )
+            entries[(2, fin_uid)] = needed
+            access_acls[path] = _encode_synthetic_acl(entries)
+
+    namespace["read_acl"] = read_synthetic_acl
+    namespace["subprocess"] = SimpleNamespace(run=apply_synthetic_acl)
+    result = namespace["restrict_fin_sdk"](sdk_root, fin_uid, source_owner)
+
+    assert calls
+    assert result["sdk_acl_entries"] == len(paths)
+    assert result["fin_uid"] == fin_uid
+    assert result["before_acl_sha256"] != result["after_acl_sha256"]
+    assert result["other_subjects_effective_permissions_and_default_acl"] == "UNCHANGED"
+    assert result["mask_recalculation"] is False
+    for path in paths:
+        before_info = path.lstat()
+        before = namespace["acl_subjects"](initial_access[path], before_info, fin_uid)
+        after_entries = namespace["decode_acl"](access_acls[path])
+        after = namespace["acl_subjects"](access_acls[path], path.lstat(), fin_uid)
+        required = 4 | (
+            1 if stat.S_ISDIR(path.lstat().st_mode) or path.lstat().st_mode & 0o111 else 0
+        )
+        assert after_entries[(2, fin_uid)] == required
+        assert after == before
+        assert default_acls[path] == initial_defaults[path]
+
+
+@pytest.mark.parametrize("unsafe", ["fin_owned", "external_link"])
+def test_sdk_acl_scope_refuses_fin_owned_nodes_and_external_links(
+    tmp_path: Path, unsafe: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check path ownership/link guards with local metadata adapters, not native ACLs."""
+    import os
+
+    namespace = _inline_namespace(
+        "Prepare isolated media candidate snapshot and runtime", "PY_MEDIA_SDK_ACL"
+    )
+    sdk_root = tmp_path / "sdk"
+    (sdk_root / "bin").mkdir(parents=True)
+    binary = sdk_root / "bin/python3.12"
+    binary.write_bytes(b"synthetic interpreter")
+    namespace["SDK_ROOT"] = sdk_root
+    fin_uid = os.getuid() + 100_000
+    source_owner = os.getuid()
+
+    if unsafe == "external_link":
+        outside = tmp_path / "outside"
+        outside.write_text("outside SDK", encoding="utf-8")
+        (sdk_root / "escape").symlink_to(outside)
+        with pytest.raises(ValueError, match="external symlink"):
+            list(namespace["sdk_acl_nodes"](sdk_root, fin_uid, source_owner))
+    else:
+        original_lstat = Path.lstat
+
+        class FinOwnedStat:
+            def __init__(self, original: os.stat_result) -> None:
+                self._original = original
+
+            def __getattr__(self, name: str) -> object:
+                if name == "st_uid":
+                    return fin_uid
+                return getattr(self._original, name)
+
+        def lstat_with_fin_owner(path: Path) -> os.stat_result:
+            info = original_lstat(path)
+            if path == binary:
+                return FinOwnedStat(info)  # type: ignore[return-value]
+            return info
+
+        monkeypatch.setattr(Path, "lstat", lstat_with_fin_owner)
+        with pytest.raises(ValueError, match="trusted non-fin ownership"):
+            list(namespace["sdk_acl_nodes"](sdk_root, fin_uid, source_owner))
+
+
+def test_sdk_acl_refusal_writes_bounded_failure_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fake ACL adapter proves refusal receipt behavior; native Linux ACL execution is NOT_RUN."""
+    import json
+    import os
+    import pwd
+    import sys
+    from types import SimpleNamespace
+
+    script = _inline_python(
+        "Prepare isolated media candidate snapshot and runtime", "PY_MEDIA_SDK_ACL"
+    )
+    tree = ast.parse(script)
+    sdk_root = tmp_path / "sdk"
+    sdk_root.mkdir()
+    sdk_root.chmod(0o700)
+    access_acl = _encode_synthetic_acl({(1, None): 7, (4, None): 0, (16, None): 0, (32, None): 0})
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+        if "SDK_ROOT" in names:
+            node.value = ast.parse(f"Path({str(sdk_root)!r})", mode="eval").body
+        elif "ANCESTORS" in names:
+            node.value = ast.parse("()", mode="eval").body
+    adapted_script = ast.unparse(ast.fix_missing_locations(tree))
+    fin_uid = os.getuid() + 100_000
+
+    def get_synthetic_xattr(
+        path: str | Path, name: str, *, follow_symlinks: bool = False
+    ) -> bytes | None:
+        assert follow_symlinks is False
+        if Path(path) == sdk_root and name == "system.posix_acl_access":
+            return access_acl
+        return None
+
+    def no_acl_command(*args: object, **kwargs: object) -> None:
+        raise AssertionError("The insufficient synthetic mask must fail before setfacl")
+
+    monkeypatch.setattr(os, "getxattr", get_synthetic_xattr, raising=False)
+    monkeypatch.setattr(subprocess, "run", no_acl_command)
+    monkeypatch.setattr(pwd, "getpwnam", lambda _name: SimpleNamespace(pw_uid=fin_uid))
+    monkeypatch.setattr(sys, "platform", "linux")
+    receipt_path = tmp_path / "sdk-acl.json"
+    monkeypatch.setattr(sys, "argv", ["PY_MEDIA_SDK_ACL", str(receipt_path), str(os.getuid())])
+
+    with pytest.raises(SystemExit, match="Fin-specific SDK ACL restriction refused"):
+        exec(compile(adapted_script, "<PY_MEDIA_SDK_ACL>", "exec"), {"__name__": "__main__"})
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["schema"] == "finance-media-ci-sdk-acl-v1"
+    assert receipt["status"] == "REFUSED"
+    assert receipt["failure_type"] == "ValueError"
+    assert "without expansion" in receipt["failure_reason"]
+    assert receipt_path.stat().st_mode & 0o777 == 0o400
+    assert receipt_path.stat().st_size <= 65_536
+
+
+@pytest.mark.parametrize("failure", ["permission", "exit126", "timeout", "invalid_identity"])
+def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
+    tmp_path: Path, failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise bounded receipts with a child-process adapter, never claim Linux admission."""
+    import json
+    import os
+    import sys
+
+    script = _inline_python(
+        "Verify isolated media startup and prepare OCR assets", "PY_MEDIA_STARTUP"
+    )
+    tree = ast.parse(script)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "run_startup_probe"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            node.keywords.append(ast.keyword(arg="timeout", value=ast.Constant(value=0.05)))
+    script = ast.unparse(ast.fix_missing_locations(tree))
+
+    root = tmp_path / "media-root"
+    root.mkdir()
+    (root / "runtime.json").write_text(
+        json.dumps(
+            {
+                "status": "PASS",
+                "base_prefix": "/opt/hostedtoolcache/Python/3.12.14/x64",
+                "selected_binary_sha256": "a" * 64,
+                "selected_libpython_sha256": "c" * 64,
+                "trusted_sdk_owners": [0, os.getuid()],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "snapshot.json").write_text(json.dumps({"candidate_sha": "b" * 40}), encoding="utf-8")
+    receipt_path = root / "startup.json"
+    original_popen = subprocess.Popen
+
+    def adapted_popen(_arguments: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        if failure == "permission":
+            raise PermissionError("synthetic interpreter execute denial")
+        command = (
+            "import json; print(json.dumps({'admission':'REFUSED'}))"
+            if failure == "invalid_identity"
+            else ("import time; time.sleep(2)" if failure == "timeout" else "raise SystemExit(126)")
+        )
+        return original_popen([sys.executable, "-I", "-c", command], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", adapted_popen)
+    monkeypatch.setattr(sys, "argv", ["PY_MEDIA_STARTUP", str(root), str(receipt_path)])
+    namespace: dict[str, object] = {"__name__": "__main__"}
+    with pytest.raises(SystemExit):
+        exec(compile(script, "<PY_MEDIA_STARTUP>", "exec"), namespace)
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["schema"] == "finance-media-ci-startup-v1"
+    assert receipt["candidate_sha"] == "b" * 40
+    assert receipt["status"] == "REFUSED"
+    assert receipt_path.stat().st_mode & 0o777 == 0o400
+    assert receipt_path.stat().st_size <= 393_216
+    assert len(receipt.get("stdout", "")) <= 8192
+    if failure == "permission":
+        assert receipt["failure_type"] == "PermissionError"
+    elif failure == "timeout":
+        assert receipt["failure_type"] == "TimeoutError"
+    elif failure == "exit126":
+        assert receipt["returncode"] == 126
+    else:
+        assert "admitted identity" in receipt["failure_reason"]
 
 
 def _media_proof_script() -> str:
@@ -491,7 +1165,19 @@ def test_actual_media_report_refuses_unsafe_files(tmp_path: Path, unsafe: str) -
 
 
 @pytest.mark.parametrize(
-    "variant", ["regular", "file_link", "directory_link", "hardlink", "oversize", "survivor"]
+    "variant",
+    [
+        "regular",
+        "file_link",
+        "directory_link",
+        "hardlink",
+        "oversize",
+        "survivor",
+        "controls",
+        "control_symlink",
+        "control_mode",
+        "control_oversize",
+    ],
 )
 def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant: str) -> None:
     """Exercise export bytes with a synthetic UID/proc adapter, never native Linux admission."""
@@ -506,6 +1192,29 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
     member = evidence / "original.bin"
     member.write_bytes(raw)
     member.chmod(0o400)
+    control_payloads = {
+        "snapshot.json": b'{"schema":"finance-media-ci-snapshot-v1","status":"REFUSED"}\n',
+        "sdk-acl.json": b'{"schema":"finance-media-ci-sdk-acl-v1","status":"REFUSED"}\n',
+        "runtime.json": b'{"schema":"finance-media-ci-runtime-v1","status":"REFUSED"}\n',
+        "startup.json": b'{"schema":"finance-media-ci-startup-v1","status":"REFUSED"}\n',
+    }
+    if variant in {"survivor", "controls", "control_symlink", "control_mode", "control_oversize"}:
+        for name, payload in control_payloads.items():
+            control = source.parent / name
+            control.write_bytes(payload)
+            control.chmod(0o400)
+        if variant == "control_symlink":
+            target = source.parent / "snapshot-target.json"
+            target.write_bytes(control_payloads["snapshot.json"])
+            target.chmod(0o400)
+            (source.parent / "snapshot.json").unlink()
+            (source.parent / "snapshot.json").symlink_to(target)
+        elif variant == "control_mode":
+            (source.parent / "snapshot.json").chmod(0o600)
+        elif variant == "control_oversize":
+            (source.parent / "snapshot.json").chmod(0o600)
+            (source.parent / "snapshot.json").write_bytes(b"x" * 65_537)
+            (source.parent / "snapshot.json").chmod(0o400)
     proc = tmp_path / "synthetic-proc"
     proc.mkdir()
     if variant == "survivor":
@@ -540,7 +1249,7 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
             isinstance(node, ast.Compare)
             and isinstance(node.left, ast.Attribute)
             and isinstance(node.left.value, ast.Name)
-            and node.left.value.id == "parent_info"
+            and node.left.value.id in {"parent_info", "before"}
             and node.left.attr == "st_uid"
         ):
             node.comparators = [ast.Constant(value=os.getuid())]
@@ -563,12 +1272,26 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
         text=True,
         capture_output=True,
     )
-    if variant == "regular":
+    if variant in {"regular", "controls"}:
         assert result.returncode == 0, result.stderr
         copied = destination / "evidence/original.bin"
         assert copied.read_bytes() == member.read_bytes() == raw
         assert hashlib.sha256(copied.read_bytes()).digest() == hashlib.sha256(raw).digest()
         assert copied.stat().st_mode & 0o777 == member.stat().st_mode & 0o777 == 0o400
+        if variant == "controls":
+            for name, payload in control_payloads.items():
+                exported = destination / ("bootstrap-" + name)
+                assert exported.read_bytes() == payload
+                assert exported.stat().st_mode & 0o777 == 0o400
+    elif variant == "survivor":
+        assert result.returncode != 0
+        for name, payload in control_payloads.items():
+            exported = destination / ("bootstrap-" + name)
+            assert exported.read_bytes() == payload
+            assert exported.stat().st_mode & 0o777 == 0o400
+        assert not (destination / "evidence/original.bin").exists()
     else:
         assert result.returncode != 0
+        if variant.startswith("control_"):
+            assert not (destination / "bootstrap-snapshot.json").exists()
         assert not (destination / "evidence/original.bin").exists()

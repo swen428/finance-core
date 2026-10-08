@@ -227,7 +227,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.12"
+          python-version: "3.12.14"
 
       - name: Verify Linux validation platform
         if: runner.os == 'Linux'
@@ -254,7 +254,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y tesseract-ocr
+          sudo apt-get install --no-install-recommends -y tesseract-ocr acl
           .venv/bin/python -I scripts/prepare_linux_ocr.py \
             --executable /usr/bin/tesseract \
             --destination "$RUNNER_TEMP/linux-ocr"
@@ -289,35 +289,633 @@ jobs:
           retention-days: 30
           if-no-files-found: warn
 
-      - name: Prepare isolated media acceptance account and OCR assets
+      - name: Prepare isolated media candidate snapshot and runtime
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           if getent passwd financemedia; then
             echo "The synthetic media account must be fresh" >&2
             exit 1
           fi
-          case "$GITHUB_RUN_ID:$GITHUB_RUN_ATTEMPT" in
-            *[!0-9:]*|:*) exit 1 ;;
-          esac
-          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          test ! -e "$media_root"
+          for value in "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"; do
+            case "$value" in ''|*[!0-9]*) exit 1 ;; esac
+          done
+          media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "$media_root" && test ! -L "$media_root"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          source_tree="$(git rev-parse "$CANDIDATE_SHA^{tree}")"
+          archive="$RUNNER_TEMP/finance-media-candidate.tar"
+          inventory="$RUNNER_TEMP/finance-media-candidate-tree.bin"
+          commit_object="$RUNNER_TEMP/finance-media-candidate-commit.bin"
+          git -c tar.umask=0022 archive --format=tar --output "$archive" "$CANDIDATE_SHA"
+          git ls-tree -r -z --full-tree "$CANDIDATE_SHA" > "$inventory"
+          git cat-file commit "$CANDIDATE_SHA" > "$commit_object"
           sudo useradd --system --no-create-home --shell /usr/sbin/nologin financemedia
           sudo install -d -m 0755 -o root -g root "$media_root"
           sudo install -d -m 0700 -o financemedia -g financemedia "$media_root/work"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$archive" "$inventory" "$media_root/source" "$media_root/snapshot.json" "$CANDIDATE_SHA" "$source_tree" "$GITHUB_WORKSPACE/.venv/bin/python" "$commit_object" <<'PY_MEDIA_SNAPSHOT'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import stat
+          import sys
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          MAX_ARCHIVE = 134_217_728
+          MAX_MEMBERS = 8192
+          MAX_FILE = 20_000_000
+
+          def canonical(value):
+              return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+          def write_receipt(path, value):
+              raw = canonical(value)
+              if len(raw) > 65_536:
+                  raise ValueError("Snapshot receipt exceeded bound")
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "wb") as stream:
+                  stream.write(raw)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+                  os.fchmod(stream.fileno(), 0o400)
+
+          def safe_name(name):
+              if not isinstance(name, str) or not name or len(name) > 4096 or "\\" in name or any(ord(c) < 32 for c in name):
+                  raise ValueError("Unsafe archive name")
+              path = PurePosixPath(name)
+              if path.is_absolute() or str(path) != name or any(p in {".", "..", ".git", ".venv"} for p in path.parts):
+                  raise ValueError("Unsafe archive path")
+              return path
+
+          def read_bounded(path, maximum):
+              fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as incoming:
+                  before = os.fstat(incoming.fileno())
+                  if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > maximum:
+                      raise ValueError("Candidate input must be a bounded regular file")
+                  raw = incoming.read(maximum + 1)
+                  def identity(info):
+                      return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                  if len(raw) != before.st_size or len(raw) > maximum or identity(os.fstat(incoming.fileno())) != identity(before) or identity(path.lstat()) != identity(before):
+                      raise ValueError("Candidate input changed during verification")
+              return raw
+
+          def committed_tree_hash(expected):
+              root = {}
+              for name, value in expected.items():
+                  current = root
+                  parts = PurePosixPath(name).parts
+                  for part in parts[:-1]:
+                      current = current.setdefault(part, {})
+                      if not isinstance(current, dict):
+                          raise ValueError("Committed file/directory paths conflict")
+                  if parts[-1] in current:
+                      raise ValueError("Committed file/directory paths conflict")
+                  current[parts[-1]] = value
+              def tree(entries):
+                  raw = bytearray()
+                  for name, value in sorted(entries.items(), key=lambda item: (item[0] + ("/" if isinstance(item[1], dict) else "")).encode("utf-8")):
+                      mode, blob = ("40000", tree(value)) if isinstance(value, dict) else value
+                      raw.extend(mode.encode("ascii") + b" " + name.encode("utf-8") + b"\0" + bytes.fromhex(blob))
+                  return hashlib.sha1(b"tree " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+              return tree(root)
+
+          def extract_candidate(archive, inventory, destination, candidate_sha, tree_sha, commit_object):
+              if not re.fullmatch(r"[0-9a-f]{40}", candidate_sha) or not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+                  raise ValueError("Malformed candidate identity")
+              raw = read_bounded(archive, MAX_ARCHIVE)
+              inventory_raw = read_bounded(inventory, 2_097_152)
+              expected = {}
+              for record in inventory_raw.split(b"\0"):
+                  if not record:
+                      continue
+                  metadata, raw_name = record.split(b"\t", 1)
+                  mode, kind, blob = metadata.decode("ascii").split(" ")
+                  name = raw_name.decode("utf-8", "strict")
+                  safe_name(name)
+                  if mode not in {"100644", "100755"} or kind != "blob" or not re.fullmatch(r"[0-9a-f]{40}", blob) or name in expected:
+                      raise ValueError("Unsupported committed tree member")
+                  expected[name] = (mode, blob)
+                  if len(expected) > MAX_MEMBERS:
+                      raise ValueError("Committed tree exceeded member bound")
+              if not expected:
+                  raise ValueError("Empty candidate tree")
+              if committed_tree_hash(expected) != tree_sha:
+                  raise ValueError("Inventory does not bind committed root tree")
+              committed = read_bounded(commit_object, 2_097_152)
+              if hashlib.sha1(b"commit " + str(len(committed)).encode("ascii") + b"\0" + committed).hexdigest() != candidate_sha or committed.split(b"\n", 1)[0] != b"tree " + tree_sha.encode("ascii"):
+                  raise ValueError("Tree does not bind committed candidate object")
+              allowed_dirs = {str(parent) for name in expected for parent in PurePosixPath(name).parents if str(parent) != "."}
+              validated = []
+              seen, total, count = set(), 0, 0
+              with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as package:
+                  if package.pax_headers.get("comment") != candidate_sha:
+                      raise ValueError("Archive does not bind candidate commit")
+                  for member in package:
+                      count += 1
+                      if count > MAX_MEMBERS or member.mode & 0o7000:
+                          raise ValueError("Unsafe archive type or count")
+                      name = member.name.rstrip("/") if member.isdir() else member.name
+                      safe_name(name)
+                      if name in seen:
+                          raise ValueError("Duplicate archive member")
+                      seen.add(name)
+                      if member.isdir():
+                          if name not in allowed_dirs:
+                              raise ValueError("Uncommitted archive directory")
+                          continue
+                      if not member.isreg() or member.issparse() or name not in expected:
+                          raise ValueError("Archive requires regular committed files only")
+                      if not 0 <= member.size <= MAX_FILE:
+                          raise ValueError("Archive file exceeded bound")
+                      total += member.size
+                      if total > MAX_ARCHIVE:
+                          raise ValueError("Candidate source exceeded byte bound")
+                      incoming = package.extractfile(member)
+                      if incoming is None:
+                          raise ValueError("Archive file is missing")
+                      content = incoming.read(MAX_FILE + 1)
+                      if len(content) != member.size:
+                          raise ValueError("Archive file size differs")
+                      mode, blob = expected[name]
+                      if member.mode != (0o755 if mode == "100755" else 0o644):
+                          raise ValueError("Archive mode differs from committed executable policy")
+                      if hashlib.sha1(b"blob " + str(len(content)).encode() + b"\0" + content).hexdigest() != blob:
+                          raise ValueError("Archive bytes differ from committed blob")
+                      validated.append((name, mode, content))
+              if {name for name, _, _ in validated} != set(expected):
+                  raise ValueError("Archive omits committed files")
+              destination.mkdir(mode=0o755)
+              observed = []
+              for name, mode, content in validated:
+                  target = destination / name
+                  target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+                  fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                  with os.fdopen(fd, "wb") as output:
+                      output.write(content)
+                      output.flush()
+                      os.fsync(output.fileno())
+                      os.fchmod(output.fileno(), 0o555 if mode == "100755" else 0o444)
+                  observed.append([name, mode, len(content), hashlib.sha256(content).hexdigest()])
+              return {"candidate_sha": candidate_sha, "candidate_tree_sha": tree_sha, "archive_sha256": hashlib.sha256(raw).hexdigest(), "source_inventory_sha256": hashlib.sha256(canonical(sorted(observed))).hexdigest(), "files": len(observed), "bytes": total, "read_only_modes": {"100644": "0444", "100755": "0555"}}
+
+          def traversal(path):
+              result = []
+              for current in reversed((path, *path.parents)):
+                  info = current.lstat()
+                  result.append({"path": str(current), "mode": oct(stat.S_IMODE(info.st_mode)), "uid": info.st_uid, "gid": info.st_gid, "symlink": stat.S_ISLNK(info.st_mode)})
+              return result
+
+          if __name__ == "__main__":
+              archive, inventory, destination, receipt = map(Path, sys.argv[1:5])
+              result = {"schema": "finance-media-ci-snapshot-v1", "status": "REFUSED", "candidate_sha": sys.argv[5], "candidate_tree_sha": sys.argv[6]}
+              try:
+                  result["original_workspace_traversal"] = traversal(Path(sys.argv[7]))
+                  result.update(extract_candidate(archive, inventory, destination, sys.argv[5], sys.argv[6], Path(sys.argv[8])))
+                  result["status"] = "PASS"
+              except Exception as error:
+                  result["failure_type"] = type(error).__name__
+                  result["failure_reason"] = str(error)[:1024]
+              write_receipt(receipt, result)
+              if result["status"] != "PASS":
+                  raise SystemExit("Scoped committed media snapshot refused")
+          PY_MEDIA_SNAPSHOT
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$media_root/sdk-acl.json" "$(id -u)" <<'PY_MEDIA_SDK_ACL'
+          import errno
+          import hashlib
+          import json
+          import os
+          import pwd
+          import stat
+          import struct
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SDK_ROOT = Path("/opt/hostedtoolcache/Python/3.12.14/x64")
+          MAX_SDK_ENTRIES = 32768
+          ANCESTORS = (Path("/opt/hostedtoolcache"), Path("/opt/hostedtoolcache/Python"), Path("/opt/hostedtoolcache/Python/3.12.14"))
+          USER_OBJ, USER, GROUP_OBJ, GROUP, MASK, OTHER = 1, 2, 4, 8, 16, 32
+
+          def read_acl(path, name):
+              try:
+                  return os.getxattr(path, name, follow_symlinks=False)
+              except OSError as error:
+                  if error.errno == errno.ENODATA:
+                      return None
+                  raise
+
+          def decode_acl(raw):
+              if raw is None:
+                  return None
+              if len(raw) < 4 or len(raw) > 4096 or (len(raw) - 4) % 8 or struct.unpack_from("<I", raw)[0] != 2:
+                  raise ValueError("Unsupported Linux POSIX ACL encoding")
+              entries = {}
+              for offset in range(4, len(raw), 8):
+                  tag, permissions, qualifier = struct.unpack_from("<HHI", raw, offset)
+                  if tag not in {USER_OBJ, USER, GROUP_OBJ, GROUP, MASK, OTHER} or permissions > 7 or (tag in {USER, GROUP}) == (qualifier == 0xffffffff):
+                      raise ValueError("Malformed Linux POSIX ACL entry")
+                  key = (tag, qualifier if tag in {USER, GROUP} else None)
+                  if key in entries:
+                      raise ValueError("Duplicate Linux POSIX ACL entry")
+                  entries[key] = permissions
+              if any((tag, None) not in entries for tag in (USER_OBJ, GROUP_OBJ, OTHER)) or (any(tag in {USER, GROUP} for tag, _ in entries) and (MASK, None) not in entries):
+                  raise ValueError("Incomplete Linux POSIX ACL")
+              return entries
+
+          def acl_subjects(raw, info, fin_uid):
+              entries = decode_acl(raw)
+              if entries is None:
+                  entries = {(USER_OBJ, None): (info.st_mode >> 6) & 7, (GROUP_OBJ, None): (info.st_mode >> 3) & 7, (OTHER, None): info.st_mode & 7}
+              mask = entries.get((MASK, None), entries[(GROUP_OBJ, None)])
+              if mask != (info.st_mode >> 3) & 7:
+                  raise ValueError("ACL mask differs from effective group mode")
+              subjects = []
+              for (tag, qualifier), permissions in sorted(entries.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else item[0][1])):
+                  if tag == MASK or (tag == USER and qualifier == fin_uid):
+                      continue
+                  effective = permissions & mask if tag in {USER, GROUP_OBJ, GROUP} else permissions
+                  subjects.append([tag, qualifier, permissions, effective])
+              return {"mask": mask, "subjects": subjects}
+
+          def sdk_acl_nodes(root, fin_uid, source_owner):
+              if root != SDK_ROOT or root.resolve(strict=True) != SDK_ROOT:
+                  raise ValueError("ACL scope must be canonical selected SDK")
+              pending, seen, visited = [root], set(), 0
+              while pending:
+                  path = pending.pop()
+                  visited += 1
+                  if visited > MAX_SDK_ENTRIES:
+                      raise ValueError("SDK ACL scope exceeded entry bound")
+                  info = path.lstat()
+                  if info.st_uid == fin_uid or info.st_uid not in {0, source_owner}:
+                      raise ValueError("SDK ACL scope must retain trusted non-fin ownership")
+                  if stat.S_ISLNK(info.st_mode):
+                      if not path.resolve(strict=True).is_relative_to(root):
+                          raise ValueError("SDK ACL scope contains an external symlink")
+                      continue  # Its canonical target is visited through the real SDK tree.
+                  if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                      raise ValueError("SDK ACL scope contains an unsafe file type")
+                  if path in seen:
+                      raise ValueError("Duplicate SDK ACL path")
+                  seen.add(path)
+                  yield path
+                  if stat.S_ISDIR(info.st_mode):
+                      children = []
+                      for child in path.iterdir():
+                          children.append(child)
+                          if len(children) + len(pending) + visited > MAX_SDK_ENTRIES:
+                              raise ValueError("SDK ACL scope exceeded entry bound")
+                      pending.extend(sorted(children, reverse=True))
+
+          def restrict_fin_sdk(root, fin_uid, source_owner):
+              before_hash, after_hash = hashlib.sha256(), hashlib.sha256()
+              records = []
+              for path in (*ANCESTORS, *sdk_acl_nodes(root, fin_uid, source_owner)):
+                  info = path.lstat()
+                  if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode) or info.st_uid == fin_uid or info.st_uid not in {0, source_owner}:
+                      raise ValueError("SDK ACL scope must retain trusted non-fin ownership")
+                  access = read_acl(path, "system.posix_acl_access")
+                  default = read_acl(path, "system.posix_acl_default")
+                  decode_acl(default)
+                  subjects = acl_subjects(access, info, fin_uid)
+                  needed = 4 | (1 if stat.S_ISDIR(info.st_mode) or info.st_mode & 0o111 else 0)
+                  if needed & subjects["mask"] != needed:
+                      raise ValueError("Existing ACL mask cannot admit read/execute without expansion")
+                  records.append((path, info, access, default, subjects, needed))
+                  before_hash.update(json.dumps([str(path), info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode), None if access is None else access.hex(), None if default is None else default.hex()], separators=(",", ":")).encode() + b"\n")
+              # No mask recomputation. A new mask must remain exactly the old group bits.
+              for start in range(0, len(records), 128):
+                  chunk = records[start:start + 128]
+                  subprocess.run(["/usr/bin/setfacl", "--no-mask", "-m", f"u:{fin_uid}:r-X", "--", *(str(record[0]) for record in chunk)], check=True, timeout=15)
+              for path, before, access, default, subjects, needed in records:
+                  after = path.lstat()
+                  if (after.st_dev, after.st_ino, after.st_uid, after.st_gid, after.st_mode, after.st_size) != (before.st_dev, before.st_ino, before.st_uid, before.st_gid, before.st_mode, before.st_size):
+                      raise ValueError("SDK ownership, mode or path custody changed during ACL restriction")
+                  actual_access = read_acl(path, "system.posix_acl_access")
+                  actual_default = read_acl(path, "system.posix_acl_default")
+                  entries = decode_acl(actual_access)
+                  if actual_default != default or acl_subjects(actual_access, after, fin_uid) != subjects or entries is None or entries.get((USER, fin_uid)) != needed:
+                      raise ValueError("SDK ACL changed a different subject, mask or default ACL")
+                  after_hash.update(json.dumps([str(path), after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode), actual_access.hex(), None if actual_default is None else actual_default.hex()], separators=(",", ":")).encode() + b"\n")
+              return {"sdk_acl_entries": len(records), "fin_uid": fin_uid, "before_acl_sha256": before_hash.hexdigest(), "after_acl_sha256": after_hash.hexdigest(), "other_subjects_effective_permissions_and_default_acl": "UNCHANGED", "mask_recalculation": False}
+
+          def write_receipt(path, receipt):
+              raw = (json.dumps(receipt, sort_keys=True) + "\n").encode()
+              if len(raw) > 65_536:
+                  raise ValueError("SDK ACL receipt exceeded bound")
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "wb") as output:
+                  output.write(raw)
+                  output.flush()
+                  os.fsync(output.fileno())
+                  os.fchmod(output.fileno(), 0o400)
+
+          if __name__ == "__main__":
+              result = {"schema": "finance-media-ci-sdk-acl-v1", "status": "REFUSED", "sdk_prefix": str(SDK_ROOT), "policy": "only ephemeral fin named UID; no mask expansion or other-subject/default ACL changes"}
+              try:
+                  uid = pwd.getpwnam("financemedia").pw_uid
+                  if uid == 0 or sys.platform != "linux":
+                      raise ValueError("SDK ACL restriction requires the fresh nonroot Linux account")
+                  result.update(restrict_fin_sdk(SDK_ROOT, uid, int(sys.argv[2])))
+                  result["status"] = "PASS"
+              except Exception as error:
+                  result["failure_type"] = type(error).__name__
+                  result["failure_reason"] = str(error)[:1024]
+              write_receipt(Path(sys.argv[1]), result)
+              if result["status"] != "PASS":
+                  raise SystemExit("Fin-specific SDK ACL restriction refused; no mask/global-permission fallback")
+          PY_MEDIA_SDK_ACL
+          selected_base="$(python -I -c 'import sys; print(sys.base_prefix)')"
+          selected_binary="$(python -I -c 'import sys; print(sys._base_executable)')"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$selected_base" "$selected_binary" "$media_root" "$media_root/source/requirements-dev.txt" "$media_root/runtime.json" "$(id -u)" <<'PY_MEDIA_RUNTIME'
+          import hashlib
+          import json
+          import os
+          import stat
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          SDK_ROOT = Path("/opt/hostedtoolcache/Python/3.12.14/x64")
+          SDK_VERSION = (3, 12, 14)
+          SDK_HASHES = {
+              "bin/python3.12": "bef88f140b625959f8af25c7b75cce2cd5d4b29cc2f2b079befd7f68eda4dba0",
+              "lib/libpython3.12.so.1.0": "1fa3c52ba5aa8f6b2852836a4bf6cbb23161f7cf379f6f19248d87124b28b38a",
+          }
+          MAX_SDK_FILE = 67_108_864
+
+          def file_identity(info):
+              return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+          def validate_selected_sdk(source, original_binary, source_owner):
+              if source != SDK_ROOT or source.resolve(strict=True) != SDK_ROOT or original_binary.resolve(strict=True) != SDK_ROOT / "bin/python3.12" or sys.version_info[:3] != SDK_VERSION:
+                  raise ValueError("Selected setup Python must be exact canonical SDK 3.12.14")
+              observed = []
+              for name, expected in SDK_HASHES.items():
+                  path = SDK_ROOT / name
+                  fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                  with os.fdopen(fd, "rb") as incoming:
+                      info = os.fstat(incoming.fileno())
+                      if not stat.S_ISREG(info.st_mode) or info.st_uid not in {0, source_owner} or info.st_size > MAX_SDK_FILE:
+                          raise ValueError("Selected SDK requires bounded trusted installation files")
+                      digest = hashlib.sha256()
+                      remaining = info.st_size
+                      while remaining:
+                          chunk = incoming.read(min(65536, remaining))
+                          if not chunk:
+                              raise ValueError("Selected SDK file was truncated")
+                          remaining -= len(chunk)
+                          digest.update(chunk)
+                      if incoming.read(1) or file_identity(os.fstat(incoming.fileno())) != file_identity(info) or file_identity(path.lstat()) != file_identity(info) or digest.hexdigest() != expected:
+                          raise ValueError("Selected SDK installation bytes or custody differ")
+                  observed.append({"path": str(path), "sha256": digest.hexdigest(), "size_bytes": info.st_size, "uid": info.st_uid, "gid": info.st_gid, "mode": oct(stat.S_IMODE(info.st_mode))})
+              return {"sdk_trust_boundary": "selected setup-python SDK and Ubuntu loader/system libraries; administrator-owned installation", "selected_base_prefix": str(SDK_ROOT), "selected_binary": str(SDK_ROOT / "bin/python3.12"), "selected_binary_sha256": SDK_HASHES["bin/python3.12"], "selected_libpython": str(SDK_ROOT / "lib/libpython3.12.so.1.0"), "selected_libpython_sha256": SDK_HASHES["lib/libpython3.12.so.1.0"], "selected_python_version": list(SDK_VERSION), "trusted_sdk_owners": sorted({0, source_owner}), "sdk_files": observed}
+
+          def seal_runtime(root):
+              for current, directories, files in os.walk(root, followlinks=False):
+                  for name in directories + files:
+                      path = Path(current) / name
+                      info = path.lstat()
+                      if stat.S_ISLNK(info.st_mode):
+                          actual = path.resolve(strict=True)
+                          if not actual.is_relative_to(SDK_ROOT) and not actual.is_relative_to(root):
+                              raise ValueError("Fresh runtime has an unexpected external symlink")
+                          continue
+                      if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                          raise ValueError("Fresh runtime has an unsafe file type")
+                      os.chown(path, 0, 0)
+                      path.chmod(0o755 if stat.S_ISDIR(info.st_mode) else 0o555 if info.st_mode & 0o111 else 0o444)
+              root.chmod(0o755)
+
+          def write_receipt(path, value):
+              raw = (json.dumps(value, sort_keys=True) + "\n").encode()
+              if len(raw) > 65_536:
+                  raise ValueError("Runtime receipt exceeded bound")
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "wb") as output:
+                  output.write(raw)
+                  output.flush()
+                  os.fsync(output.fileno())
+                  os.fchmod(output.fileno(), 0o400)
+
+          if __name__ == "__main__":
+              source, original_binary, root, requirements, receipt = map(Path, sys.argv[1:6])
+              result = {"schema": "finance-media-ci-runtime-v1", "status": "REFUSED", "selected_base_prefix": str(source), "selected_binary": str(original_binary)}
+              try:
+                  result.update(validate_selected_sdk(source, original_binary, int(sys.argv[6])))
+                  environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C", "TZ": "UTC", "TMPDIR": str(root), "PIP_CONFIG_FILE": os.devnull}
+                  with (root / "runtime-install.log").open("xb") as log:
+                      subprocess.run([str(SDK_ROOT / "bin/python3.12"), "-I", "-B", "-m", "venv", str(root / "runtime")], env=environment, stdout=log, stderr=log, check=True, timeout=30)
+                      subprocess.run([str(root / "runtime/bin/python"), "-I", "-B", "-m", "pip", "install", "--no-cache-dir", "--only-binary=:all:", "--require-hashes", "-r", str(requirements)], env=environment, stdout=log, stderr=log, check=True, timeout=120)
+                  config = dict(line.split(" = ", 1) for line in (root / "runtime/pyvenv.cfg").read_text().splitlines() if " = " in line)
+                  if config.get("include-system-site-packages") != "false":
+                      raise ValueError("Fresh runtime must exclude SDK site-packages")
+                  seal_runtime(root / "runtime")
+                  result["runtime_prefix"] = str(root / "runtime")
+                  result["base_prefix"] = str(SDK_ROOT)
+                  result["include_system_site_packages"] = False
+                  result["requirements_sha256"] = hashlib.sha256(requirements.read_bytes()).hexdigest()
+                  result["status"] = "PASS"
+              except Exception as error:
+                  result["failure_type"] = type(error).__name__
+                  result["failure_reason"] = str(error)[:1024]
+              log_path = root / "runtime-install.log"
+              if log_path.exists():
+                  result["install_log_bytes"] = log_path.stat().st_size
+                  with log_path.open("rb") as log:
+                      log.seek(max(0, result["install_log_bytes"] - 8192))
+                      result["install_log_tail"] = log.read(8192).decode("utf-8", "replace")
+              write_receipt(receipt, result)
+              if result["status"] != "PASS":
+                  raise SystemExit("Selected SDK/fresh runtime preparation refused; no loader fallback")
+          PY_MEDIA_RUNTIME
+
+      - name: Verify isolated media startup and prepare OCR assets
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$media_root" "$media_root/startup.json" <<'PY_MEDIA_STARTUP'
+          import hashlib
+          import json
+          import os
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          STARTUP_CODE = r'''
+          import hashlib, json, os, platform, pwd, resource, sys, time
+          from pathlib import Path
+          repository, work, expected_prefix, expected_base = map(Path, sys.argv[1:5])
+          expected_hash, expected_libpython_hash = sys.argv[5:7]
+          trusted_owners = {0, int(sys.argv[7])}
+          uid = pwd.getpwnam("financemedia").pw_uid
+          status = Path("/proc/self/status").read_text()
+          caps = {key: next(line.split()[1] for line in status.splitlines() if line.startswith(key + ":")) for key in ("CapEff", "CapPrm")}
+          resource.setrlimit(resource.RLIMIT_NPROC, (16, 16))
+          tasks = []
+          for process in Path("/proc").iterdir():
+              if not process.name.isdecimal():
+                  continue
+              try:
+                  lines = (process / "status").read_text().splitlines()
+                  if int(next(line.split()[1] for line in lines if line.startswith("Uid:"))) == uid:
+                      tasks.append({"pid": int(process.name), "threads": len(list((process / "task").iterdir()))})
+              except FileNotFoundError:
+                  continue
+          required = (repository, expected_prefix, expected_base, repository / "scripts/prepare_linux_ocr.py", repository / "finance_core/intake/receipt_media.py", repository / "finance_core/intake/_receipt_media_worker.py", expected_prefix / "pyvenv.cfg", Path(sys.executable), expected_base / "bin/python3.12", expected_base / "lib/libpython3.12.so.1.0", expected_base / "lib/python3.12")
+          components = {path for selected in required for path in (selected, *selected.parents)}
+          permissions = []
+          for path in sorted(components):
+              info = path.lstat()
+              directory = path.is_dir()
+              permissions.append({"path": str(path), "uid": info.st_uid, "gid": info.st_gid, "mode": oct(info.st_mode & 0o7777), "directory": directory, "read": os.access(path, os.R_OK), "execute": os.access(path, os.X_OK), "write": os.access(path, os.W_OK)})
+          read_only = all(item["uid"] in trusted_owners and item["read"] and not item["write"] and (not item["directory"] or item["execute"]) for item in permissions) and os.access(Path(sys.executable), os.X_OK)
+          binary_hash = hashlib.sha256(Path(sys.executable).resolve(strict=True).read_bytes()).hexdigest()
+          mapped_libpython = {parts[5] for line in Path("/proc/self/maps").read_text().splitlines() if len(parts := line.split(None, 5)) == 6 and "/libpython3.12.so" in parts[5]}
+          expected_libpython = expected_base / "lib/libpython3.12.so.1.0"
+          libpython_hash = hashlib.sha256(expected_libpython.read_bytes()).hexdigest() if mapped_libpython == {str(expected_libpython)} else None
+          config = dict(line.split(" = ", 1) for line in (expected_prefix / "pyvenv.cfg").read_text().splitlines() if " = " in line)
+          platform_identity = [sys.platform, platform.machine(), platform.freedesktop_os_release().get("ID"), platform.freedesktop_os_release().get("VERSION_ID")]
+          receipt = {"platform": platform_identity, "schema": "finance-media-ci-startup-child-v1", "uid": os.getuid(), "euid": os.geteuid(), "capabilities": caps, "uid_tasks": tasks, "caller_os_threads": len(list(Path("/proc/self/task").iterdir())), "nproc": resource.getrlimit(resource.RLIMIT_NPROC), "python": list(sys.version_info[:3]), "python_prefix": sys.prefix, "python_base_prefix": sys.base_prefix, "interpreter_sha256": binary_hash, "code_runtime_read_only": read_only, "path_permissions": permissions, "mapped_libpython": sorted(mapped_libpython), "libpython_sha256": libpython_hash, "sdk_trust_boundary": "selected setup-python SDK and Ubuntu loader/system libraries; administrator-owned installation"}
+          admitted = platform_identity == ["linux", "x86_64", "ubuntu", "24.04"] and os.getuid() == os.geteuid() == uid != 0 and all(int(value, 16) == 0 for value in caps.values()) and tasks == [{"pid": os.getpid(), "threads": 1}] and read_only and sys.version_info[:3] == (3, 12, 14) and expected_base == Path("/opt/hostedtoolcache/Python/3.12.14/x64") and libpython_hash == expected_libpython_hash and config.get("include-system-site-packages") == "false" and Path(sys.prefix) == expected_prefix and Path(sys.base_prefix) == expected_base and binary_hash == expected_hash
+          receipt["admission"] = "PASS" if admitted else "REFUSED"
+          if admitted:
+              sys.path.insert(0, str(repository))
+              from finance_core.intake.receipt_media import _worker_run
+              result = _worker_run([sys.executable, "-I", "-B", str(repository / "finance_core/intake/_receipt_media_worker.py"), "--identity"], pass_fds=(), directory=str(work), deadline=time.monotonic() + 30)
+              receipt["pinned_worker_identity"] = result
+              decoder = result.get("decoder", {})
+              admitted = result.get("status") == "identity" and decoder.get("python_prefix") == sys.prefix and decoder.get("python_base_prefix") == sys.base_prefix
+              receipt["admission"] = "PASS" if admitted else "REFUSED"
+          print(json.dumps(receipt, sort_keys=True))
+          if not admitted:
+              raise SystemExit("Dedicated clean pinned-worker startup refused")
+          '''
+
+          def run_startup_probe(arguments, timeout=45, stdout_limit=262144, stderr_limit=65536):
+              result = {"status": "REFUSED", "returncode": None, "stdout": "", "stderr": ""}
+              process = None
+              captured = {"stdout": bytearray(), "stderr": bytearray()}
+              try:
+                  process = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                  deadline = time.monotonic() + timeout
+                  with selectors.DefaultSelector() as selector:
+                      for name in captured:
+                          stream = getattr(process, name)
+                          os.set_blocking(stream.fileno(), False)
+                          selector.register(stream, selectors.EVENT_READ, name)
+                      while selector.get_map():
+                          remaining = deadline - time.monotonic()
+                          if remaining <= 0:
+                              raise TimeoutError("Dedicated startup exceeded deadline")
+                          for key, _ in selector.select(min(0.1, remaining)):
+                              chunk = os.read(key.fileobj.fileno(), 65536)
+                              if not chunk:
+                                  selector.unregister(key.fileobj)
+                                  key.fileobj.close()
+                                  continue
+                              target = captured[key.data]
+                              limit = stdout_limit if key.data == "stdout" else stderr_limit
+                              if len(target) + len(chunk) > limit:
+                                  target.extend(chunk[:max(0, limit - len(target))])
+                                  raise ValueError("Dedicated startup output exceeded bound")
+                              target.extend(chunk)
+                      process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                  result["returncode"] = process.returncode
+                  result["status"] = "PASS" if process.returncode == 0 else "REFUSED"
+                  if process.returncode == 0:
+                      try:
+                          identity = json.loads(captured["stdout"])
+                          if not isinstance(identity, dict) or identity.get("admission") != "PASS":
+                              raise ValueError("Dedicated startup has no admitted identity")
+                          if len(json.dumps(identity, sort_keys=True).encode()) > 131_072:
+                              raise ValueError("Dedicated startup identity exceeds receipt bound")
+                          result["identity"] = identity
+                      except (ValueError, UnicodeError, TypeError) as error:
+                          result["status"] = "REFUSED"
+                          result["failure_reason"] = str(error)[:1024]
+              except Exception as error:
+                  result["failure_type"] = type(error).__name__
+                  result["failure_reason"] = str(error)[:1024]
+              finally:
+                  if process is not None:
+                      try:
+                          os.killpg(process.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                      except OSError as error:
+                          result["status"] = "REFUSED"
+                          result["cleanup_failure"] = type(error).__name__
+                      try:
+                          process.wait(timeout=2)
+                      except subprocess.TimeoutExpired:
+                          result["status"] = "REFUSED"
+                          result["cleanup_failure"] = "leader_not_reaped"
+                      for stream in (process.stdout, process.stderr):
+                          if stream is not None:
+                              stream.close()
+                  for name in captured:
+                      result[name + "_bytes"] = len(captured[name])
+                      result[name + "_sha256"] = hashlib.sha256(captured[name]).hexdigest()
+                      result[name + "_truncated"] = len(captured[name]) > 8192
+                      result[name] = captured[name].decode("utf-8", "replace")[:8192]
+              return result
+
+          def write_receipt(path, receipt):
+              raw = (json.dumps(receipt, sort_keys=True) + "\n").encode()
+              if len(raw) > 393_216:
+                  raise ValueError("Startup receipt exceeded bound")
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+              with os.fdopen(fd, "wb") as stream:
+                  stream.write(raw)
+                  stream.flush()
+                  os.fsync(stream.fileno())
+                  os.fchmod(stream.fileno(), 0o400)
+
+          if __name__ == "__main__":
+              root, receipt_path = map(Path, sys.argv[1:3])
+              runtime_receipt = json.loads((root / "runtime.json").read_bytes())
+              if runtime_receipt.get("status") != "PASS":
+                  raise SystemExit("Runtime preparation has no successful receipt")
+              arguments = ["/usr/bin/sudo", "-u", "financemedia", "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "TZ=UTC", "TMPDIR=" + str(root / "work"), str(root / "runtime/bin/python"), "-I", "-B", "-c", STARTUP_CODE, str(root / "source"), str(root / "work"), str(root / "runtime"), runtime_receipt["base_prefix"], runtime_receipt["selected_binary_sha256"], runtime_receipt["selected_libpython_sha256"], str(runtime_receipt["trusted_sdk_owners"][-1])]
+              result = run_startup_probe(arguments)
+              result["schema"] = "finance-media-ci-startup-v1"
+              result["candidate_sha"] = json.loads((root / "snapshot.json").read_bytes())["candidate_sha"]
+              if result["status"] == "PASS":
+                  try:
+                      child = result.get("identity", {})
+                      if child.get("admission") != "PASS":
+                          raise ValueError("Startup has no complete admitted identity")
+                  except (ValueError, TypeError) as error:
+                      result["status"] = "REFUSED"
+                      result["failure_reason"] = str(error)[:1024]
+              write_receipt(receipt_path, result)
+              if result["status"] != "PASS":
+                  raise SystemExit("Dedicated startup failed; inspect retained bounded receipt")
+          PY_MEDIA_STARTUP
           sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
-            TMPDIR="$media_root/work" "$GITHUB_WORKSPACE/.venv/bin/python" -I -B \
-            "$GITHUB_WORKSPACE/scripts/prepare_linux_ocr.py" \
+            TMPDIR="$media_root/work" "$media_root/runtime/bin/python" -I -B \
+            "$media_root/source/scripts/prepare_linux_ocr.py" \
             --executable /usr/bin/tesseract --destination "$media_root/work/ocr"
 
       - name: Require actual Linux receipt media acceptance
         if: runner.os == 'Linux'
         run: |
-          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
             TMPDIR="$media_root/work" FINANCE_LINUX_MEDIA_REQUIRED=1 \
             FINANCE_LINUX_OCR_CONFIG="$media_root/work/ocr/ocr_engine.json" \
             FINANCE_LINUX_MEDIA_EVIDENCE="$media_root/work/evidence" \
-            "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$GITHUB_WORKSPACE" "$media_root/work" <<'PY_MEDIA_LAUNCH'
+            "$media_root/runtime/bin/python" -I -B - "$media_root/source" "$media_root/work" "$media_root/runtime" "/opt/hostedtoolcache/Python/3.12.14/x64" <<'PY_MEDIA_LAUNCH'
           import json
           import os
           import platform
@@ -325,7 +923,7 @@ jobs:
           import resource
           import sys
           from pathlib import Path
-          repository, work = map(Path, sys.argv[1:])
+          repository, work, runtime, base = map(Path, sys.argv[1:])
           uid = pwd.getpwnam("financemedia").pw_uid
           status = Path("/proc/self/status").read_text()
           caps = {key: next(line.split()[1] for line in status.splitlines() if line.startswith(key + ":")) for key in ("CapEff", "CapPrm")}
@@ -356,9 +954,9 @@ jobs:
               if group == Path("/sys/fs/cgroup"):
                   break
               group = group.parent
-          code_read_only = all(not os.access(path, os.W_OK) for path in (repository, repository / ".venv", repository / "finance_core/intake/receipt_media.py", repository / "finance_core/intake/_receipt_media_worker.py"))
-          receipt = {"schema": "finance-media-ci-admission-v1", "platform": [sys.platform, platform.machine(), platform.freedesktop_os_release().get("ID"), platform.freedesktop_os_release().get("VERSION_ID")], "uid_gid": identities, "capabilities": caps, "uid_tasks": tasks, "nproc": resource.getrlimit(resource.RLIMIT_NPROC), "caller_os_threads": len(list(Path("/proc/self/task").iterdir())), "cgroup_pids": cgroups, "code_read_only": code_read_only, "interpreter": sys.executable, "python_prefix": sys.prefix}
-          admitted = receipt["platform"] == ["linux", "x86_64", "ubuntu", "24.04"] and identities[0] == identities[1] == uid != 0 and identities[2] == identities[3] and all(int(value, 16) == 0 for value in caps.values()) and tasks == [{"pid": os.getpid(), "threads": 1}] and code_read_only and all(item["max"] == "max" or int(item["max"]) - item["current"] >= 16 for item in cgroups)
+          code_read_only = all(not os.access(path, os.W_OK) for path in (repository, runtime, base, repository / "finance_core/intake/receipt_media.py", repository / "finance_core/intake/_receipt_media_worker.py"))
+          receipt = {"schema": "finance-media-ci-admission-v1", "platform": [sys.platform, platform.machine(), platform.freedesktop_os_release().get("ID"), platform.freedesktop_os_release().get("VERSION_ID")], "uid_gid": identities, "capabilities": caps, "uid_tasks": tasks, "nproc": resource.getrlimit(resource.RLIMIT_NPROC), "caller_os_threads": len(list(Path("/proc/self/task").iterdir())), "cgroup_pids": cgroups, "code_read_only": code_read_only, "interpreter": sys.executable, "python_prefix": sys.prefix, "python_base_prefix": sys.base_prefix}
+          admitted = receipt["platform"] == ["linux", "x86_64", "ubuntu", "24.04"] and identities[0] == identities[1] == uid != 0 and identities[2] == identities[3] and all(int(value, 16) == 0 for value in caps.values()) and tasks == [{"pid": os.getpid(), "threads": 1}] and code_read_only and sys.version_info[:3] == (3, 12, 14) and Path(sys.prefix) == runtime and Path(sys.base_prefix) == base and all(item["max"] == "max" or int(item["max"]) - item["current"] >= 16 for item in cgroups)
           receipt["admission"] = "PASS" if admitted else "REFUSED"
           target = work / "preflight.json"
           target.write_text(json.dumps(receipt, sort_keys=True) + "\n")
@@ -366,7 +964,7 @@ jobs:
           if not admitted:
               raise SystemExit("Dedicated non-root media worker admission refused")
           os.chdir(repository)
-          # Preserve the .venv executable spelling; resolving its symlink loses the environment.
+          # Preserve the fresh runtime executable spelling; resolving its symlink loses the environment.
           os.execv(sys.executable, [sys.executable, "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider", "-q", "tests/test_receipt_media_vectors_v1.py", "--basetemp=" + str(work / "tests"), "--junitxml=" + str(work / "acceptance.xml"), "--durations=15"])
           PY_MEDIA_LAUNCH
           sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work/acceptance.xml" "$(id -u financemedia)" <<'PY_MEDIA_PROOF'
@@ -397,7 +995,7 @@ jobs:
       - name: Preserve actual Linux receipt media acceptance evidence
         if: ${{ always() && runner.os == 'Linux' }}
         run: |
-          media_root="/tmp/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work" "$RUNNER_TEMP/linux-media" "$(id -u)" "$(id -g)" <<'PY_MEDIA_EXPORT'
           import json
           import os
@@ -431,6 +1029,32 @@ jobs:
           cleanup.write_text(json.dumps({"schema": "finance-media-ci-export-v1", "remaining_uid_processes": survivors}) + "\n")
           os.chown(cleanup, owner, group)
           cleanup.chmod(0o400)
+          # Immutable root-owned control receipts are separate from fin-owned bundles.
+          # Preserve bootstrap refusals even when no dedicated interpreter ever started.
+          def copy_control_receipt(name, maximum):
+              selected = source.parent / name
+              try:
+                  before = selected.lstat()
+              except FileNotFoundError:
+                  return
+              if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or stat.S_IMODE(before.st_mode) != 0o400 or before.st_nlink != 1 or before.st_size > maximum:
+                  raise SystemExit("Unsafe root-owned media bootstrap receipt")
+              def control_identity(info):
+                  return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+              fd = os.open(selected, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+              with os.fdopen(fd, "rb") as incoming:
+                  if control_identity(os.fstat(incoming.fileno())) != control_identity(before):
+                      raise SystemExit("Bootstrap receipt changed before export")
+                  raw = incoming.read(maximum + 1)
+                  if len(raw) != before.st_size or len(raw) > maximum or control_identity(os.fstat(incoming.fileno())) != control_identity(before) or control_identity(selected.lstat()) != control_identity(before):
+                      raise SystemExit("Bootstrap receipt changed during export")
+              target = destination / ("bootstrap-" + name)
+              with target.open("xb") as output:
+                  output.write(raw)
+              os.chown(target, owner, group)
+              target.chmod(0o400)
+          for name, maximum in (("snapshot.json", 65_536), ("sdk-acl.json", 65_536), ("runtime.json", 65_536), ("startup.json", 393_216)):
+              copy_control_receipt(name, maximum)
           if survivors:
               raise SystemExit("Media processes remain; no mutable bundle export permitted")
           def identity(info):

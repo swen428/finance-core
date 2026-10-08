@@ -139,6 +139,53 @@ write the checkout or dependency environment. The lane preserves
 its admission receipt, JUnit and bounded synthetic original/PNG/result evidence, including failure
 records, as `linux-media-acceptance-<run>-<attempt>`.
 
+### Hosted bootstrap failure and recovery boundary
+
+Run `37709785108`, attempt 1, used candidate
+`c0b8ad02a22b23939631b0734843b357f0a28d07`. The existing Linux OCR acceptance
+completed all 13 tests without skips, failures or errors. The media stage then
+failed before its worker started: the `financemedia` account received
+`Permission denied` executing the checkout's `.venv/bin/python` (exit 126). All
+49 media cases were not run, and no image decode or media OCR operation took
+place. The uploaded media artifact contained only the export-state receipt, so
+this run is not media acceptance.
+
+The same run's Python shard also refused the new synthetic media archive
+because its exact path/hash was absent from the public binary-fixture registry.
+The corrected registry admits only the reviewed archive digest; private-data
+checks remain active, with narrowly identified image-format language excluded
+from name matching.
+
+The recovery bootstrap takes a root-owned, read-only snapshot from the exact
+candidate commit archive and Git tree/blob/mode inventory. The Bridge selects
+Python 3.12.14; Linux binds the original canonical setup-python SDK, including
+its official interpreter and libpython digests, and creates a fresh hash-locked
+venv in `/opt/finance-media-<run>-<attempt>/runtime`. It neither relocates the
+SDK nor rewrites its binary or dynamic-loader search path.
+
+Toolcache paths cannot be assumed read-only. A bounded SDK/path preparation
+adds only the media account's numeric-UID access ACL with `setfacl --no-mask`:
+read/search permissions without write, preserving every other principal's
+effective rights and default ACL. An insufficient existing mask or mismatched
+ACL state refuses preparation; it is never widened to produce a pass. The
+`financemedia` account then checks effective source/runtime/SDK permissions,
+exact Python version and prefixes, interpreter and actual mapped libpython
+identity, and the actual pinned worker identity before OCR preparation or media
+tests. The environment is explicitly rebuilt without inherited Python or
+dynamic-loader settings. This is a trusted, ephemeral CI installation boundary;
+SDK and Ubuntu loader/system libraries are not globally immutable to root or
+runner administrators, and this is not a general native-code sandbox.
+
+Bootstrap and startup failures are retained as small, read-only receipts
+separate from the account-owned synthetic media evidence; the evidence exporter
+copies those control receipts under fixed names and bounds.
+
+The original checkout, home and workspace permissions remain unchanged; the
+media account does not open them. This bootstrap change resolves the setup
+failure only. It does not convert the unrun media cases into a pass. Preserve
+the failed run's evidence and validate the corrected, reviewed candidate
+against the unchanged media acceptance requirements.
+
 Media source/worker modules, their unit/vector tests and the whole
 `tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
 modification, deletion and rename. The workflow and independent verifier
