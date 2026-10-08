@@ -168,6 +168,34 @@ lineage, and a changed current leaf/version/content invalidates an old review.
 Confirmed or already accepted posting cannot be edited through this boundary;
 posted correction remains a separate work package.
 
+Successful OCR can leave an unparseable receipt whose original confidence and
+merchant indicators remain historical evidence. The independent personal
+receipt path may retain `low_confidence` and `merchant_not_determined` in its
+complete review only when every current editable field has a verified material
+human correction or completion on that same independent source ancestry.
+This includes description/category. The latest genuine material witness must
+match each current value; inherited witnesses survive a later valid partial
+edit. An unchanged supplied value or system normalization adds no witness.
+The original OCR, flags and confidence remain unchanged. Financial ambiguity
+still requires its existing durable amount/currency/date resolution.
+
+A later independent merchant/date/description/category completion can replace
+an earlier human value while its inherited field evidence remains historical.
+The receipt conversion owner first verifies the original evidence, then the
+exact complete current payload, independent ancestry and latest field-specific
+sealed completion, including its actual publication and audit history. A bare
+completion row cannot excuse a mismatch. Amount and currency never use this
+override; legacy receipt behavior remains governed by its existing evidence.
+
+Failed, missing or partial extraction, unknown indicators, incomplete human
+coverage and unsealed or conflicting evidence remain ineligible. Preparation
+and acceptance revalidate the current exact lineage and complete values;
+pending writes and accepted-result recovery/readback repeat that verification.
+The existing immutable posting review binds the source, version/content and
+all six values, without a new approval domain. Edits and eligible review
+creation still produce no financial facts: a separately delivered current
+review and fresh exact human confirmation are mandatory.
+
 ## Compatibility and validation
 
 The independent path is additive. Historical D1/D2 source and approval proofs,

@@ -86,6 +86,19 @@ proposals are eligible only with a fully verified independent edit lineage.
 Arbitrary legacy edited states and generic human actors cannot inherit this
 permission. Legacy D1/D2 owners retain their own authority contracts.
 
+For a successfully extracted receipt with historical low confidence or an
+undetermined merchant, [independent posting](independent_posting_v1.md) requires
+material human provenance for all six current fields before allowing a new
+posting review. Genuine inherited corrections/completions remain attributable
+to their original publications and must equal the latest current values.
+Echoes and normalization create no material provenance. Historical OCR
+confidence/flags remain evidence; an edit never clears them or confirms posting.
+Subsequent nonmonetary completions preserve inherited evidence bytes. The
+conversion owner recognizes an older value as historical only after verifying
+both its original owner and the later independent field-specific completion
+on the exact current ancestry. Sequential completions retain each latest
+material field witness, including through a subsequent monetary supersession.
+
 ## Whole-expense description and category
 
 Independent receipt description/category describe the whole expense. They do

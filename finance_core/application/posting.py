@@ -7,6 +7,7 @@ ports and clock. Core owns immutable decision consumption, not the adapter.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import unicodedata
 from collections.abc import Callable, Mapping
@@ -52,9 +53,11 @@ from finance_core.financial_audit import (
     derive_audit_event_public_id,
     verify_financial_audit_chain,
 )
+from finance_core.intake.receipt_ocr_proposal import get_receipt_ocr_extraction_status_for_proposal
 from finance_core.parser_proposals import decision_owner
 from finance_core.parser_proposals.amendment_lineage import (
     require_independent_source_edit_history,
+    verify_amendment_record,
     verify_independent_amendment_descendant,
 )
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
@@ -65,6 +68,8 @@ from finance_core.parser_proposals.receipt_facts_conversion import (
     _CURRENCY_FLAGS,
     _DATE_FLAGS,
     ReceiptFactsConversionCommand,
+    _durable_resolution_provenance,
+    _field_values_equal,
     _require_flags_resolved,
     convert_confirmed_receipt_proposal_to_facts,
     resolve_independent_receipt_payload_fields,
@@ -80,6 +85,11 @@ from finance_core.sqlite_connection import require_foreign_keys_enabled
 from finance_core.staging_guard import require_staging_database
 
 _failure_injection_hook: Callable[[str], None] | None = None
+
+_HUMAN_RECEIPT_FIELDS = frozenset(
+    {"amount", "currency", "transaction_date", "merchant", "description", "category"}
+)
+_HISTORICAL_RECEIPT_INDICATORS = frozenset({"low_confidence", "merchant_not_determined"})
 
 
 class PostingError(ValueError):
@@ -377,12 +387,16 @@ class PostingService:
         if has_receipt_ocr_proposal_link(self._conn, int(proposal["id"])):
             route = "personal_receipt"
             # OCR flags remain in the signed display as historical evidence.
-            # Only the genuine owner can verify that monetary/date flags have
-            # durable resolution; all other indicators retain their refusal.
+            # Monetary/date resolution remains owned by the conversion guard.
             _require_flags_resolved(self._conn, proposal, payload)
             historical_flags = _AMOUNT_FLAGS | _CURRENCY_FLAGS | _DATE_FLAGS
-            if set(view["ambiguity_indicators"]) - historical_flags:
-                raise PostingError("Receipt posting requires resolved complete inputs")
+            remaining = set(view["ambiguity_indicators"]) - historical_flags
+            if remaining:
+                if remaining - _HISTORICAL_RECEIPT_INDICATORS:
+                    raise PostingError("Receipt posting requires resolved complete inputs")
+                self._require_complete_human_receipt(
+                    proposal, payload, independent_lineage, vars(source)
+                )
             fields = resolve_independent_receipt_payload_fields(self._conn, payload)
             metadata = (
                 ReceiptBookkeepingMetadata(fields["description"], fields["category"])
@@ -439,6 +453,73 @@ class PostingService:
             "proposal_version": view["proposal_version"],
             "effective_content_hash": view["effective_content_hash"],
         }
+
+    def _require_complete_human_receipt(self, proposal, payload, lineage, source):
+        """Prove six current values from material edits on the verified source path.
+
+        Historical OCR confidence is never replaced. A supplied echo or system
+        normalization cannot create a human witness. Existing lineage owners
+        verify seals/publications; the latest material witness must still equal
+        each current value, including inherited nonmonetary fields.
+        """
+        if (
+            lineage is None
+            or get_receipt_ocr_extraction_status_for_proposal(self._conn, int(proposal["id"]))
+            != "succeeded"
+        ):
+            raise PostingError("Historical OCR indicators require independent human resolution")
+        corrected, completed = _durable_resolution_provenance(self._conn, proposal, payload)
+        if not _HUMAN_RECEIPT_FIELDS <= corrected | completed:
+            raise PostingError("Receipt resolution requires six durable human fields")
+        path = []
+        current = ParserProposalRepository(self._conn).get_lineage_row_by_id(proposal["id"])
+        if current is None:
+            raise PostingError("Human receipt resolution proposal is absent")
+        while True:
+            path.append(int(current["id"]))
+            if current["id"] == lineage["root_proposal"]["id"]:
+                break
+            current = ParserProposalRepository(self._conn).get_lineage_row_by_id(
+                current["parent_parser_output_id"]
+            )
+            if current is None:
+                raise PostingError("Human receipt resolution ancestry is absent")
+        witnesses = {}
+        for proposal_id in reversed(path):
+            rows = self._conn.execute(
+                "SELECT * FROM application_amendment_records WHERE resulting_parser_output_id=? "
+                "ORDER BY resulting_version",
+                (proposal_id,),
+            ).fetchall()
+            for row in rows:
+                material = verify_amendment_record(self._conn, row)
+                old = _material(
+                    self._conn.execute(
+                        "SELECT * FROM application_amendment_reviews WHERE review_id=?",
+                        (row["review_id"],),
+                    ).fetchone()
+                )
+                if old["binding"]["binding"] != vars(self._binding) or old["source"] != source:
+                    raise PostingError("Human receipt witness belongs to another trusted source")
+                result = json.loads(material["result_payload_json"])
+                if not isinstance(result, dict):
+                    raise PostingError("Human receipt publication is not an object")
+                for field, value in material["material_patch"].items():
+                    if (
+                        field not in _HUMAN_RECEIPT_FIELDS
+                        or material["canonical_patch"].get(field) != value
+                        or not _field_values_equal(field, value, result.get(field))
+                    ):
+                        raise PostingError("Human receipt publication does not bind its field")
+                    witnesses[field] = value
+        if any(
+            field not in witnesses
+            or not isinstance(payload.get(field), str)
+            or not payload[field].strip()
+            or not _field_values_equal(field, witnesses[field], payload[field])
+            for field in _HUMAN_RECEIPT_FIELDS
+        ):
+            raise PostingError("Receipt resolution does not bind all six current human values")
 
     def _payer(self) -> str:
         rows = self._conn.execute(
@@ -664,8 +745,8 @@ class PostingService:
         proposal = ParserProposalRepository(self._conn).get(int(review_row["parser_output_id"]))
         if proposal is None:
             raise PostingError("Accepted proposal is unavailable")
-        _, _, version = resolve_effective_payload(self._conn, proposal)
-        verify_independent_amendment_descendant(
+        payload, _, version = resolve_effective_payload(self._conn, proposal)
+        lineage = verify_independent_amendment_descendant(
             self._conn,
             proposal,
             content_hash=compute_effective_proposal_content_hash(self._conn, proposal),
@@ -678,6 +759,11 @@ class PostingService:
             != material["effective_content_hash"]
         ):
             raise PostingError("Accepted financial content changed")
+        if material["posting_path"] == "personal_receipt" and (
+            set(material["proposal_review"]["ambiguity_indicators"])
+            & _HISTORICAL_RECEIPT_INDICATORS
+        ):
+            self._require_complete_human_receipt(proposal, payload, lineage, material["source"])
         if verify_confirmation:
             authorization = self._conn.execute(
                 "SELECT * FROM parser_proposal_authorizations WHERE confirmation_public_id=?",
