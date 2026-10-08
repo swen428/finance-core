@@ -766,10 +766,13 @@ jobs:
         run: |
           set -euo pipefail
           media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$media_root" "$media_root/startup.json" <<'PY_MEDIA_STARTUP'
+          core_root="/tmp/finance-media-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -B - "$media_root" "$media_root/startup.json" "$core_root" <<'PY_MEDIA_STARTUP'
           import hashlib
           import json
           import os
+          import pwd
+          import re
           import selectors
           import signal
           import stat
@@ -778,12 +781,47 @@ jobs:
           import time
           from pathlib import Path
 
+          def directory_identity(info):
+              return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+
+          def prepare_core_runtime(path, uid, gid):
+              temporary = Path("/tmp")
+              if uid == 0 or path.parent != temporary or not re.fullmatch(r"finance-media-core-[0-9]+-[0-9]+", path.name) or temporary.resolve(strict=True) != temporary:
+                  raise ValueError("Synthetic Core root requires its exact canonical /tmp scope")
+              for parent in (temporary, Path("/")):
+                  info = parent.lstat()
+                  if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or (parent == temporary and not info.st_mode & stat.S_ISVTX) or (parent == Path("/") and info.st_mode & 0o022):
+                      raise ValueError("Synthetic Core root requires a root-owned sticky /tmp and trusted chain")
+              parent_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              root_fd = database_fd = None
+              try:
+                  if directory_identity(os.fstat(parent_fd)) != directory_identity(temporary.lstat()):
+                      raise ValueError("Synthetic Core parent custody changed")
+                  os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)  # Exclusive: no adoption or retry.
+                  root_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                  os.mkdir("database", mode=0o700, dir_fd=root_fd)
+                  database_fd = os.open("database", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                  for fd in (root_fd, database_fd):
+                      os.fchown(fd, uid, gid)
+                      os.fchmod(fd, 0o700)
+                  with os.scandir(database_fd) as entries:
+                      database_empty = next(entries, None) is None
+                  result = {"path": str(path), "root_identity": directory_identity(os.fstat(root_fd)), "database_identity": directory_identity(os.fstat(database_fd)), "tmp_identity": directory_identity(os.fstat(parent_fd)), "database_empty": database_empty}
+                  if not result["database_empty"] or path.resolve(strict=True) != path or directory_identity(path.lstat()) != result["root_identity"] or directory_identity((path / "database").lstat()) != result["database_identity"]:
+                      raise ValueError("Synthetic Core root custody or empty database changed")
+                  return result
+              finally:
+                  for fd in (database_fd, root_fd, parent_fd):
+                      if fd is not None:
+                          os.close(fd)
+
           STARTUP_CODE = r'''
-          import hashlib, json, os, platform, pwd, resource, sys, time
+          import hashlib, json, os, platform, pwd, resource, stat, sys, time
           from pathlib import Path
           repository, work, expected_prefix, expected_base = map(Path, sys.argv[1:5])
           expected_hash, expected_libpython_hash = sys.argv[5:7]
           trusted_owners = {0, int(sys.argv[7])}
+          expected_core = json.loads(sys.argv[8])
           uid = pwd.getpwnam("financemedia").pw_uid
           status = Path("/proc/self/status").read_text()
           caps = {key: next(line.split()[1] for line in status.splitlines() if line.startswith(key + ":")) for key in ("CapEff", "CapPrm")}
@@ -817,6 +855,35 @@ jobs:
           receipt["admission"] = "PASS" if admitted else "REFUSED"
           if admitted:
               sys.path.insert(0, str(repository))
+              try:
+                  from finance_core.runtime_paths import require_runtime_root, live_database_path
+                  core = require_runtime_root()
+                  database_path = live_database_path()
+                  database = core / "database"
+                  def core_identity(path):
+                      info = path.lstat()
+                      if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700 or path.resolve(strict=True) != path:
+                          raise ValueError("Synthetic Core directory must remain canonical fin-owned 0700")
+                      return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+                  root_identity = core_identity(core)
+                  database_identity = core_identity(database)
+                  if core != Path(expected_core["path"]) or os.environ.get("FINANCE_RUNTIME_ROOT") != expected_core["path"] or root_identity != expected_core["root_identity"] or database_identity != expected_core["database_identity"] or database_path != database / "finance.db":
+                      raise ValueError("Synthetic Core configuration, custody or empty-root precondition failed")
+                  # Never scan a database directory before its real Core/custody checks.
+                  with os.scandir(core) as entries:
+                      first, second = next(entries, None), next(entries, None)
+                      root_empty = first is not None and first.name == "database" and second is None
+                  with os.scandir(database) as entries:
+                      database_empty = next(entries, None) is None
+                  core_check = {"path": str(core), "root_identity": root_identity, "database_identity": database_identity, "only_empty_database": root_empty and database_empty, "database_path": str(database_path)}
+                  if not core_check["only_empty_database"]:
+                      raise ValueError("Synthetic Core configuration, custody or empty-root precondition failed")
+                  receipt["core_runtime"] = core_check
+              except Exception as error:
+                  admitted = False
+                  receipt["core_runtime"] = {"status": "REFUSED", "failure_type": type(error).__name__, "failure_reason": str(error)[:1024]}
+                  receipt["admission"] = "REFUSED"
+          if admitted:
               from finance_core.intake.receipt_media import _worker_run
               result = _worker_run([sys.executable, "-I", "-B", str(repository / "finance_core/intake/_receipt_media_worker.py"), "--identity"], pass_fds=(), directory=str(work), deadline=time.monotonic() + 30)
               receipt["pinned_worker_identity"] = result
@@ -910,11 +977,20 @@ jobs:
 
           if __name__ == "__main__":
               root, receipt_path = map(Path, sys.argv[1:3])
-              runtime_receipt = json.loads((root / "runtime.json").read_bytes())
-              if runtime_receipt.get("status") != "PASS":
-                  raise SystemExit("Runtime preparation has no successful receipt")
-              arguments = ["/usr/bin/sudo", "-u", "financemedia", "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "TZ=UTC", "TMPDIR=" + str(root / "work"), str(root / "runtime/bin/python"), "-I", "-B", "-c", STARTUP_CODE, str(root / "source"), str(root / "work"), str(root / "runtime"), runtime_receipt["base_prefix"], runtime_receipt["selected_binary_sha256"], runtime_receipt["selected_libpython_sha256"], str(runtime_receipt["trusted_sdk_owners"][-1])]
-              result = run_startup_probe(arguments)
+              core_path = Path(sys.argv[3])
+              result = {"status": "REFUSED", "core_runtime_path": str(core_path)}
+              try:
+                  account = pwd.getpwnam("financemedia")
+                  core_runtime = prepare_core_runtime(core_path, account.pw_uid, account.pw_gid)
+                  result["core_runtime"] = core_runtime
+                  runtime_receipt = json.loads((root / "runtime.json").read_bytes())
+                  if runtime_receipt.get("status") != "PASS":
+                      raise ValueError("Runtime preparation has no successful receipt")
+                  arguments = ["/usr/bin/sudo", "-u", "financemedia", "--", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "TZ=UTC", "TMPDIR=" + str(root / "work"), "FINANCE_RUNTIME_ROOT=" + str(core_path), str(root / "runtime/bin/python"), "-I", "-B", "-c", STARTUP_CODE, str(root / "source"), str(root / "work"), str(root / "runtime"), runtime_receipt["base_prefix"], runtime_receipt["selected_binary_sha256"], runtime_receipt["selected_libpython_sha256"], str(runtime_receipt["trusted_sdk_owners"][-1]), json.dumps(core_runtime, sort_keys=True)]
+                  result.update(run_startup_probe(arguments))
+              except Exception as error:
+                  result["failure_type"] = type(error).__name__
+                  result["failure_reason"] = str(error)[:1024]
               result["schema"] = "finance-media-ci-startup-v1"
               result["candidate_sha"] = json.loads((root / "snapshot.json").read_bytes())["candidate_sha"]
               if result["status"] == "PASS":
@@ -930,27 +1006,32 @@ jobs:
                   raise SystemExit("Dedicated startup failed; inspect retained bounded receipt")
           PY_MEDIA_STARTUP
           sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
-            TMPDIR="$media_root/work" "$media_root/runtime/bin/python" -I -B \
+            TMPDIR="$media_root/work" FINANCE_RUNTIME_ROOT="$core_root" "$media_root/runtime/bin/python" -I -B \
             "$media_root/source/scripts/prepare_linux_ocr.py" \
             --executable /usr/bin/tesseract --destination "$media_root/work/ocr"
 
       - name: Require actual Linux receipt media acceptance
         if: runner.os == 'Linux'
         run: |
+          set -euo pipefail
           media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          core_root="/tmp/finance-media-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          core_identity="$(sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I -c 'import json,sys; from pathlib import Path; receipt=json.loads(Path(sys.argv[1]).read_bytes()); assert receipt["status"] == "PASS"; print(json.dumps(receipt["core_runtime"],sort_keys=True))' "$media_root/startup.json")"
           sudo -u financemedia -- env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C TZ=UTC \
-            TMPDIR="$media_root/work" FINANCE_LINUX_MEDIA_REQUIRED=1 \
+            TMPDIR="$media_root/work" FINANCE_RUNTIME_ROOT="$core_root" FINANCE_LINUX_MEDIA_REQUIRED=1 \
             FINANCE_LINUX_OCR_CONFIG="$media_root/work/ocr/ocr_engine.json" \
             FINANCE_LINUX_MEDIA_EVIDENCE="$media_root/work/evidence" \
-            "$media_root/runtime/bin/python" -I -B - "$media_root/source" "$media_root/work" "$media_root/runtime" "/opt/hostedtoolcache/Python/3.12.14/x64" <<'PY_MEDIA_LAUNCH'
+            "$media_root/runtime/bin/python" -I -B - "$media_root/source" "$media_root/work" "$media_root/runtime" "/opt/hostedtoolcache/Python/3.12.14/x64" "$core_identity" <<'PY_MEDIA_LAUNCH'
           import json
           import os
           import platform
           import pwd
           import resource
+          import stat
           import sys
           from pathlib import Path
-          repository, work, runtime, base = map(Path, sys.argv[1:])
+          repository, work, runtime, base = map(Path, sys.argv[1:5])
+          expected_core = json.loads(sys.argv[5])
           uid = pwd.getpwnam("financemedia").pw_uid
           status = Path("/proc/self/status").read_text()
           caps = {key: next(line.split()[1] for line in status.splitlines() if line.startswith(key + ":")) for key in ("CapEff", "CapPrm")}
@@ -984,6 +1065,35 @@ jobs:
           code_read_only = all(not os.access(path, os.W_OK) for path in (repository, runtime, base, repository / "finance_core/intake/receipt_media.py", repository / "finance_core/intake/_receipt_media_worker.py"))
           receipt = {"schema": "finance-media-ci-admission-v1", "platform": [sys.platform, platform.machine(), platform.freedesktop_os_release().get("ID"), platform.freedesktop_os_release().get("VERSION_ID")], "uid_gid": identities, "capabilities": caps, "uid_tasks": tasks, "nproc": resource.getrlimit(resource.RLIMIT_NPROC), "caller_os_threads": len(list(Path("/proc/self/task").iterdir())), "cgroup_pids": cgroups, "code_read_only": code_read_only, "interpreter": sys.executable, "python_prefix": sys.prefix, "python_base_prefix": sys.base_prefix}
           admitted = receipt["platform"] == ["linux", "x86_64", "ubuntu", "24.04"] and identities[0] == identities[1] == uid != 0 and identities[2] == identities[3] and all(int(value, 16) == 0 for value in caps.values()) and tasks == [{"pid": os.getpid(), "threads": 1}] and code_read_only and sys.version_info[:3] == (3, 12, 14) and Path(sys.prefix) == runtime and Path(sys.base_prefix) == base and all(item["max"] == "max" or int(item["max"]) - item["current"] >= 16 for item in cgroups)
+          if admitted:
+              sys.path.insert(0, str(repository))
+              try:
+                  from finance_core.runtime_paths import require_runtime_root, live_database_path
+                  core = require_runtime_root()
+                  database_path = live_database_path()
+                  database = core / "database"
+                  def core_identity(path):
+                      info = path.lstat()
+                      if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700 or path.resolve(strict=True) != path:
+                          raise ValueError("Synthetic Core directory must remain canonical fin-owned 0700")
+                      return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+                  root_identity = core_identity(core)
+                  database_identity = core_identity(database)
+                  if core != Path(expected_core["path"]) or os.environ.get("FINANCE_RUNTIME_ROOT") != expected_core["path"] or root_identity != expected_core["root_identity"] or database_identity != expected_core["database_identity"] or database_path != database / "finance.db":
+                      raise ValueError("Synthetic Core configuration, custody or empty-root precondition failed")
+                  # Never scan a database directory before its real Core/custody checks.
+                  with os.scandir(core) as entries:
+                      first, second = next(entries, None), next(entries, None)
+                      root_empty = first is not None and first.name == "database" and second is None
+                  with os.scandir(database) as entries:
+                      database_empty = next(entries, None) is None
+                  core_check = {"path": str(core), "root_identity": root_identity, "database_identity": database_identity, "only_empty_database": root_empty and database_empty, "database_path": str(database_path)}
+                  if not core_check["only_empty_database"]:
+                      raise ValueError("Synthetic Core configuration, custody or empty-root precondition failed")
+                  receipt["core_runtime"] = core_check
+              except Exception as error:
+                  admitted = False
+                  receipt["core_runtime"] = {"status": "REFUSED", "failure_type": type(error).__name__, "failure_reason": str(error)[:1024]}
           receipt["admission"] = "PASS" if admitted else "REFUSED"
           target = work / "preflight.json"
           target.write_text(json.dumps(receipt, sort_keys=True) + "\n")
@@ -1023,7 +1133,8 @@ jobs:
         if: ${{ always() && runner.os == 'Linux' }}
         run: |
           media_root="/opt/finance-media-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work" "$RUNNER_TEMP/linux-media" "$(id -u)" "$(id -g)" <<'PY_MEDIA_EXPORT'
+          core_root="/tmp/finance-media-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo "$GITHUB_WORKSPACE/.venv/bin/python" -I - "$media_root/work" "$RUNNER_TEMP/linux-media" "$(id -u)" "$(id -g)" "$core_root" <<'PY_MEDIA_EXPORT'
           import json
           import os
           import pwd
@@ -1031,7 +1142,8 @@ jobs:
           import sys
           from pathlib import Path
           source, destination = map(Path, sys.argv[1:3])
-          owner, group = map(int, sys.argv[3:])
+          owner, group = map(int, sys.argv[3:5])
+          core_path = Path(sys.argv[5])
           uid = pwd.getpwnam("financemedia").pw_uid
           root_info = source.lstat()
           if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != uid or stat.S_IMODE(root_info.st_mode) != 0o700:
@@ -1053,9 +1165,15 @@ jobs:
           destination.mkdir(mode=0o700)
           os.chown(destination, owner, group)
           cleanup = destination / "export-state.json"
-          cleanup.write_text(json.dumps({"schema": "finance-media-ci-export-v1", "remaining_uid_processes": survivors}) + "\n")
-          os.chown(cleanup, owner, group)
-          cleanup.chmod(0o400)
+          export_state = {"schema": "finance-media-ci-export-v1", "remaining_uid_processes": survivors, "core_runtime_postcondition": {"status": "NOT_CHECKED", "path": str(core_path)}}
+          def write_export_state():
+              raw = json.dumps(export_state, sort_keys=True) + "\n"
+              if len(raw.encode()) > 65_536:
+                  raise SystemExit("Media export control metadata exceeded bound")
+              cleanup.write_text(raw)
+              os.chown(cleanup, owner, group)
+              cleanup.chmod(0o400)
+          write_export_state()
           # Immutable root-owned control receipts are separate from fin-owned bundles.
           # Preserve bootstrap refusals even when no dedicated interpreter ever started.
           def copy_control_receipt(name, maximum):
@@ -1084,6 +1202,59 @@ jobs:
               copy_control_receipt(name, maximum)
           if survivors:
               raise SystemExit("Media processes remain; no mutable bundle export permitted")
+          # This independent synthetic Core root must contain only its empty database.
+          # No recursive cleanup: preserve unexpected content or lost custody as failure.
+          def remove_empty_core_runtime(path, expected):
+              temporary = Path("/tmp")
+              if path.parent != temporary or temporary.resolve(strict=True) != temporary or path.resolve(strict=True) != path or expected.get("path") != str(path):
+                  raise ValueError("Synthetic Core postcondition path differs")
+              def directory_identity(info):
+                  return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+              parent_info = temporary.lstat()
+              root_info = Path("/").lstat()
+              if not stat.S_ISDIR(parent_info.st_mode) or parent_info.st_uid != 0 or not parent_info.st_mode & stat.S_ISVTX or not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0 or root_info.st_mode & 0o022 or directory_identity(parent_info) != expected["tmp_identity"]:
+                  raise ValueError("Synthetic Core trusted parent changed")
+              parent_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+              root_fd = database_fd = None
+              try:
+                  root_fd = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                  database_fd = os.open("database", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+                  for fd, selected, key in ((root_fd, path, "root_identity"), (database_fd, path / "database", "database_identity")):
+                      info = os.fstat(fd)
+                      if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700 or directory_identity(info) != expected[key] or directory_identity(selected.lstat()) != expected[key]:
+                          raise ValueError("Synthetic Core directory custody changed")
+                  with os.scandir(root_fd) as entries:
+                      first, second = next(entries, None), next(entries, None)
+                      if first is None or first.name != "database" or second is not None:
+                          raise ValueError("Synthetic Core root contains unexpected content")
+                  with os.scandir(database_fd) as entries:
+                      if next(entries, None) is not None:
+                          raise ValueError("Synthetic Core database contains unexpected content")
+                  if directory_identity(os.fstat(parent_fd)) != expected["tmp_identity"] or directory_identity(temporary.lstat()) != expected["tmp_identity"] or directory_identity((path / "database").lstat()) != expected["database_identity"]:
+                      raise ValueError("Synthetic Core parent/database changed before empty removal")
+                  os.rmdir("database", dir_fd=root_fd)
+                  if directory_identity(os.fstat(root_fd)) != expected["root_identity"] or directory_identity(path.lstat()) != expected["root_identity"]:
+                      raise ValueError("Synthetic Core root changed before empty removal")
+                  os.rmdir(path.name, dir_fd=parent_fd)
+                  return {"status": "PASS_REMOVED", "path": str(path), "root_identity": expected["root_identity"], "database_identity": expected["database_identity"], "only_empty_database": True}
+              finally:
+                  for fd in (database_fd, root_fd, parent_fd):
+                      if fd is not None:
+                          os.close(fd)
+          core_postcondition_failed = False
+          try:
+              startup = destination / "bootstrap-startup.json"
+              expected_core = json.loads(startup.read_bytes()).get("core_runtime") if startup.exists() else None
+              if expected_core is None:
+                  if os.path.lexists(core_path):
+                      raise ValueError("Synthetic Core residue has no recorded initial identity")
+                  export_state["core_runtime_postcondition"] = {"status": "NOT_PREPARED", "path": str(core_path)}
+              else:
+                  export_state["core_runtime_postcondition"] = remove_empty_core_runtime(core_path, expected_core)
+          except Exception as error:
+              export_state["core_runtime_postcondition"] = {"status": "REFUSED", "path": str(core_path), "failure_type": type(error).__name__, "failure_reason": str(error)[:1024]}
+              core_postcondition_failed = True
+          write_export_state()
           def identity(info):
               return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
           def owned_directory(path):
@@ -1145,6 +1316,8 @@ jobs:
                       break
                   owned_directory(parent)
               copy_member(selected)
+          if core_postcondition_failed:
+              raise SystemExit("Synthetic Core postcondition refused; residue and bounded media evidence retained")
           PY_MEDIA_EXPORT
 
       - name: Upload actual Linux receipt media acceptance evidence

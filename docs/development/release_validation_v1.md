@@ -212,6 +212,39 @@ mask/default ACL. The filesystem root is checked separately at startup. All
 49 media cases remained unrun; expensive remaining jobs were cancelled after
 the required Linux failure. This receipt is diagnostic evidence, not acceptance.
 
+Run `37721656261`, attempt 1, used candidate
+`6783f6aace1dff7b332c36acae965cf152c96628`. The isolated startup, pinned worker
+identity and Fin admission passed. Pytest then exited 4 while loading the
+unchanged shared conftest, before collecting or running the 49 media cases.
+With no explicit `FINANCE_RUNTIME_ROOT`, conftest selected the source snapshot
+under `/opt`; the real Core guard correctly refused its globally writable
+ancestor. Fin-effective read-only ACLs do not replace Core's stricter runtime
+directory-chain contract.
+
+Media acceptance now explicitly configures a separate, exclusively created
+Fin-owned 0700 synthetic runtime root at `/tmp/finance-media-core-<run>-<attempt>`
+with only an empty Fin-owned 0700 `database/`. The canonical `/tmp` ancestor
+must be root-owned and sticky. Before any Core import, startup and the actual
+pytest process receive the same runtime setting and call the unchanged
+`require_runtime_root()` and `live_database_path()` guards. Both verify the
+expected canonical paths, original directory identities, ownership, permissions
+and empty database. Source, SDK, venv, OCR workspace and media evidence keep
+their existing separate locations. No `finance.db`, seed, SQL execution or
+financial runtime activation is part of this setup.
+
+After Fin processes exit, export verifies the original synthetic directory
+identities and empty content before removing only the two empty directories.
+Unexpected content or lost custody refuses cleanup and retains bounded
+diagnostics; already produced media failure evidence remains subject to the
+original export limits. Unknown runtime contents are not uploaded.
+
+A real local reproduction uses the same read-only source snapshot and shared
+conftest in two fresh isolated processes: the unconfigured unsafe ancestor
+fails with the same Core error; the explicit compliant runtime collects the
+original 50 named tests and leaves its database empty. Collection does not run
+fixtures, decode images or perform OCR, and does not replace exact-head Linux
+acceptance. Core policy, conftest and all required media cases remain unchanged.
+
 Media source/worker modules, their unit/vector tests and the whole
 `tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
 modification, deletion and rename. The workflow and independent verifier

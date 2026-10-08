@@ -464,6 +464,68 @@ def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
     assert '"finance-media-ci-sdk-acl-v1"' in section
     assert '"finance-media-ci-runtime-v1"' in section
     assert '"finance-media-ci-startup-v1"' in section
+    assert 'core_root="/tmp/finance-media-core-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in section
+    assert 'FINANCE_RUNTIME_ROOT="$core_root"' in section
+    assert "def prepare_core_runtime(path, uid, gid)" in section
+    assert "os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)" in section
+    assert (
+        "core_runtime = prepare_core_runtime(core_path, account.pw_uid, account.pw_gid)" in section
+    )
+
+    startup = _inline_python(
+        "Verify isolated media startup and prepare OCR assets", "PY_MEDIA_STARTUP"
+    )
+    startup_tree = ast.parse(startup)
+    startup_code = next(
+        ast.literal_eval(node.value)
+        for node in startup_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "STARTUP_CODE" for target in node.targets
+        )
+    )
+    assert (
+        "from finance_core.runtime_paths import require_runtime_root, live_database_path"
+        in startup_code
+    )
+    assert startup_code.index("core = require_runtime_root()") < startup_code.index(
+        "from finance_core.intake.receipt_media import _worker_run"
+    )
+    assert startup_code.index("core = require_runtime_root()") < startup_code.index(
+        "with os.scandir(core)"
+    )
+    assert startup_code.index("live_database_path()") < startup_code.index(
+        "from finance_core.intake.receipt_media import _worker_run"
+    )
+    assert startup_code.index("live_database_path()") < startup_code.index("with os.scandir(core)")
+    assert '"FINANCE_RUNTIME_ROOT=" + str(core_path)' in startup
+
+    launch = _inline_python("Require actual Linux receipt media acceptance", "PY_MEDIA_LAUNCH")
+    assert (
+        "from finance_core.runtime_paths import require_runtime_root, live_database_path" in launch
+    )
+    assert launch.index("core = require_runtime_root()") < launch.index("os.execv(")
+    assert launch.index("core = require_runtime_root()") < launch.index("with os.scandir(core)")
+    assert launch.index("live_database_path()") < launch.index("os.execv(")
+    assert launch.index("live_database_path()") < launch.index("with os.scandir(core)")
+    assert 'FINANCE_RUNTIME_ROOT="$core_root"' in section
+
+    export = _inline_python(
+        "Preserve actual Linux receipt media acceptance evidence", "PY_MEDIA_EXPORT"
+    )
+    assert "def remove_empty_core_runtime(path, expected)" in export
+    assert export.count('os.rmdir("database", dir_fd=root_fd)') == 1
+    assert export.count("os.rmdir(path.name, dir_fd=parent_fd)") == 1
+    assert "shutil.rmtree" not in export
+    assert "core_runtime_postcondition" in export
+    assert export.index("if survivors:") < export.index(
+        'export_state["core_runtime_postcondition"] = remove_empty_core_runtime'
+    )
+    assert export.index("copy_member(selected)") < export.index("if core_postcondition_failed:")
+    assert (
+        "Synthetic Core postcondition refused; residue and bounded media evidence retained"
+        in export
+    )
 
     for label in (
         "PY_MEDIA_SNAPSHOT",
@@ -490,6 +552,104 @@ def test_linux_media_is_mandatory_and_preserves_failure_evidence() -> None:
         script = _step_script(step)
         ast.parse(_inline_python(step, label))
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+
+@pytest.mark.parametrize("entrypoint", ["startup", "launch"])
+@pytest.mark.parametrize("runtime", ["canonical", "symlink", "groupwrite"])
+def test_actual_inline_core_guard_runs_before_directory_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entrypoint: str,
+    runtime: str,
+) -> None:
+    """Execute the inline Core guard with the real runtime-path functions and count scans."""
+    import stat
+
+    if entrypoint == "startup":
+        startup = ast.parse(
+            _inline_python(
+                "Verify isolated media startup and prepare OCR assets", "PY_MEDIA_STARTUP"
+            )
+        )
+        code = next(
+            ast.literal_eval(node.value)
+            for node in startup.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "STARTUP_CODE"
+                for target in node.targets
+            )
+        )
+    else:
+        code = _inline_python("Require actual Linux receipt media acceptance", "PY_MEDIA_LAUNCH")
+    tree = ast.parse(code)
+    guard = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any(
+            isinstance(child, ast.ImportFrom) and child.module == "finance_core.runtime_paths"
+            for child in ast.walk(node)
+        )
+    )
+
+    root = tmp_path / "private-runtime"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    database = root / "database"
+    database.mkdir(mode=0o700)
+    database.chmod(0o700)
+    selected = root
+    if runtime == "symlink":
+        selected = tmp_path / "runtime-alias"
+        selected.symlink_to(root, target_is_directory=True)
+    elif runtime == "groupwrite":
+        root.chmod(0o770)
+
+    def directory_identity(path: Path) -> list[int]:
+        info = path.lstat()
+        return [info.st_dev, info.st_ino, info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)]
+
+    expected = {
+        "path": str(root),
+        "root_identity": directory_identity(root),
+        "database_identity": directory_identity(database),
+    }
+    monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(selected))
+    calls: list[str] = []
+    original_scandir = os.scandir
+
+    def count_scandir(path: str | os.PathLike[str] | int) -> Any:
+        calls.append(str(path))
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", count_scandir)
+    namespace: dict[str, object] = {
+        "Path": Path,
+        "os": os,
+        "stat": stat,
+        "uid": os.getuid(),
+        "expected_core": expected,
+        "receipt": {},
+        "admitted": True,
+    }
+    module = ast.Module(body=[guard], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), f"<{entrypoint}-core-guard>", "exec"), namespace
+    )
+
+    if runtime == "canonical":
+        assert namespace["admitted"] is True
+        assert len(calls) == 2
+        assert namespace["receipt"]["core_runtime"]["only_empty_database"] is True  # type: ignore[index]
+        assert namespace["receipt"]["core_runtime"]["database_path"] == str(database / "finance.db")  # type: ignore[index]
+        assert not (database / "finance.db").exists()
+    else:
+        assert namespace["admitted"] is False
+        assert calls == []
+        core_result = namespace["receipt"]["core_runtime"]  # type: ignore[index]
+        assert core_result["failure_type"] == "RuntimePathConfigurationError"  # type: ignore[index]
+        assert not (database / "finance.db").exists()
 
 
 def test_actual_snapshot_helper_binds_commit_tree_blobs_modes_and_paths(tmp_path: Path) -> None:
@@ -1124,13 +1284,19 @@ def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
     """Exercise bounded receipts with a child-process adapter, never claim Linux admission."""
     import json
     import os
+    import pwd
+    import stat
     import sys
+    import time
+    from types import SimpleNamespace
 
     script = _inline_python(
         "Verify isolated media startup and prepare OCR assets", "PY_MEDIA_STARTUP"
     )
     tree = ast.parse(script)
     for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and node.value == "/tmp":
+            node.value = "/private/tmp"
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -1157,9 +1323,21 @@ def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
     )
     (root / "snapshot.json").write_text(json.dumps({"candidate_sha": "b" * 40}), encoding="utf-8")
     receipt_path = root / "startup.json"
+    core_path = Path("/private/tmp") / f"finance-media-core-{os.getpid()}-{time.time_ns()}"
     original_popen = subprocess.Popen
+    observed_arguments: list[str] = []
 
-    def adapted_popen(_arguments: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()),
+    )
+
+    def adapted_popen(arguments: list[str], **kwargs: Any) -> subprocess.Popen[bytes]:
+        observed_arguments.extend(arguments)
+        assert "/usr/bin/env" in arguments
+        assert "-i" in arguments
+        assert f"FINANCE_RUNTIME_ROOT={core_path}" in arguments
         if failure == "permission":
             raise PermissionError("synthetic interpreter execute denial")
         command = (
@@ -1170,26 +1348,43 @@ def test_actual_startup_helper_records_bounded_refusal_for_bootstrap_failures(
         return original_popen([sys.executable, "-I", "-c", command], **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", adapted_popen)
-    monkeypatch.setattr(sys, "argv", ["PY_MEDIA_STARTUP", str(root), str(receipt_path)])
+    monkeypatch.setattr(
+        sys, "argv", ["PY_MEDIA_STARTUP", str(root), str(receipt_path), str(core_path)]
+    )
     namespace: dict[str, object] = {"__name__": "__main__"}
-    with pytest.raises(SystemExit):
-        exec(compile(script, "<PY_MEDIA_STARTUP>", "exec"), namespace)
+    try:
+        with pytest.raises(SystemExit):
+            exec(compile(script, "<PY_MEDIA_STARTUP>", "exec"), namespace)
 
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert receipt["schema"] == "finance-media-ci-startup-v1"
-    assert receipt["candidate_sha"] == "b" * 40
-    assert receipt["status"] == "REFUSED"
-    assert receipt_path.stat().st_mode & 0o777 == 0o400
-    assert receipt_path.stat().st_size <= 393_216
-    assert len(receipt.get("stdout", "")) <= 8192
-    if failure == "permission":
-        assert receipt["failure_type"] == "PermissionError"
-    elif failure == "timeout":
-        assert receipt["failure_type"] == "TimeoutError"
-    elif failure == "exit126":
-        assert receipt["returncode"] == 126
-    else:
-        assert "admitted identity" in receipt["failure_reason"]
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert receipt["schema"] == "finance-media-ci-startup-v1"
+        assert receipt["candidate_sha"] == "b" * 40
+        assert receipt["status"] == "REFUSED"
+        assert receipt["core_runtime"]["path"] == str(core_path)
+        assert receipt["core_runtime"]["database_empty"] is True
+        assert receipt_path.stat().st_mode & 0o777 == 0o400
+        assert receipt_path.stat().st_size <= 393_216
+        assert len(receipt.get("stdout", "")) <= 8192
+        assert f"FINANCE_RUNTIME_ROOT={core_path}" in observed_arguments
+        if failure == "permission":
+            assert receipt["failure_type"] == "PermissionError"
+        elif failure == "timeout":
+            assert receipt["failure_type"] == "TimeoutError"
+        elif failure == "exit126":
+            assert receipt["returncode"] == 126
+        else:
+            assert "admitted identity" in receipt["failure_reason"]
+    finally:
+        if core_path.exists():
+            database_path = core_path / "database"
+            assert core_path.stat().st_uid == os.getuid()
+            assert stat.S_IMODE(core_path.stat().st_mode) == 0o700
+            assert database_path.stat().st_uid == os.getuid()
+            assert stat.S_IMODE(database_path.stat().st_mode) == 0o700
+            assert list(core_path.iterdir()) == [database_path]
+            assert list(database_path.iterdir()) == []
+            database_path.rmdir()
+            core_path.rmdir()
 
 
 def _media_proof_script() -> str:
@@ -1292,6 +1487,31 @@ def test_actual_media_report_refuses_unsafe_files(tmp_path: Path, unsafe: str) -
     assert result.returncode != 0
 
 
+def _prepare_export_core_runtime(core_path: Path) -> dict[str, Any]:
+    """Run the workflow's real exclusive Core-root creator with a local UID adapter."""
+    import re
+    import stat
+
+    startup = ast.parse(
+        _inline_python("Verify isolated media startup and prepare OCR assets", "PY_MEDIA_STARTUP")
+    )
+    definitions: list[ast.stmt] = []
+    for node in startup.body:
+        if isinstance(node, ast.FunctionDef) and node.name in {
+            "directory_identity",
+            "prepare_core_runtime",
+        }:
+            definitions.append(node)
+    for ast_node in ast.walk(ast.Module(body=definitions, type_ignores=[])):
+        if isinstance(ast_node, ast.Constant) and ast_node.value == "/tmp":
+            ast_node.value = "/private/tmp"
+    namespace: dict[str, object] = {"Path": Path, "os": os, "re": re, "stat": stat}
+    module = ast.Module(body=definitions, type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module), "<PY_MEDIA_CORE_SETUP>", "exec"), namespace)
+    prepare = cast(Any, namespace["prepare_core_runtime"])
+    return cast(dict[str, Any], prepare(core_path, os.getuid(), os.getgid()))
+
+
 @pytest.mark.parametrize(
     "variant",
     [
@@ -1305,12 +1525,17 @@ def test_actual_media_report_refuses_unsafe_files(tmp_path: Path, unsafe: str) -
         "control_symlink",
         "control_mode",
         "control_oversize",
+        "core_content",
+        "core_custody",
     ],
 )
 def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant: str) -> None:
-    """Exercise export bytes with a synthetic UID/proc adapter, never native Linux admission."""
+    """Exercise bounded export with local UID/proc adapters, never Linux admission."""
     import hashlib
+    import json
+    import stat
     import sys
+    import time
 
     source = tmp_path / "work"
     source.mkdir(mode=0o700)
@@ -1320,11 +1545,23 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
     member = evidence / "original.bin"
     member.write_bytes(raw)
     member.chmod(0o400)
+    core_path = Path("/private/tmp") / f"finance-media-core-{os.getpid()}-{time.time_ns()}"
+    core_runtime = _prepare_export_core_runtime(core_path)
     control_payloads = {
         "snapshot.json": b'{"schema":"finance-media-ci-snapshot-v1","status":"REFUSED"}\n',
         "sdk-acl.json": b'{"schema":"finance-media-ci-sdk-acl-v1","status":"REFUSED"}\n',
         "runtime.json": b'{"schema":"finance-media-ci-runtime-v1","status":"REFUSED"}\n',
-        "startup.json": b'{"schema":"finance-media-ci-startup-v1","status":"REFUSED"}\n',
+        "startup.json": (
+            json.dumps(
+                {
+                    "schema": "finance-media-ci-startup-v1",
+                    "status": "REFUSED",
+                    "core_runtime": core_runtime,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
     }
     if variant in {"survivor", "controls", "control_symlink", "control_mode", "control_oversize"}:
         for name, payload in control_payloads.items():
@@ -1343,6 +1580,16 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
             (source.parent / "snapshot.json").chmod(0o600)
             (source.parent / "snapshot.json").write_bytes(b"x" * 65_537)
             (source.parent / "snapshot.json").chmod(0o400)
+    else:
+        startup_control = source.parent / "startup.json"
+        startup_control.write_bytes(control_payloads["startup.json"])
+        startup_control.chmod(0o400)
+    if variant == "core_content":
+        unexpected = core_path / "database" / "synthetic-unexpected"
+        unexpected.write_bytes(b"synthetic residue")
+        unexpected.chmod(0o400)
+    elif variant == "core_custody":
+        (core_path / "database").chmod(0o750)
     proc = tmp_path / "synthetic-proc"
     proc.mkdir()
     if variant == "survivor":
@@ -1370,17 +1617,75 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
     export = shell.split("<<'PY_MEDIA_EXPORT'\n", 1)[1].rsplit("PY_MEDIA_EXPORT", 1)[0]
     tree = ast.parse(export)
     # Adapt only OS admission observations to an unprivileged synthetic test host.
+    parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+
+    def enclosing_function(node: ast.AST) -> str | None:
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return parent.name
+            parent = parents.get(parent)
+        return None
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and node.value == "/proc":
             node.value = str(proc)
-        if (
+        if isinstance(node, ast.Constant) and node.value == "/tmp":
+            node.value = "/private/tmp"
+        if not (
             isinstance(node, ast.Compare)
             and isinstance(node.left, ast.Attribute)
             and isinstance(node.left.value, ast.Name)
-            and node.left.value.id in {"parent_info", "before"}
             and node.left.attr == "st_uid"
         ):
+            continue
+        if node.left.value.id == "parent_info" and enclosing_function(node) is None:
             node.comparators = [ast.Constant(value=os.getuid())]
+        elif node.left.value.id == "before" and enclosing_function(node) == "copy_control_receipt":
+            node.comparators = [ast.Constant(value=os.getuid())]
+    export_state_writer = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "write_export_state"
+    )
+    write_call_index = next(
+        index
+        for index, node in enumerate(export_state_writer.body)
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and isinstance(node.value.func.value, ast.Name)
+        and node.value.func.value.id == "cleanup"
+        and node.value.func.attr == "write_text"
+    )
+    # The hosted exporter is root and can refresh its fin-owned 0400 state file;
+    # this adapter opens it before each rewrite, then the real helper seals it again.
+    export_state_writer.body.insert(
+        write_call_index,
+        ast.If(
+            test=ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="cleanup", ctx=ast.Load()), attr="exists", ctx=ast.Load()
+                ),
+                args=[],
+                keywords=[],
+            ),
+            body=[
+                ast.Expr(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="cleanup", ctx=ast.Load()),
+                            attr="chmod",
+                            ctx=ast.Load(),
+                        ),
+                        args=[ast.Constant(value=0o600)],
+                        keywords=[],
+                    )
+                )
+            ],
+            orelse=[],
+        ),
+    )
     adapter = (
         "import pwd, types, os\n"
         "pwd.getpwnam = lambda _: types.SimpleNamespace(pw_uid=os.getuid())\n"
@@ -1395,31 +1700,67 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
             str(destination),
             str(os.getuid()),
             str(os.getgid()),
+            str(core_path),
         ],
         input=adapter + ast.unparse(ast.fix_missing_locations(tree)),
         text=True,
         capture_output=True,
     )
-    if variant in {"regular", "controls"}:
-        assert result.returncode == 0, result.stderr
-        copied = destination / "evidence/original.bin"
-        assert copied.read_bytes() == member.read_bytes() == raw
-        assert hashlib.sha256(copied.read_bytes()).digest() == hashlib.sha256(raw).digest()
-        assert copied.stat().st_mode & 0o777 == member.stat().st_mode & 0o777 == 0o400
-        if variant == "controls":
+    try:
+        if variant in {"regular", "controls"}:
+            assert result.returncode == 0, result.stderr
+            copied = destination / "evidence/original.bin"
+            assert copied.read_bytes() == member.read_bytes() == raw
+            assert hashlib.sha256(copied.read_bytes()).digest() == hashlib.sha256(raw).digest()
+            assert copied.stat().st_mode & 0o777 == member.stat().st_mode & 0o777 == 0o400
+            export_state = json.loads((destination / "export-state.json").read_text())
+            assert (destination / "export-state.json").stat().st_mode & 0o777 == 0o400
+            assert export_state["core_runtime_postcondition"]["status"] == "PASS_REMOVED"
+            assert export_state["core_runtime_postcondition"]["only_empty_database"] is True
+            assert not core_path.exists()
+            if variant == "controls":
+                for name, payload in control_payloads.items():
+                    exported = destination / ("bootstrap-" + name)
+                    assert exported.read_bytes() == payload
+                    assert exported.stat().st_mode & 0o777 == 0o400
+        elif variant == "survivor":
+            assert result.returncode != 0
             for name, payload in control_payloads.items():
                 exported = destination / ("bootstrap-" + name)
                 assert exported.read_bytes() == payload
                 assert exported.stat().st_mode & 0o777 == 0o400
-    elif variant == "survivor":
-        assert result.returncode != 0
-        for name, payload in control_payloads.items():
-            exported = destination / ("bootstrap-" + name)
-            assert exported.read_bytes() == payload
-            assert exported.stat().st_mode & 0o777 == 0o400
-        assert not (destination / "evidence/original.bin").exists()
-    else:
-        assert result.returncode != 0
-        if variant.startswith("control_"):
-            assert not (destination / "bootstrap-snapshot.json").exists()
-        assert not (destination / "evidence/original.bin").exists()
+            assert not (destination / "evidence/original.bin").exists()
+            assert core_path.exists()
+            export_state = json.loads((destination / "export-state.json").read_text())
+            assert export_state["core_runtime_postcondition"]["status"] == "NOT_CHECKED"
+        elif variant in {"core_content", "core_custody"}:
+            assert result.returncode != 0, result.stderr
+            copied = destination / "evidence/original.bin"
+            assert copied.read_bytes() == raw
+            export_state = json.loads((destination / "export-state.json").read_text())
+            assert (destination / "export-state.json").stat().st_mode & 0o777 == 0o400
+            assert export_state["core_runtime_postcondition"]["status"] == "REFUSED"
+            assert len(export_state["core_runtime_postcondition"]["failure_reason"]) <= 1024
+            assert core_path.exists()
+        else:
+            assert result.returncode != 0
+            if variant.startswith("control_"):
+                assert not (destination / "bootstrap-snapshot.json").exists()
+            assert not (destination / "evidence/original.bin").exists()
+    finally:
+        if core_path.exists():
+            database_path = core_path / "database"
+            if variant == "core_content":
+                unexpected = database_path / "synthetic-unexpected"
+                assert unexpected.is_file() and unexpected.stat().st_uid == os.getuid()
+                unexpected.unlink()
+            if variant == "core_custody":
+                database_path.chmod(0o700)
+            assert core_path.stat().st_uid == os.getuid()
+            assert stat.S_IMODE(core_path.stat().st_mode) == 0o700
+            assert database_path.stat().st_uid == os.getuid()
+            assert stat.S_IMODE(database_path.stat().st_mode) == 0o700
+            assert list(core_path.iterdir()) == [database_path]
+            assert list(database_path.iterdir()) == []
+            database_path.rmdir()
+            core_path.rmdir()
