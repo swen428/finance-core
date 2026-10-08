@@ -112,6 +112,7 @@ class ProposalConversionError(ParserConfirmationError):
 
 def _require_legacy_conversion_target(conn: sqlite3.Connection, parser_output_id: int) -> None:
     """Keep compatibility callers on their original authority without platform imports."""
+    require_staging_database(conn)
     proposal = ParserProposalRepository(conn).get(parser_output_id)
     if proposal is not None:
         try:
