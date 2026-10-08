@@ -42,6 +42,12 @@ from finance_core.money import (
     money_decimal,
     quantize_for_currency,
 )
+from finance_core.receipt_finalization.application_conditional import (
+    APPLICATION_CONDITIONAL_VERSION,
+    ApplicationConditionalAuthorityError,
+    require_application_authorization_version,
+    require_application_conditional_authority,
+)
 from finance_core.receipt_finalization.d2_conditional import (
     D2ConditionalAuthorityError,
     require_d2_conditional_authority,
@@ -173,11 +179,15 @@ def finalize_receipt_split(
     fin_input: FinalizationInput,
     *,
     clock: Callable[[], str] | None = None,
+    persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
 ) -> FinalizationOutput:
     """Finalize a calculated receipt split -- atomic, authorized, durably idempotent.
 
     All writes occur inside one explicit ``BEGIN IMMEDIATE ... COMMIT``.
     On any error, everything is rolled back.
+    A trusted composition's optional persistence effect supplements required
+    authority verification under the same lock; it cannot waive those checks.
+    Replay invokes it after complete truth verification in the read snapshot.
     """
     require_staging_database(conn)
     require_foreign_keys_enabled(conn)
@@ -212,6 +222,7 @@ def finalize_receipt_split(
             conn,
             fin_input=fin_input,
             fingerprint=fingerprint,
+            persistence_effect=persistence_effect,
             recheck=lambda: _check_idempotency(conn, fin_input.idempotency_key, fingerprint),
         )
         if replay is not None:
@@ -231,6 +242,7 @@ def finalize_receipt_split(
             conn,
             fin_input=fin_input,
             fingerprint=fingerprint,
+            persistence_effect=persistence_effect,
             recheck=lambda: _check_existing_finalization(
                 conn, fin_input.receipt_group_public_id, fingerprint
             ),
@@ -259,6 +271,8 @@ def finalize_receipt_split(
             )
             # Replay never writes: release the write lock with a rollback so an
             # accidental future write inside the verifier can never persist.
+            if persistence_effect is not None:
+                persistence_effect(conn, idem)
             conn.rollback()
             return idem
 
@@ -276,6 +290,8 @@ def finalize_receipt_split(
                 fin_input=fin_input,
                 fingerprint=fingerprint,
             )
+            if persistence_effect is not None:
+                persistence_effect(conn, existing)
             conn.rollback()
             return existing
 
@@ -451,6 +467,20 @@ def finalize_receipt_split(
             created_at=created_at,
         )
 
+        result = FinalizationOutput(
+            finalization_public_id=finalization_pub_id,
+            calculation_run_public_id=fin_input.calculation_run_public_id,
+            obligations_created=len(fin_input.settlement_obligations),
+            settlement_public_ids=settlement_pub_ids,
+            status=FinalizationStatus.FINALIZED.value,
+            transaction_public_id=txn_public_id,
+            audit_id=finalization_pub_id,
+            idempotency_key=fin_input.idempotency_key,
+        )
+
+        if persistence_effect is not None:
+            persistence_effect(conn, result)
+
         # --- COMMIT ---
         conn.commit()
 
@@ -483,16 +513,7 @@ def finalize_receipt_split(
             conn.rollback()
         raise
 
-    return FinalizationOutput(
-        finalization_public_id=finalization_pub_id,
-        calculation_run_public_id=fin_input.calculation_run_public_id,
-        obligations_created=len(fin_input.settlement_obligations),
-        settlement_public_ids=settlement_pub_ids,
-        status=FinalizationStatus.FINALIZED.value,
-        transaction_public_id=txn_public_id,
-        audit_id=finalization_pub_id,
-        idempotency_key=fin_input.idempotency_key,
-    )
+    return result
 
 
 def verify_finalized_receipt_split(
@@ -523,6 +544,7 @@ def _verify_replay_in_coherent_snapshot(
     fin_input: FinalizationInput,
     fingerprint: str,
     recheck: Callable[[], FinalizationOutput | None],
+    persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
 ) -> FinalizationOutput | None:
     """Verify a durable replay under one coherent read snapshot (R3-04).
 
@@ -550,6 +572,8 @@ def _verify_replay_in_coherent_snapshot(
             fin_input=fin_input,
             fingerprint=fingerprint,
         )
+        if persistence_effect is not None:
+            persistence_effect(conn, inner)
         if not replay_in_caller_txn:
             conn.rollback()
         return inner
@@ -1260,6 +1284,12 @@ def _load_and_validate_authorization(
         )
 
     # --- Version and version-specific authority proof ---
+    try:
+        require_application_authorization_version(conn, auth)
+    except ApplicationConditionalAuthorityError as exc:
+        raise FinalizationAuthorizationError(
+            str(exc), reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED
+        ) from exc
     authorization_version = str(auth.get("authorization_version") or "")
     if not authorization_version:
         raise FinalizationAuthorizationError(
@@ -1270,6 +1300,15 @@ def _load_and_validate_authorization(
         try:
             require_d2_conditional_authority(conn, auth)
         except D2ConditionalAuthorityError as exc:
+            raise FinalizationAuthorizationError(
+                str(exc), reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED
+            ) from exc
+    elif authorization_version == APPLICATION_CONDITIONAL_VERSION:
+        try:
+            require_application_conditional_authority(
+                conn, auth, require_current_payer=True, require_authorization_evidence=True
+            )
+        except ApplicationConditionalAuthorityError as exc:
             raise FinalizationAuthorizationError(
                 str(exc), reason=FinalizationBlockReason.AUTHORIZATION_MALFORMED
             ) from exc
@@ -2462,11 +2501,24 @@ def _require_replay_authorization_truth(
             "a durably finalized authorization can only be 'consumed'",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
+    try:
+        require_application_authorization_version(conn, auth)
+    except ApplicationConditionalAuthorityError as exc:
+        raise FinalizationIdempotencyError(
+            str(exc), reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value
+        ) from exc
     authorization_version = str(auth.get("authorization_version") or "")
     if authorization_version == "d2_conditional_v1":
         try:
             require_d2_conditional_authority(conn, auth)
         except D2ConditionalAuthorityError as exc:
+            raise FinalizationIdempotencyError(
+                str(exc), reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value
+            ) from exc
+    elif authorization_version == APPLICATION_CONDITIONAL_VERSION:
+        try:
+            require_application_conditional_authority(conn, auth)
+        except ApplicationConditionalAuthorityError as exc:
             raise FinalizationIdempotencyError(
                 str(exc), reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value
             ) from exc

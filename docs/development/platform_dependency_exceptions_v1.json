@@ -112,10 +112,6 @@
       "finance_core.telegram_source_context"
     ],
     [
-      "finance_core.parser_proposals.conversion",
-      "finance_core.telegram_source_context"
-    ],
-    [
       "finance_core.parser_proposals.service",
       "finance_core.telegram_source_context"
     ],

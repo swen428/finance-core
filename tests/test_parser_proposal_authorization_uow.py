@@ -46,7 +46,7 @@ from tests.test_parser_human_drafts_v1 import (
     _start,
 )
 
-LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:54]
 
 
 def _proposal(

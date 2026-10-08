@@ -16,7 +16,7 @@ from finance_core.reconciliation.migrations import (
     migration_ledger_rows,
 )
 
-LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:-1]
+LEGACY_D1_MIGRATION_PATHS = TEMP_DB_MIGRATION_PATHS[:54]
 
 TABLES_047 = {
     "parser_human_drafts",

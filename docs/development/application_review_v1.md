@@ -31,7 +31,10 @@ upfront projection in the adapter would change this observable contract.
 Direct callers use the composed entry without callbacks. A prepared review is
 an internal read snapshot, not authorization and not a safe substitute for
 D2's delivered-content, actor, version, expiry and one-use proof. Existing
-signing/redemption/posting/recovery services continue to own that authority.
+signing/redemption/posting/recovery services continue to own that authority. The additive
+[independent posting path](independent_posting_v1.md) binds the complete review
+and its own Python receipt-calculation projection to a separately verified
+human decision; this read-only review entry still grants no write authority.
 
 The financial rules exist once. Existing Bridge callers of proposal lookup,
 effective state, ambiguity and classification delegate to the same helpers;
