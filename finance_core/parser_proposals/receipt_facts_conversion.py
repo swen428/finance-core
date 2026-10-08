@@ -399,14 +399,14 @@ def convert_confirmed_receipt_proposal_to_facts(
         )
         if metadata_authority is None:
             from finance_core.parser_proposals.amendment_lineage import refuse_legacy_amendment
-
-            refuse_legacy_amendment(conn, _require_proposal(conn, command.proposal_public_id))
         if existing is not None:  # guard 4
             # The conflict decision precedes replay integrity: changed
             # material is reported first even when dependent facts or
             # evidence rows were destroyed out-of-band.
             _require_replay_material(existing, material_hash, command)
             _verify_replay_integrity(conn, existing)
+            if metadata_authority is None:
+                refuse_legacy_amendment(conn, _require_proposal(conn, command.proposal_public_id))
             result = _replay_result(existing)
             if persistence_effect is not None:
                 persistence_effect(conn, result)
@@ -414,6 +414,8 @@ def convert_confirmed_receipt_proposal_to_facts(
             return result
 
         proposal = _require_proposal(conn, command.proposal_public_id)  # guard 5
+        if metadata_authority is None:
+            refuse_legacy_amendment(conn, proposal)
         parser_output_id = int(proposal["id"])
         link = _require_single_receipt_link(conn, parser_output_id)  # guard 6
         _require_leaf(conn, proposal)  # guard 7

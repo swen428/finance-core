@@ -7,6 +7,11 @@ from pathlib import Path
 
 import pytest
 from test_application_amendment_smoke_v1 import SignedAmendmentPort, persist_edit
+from test_application_amendment_v1 import (
+    _amendment_service,
+    _apply,
+    _prepare_edited_posting,
+)
 from test_application_posting_recovery_v1 import (
     BINDING,
     DECISION_KEY,
@@ -20,13 +25,20 @@ from test_application_posting_recovery_v1 import (
 )
 from test_parser_proposal_authorization_uow import _proposal
 
+from finance_core.application import posting as posting_module
 from finance_core.application.amendment import AmendmentService
 from finance_core.application.amendment_contract import AmendmentBinding, AmendmentError
 from finance_core.application.posting import PostingError
 from finance_core.parser_proposals import decision_owner, service
+from finance_core.parser_proposals.amendment_lineage import AmendmentLineageError
 from finance_core.parser_proposals.completion import complete_proposal
 from finance_core.parser_proposals.confirmation import confirm_proposal
 from finance_core.parser_proposals.conversion import convert_confirmed_proposal_to_transaction
+from finance_core.parser_proposals.receipt_facts_conversion import (
+    ConversionPersistenceError,
+    ReceiptFactsConversionCommand,
+    convert_confirmed_receipt_proposal_to_facts,
+)
 from finance_core.parser_proposals.receipt_supersession import supersede_receipt_total_proposal
 from finance_core.parser_proposals.repository import ParserProposalRepository
 
@@ -210,3 +222,101 @@ def test_legacy_converter_facades_refuse_independently_amended_posting_replay(
         posting.get_status(posted.attempt_id).transaction_public_id == posted.transaction_public_id
     )
     assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+
+
+def test_legacy_receipt_replay_refuses_independent_amendment_before_persistence_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        connection,
+        _workspace,
+        _manifest,
+        posting,
+        _old_review,
+        proposal,
+        _intake_public_id,
+        _old_decision,
+        _old_display,
+        source_verifier,
+        _decision_authority,
+    ) = _prepare_receipt_subject(tmp_path, "legacy-amended-receipt-replay")
+    try:
+        amendments = _amendment_service(connection, source_verifier=source_verifier)
+        amended = _apply(
+            connection,
+            amendments,
+            amendments.prepare(proposal),
+            {"amount": "14.00", "description": "Edited dinner", "category": "dining"},
+        )
+        review = _prepare_edited_posting(posting, amended, connection, "fresh-receipt-owner-proof")
+
+        def stop_after_conversion(stage):
+            if stage == "after_conversion_commit":
+                raise RuntimeError("Stop after real receipt conversion commit")
+
+        monkeypatch.setattr(posting_module, "_failure_injection_hook", stop_after_conversion)
+        with pytest.raises(RuntimeError, match="real receipt conversion commit"):
+            posting.submit_post(review.review_id, "fresh-receipt-owner-proof")
+        attempt_id = connection.execute(
+            "SELECT attempt_id FROM application_posting_attempts"
+        ).fetchone()[0]
+
+        registry = connection.execute(
+            "SELECT * FROM receipt_proposal_conversions WHERE parser_output_id="
+            "(SELECT id FROM parser_outputs WHERE public_id=?)",
+            (amended.proposal_public_id,),
+        ).fetchone()
+        assert registry is not None
+        payer = review.projection["payer_participant_public_id"]
+        command = ReceiptFactsConversionCommand(
+            command_public_id=registry["command_public_id"],
+            proposal_public_id=amended.proposal_public_id,
+            expected_content_hash=registry["proposal_content_hash"],
+            payer_participant_public_id=payer,
+            participants=({"participant_public_id": payer, "is_included": 1},),
+            authenticated_actor_id=registry["authenticated_actor_id"],
+            channel="independent_application",
+        )
+        database_before = tuple(connection.iterdump())
+        changes_before = connection.total_changes
+        effect_calls = []
+
+        def persistence_effect(_connection, _result):
+            effect_calls.append(True)
+
+        with pytest.raises(AmendmentLineageError, match="independent decision owner"):
+            convert_confirmed_receipt_proposal_to_facts(
+                connection, command, persistence_effect=persistence_effect
+            )
+
+        assert not connection.in_transaction
+        assert effect_calls == []
+        assert connection.total_changes == changes_before
+        assert tuple(connection.iterdump()) == database_before
+        assert connection.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+
+        monkeypatch.setattr(posting_module, "_failure_injection_hook", None)
+        posted = posting.resume_post(attempt_id)
+        assert posted.state == "finalized"
+        database_before = tuple(connection.iterdump())
+        changes_before = connection.total_changes
+        # Finalization appends audit events. The original strict conversion
+        # replay integrity guard refuses this state before authority isolation.
+        with pytest.raises(ConversionPersistenceError, match="conversion audit state"):
+            convert_confirmed_receipt_proposal_to_facts(
+                connection, command, persistence_effect=persistence_effect
+            )
+
+        assert not connection.in_transaction
+        assert effect_calls == []
+        assert connection.total_changes == changes_before
+        assert tuple(connection.iterdump()) == database_before
+        assert connection.execute("SELECT COUNT(*) FROM receipts").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 1
+        assert posting.get_status(posted.attempt_id).transaction_public_id == (
+            posted.transaction_public_id
+        )
+    finally:
+        connection.close()
