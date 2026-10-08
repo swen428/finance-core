@@ -72,6 +72,7 @@ PYTHON_METADATA_MULTI_FIELDS = {"Requires-Dist", "License-File", "Dynamic"}
 # This reviewed allowlist is independent of candidate package metadata. Keep
 # wheel and sdist checks bound to the same explicitly approved dependencies.
 APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.16.1", "typing-extensions==4.16.0")
+APPROVED_MEDIA_DEPENDENCIES = ("Pillow==12.3.0", "pillow-heif==1.8.0")
 
 
 def _sha256(path: Path) -> str:
@@ -225,7 +226,7 @@ def _project_metadata(source_files: dict[str, bytes], version: str) -> dict[str,
         or project.get("version") != version
         or project.get("license") != "Apache-2.0"
         or project.get("requires-python") != expected["Requires-Python"]
-        or project.get("dependencies") != expected["Requires-Dist"]
+        or project.get("dependencies") != list(APPROVED_RUNTIME_DEPENDENCIES)
         or project.get("license-files") != expected["License-File"]
         or project.get("readme") != "README.md"
         or not isinstance(project.get("description"), str)
@@ -233,11 +234,20 @@ def _project_metadata(source_files: dict[str, bytes], version: str) -> dict[str,
         or build_system.get("build-backend") != "setuptools.build_meta"
     ):
         raise ValueError("pyproject.toml release metadata is not the approved contract")
+    if "optional-dependencies" in project:
+        if project["optional-dependencies"] != {"media": list(APPROVED_MEDIA_DEPENDENCIES)}:
+            raise ValueError("pyproject.toml optional dependencies are not the approved contract")
+        expected["Provides-Extra"] = ["media"]
+        expected["Requires-Dist"] = list(APPROVED_RUNTIME_DEPENDENCIES) + [
+            f'{item}; extra == "media"' for item in APPROVED_MEDIA_DEPENDENCIES
+        ]
     return expected
 
 
 def _verify_python_metadata(metadata: Message, expected: dict[str, object], label: str) -> None:
     expected_fields = PYTHON_METADATA_SINGLE_FIELDS | PYTHON_METADATA_MULTI_FIELDS
+    if "Provides-Extra" in expected:
+        expected_fields = expected_fields | {"Provides-Extra"}
     if set(metadata.keys()) != expected_fields:
         raise ValueError(f"{label} metadata fields are not the approved allowlist")
     for field in PYTHON_METADATA_SINGLE_FIELDS:
@@ -246,6 +256,8 @@ def _verify_python_metadata(metadata: Message, expected: dict[str, object], labe
     for field in PYTHON_METADATA_MULTI_FIELDS:
         if metadata.get_all(field, []) != expected[field]:
             raise ValueError(f"{label} metadata field {field} does not match the release source")
+    if metadata.get_all("Provides-Extra", []) != expected.get("Provides-Extra", []):
+        raise ValueError(f"{label} optional extra metadata does not match the approved contract")
     body = metadata.get_payload()
     if not isinstance(body, str) or body != expected["body"]:
         raise ValueError(f"{label} long description does not match README.md")
@@ -452,6 +464,10 @@ def _inspect_sdist(
     if egg_info_files["dependency_links.txt"] != b"\n":
         raise ValueError("source distribution dependency links are unexpected")
     expected_dependencies = "".join(f"{item}\n" for item in APPROVED_RUNTIME_DEPENDENCIES).encode()
+    if expected_metadata.get("Provides-Extra") == ["media"]:
+        expected_dependencies += (
+            b"\n[media]\n" + "".join(f"{item}\n" for item in APPROVED_MEDIA_DEPENDENCIES).encode()
+        )
     if egg_info_files["requires.txt"] != expected_dependencies:
         raise ValueError("source distribution dependency metadata is unexpected")
     if egg_info_files["top_level.txt"] != b"finance_core\n":

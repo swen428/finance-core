@@ -10,7 +10,12 @@ event/workflow identity, not the tested source identity. See the official
 [PR event semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request).
 
 PR validation runs Python quality checks, the complete sharded Python inventory
-and its aggregated inventory/timing proof. The Bridge runs when its inputs or
+and its aggregated inventory/timing proof. The quality job runs the focused
+public CI security guards before the four complete Python shards may start;
+these checks use the host's canonical temporary directory and preserve the
+existing runtime/custody assertions. A failed guard blocks the shards instead
+of waiting for the full inventory to expose a bootstrap-test failure. The
+Bridge runs when its inputs or
 the CI/build/dependency controls change. A PR with no Bridge requirement may
 have a skipped Bridge job; a required Bridge may never be skipped. All Actions
 remain pinned and all fork execution uses read-only permissions without secrets
@@ -122,3 +127,135 @@ skips do not constitute this acceptance. OCR sources, tests, fixtures and asset
 locks require Bridge scope, including their deletion or rename. Workflow and
 independent candidate verification recompute the same complete changed-path
 classification. See [the pinned Linux OCR contract](linux_receipt_ocr_v1.md).
+
+
+## Actual Linux receipt media acceptance
+
+The existing mandatory Ubuntu 24.04 Bridge lane also runs the actual bounded
+receipt-media worker through `tests/test_receipt_media_vectors_v1.py`. It uses
+the exact hash-locked optional `media` dependencies and the separately pinned
+local Tesseract preparation. `FINANCE_LINUX_MEDIA_REQUIRED=1` makes a missing
+platform, decoder or OCR configuration fail; the JUnit inventory must contain
+exactly 50 named tests (the archive check and all 49 media cases), each executed
+with zero skips/errors/failures. A fresh non-root account owns separate pinned
+OCR assets, with no effective/permitted capabilities and verified UID/cgroup
+process headroom before the bounded worker starts. The test account cannot
+write the checkout or dependency environment. The lane preserves
+its admission receipt, JUnit and bounded synthetic original/PNG/result evidence, including failure
+records, as `linux-media-acceptance-<run>-<attempt>`.
+
+### Hosted bootstrap failure and recovery boundary
+
+Run `37709785108`, attempt 1, used candidate
+`c0b8ad02a22b23939631b0734843b357f0a28d07`. The existing Linux OCR acceptance
+completed all 13 tests without skips, failures or errors. The media stage then
+failed before its worker started: the `financemedia` account received
+`Permission denied` executing the checkout's `.venv/bin/python` (exit 126). All
+49 media cases were not run, and no image decode or media OCR operation took
+place. The uploaded media artifact contained only the export-state receipt, so
+this run is not media acceptance.
+
+The same run's Python shard also refused the new synthetic media archive
+because its exact path/hash was absent from the public binary-fixture registry.
+The corrected registry admits only the reviewed archive digest; private-data
+checks remain active, with narrowly identified image-format language excluded
+from name matching.
+
+The recovery bootstrap takes a root-owned, read-only snapshot from the exact
+candidate commit archive and Git tree/blob/mode inventory. The Bridge selects
+Python 3.12.14 on Linux and 3.12.10 on macOS, whose supported arm64 installer
+was used by the first run. Linux binds the original canonical setup-python SDK, including
+its official interpreter and libpython digests, and creates a fresh hash-locked
+venv in `/opt/finance-media-<run>-<attempt>/runtime`. It neither relocates the
+SDK nor rewrites its binary or dynamic-loader search path.
+
+Toolcache paths cannot be assumed read-only. A bounded SDK/path preparation
+adds only the media account's numeric-UID access ACL with `setfacl --no-mask`:
+explicit precomputed numeric read or read/search permissions (`4` or `5`)
+without write, preserving every other principal's raw and effective rights,
+the existing mask and default ACL. Conditional `X` is not used: GNU ACL checks
+raw execute bits, which can differ from the effective file mode. An insufficient existing mask or mismatched
+ACL state refuses preparation; it is never widened to produce a pass. The
+`financemedia` account then checks effective source/runtime/SDK permissions,
+exact Python version and prefixes, interpreter and actual mapped libpython
+identity, and the actual pinned worker identity before OCR preparation or media
+tests. The environment is explicitly rebuilt without inherited Python or
+dynamic-loader settings. This is a trusted, ephemeral CI installation boundary;
+SDK and Ubuntu loader/system libraries are not globally immutable to root or
+runner administrators, and this is not a general native-code sandbox.
+
+Bootstrap and startup failures are retained as small, read-only receipts
+separate from the account-owned synthetic media evidence; the evidence exporter
+copies those control receipts under fixed names and bounds.
+
+The original checkout, home and workspace permissions remain unchanged; the
+media account does not open them. This bootstrap change resolves the setup
+failure only. It does not convert the unrun media cases into a pass. Preserve
+the failed run's evidence and validate the corrected, reviewed candidate
+against the unchanged media acceptance requirements.
+
+Run `37717084251`, attempt 1, used candidate
+`9c9144bb76958253007431001a6bf73921450e2e`. The old Linux OCR's 13 tests and
+the exact-commit source snapshot passed. SDK ACL preparation then refused
+before startup, leaving all 49 media cases unrun. Its generic receipt did not
+identify the offending node; a source-semantics counterexample independently
+demonstrated the conditional-`X` mismatch described above. The corrected
+preparation retains the same checks and bounded path/comparison diagnostics.
+The macOS job also refused the unavailable 3.12.14 arm64 installer. Once both
+required Bridge jobs had failed, the remaining expensive work was cancelled;
+this run supplies failure evidence, not complete validation. A corrected
+candidate still needs actual Linux media acceptance and all required jobs.
+
+Run `37720413872`, attempt 1, used candidate
+`2414d25c54b56a7172643c3fb49440be3da208f6`. The exact-source snapshot, Fin-only
+SDK ACL and hash-locked runtime preparation passed. The startup receipt bound
+the correct interpreter and libpython but refused because `/opt` was writable
+to Fin. It was the only writable checked path and was missing from the ACL
+ancestor inventory. Preparation now includes every intermediate SDK ancestor,
+including `/opt`, while preserving other accounts' permissions and the existing
+mask/default ACL. The filesystem root is checked separately at startup. All
+49 media cases remained unrun; expensive remaining jobs were cancelled after
+the required Linux failure. This receipt is diagnostic evidence, not acceptance.
+
+Run `37721656261`, attempt 1, used candidate
+`6783f6aace1dff7b332c36acae965cf152c96628`. The isolated startup, pinned worker
+identity and Fin admission passed. Pytest then exited 4 while loading the
+unchanged shared conftest, before collecting or running the 49 media cases.
+With no explicit `FINANCE_RUNTIME_ROOT`, conftest selected the source snapshot
+under `/opt`; the real Core guard correctly refused its globally writable
+ancestor. Fin-effective read-only ACLs do not replace Core's stricter runtime
+directory-chain contract.
+
+Media acceptance now explicitly configures a separate, exclusively created
+Fin-owned 0700 synthetic runtime root at `/tmp/finance-media-core-<run>-<attempt>`
+with only an empty Fin-owned 0700 `database/`. The canonical `/tmp` ancestor
+must be root-owned and sticky. Before any Core import, startup and the actual
+pytest process receive the same runtime setting and call the unchanged
+`require_runtime_root()` and `live_database_path()` guards. Both verify the
+expected canonical paths, original directory identities, ownership, permissions
+and empty database. Source, SDK, venv, OCR workspace and media evidence keep
+their existing separate locations. No `finance.db`, seed, SQL execution or
+financial runtime activation is part of this setup.
+
+After Fin processes exit, export verifies the original synthetic directory
+identities and empty content before removing only the two empty directories.
+Unexpected content or lost custody refuses cleanup and retains bounded
+diagnostics; already produced media failure evidence remains subject to the
+original export limits. Unknown runtime contents are not uploaded.
+
+A real local reproduction uses the same read-only source snapshot and shared
+conftest in two fresh isolated processes: the unconfigured unsafe ancestor
+fails with the same Core error; the explicit compliant runtime collects the
+original 50 named tests and leaves its database empty. Collection does not run
+fixtures, decode images or perform OCR, and does not replace exact-head Linux
+acceptance. Core policy, conftest and all required media cases remain unchanged.
+
+Media source/worker modules, their unit/vector tests and the whole
+`tests/fixtures/receipt_media_v1/` subtree require both Bridge systems for
+modification, deletion and rename. The workflow and independent verifier
+recompute identical path scope. Neither an ordinary skipped test nor the older
+JPEG/PNG staging OCR lane establishes this new worker's actual acceptance.
+See [the receipt-media contract](receipt_media_v1.md) for exact received-original,
+normalization, actual OCR fingerprint, orientation and refusal semantics. This
+is a standalone verified media evidence component; existing financial posting,
+transport and managed backup do not automatically consume its records.

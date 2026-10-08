@@ -13,6 +13,12 @@ Direct runtime dependencies and their declared licenses:
 - `typebox` 1.3.3 — MIT.
 - `openclaw` 2026.7.1-2 is an optional peer dependency — MIT.
 
+The optional Python `media` extra adds `Pillow` 12.3.0 (MIT-CMU) and
+`pillow-heif` 1.8.0 (BSD-3-Clause). Their binary wheels include native
+libraries under their own licenses; retain each installed wheel's license
+files, including `pillow-heif`'s `LICENSES_bundled.txt`. This repository
+declares these dependencies and does not vendor their binaries or source.
+
 Direct build and test dependencies include `@openclaw/ai` (MIT),
 `@types/node` (MIT), `openclaw` through the `openclaw-sdk` npm alias (MIT),
 and TypeScript (Apache-2.0). Transitive packages and the complete resolved
