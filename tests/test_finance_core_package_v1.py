@@ -51,6 +51,88 @@ PRIVATE_ARTIFACT_MARKERS = (
 EXPECTED_LEDGER_DIGEST = "e1ddc699d185384408d9cb0119094d389165deca4a4251c2374c6579def75fc5"
 
 
+def _load_bridge_distribution_verifier(script: Path):
+    spec = importlib.util.spec_from_file_location("bridge_distribution_inventory_test", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    cache = script.parent / "__pycache__"
+    cache_existed = cache.exists()
+    # Execute trusted repository source directly: no loader bytecode cache may
+    # enter the Bridge build's reviewed source inventory. The spec-created
+    # module keeps __main__ false, preserving the verifier's CLI boundary.
+    exec(compile(script.read_bytes(), str(script), "exec"), module.__dict__)
+    assert cache_existed or not cache.exists()
+    return module
+
+
+@pytest.fixture(scope="module")
+def bridge_distribution_verifier():
+    return _load_bridge_distribution_verifier(
+        REPOSITORY_ROOT / "plugins/finance-bridge/scripts/verify-core-distribution.py"
+    )
+
+
+def test_bridge_distribution_inventory_import_does_not_create_bytecode_cache(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "verify_core_distribution.py"
+    script.write_bytes(
+        (
+            REPOSITORY_ROOT / "plugins/finance-bridge/scripts/verify-core-distribution.py"
+        ).read_bytes()
+    )
+    cache = tmp_path / "__pycache__"
+    assert not cache.exists()
+    verifier = _load_bridge_distribution_verifier(script)
+    assert verifier._migration_digest(_bridge_migration_payloads()) == EXPECTED_LEDGER_DIGEST
+    assert not cache.exists()
+
+
+def _bridge_migration_payloads() -> dict[str, bytes]:
+    return {
+        f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+        for path in migration_resource_paths()
+    }
+
+
+def test_bridge_distribution_inventory_accepts_reviewed_complete_056(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = _bridge_migration_payloads()
+    assert len(payloads) == 56
+    assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing_056", "missing_middle", "extra_057", "duplicate_055"]
+)
+def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
+    bridge_distribution_verifier, mutation: str
+) -> None:
+    payloads = _bridge_migration_payloads()
+    if mutation in {"missing_056", "missing_middle"}:
+        sequence = "056_" if mutation == "missing_056" else "028_"
+        missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
+        del payloads[missing]
+    else:
+        sequence = "057" if mutation == "extra_057" else "055"
+        payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
+            b"-- test"
+        )
+    with pytest.raises(ValueError, match="migration inventory"):
+        bridge_distribution_verifier._migration_digest(payloads)
+
+
+def test_bridge_distribution_inventory_byte_change_cannot_match_pinned_ledger(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = _bridge_migration_payloads()
+    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("056_"))
+    payloads[migration] += b"\n-- synthetic byte change, never written to source\n"
+    observed = bridge_distribution_verifier._migration_digest(payloads)
+    assert observed != EXPECTED_LEDGER_DIGEST
+
+
 def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> None:
     project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
     pin = next(item for item in project["project"]["dependencies"] if item.startswith("pypdf=="))
