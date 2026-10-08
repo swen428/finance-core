@@ -186,6 +186,11 @@ exact complete current payload, independent ancestry and latest field-specific
 sealed completion, including its actual publication and audit history. A bare
 completion row cannot excuse a mismatch. Amount and currency never use this
 override; legacy receipt behavior remains governed by its existing evidence.
+The latest independently verified material date remains authoritative through
+later unrelated monetary supersessions. The receipt owner follows actual
+publication/version order and full before/after payloads, so an inherited date
+completion can replace an older corrected date while a later date correction
+or completion still wins. A field-name claim alone supplies no date authority.
 
 Failed, missing or partial extraction, unknown indicators, incomplete human
 coverage and unsealed or conflicting evidence remain ineligible. Preparation

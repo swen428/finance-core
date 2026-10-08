@@ -770,3 +770,325 @@ def test_legacy_receipt_completion_cannot_acquire_independent_history_override(t
         _assert_no_posting_facts(connection)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("latest", ["inherited", "leaf_completion", "reverting_correction"])
+def test_latest_independent_date_survives_sequential_monetary_supersessions(
+    tmp_path, monkeypatch, latest
+):
+    connection, posting, proposal = _subject(tmp_path, monkeypatch)
+    try:
+        service = _amendment_service(connection, source_verifier=posting._source_port)
+        result = _apply(connection, service, service.prepare(proposal), PATCH)
+        source_before = tuple(
+            connection.execute(
+                "SELECT raw_input,source_content_hash,attachment_path,attachment_hash "
+                "FROM raw_intake_records"
+            ).fetchone()
+        )
+        first_record = tuple(
+            connection.execute(
+                "SELECT material_json,record_hash FROM application_amendment_records"
+            ).fetchone()
+        )
+        patches = [{"transaction_date": "2026-10-06"}, {"amount": "16.50"}, {"currency": "USD"}]
+        expected_date = "2026-10-06"
+        if latest == "leaf_completion":
+            patches.append({"transaction_date": "2026-10-05"})
+            expected_date = "2026-10-05"
+        elif latest == "reverting_correction":
+            patches.append({"amount": "17.00", "transaction_date": "2026-10-07"})
+            expected_date = "2026-10-07"
+        expected = dict(PATCH)
+        for index, patch in enumerate(patches):
+            old = _prepare_edited_posting(posting, result, connection, f"date-old-{index}")
+            result = _apply(
+                connection,
+                service,
+                service.prepare(result.proposal_public_id),
+                patch,
+                evidence_id=f"date-edit-{index}",
+                amendment_id=f"date-edit-{index}",
+            )
+            expected.update(patch)
+            with pytest.raises((PostingError, HumanRevisionLineageError)):
+                posting.submit_post(old.review_id, f"date-old-{index}")
+            _assert_no_posting_facts(connection)
+        fresh = _prepare_edited_posting(posting, result, connection, "latest-date-confirm")
+        assert {
+            field: fresh.projection["financial_projection"][field] for field in PATCH
+        } == expected
+        _assert_no_posting_facts(connection)
+        posted = posting.submit_post(fresh.review_id, "latest-date-confirm")
+        assert posted.state == "finalized"
+        transaction = connection.execute(
+            "SELECT amount,currency,transaction_date FROM transactions"
+        ).fetchone()
+        assert Decimal(str(transaction[0])) == Decimal(expected["amount"])
+        assert tuple(transaction)[1:] == ("USD", expected_date)
+        assert tuple(
+            connection.execute("SELECT currency,receipt_datetime FROM receipts").fetchone()
+        ) == ("USD", expected_date)
+        snapshot = canonical_json_value(
+            connection.execute(
+                "SELECT input_payload_json FROM authoritative_calculation_snapshots"
+            ).fetchone()[0],
+            label="latest date snapshot",
+        )["confirmed_receipt_identity"]
+        assert snapshot["receipt_date"] == expected_date and snapshot["currency"] == "USD"
+        assert (
+            _count(connection, "transactions")
+            == _count(connection, "authoritative_calculation_snapshots")
+            == 1
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT raw_input,source_content_hash,attachment_path,attachment_hash "
+                    "FROM raw_intake_records"
+                ).fetchone()
+            )
+            == source_before
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT material_json,record_hash FROM application_amendment_records "
+                    "WHERE amendment_id='amendment-one'"
+                ).fetchone()
+            )
+            == first_record
+        )
+        posting._clock = lambda: NOW + 10_000
+        assert posting.resume_post(posted.attempt_id) == posted
+    finally:
+        connection.close()
+
+
+def _inherited_date_subject(tmp_path, monkeypatch):
+    connection, posting, proposal = _subject(tmp_path, monkeypatch)
+    service = _amendment_service(connection, source_verifier=posting._source_port)
+    result = _apply(connection, service, service.prepare(proposal), PATCH)
+    date = _apply(
+        connection,
+        service,
+        service.prepare(result.proposal_public_id),
+        {"transaction_date": "2026-10-06"},
+        evidence_id="date",
+        amendment_id="date",
+    )
+    result = _apply(
+        connection,
+        service,
+        service.prepare(date.proposal_public_id),
+        {"amount": "16.50"},
+        evidence_id="amount",
+        amendment_id="amount",
+    )
+    result = _apply(
+        connection,
+        service,
+        service.prepare(result.proposal_public_id),
+        {"currency": "USD"},
+        evidence_id="currency",
+        amendment_id="currency",
+    )
+    return connection, posting, result, date
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "date_updates",
+        "date_seal",
+        "date_publication",
+        "date_audit",
+        "date_invalidation",
+        "foreign_date_owner",
+        "current_date",
+        "typed_evidence",
+    ],
+)
+@pytest.mark.parametrize("phase", ["prepare", "submit", "accepted"])
+def test_inherited_date_owner_damage_refuses_before_writes_or_during_readback(
+    tmp_path, monkeypatch, damage, phase
+):
+    connection, posting, result, date = _inherited_date_subject(tmp_path, monkeypatch)
+    try:
+        review = _prepare_edited_posting(posting, result, connection, "date-confirm")
+        posted = (
+            posting.submit_post(review.review_id, "date-confirm") if phase == "accepted" else None
+        )
+        live = ParserProposalRepository(connection).get_by_public_id(result.proposal_public_id)
+        old_hash = compute_effective_proposal_content_hash(connection, live)
+        if damage in {"current_date", "typed_evidence"}:
+
+            def change(payload):
+                if damage == "current_date":
+                    payload["transaction_date"] = "2026-10-04"
+                else:
+                    for item in payload["field_evidence"]:
+                        if item["field_name"] == "transaction_date":
+                            assert item["completion_version"] == 1
+                            item["completion_version"] = True
+
+            _damage_payload(connection, result.proposal_public_id, change)
+            if damage == "typed_evidence":
+                assert compute_effective_proposal_content_hash(connection, live) == old_hash
+        else:
+            table, update, params, where, owner_id = {
+                "date_updates": (
+                    "parser_proposal_completions",
+                    "field_updates_json=?",
+                    ('{"transaction_date":"2026-10-04"}',),
+                    "completion_public_id=?",
+                    date.publication_public_id,
+                ),
+                "date_seal": (
+                    "application_amendment_records",
+                    "record_hash=?",
+                    ("0" * 64,),
+                    "amendment_id=?",
+                    "date",
+                ),
+                "date_publication": (
+                    "application_amendment_records",
+                    "publication_public_id=?",
+                    ("orphan",),
+                    "amendment_id=?",
+                    "date",
+                ),
+                "date_audit": (
+                    "financial_audit_events",
+                    "event_payload_json=?",
+                    ("{}",),
+                    "causation_public_id=?",
+                    date.publication_public_id,
+                ),
+                "date_invalidation": (
+                    "application_amendment_invalidations",
+                    "base_content_hash=?",
+                    ("0" * 64,),
+                    "amendment_id=?",
+                    "date",
+                ),
+                "foreign_date_owner": (
+                    "parser_proposal_completions",
+                    "parser_output_id=?",
+                    (1,),
+                    "completion_public_id=?",
+                    date.publication_public_id,
+                ),
+            }[damage]
+            triggers = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=? "
+                    "AND sql LIKE '%BEFORE UPDATE%'",
+                    (table,),
+                )
+            )
+            _temporarily_drop_triggers(
+                connection,
+                triggers,
+                lambda: connection.execute(
+                    f"UPDATE {table} SET {update} WHERE {where}", (*params, owner_id)
+                ),
+            )
+        changes = connection.total_changes
+        with pytest.raises((ValueError, HumanRevisionLineageError)):
+            if phase == "prepare":
+                posting.prepare(result.proposal_public_id)
+            elif phase == "submit":
+                posting.submit_post(review.review_id, "date-confirm")
+            else:
+                posting.resume_post(posted.attempt_id)
+        assert connection.total_changes == changes
+        if posted:
+            with pytest.raises((ValueError, HumanRevisionLineageError)):
+                posting.get_status(posted.attempt_id)
+            assert _count(connection, "transactions") == 1
+        else:
+            _assert_no_posting_facts(connection)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_inherited_date_never_accepts_different_full_payload_with_matching_content_hash(
+    tmp_path, monkeypatch, typed
+):
+    connection, posting, result, _date = _inherited_date_subject(tmp_path, monkeypatch)
+    try:
+        live = ParserProposalRepository(connection).get_by_public_id(result.proposal_public_id)
+        current, _, _ = resolve_effective_payload(connection, live)
+        fake = copy.deepcopy(current)
+        for item in fake["field_evidence"]:
+            if item["field_name"] == "transaction_date":
+                if typed:
+                    item["completion_version"] = True
+                    assert fake == current
+                else:
+                    item["untrusted_claim"] = True
+        assert compute_proposal_content_hash(
+            connection, {**live, "parsed_payload": json.dumps(fake)}
+        ) == (compute_effective_proposal_content_hash(connection, live))
+        changes = connection.total_changes
+        with pytest.raises(ConversionEvidenceLineageError):
+            _durable_resolution_provenance(connection, live, fake)
+        assert connection.total_changes == changes
+        _assert_no_posting_facts(connection)
+    finally:
+        connection.close()
+
+
+def test_legacy_inherited_completion_does_not_override_a_corrected_date(tmp_path):
+    from finance_core.parser_proposals.completion import complete_proposal
+    from finance_core.parser_proposals.receipt_supersession import supersede_receipt_total_proposal
+
+    connection, _, _, _, _, proposal, *_ = _prepare_receipt_subject(
+        tmp_path, "legacy-inherited-date"
+    )
+    try:
+        live = ParserProposalRepository(connection).get_by_public_id(proposal)
+        first = supersede_receipt_total_proposal(
+            connection,
+            live["id"],
+            actor="synthetic-human",
+            expected_content_hash=compute_effective_proposal_content_hash(connection, live),
+            field_updates={"amount": "14.25", "transaction_date": "2026-10-07"},
+            correction_public_id="rcor_legacy_date_first",
+        )
+        live = ParserProposalRepository(connection).get_by_public_id(
+            first["replacement_proposal_public_id"]
+        )
+        complete_proposal(
+            connection,
+            live["id"],
+            actor="synthetic-human",
+            expected_content_hash=compute_effective_proposal_content_hash(connection, live),
+            field_updates={"transaction_date": "2026-10-06"},
+            completion_public_id="pco_legacy_date",
+        )
+        second = supersede_receipt_total_proposal(
+            connection,
+            live["id"],
+            actor="synthetic-human",
+            expected_content_hash=compute_effective_proposal_content_hash(connection, live),
+            field_updates={"amount": "16.50"},
+            correction_public_id="rcor_legacy_date_second",
+        )
+        live = ParserProposalRepository(connection).get_by_public_id(
+            second["replacement_proposal_public_id"]
+        )
+        assert _count(connection, "application_amendment_records") == 0
+        effective, _, _ = resolve_effective_payload(connection, live)
+        changes = connection.total_changes
+        with pytest.raises(
+            ConversionEvidenceLineageError, match="durably corrected transaction date"
+        ):
+            _durable_resolution_provenance(connection, live, effective)
+        assert connection.total_changes == changes
+        _assert_no_posting_facts(connection)
+    finally:
+        connection.close()

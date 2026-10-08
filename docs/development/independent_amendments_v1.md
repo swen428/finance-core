@@ -98,6 +98,9 @@ conversion owner recognizes an older value as historical only after verifying
 both its original owner and the later independent field-specific completion
 on the exact current ancestry. Sequential completions retain each latest
 material field witness, including through a subsequent monetary supersession.
+Dates follow that same verified publication order: changing only amount or
+currency cannot reactivate an older corrected date or invalidate the newer
+independently completed date.
 
 ## Whole-expense description and category
 
