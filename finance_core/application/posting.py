@@ -34,6 +34,13 @@ from finance_core.application.posting_contract import (
     require_posting_schema,
 )
 from finance_core.application.review import get_proposal_review, review_snapshot
+from finance_core.bookkeeping_metadata import (
+    ReceiptBookkeepingMetadata,
+    build_application_receipt_projection,
+    metadata_from_payload,
+    metadata_hash,
+    read_receipt_bookkeeping_metadata,
+)
 from finance_core.calculation.authoritative_snapshot import (
     AuthoritativeSnapshotRepository,
     canonical_json_text,
@@ -46,13 +53,21 @@ from finance_core.financial_audit import (
     verify_financial_audit_chain,
 )
 from finance_core.parser_proposals import decision_owner
+from finance_core.parser_proposals.amendment_lineage import (
+    require_independent_source_edit_history,
+    verify_independent_amendment_descendant,
+)
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.conversion_state import has_receipt_ocr_proposal_link
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.receipt_facts_conversion import (
+    _AMOUNT_FLAGS,
+    _CURRENCY_FLAGS,
+    _DATE_FLAGS,
     ReceiptFactsConversionCommand,
+    _require_flags_resolved,
     convert_confirmed_receipt_proposal_to_facts,
-    resolve_receipt_conversion_payload_fields,
+    resolve_independent_receipt_payload_fields,
 )
 from finance_core.parser_proposals.receipt_item_allocation_facts import (
     ReceiptItemAllocationFactsCommand,
@@ -61,7 +76,6 @@ from finance_core.parser_proposals.receipt_item_allocation_facts import (
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.receipt_finalization import fact_set_bridge
-from finance_core.receipt_finalization.d2_conditional import build_d2_receipt_projection
 from finance_core.sqlite_connection import require_foreign_keys_enabled
 from finance_core.staging_guard import require_staging_database
 
@@ -183,6 +197,56 @@ class _AcceptedDecisionAuthority:
             raise PostingError("Confirmation lost its atomic decision/attempt binding")
 
 
+class _AcceptedReceiptMetadataAuthority:
+    def __init__(self, service: PostingService, attempt_id: str) -> None:
+        self.service, self.attempt_id = service, attempt_id
+
+    def verify_in_transaction(self, connection, *, command, existing):
+        self.service._revalidate_pending_write(connection, self.attempt_id)
+        _row, review, decision = self.service._accepted(self.attempt_id)
+        if (
+            review["posting_path"] != "personal_receipt"
+            or command.proposal_public_id != review["proposal_public_id"]
+            or command.expected_content_hash != review["effective_content_hash"]
+            or command.authenticated_actor_id != decision.human_principal_id
+        ):
+            raise PostingError("Receipt metadata authority is not this accepted decision")
+        metadata = metadata_from_payload(review["financial_projection"].get("bookkeeping_metadata"))
+        if existing is not None:
+            live = read_receipt_bookkeeping_metadata(
+                connection,
+                connection.execute(
+                    "SELECT public_id FROM receipts WHERE id=?", (existing["receipt_id"],)
+                ).fetchone()[0],
+            )
+            if live != metadata:
+                raise PostingError("Receipt metadata drifted from accepted full projection")
+        return metadata
+
+    def persist_in_transaction(self, connection, *, command, receipt_id, metadata):
+        if metadata is None:
+            return
+        self.service._revalidate_pending_write(connection, self.attempt_id)
+        values = (
+            receipt_id,
+            command.command_public_id,
+            self.attempt_id,
+            metadata.version,
+            metadata.description,
+            metadata.category,
+            metadata_hash(metadata),
+        )
+        row = connection.execute(
+            "SELECT * FROM application_amendment_receipt_metadata WHERE receipt_id=?", (receipt_id,)
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                "INSERT INTO application_amendment_receipt_metadata VALUES (?,?,?,?,?,?,?)", values
+            )
+        elif tuple(row) != values:
+            raise PostingError("Receipt metadata seal identity conflict")
+
+
 class PostingService:
     def __init__(
         self,
@@ -255,15 +319,38 @@ class PostingService:
         expires_at: int,
     ) -> dict[str, Any]:
         proposal = ParserProposalRepository(self._conn).get_by_public_id(proposal_id)
-        if proposal is None or proposal["parse_status"] != "parsed_pending_confirmation":
+        if proposal is None or proposal["parse_status"] not in {
+            "parsed_pending_confirmation",
+            "edited_pending_confirmation",
+        }:
             raise PostingError("Posting requires a current pending proposal")
         view = get_proposal_review(self._conn, proposal_id)
-        payload, _, _ = resolve_effective_payload(self._conn, proposal)
+        payload, _, version = resolve_effective_payload(self._conn, proposal)
+        independent_lineage = verify_independent_amendment_descendant(
+            self._conn,
+            proposal,
+            content_hash=view["effective_content_hash"],
+            proposal_version=version,
+        )
+        if (
+            proposal["parse_status"] == "edited_pending_confirmation"
+            and independent_lineage is None
+        ):
+            raise PostingError(
+                "Edited pending posting requires complete independent amendment lineage"
+            )
+        require_independent_source_edit_history(self._conn, proposal)
         if view["classification"] != "personal" or view["account_status"] != "absent":
             raise PostingError("Only personal expenses with an unspecified account are supported")
         if not view["confirm_available"]:
             raise PostingError("Unresolved proposal ambiguity cannot be prepared for posting")
-        if payload.get("intent") not in {None, "personal_expense_log", "simple_expense_log"}:
+        if payload.get("intent") not in {
+            None,
+            "personal_expense_log",
+            "simple_expense_log",
+        } and not (
+            payload.get("intent") == "personal_expense" and view["proposal_origin"] == "ai_fallback"
+        ):
             raise PostingError("Posting supports only personal expense intent")
         if payload.get("category") is not None and not isinstance(payload["category"], str):
             raise PostingError("Posting category must have an exact text representation")
@@ -289,9 +376,19 @@ class PostingService:
         route = "text"
         if has_receipt_ocr_proposal_link(self._conn, int(proposal["id"])):
             route = "personal_receipt"
-            if view["ambiguity_indicators"]:
+            # OCR flags remain in the signed display as historical evidence.
+            # Only the genuine owner can verify that monetary/date flags have
+            # durable resolution; all other indicators retain their refusal.
+            _require_flags_resolved(self._conn, proposal, payload)
+            historical_flags = _AMOUNT_FLAGS | _CURRENCY_FLAGS | _DATE_FLAGS
+            if set(view["ambiguity_indicators"]) - historical_flags:
                 raise PostingError("Receipt posting requires resolved complete inputs")
-            fields = resolve_receipt_conversion_payload_fields(self._conn, payload)
+            fields = resolve_independent_receipt_payload_fields(self._conn, payload)
+            metadata = (
+                ReceiptBookkeepingMetadata(fields["description"], fields["category"])
+                if fields["description"] is not None or fields["category"] is not None
+                else None
+            )
             payer = self._payer()
             amount, currency = fields["canonical_amount"], fields["currency"]
             calculation = calculate_receipt_split(
@@ -315,7 +412,8 @@ class PostingService:
                     ],
                 }
             )
-            financial = build_d2_receipt_projection(
+            financial = build_application_receipt_projection(
+                bookkeeping_metadata=metadata,
                 merchant=fields["merchant"],
                 receipt_date=fields["receipt_date"],
                 currency=currency,
@@ -379,6 +477,13 @@ class PostingService:
                 raise PostingError("Posting review identity conflict")
             self._conn.commit()
             return PostingReview(review_id, digest, material, now + 900)
+        except ValueError as exc:
+            self._conn.rollback()
+            if isinstance(exc, PostingError):
+                raise
+            raise PostingError(
+                "Posting review cannot approve these incomplete or contradictory inputs"
+            ) from exc
         except BaseException:
             self._conn.rollback()
             raise
@@ -560,6 +665,12 @@ class PostingService:
         if proposal is None:
             raise PostingError("Accepted proposal is unavailable")
         _, _, version = resolve_effective_payload(self._conn, proposal)
+        verify_independent_amendment_descendant(
+            self._conn,
+            proposal,
+            content_hash=compute_effective_proposal_content_hash(self._conn, proposal),
+            proposal_version=version,
+        )
         if (
             proposal["public_id"] != material["proposal_public_id"]
             or version != material["proposal_version"]
@@ -808,6 +919,7 @@ class PostingService:
                     self._conn,
                     command,
                     persistence_effect=bind_conversion,
+                    metadata_authority=_AcceptedReceiptMetadataAuthority(self, attempt_id),
                 )
                 _inject("after_conversion_commit")
                 self._advance(attempt_id, "conversion_persisted", converted.command_public_id)
@@ -902,7 +1014,8 @@ class PostingService:
                 _inject("after_snapshot_commit")
                 self._advance(attempt_id, "snapshot_persisted", prepared.calculation_snapshot_id)
                 continue
-            actual = build_d2_receipt_projection(
+            actual = build_application_receipt_projection(
+                bookkeeping_metadata=prepared.confirmed_receipt_identity.bookkeeping_metadata,
                 merchant=prepared.confirmed_receipt_identity.merchant,
                 receipt_date=prepared.confirmed_receipt_identity.receipt_date,
                 currency=prepared.currency,

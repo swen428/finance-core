@@ -27,8 +27,12 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
+from finance_core.bookkeeping_metadata import (
+    ReceiptBookkeepingMetadata,
+    read_receipt_bookkeeping_metadata,
+)
 from finance_core.calculation.authoritative_snapshot import canonical_json_text
 from finance_core.financial_audit import (
     AUDIT_SCHEMA_VERSION,
@@ -346,11 +350,30 @@ class ReceiptFactsConversionResult:
 # ---------------------------------------------------------------------------
 
 
+class ReceiptMetadataAuthority(Protocol):
+    def verify_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        command: ReceiptFactsConversionCommand,
+        existing: dict[str, Any] | None,
+    ) -> ReceiptBookkeepingMetadata | None: ...
+    def persist_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        command: ReceiptFactsConversionCommand,
+        receipt_id: int,
+        metadata: ReceiptBookkeepingMetadata | None,
+    ) -> None: ...
+
+
 def convert_confirmed_receipt_proposal_to_facts(
     conn: sqlite3.Connection,
     command: ReceiptFactsConversionCommand,
     *,
     clock: Callable[[], str] | None = None,
+    metadata_authority: ReceiptMetadataAuthority | None = None,
     persistence_effect: Callable[[sqlite3.Connection, ReceiptFactsConversionResult], None]
     | None = None,
 ) -> ReceiptFactsConversionResult:
@@ -369,12 +392,21 @@ def convert_confirmed_receipt_proposal_to_facts(
         material_hash = _command_material_hash(command, entries)
 
         existing = _get_registry_row(conn, command.command_public_id)
+        metadata = (
+            metadata_authority.verify_in_transaction(conn, command=command, existing=existing)
+            if metadata_authority is not None
+            else None
+        )
+        if metadata_authority is None:
+            from finance_core.parser_proposals.amendment_lineage import refuse_legacy_amendment
         if existing is not None:  # guard 4
             # The conflict decision precedes replay integrity: changed
             # material is reported first even when dependent facts or
             # evidence rows were destroyed out-of-band.
             _require_replay_material(existing, material_hash, command)
             _verify_replay_integrity(conn, existing)
+            if metadata_authority is None:
+                refuse_legacy_amendment(conn, _require_proposal(conn, command.proposal_public_id))
             result = _replay_result(existing)
             if persistence_effect is not None:
                 persistence_effect(conn, result)
@@ -382,6 +414,8 @@ def convert_confirmed_receipt_proposal_to_facts(
             return result
 
         proposal = _require_proposal(conn, command.proposal_public_id)  # guard 5
+        if metadata_authority is None:
+            refuse_legacy_amendment(conn, proposal)
         parser_output_id = int(proposal["id"])
         link = _require_single_receipt_link(conn, parser_output_id)  # guard 6
         _require_leaf(conn, proposal)  # guard 7
@@ -398,7 +432,9 @@ def convert_confirmed_receipt_proposal_to_facts(
         )
         _require_source_binding(conn, proposal, raw_intake, extraction, attachment)
         _require_flags_resolved(conn, proposal, effective)  # guard 13
-        facts = _require_complete_inputs(conn, command, entries, effective)  # guard 14
+        facts = _require_complete_inputs(
+            conn, command, entries, effective, bookkeeping_metadata=metadata
+        )  # guard 14
 
         receipt_public_id = derive_receipt_public_id(command.command_public_id)
         confirmation_public_id = str(authorization["confirmation_public_id"])
@@ -446,6 +482,11 @@ def convert_confirmed_receipt_proposal_to_facts(
             conversion_result_hash=result_hash,
             created_at=now,
         )
+
+        if metadata_authority is not None:
+            metadata_authority.persist_in_transaction(
+                conn, command=command, receipt_id=receipt_id, metadata=metadata
+            )
 
         _inject_failure("before_audit_append")
         audit_event = _append_conversion_audit(
@@ -858,9 +899,15 @@ def _verify_replay_integrity(conn: sqlite3.Connection, existing: dict[str, Any])
         entries.append((str(participant_public_id), included))
     if payer_membership_rows != 1:
         raise ConversionPersistenceError(_REPLAY_DRIFT_MESSAGE)
+    live_metadata = read_receipt_bookkeeping_metadata(conn, str(receipt["public_id"]))
     recomputed = _conversion_result_hash(
         receipt_public_id=str(receipt["public_id"]),
         facts={
+            **(
+                {"bookkeeping_metadata": live_metadata.as_payload()}
+                if live_metadata is not None
+                else {}
+            ),
             "merchant": receipt["merchant"],
             "receipt_date": receipt["receipt_datetime"],
             "canonical_amount": receipt["net_paid_amount_canonical_text"],
@@ -2109,13 +2156,35 @@ def resolve_receipt_conversion_payload_fields(
     }
 
 
+def resolve_independent_receipt_payload_fields(
+    conn: sqlite3.Connection, effective: Mapping[str, Any]
+) -> dict[str, Any]:
+    metadata = ReceiptBookkeepingMetadata(effective.get("description"), effective.get("category"))
+    fields = resolve_receipt_conversion_payload_fields(
+        conn, {**effective, "description": None, "category": None}
+    )
+    return {**fields, "description": metadata.description, "category": metadata.category}
+
+
 def _require_complete_inputs(
     conn: sqlite3.Connection,
     command: ReceiptFactsConversionCommand,
     entries: list[tuple[str, int]],
     effective: dict[str, Any],
+    *,
+    bookkeeping_metadata: ReceiptBookkeepingMetadata | None = None,
 ) -> dict[str, Any]:
-    payload_fields = resolve_receipt_conversion_payload_fields(conn, effective)
+    if bookkeeping_metadata is None:
+        payload_fields = resolve_receipt_conversion_payload_fields(conn, effective)
+    else:
+        payload_fields = resolve_independent_receipt_payload_fields(conn, effective)
+        if (
+            payload_fields["description"] != bookkeeping_metadata.description
+            or payload_fields["category"] != bookkeeping_metadata.category
+        ):
+            raise UnsupportedReceiptFactsMetadataError(
+                "Receipt metadata does not match accepted independent authority"
+            )
 
     resolved_entries: list[dict[str, Any]] = []
     payer_participant_id: int | None = None
@@ -2147,6 +2216,11 @@ def _require_complete_inputs(
 
     return {
         **payload_fields,
+        **(
+            {"bookkeeping_metadata": bookkeeping_metadata.as_payload()}
+            if bookkeeping_metadata is not None
+            else {}
+        ),
         "payer_participant_id": payer_participant_id,
         "resolved_entries": resolved_entries,
     }
@@ -2275,6 +2349,8 @@ def _conversion_result_hash(
         "proposal_content_hash": proposal_content_hash,
         "command_material_hash": command_material_hash,
     }
+    if "bookkeeping_metadata" in facts:
+        material["bookkeeping_metadata"] = facts["bookkeeping_metadata"]
     return _sha256_hex(_canonical_json(material))
 
 
@@ -2333,6 +2409,13 @@ def _insert_receipt(
     lastrowid = cursor.lastrowid
     if lastrowid is None:
         raise ConversionPersistenceError("Receipt fact insert returned no identity")
+    if "bookkeeping_metadata" in facts:
+        metadata = facts["bookkeeping_metadata"]
+        conn.execute(
+            "UPDATE receipts SET description=?,category=?,bookkeeping_metadata_version=? "
+            "WHERE id=?",
+            (metadata["description"], metadata["category"], metadata["version"], lastrowid),
+        )
     return int(lastrowid)
 
 
@@ -2855,11 +2938,17 @@ def _revalidate_before_commit(
         conn, fresh_proposal, fresh_raw_intake, fresh_extraction, fresh_attachment
     )
     _require_flags_resolved(conn, fresh_proposal, fresh_effective)
-    fresh_facts = _require_complete_inputs(conn, command, entries, fresh_effective)
+    live_metadata = read_receipt_bookkeeping_metadata(
+        conn, derive_receipt_public_id(command.command_public_id)
+    )
+    fresh_facts = _require_complete_inputs(
+        conn, command, entries, fresh_effective, bookkeeping_metadata=live_metadata
+    )
     fresh_amount = _try_money_decimal(fresh_facts["canonical_amount"])
     cached_amount = _try_money_decimal(facts["canonical_amount"])
     if (
-        fresh_facts["merchant"] != facts["merchant"]
+        fresh_facts.get("bookkeeping_metadata") != facts.get("bookkeeping_metadata")
+        or fresh_facts["merchant"] != facts["merchant"]
         or fresh_facts["currency"] != facts["currency"]
         or fresh_facts["receipt_date"] != facts["receipt_date"]
         or fresh_amount is None

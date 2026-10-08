@@ -1869,6 +1869,7 @@ def test_local_receipt_source_drift_inside_conversion_owner_rolls_back_receipt_f
         command,
         *,
         clock=None,
+        metadata_authority=None,
         persistence_effect=None,
     ):
         def replace_source_before_application_effect(inner_connection, result):
@@ -1887,6 +1888,7 @@ def test_local_receipt_source_drift_inside_conversion_owner_rolls_back_receipt_f
             owner_connection,
             command,
             clock=clock,
+            metadata_authority=metadata_authority,
             persistence_effect=replace_source_before_application_effect,
         )
 

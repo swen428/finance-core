@@ -43,6 +43,10 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from finance_core.bookkeeping_metadata import (
+    ReceiptBookkeepingMetadata,
+    read_receipt_bookkeeping_metadata,
+)
 from finance_core.calculators.receipt_calculator_input_mapping import (
     CalculatorInputMappingError,
     build_calculator_receipt,
@@ -134,6 +138,7 @@ class ReceiptCalculatorInputProjection:
     receipt_date: str = ""
     receipt_source_channel: str = ""
     schema_version: str = PROJECTION_SCHEMA_VERSION
+    bookkeeping_metadata: ReceiptBookkeepingMetadata | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +251,7 @@ def _project_within_snapshot(
         receipt_merchant=merchant,
         receipt_date=receipt_date,
         receipt_source_channel=source_channel,
+        bookkeeping_metadata=read_receipt_bookkeeping_metadata(conn, receipt_public_id),
     )
 
 

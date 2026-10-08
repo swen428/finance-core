@@ -13,6 +13,7 @@ import tarfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -21,6 +22,74 @@ SCRIPT = REPOSITORY_ROOT / "scripts" / "build_release_manifest.py"
 MIGRATION_DIGEST = json.loads(
     (REPOSITORY_ROOT / "finance_core/resources/migration-contract-v1.json").read_text()
 )["migration_ledger_digest"]
+
+
+def _load_release_manifest_builder() -> ModuleType:
+    module = ModuleType("release_manifest_inventory_test")
+    module.__file__ = str(SCRIPT)
+    exec(compile(SCRIPT.read_bytes(), str(SCRIPT), "exec"), module.__dict__)
+    return module
+
+
+def _synthetic_057_migration_payloads() -> dict[str, bytes]:
+    migration_root = REPOSITORY_ROOT / "finance_core/resources/migrations"
+    payloads = {
+        f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+        for path in sorted(migration_root.glob("*.sql"))
+        if path.name[:3].isdigit() and int(path.name[:3]) <= 56
+    }
+    payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"] = (
+        b"-- synthetic inventory member; never written to source\n"
+    )
+    return payloads
+
+
+def _payload_ledger_digest(payloads: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path, body in sorted(payloads.items(), key=lambda item: item[0].rsplit("/", 1)[-1]):
+        digest.update(path.rsplit("/", 1)[-1].encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(body).to_bytes(8, "big"))
+        digest.update(body)
+    return digest.hexdigest()
+
+
+@pytest.fixture(scope="module")
+def release_manifest_builder() -> ModuleType:
+    return _load_release_manifest_builder()
+
+
+def test_release_manifest_migration_inventory_accepts_synthetic_057(
+    release_manifest_builder: ModuleType,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+
+    assert len(payloads) == 57
+    assert release_manifest_builder._migration_ledger_digest(payloads) == _payload_ledger_digest(
+        payloads
+    )
+
+
+def test_release_manifest_migration_inventory_rejects_missing_synthetic_057(
+    release_manifest_builder: ModuleType,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+    del payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"]
+
+    with pytest.raises(ValueError, match="migration inventory"):
+        release_manifest_builder._migration_ledger_digest(payloads)
+
+
+def test_release_manifest_migration_inventory_rejects_extra_synthetic_058(
+    release_manifest_builder: ModuleType,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+    payloads["finance_core/resources/migrations/058_synthetic_inventory.sql"] = (
+        b"-- synthetic inventory member; never written to source\n"
+    )
+
+    with pytest.raises(ValueError, match="migration inventory"):
+        release_manifest_builder._migration_ledger_digest(payloads)
 
 
 def _manifest_command(
@@ -512,8 +581,8 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
         lambda payload: payload.replace(
-            b'    "055_d3_interaction_routes.sql",\n    "056_independent_posting.sql"\n',
-            b'    "055_d3_interaction_routes.sql"\n',
+            b'    "056_independent_posting.sql",\n    "057_independent_amendments.sql"\n',
+            b'    "056_independent_posting.sql"\n',
         ),
     ],
 )

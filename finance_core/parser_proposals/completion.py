@@ -18,6 +18,10 @@ from finance_core.financial_audit import (
     append_financial_audit_event,
     derive_audit_event_public_id,
 )
+from finance_core.parser_proposals.amendment_lineage import (
+    AmendmentPublicationAuthority,
+    refuse_legacy_amendment,
+)
 from finance_core.parser_proposals.content_hash import (
     compute_effective_proposal_content_hash,
     compute_proposal_content_hash,
@@ -134,6 +138,7 @@ def complete_proposal(
     reason: str | None = None,
     clock: Callable[[], str] | None = None,
     transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
+    amendment_authority: AmendmentPublicationAuthority | None = None,
 ) -> dict[str, Any]:
     """Complete a parser proposal with authenticated non-monetary field updates.
 
@@ -167,6 +172,16 @@ def complete_proposal(
         )
 
         existing = _get_completion_by_public_id(conn, public_id)
+        if amendment_authority is not None:
+            canonical_for_authority = _validate_and_canonicalize_field_updates(field_updates)
+            amendment_authority.verify_in_transaction(
+                conn,
+                persisted_operation=existing,
+                proposal=proposal,
+                canonical_patch=canonical_for_authority,
+            )
+        else:
+            refuse_legacy_amendment(conn, proposal)
         if existing is not None:
             result = _handle_existing_completion(
                 conn,
@@ -178,6 +193,8 @@ def complete_proposal(
                 public_id,
                 completion_channel,
             )
+            if amendment_authority is not None:
+                amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
             conn.commit()
             return result
 
@@ -263,8 +280,7 @@ def complete_proposal(
             created_at=now,
         )
 
-        conn.commit()
-        return {
+        result = {
             "parser_output_id": parser_output_id,
             "completion_public_id": public_id,
             "version_number": next_version,
@@ -277,7 +293,11 @@ def complete_proposal(
             "event_id": event_id,
             "idempotent": False,
         }
-    except Exception:
+        if amendment_authority is not None:
+            amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
+        conn.commit()
+        return result
+    except BaseException:
         _rollback_if_needed(conn)
         raise
 

@@ -29,6 +29,10 @@ from finance_core.financial_audit import (
     derive_audit_event_public_id,
 )
 from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
+from finance_core.parser_proposals.amendment_lineage import (
+    AmendmentPublicationAuthority,
+    refuse_legacy_amendment,
+)
 from finance_core.parser_proposals.content_hash import (
     canonicalize_proposal_money,
     compute_effective_proposal_content_hash,
@@ -187,6 +191,7 @@ def supersede_receipt_total_proposal(
     reason: str | None = None,
     clock: Callable[[], str] | None = None,
     transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
+    amendment_authority: AmendmentPublicationAuthority | None = None,
 ) -> dict[str, Any]:
     """Supersede a receipt total proposal with an authenticated monetary correction.
 
@@ -213,6 +218,18 @@ def supersede_receipt_total_proposal(
         parent = _require_full_proposal(conn, parser_output_id)
 
         existing = _get_revision_by_correction_id(conn, correction_public_id)
+        if amendment_authority is not None:
+            canonical_for_authority = _canonicalize_field_updates(
+                field_updates, _resolve_effective(conn, parent)
+            )[0]
+            amendment_authority.verify_in_transaction(
+                conn,
+                persisted_operation=existing,
+                proposal=parent,
+                canonical_patch=canonical_for_authority,
+            )
+        else:
+            refuse_legacy_amendment(conn, parent)
         if existing is not None:
             _verify_existing_d1_revision_lineage(conn, existing)
             result = _handle_existing_revision(
@@ -225,6 +242,8 @@ def supersede_receipt_total_proposal(
                 correction_channel=correction_channel,
                 correction_public_id=correction_public_id,
             )
+            if amendment_authority is not None:
+                amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
             conn.commit()
             return result
 
@@ -381,7 +400,8 @@ def supersede_receipt_total_proposal(
         )
 
         _inject_failure("before_raw_intake_repoint")
-        _repoint_raw_intake(conn, int(raw_intake["id"]), replacement_id)
+        if amendment_authority is None:
+            _repoint_raw_intake(conn, int(raw_intake["id"]), replacement_id)
 
         _inject_failure("before_audit_append")
         _append_supersession_audit(
@@ -397,18 +417,7 @@ def supersede_receipt_total_proposal(
             created_at=now,
         )
 
-        _verify_persisted(
-            conn,
-            replacement_id=replacement_id,
-            replacement_public_id=replacement_public_id,
-            child_payload_json=child_payload_json,
-            correction_public_id=correction_public_id,
-            raw_intake_id=int(raw_intake["id"]),
-        )
-
-        _inject_failure("before_commit")
-        conn.commit()
-        return {
+        result = {
             "correction_public_id": correction_public_id,
             "superseded_parser_output_id": parser_output_id,
             "replacement_parser_output_id": replacement_id,
@@ -423,6 +432,24 @@ def supersede_receipt_total_proposal(
             "actor_type": _PERSISTED_ACTOR_TYPE,
             "idempotent": False,
         }
+        if amendment_authority is not None:
+            amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
+            _repoint_raw_intake(conn, int(raw_intake["id"]), replacement_id)
+
+        _verify_persisted(
+            conn,
+            replacement_id=replacement_id,
+            replacement_public_id=replacement_public_id,
+            child_payload_json=child_payload_json,
+            correction_public_id=correction_public_id,
+            raw_intake_id=int(raw_intake["id"]),
+        )
+
+        _inject_failure("before_commit")
+        if amendment_authority is not None:
+            amendment_authority.persist_effect_in_transaction(conn, publication_result=result)
+        conn.commit()
+        return result
     except ReceiptSupersessionError:
         _rollback_if_needed(conn)
         raise
@@ -431,7 +458,7 @@ def supersede_receipt_total_proposal(
         raise SupersessionPersistenceError(
             "Receipt proposal supersession could not be persisted atomically"
         ) from exc
-    except Exception:
+    except BaseException:
         _rollback_if_needed(conn)
         raise
 

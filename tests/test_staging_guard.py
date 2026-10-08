@@ -54,6 +54,7 @@ from pathlib import Path
 import pytest
 
 import finance_core.staging_guard as _guard
+from finance_core.parser_proposals import conversion, service
 from finance_core.resources import migrations_dir
 from finance_core.staging_guard import (
     StagingDatabaseError,
@@ -792,22 +793,46 @@ def test_require_staging_does_not_modify_transaction_state(tmp_path: Path) -> No
 # ======================================================================
 # 27. Guard fires before business mutation (parser conversion)
 # ======================================================================
-def test_conversion_guard_fires_before_validation(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "converter",
+    [
+        conversion.convert_confirmed_proposal_to_transaction,
+        conversion.convert_confirmed_parser_proposal,
+        service.convert_confirmed_parser_proposal,
+    ],
+    ids=["conversion-transaction", "conversion-parser", "service-parser"],
+)
+@pytest.mark.parametrize("pending_write", [False, True])
+def test_conversion_guard_fires_before_validation(
+    tmp_path: Path, converter, pending_write: bool
+) -> None:
     """The guard fires before proposal validation, so no proposal lookup
     or transaction insert occurs."""
-    from finance_core.parser_proposals.conversion import convert_confirmed_proposal_to_transaction
-
     db_path = tmp_path / "conv_early.sqlite"
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
 
-    # DB has no schema at all -- if the guard fires after validation,
-    # we would get a different error.  The guard fires first.
-    with pytest.raises(StagingDatabaseError):
-        convert_confirmed_proposal_to_transaction(conn, 1)
+    try:
+        if pending_write:
+            conn.execute("CREATE TABLE caller_owned (id INTEGER)")
+            conn.commit()
+            conn.execute("INSERT INTO caller_owned VALUES (1)")
 
-    conn.close()
+        # No business schema: proposal lookup would raise OperationalError.
+        # The guard must reject first and preserve the caller's transaction.
+        with pytest.raises(StagingDatabaseError):
+            converter(conn, 1)
+
+        assert conn.in_transaction is pending_write
+        if pending_write:
+            assert conn.execute("SELECT COUNT(*) FROM caller_owned").fetchone()[0] == 1
+            conn.rollback()
+            assert conn.execute("SELECT COUNT(*) FROM caller_owned").fetchone()[0] == 0
+        else:
+            assert conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
+    finally:
+        conn.close()
 
 
 # ======================================================================

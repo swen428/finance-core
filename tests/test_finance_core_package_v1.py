@@ -48,7 +48,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "e1ddc699d185384408d9cb0119094d389165deca4a4251c2374c6579def75fc5"
+EXPECTED_LEDGER_DIGEST = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
 
 
 def _load_bridge_distribution_verifier(script: Path):
@@ -95,27 +95,82 @@ def _bridge_migration_payloads() -> dict[str, bytes]:
     }
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_056(
+def _synthetic_057_migration_payloads() -> dict[str, bytes]:
+    payloads = {
+        path: body
+        for path, body in _bridge_migration_payloads().items()
+        if int(PurePosixPath(path).name[:3]) <= 56
+    }
+    payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"] = (
+        b"-- synthetic inventory member; never written to source\n"
+    )
+    return payloads
+
+
+def _payload_ledger_digest(payloads: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path, body in sorted(payloads.items(), key=lambda item: PurePosixPath(item[0]).name):
+        digest.update(PurePosixPath(path).name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(body).to_bytes(8, "big"))
+        digest.update(body)
+    return digest.hexdigest()
+
+
+def test_bridge_distribution_inventory_accepts_synthetic_complete_057(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+
+    assert len(payloads) == 57
+    assert bridge_distribution_verifier._migration_digest(payloads) == _payload_ledger_digest(
+        payloads
+    )
+
+
+def test_bridge_distribution_inventory_rejects_missing_synthetic_057(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+    del payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"]
+
+    with pytest.raises(ValueError, match="migration inventory"):
+        bridge_distribution_verifier._migration_digest(payloads)
+
+
+def test_bridge_distribution_inventory_rejects_extra_synthetic_058(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = _synthetic_057_migration_payloads()
+    payloads["finance_core/resources/migrations/058_synthetic_inventory.sql"] = (
+        b"-- synthetic inventory member; never written to source\n"
+    )
+
+    with pytest.raises(ValueError, match="migration inventory"):
+        bridge_distribution_verifier._migration_digest(payloads)
+
+
+def test_bridge_distribution_inventory_accepts_reviewed_complete_057(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 56
+    assert len(payloads) == 57
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing_056", "missing_middle", "extra_057", "duplicate_055"]
+    "mutation", ["missing_057", "missing_middle", "extra_058", "duplicate_055"]
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
 ) -> None:
     payloads = _bridge_migration_payloads()
-    if mutation in {"missing_056", "missing_middle"}:
-        sequence = "056_" if mutation == "missing_056" else "028_"
+    if mutation in {"missing_057", "missing_middle"}:
+        sequence = "057_" if mutation == "missing_057" else "028_"
         missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
         del payloads[missing]
     else:
-        sequence = "057" if mutation == "extra_057" else "055"
+        sequence = "058" if mutation == "extra_058" else "055"
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -127,7 +182,7 @@ def test_bridge_distribution_inventory_byte_change_cannot_match_pinned_ledger(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("056_"))
+    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("057_"))
     payloads[migration] += b"\n-- synthetic byte change, never written to source\n"
     observed = bridge_distribution_verifier._migration_digest(payloads)
     assert observed != EXPECTED_LEDGER_DIGEST
@@ -159,8 +214,8 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 56
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 57))
+    assert len(paths) == 57
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 58))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
@@ -175,7 +230,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 56
+    assert len(paths) == 57
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 
@@ -285,6 +340,37 @@ sys.path.insert(0, {str(install_dir)!r})
 from finance_core.receipt_staging_runner.models import RunnerWorkspaceError
 from finance_core.receipt_staging_runner.workspace import _validate_workspace_path
 from finance_core.staging_guard import StagingDatabaseError, create_staging_database
+from finance_core.application.amendment import AmendmentService
+from finance_core.application.amendment_contract import AmendmentBinding, AmendmentError
+from finance_core.application.admission import TrustedBinding
+from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS, apply_migration_paths
+
+class UnusedAuthority:
+    calls = 0
+    def verify_persisted(self, *_args):
+        self.calls += 1
+        raise AssertionError("Absent status must not invent source or edit authority")
+
+from pathlib import Path
+import finance_core.application.amendment as installed_amendment
+assert Path(installed_amendment.__file__).resolve().is_relative_to(Path({str(install_dir)!r}))
+probe_database = Path({str(external_workspace)!r}) / (
+    "amendment-" + Path({str(install_dir)!r}).name + ".sqlite")
+with create_staging_database(probe_database) as connection:
+    apply_migration_paths(connection, TEMP_DB_MIGRATION_PATHS)
+    binding = TrustedBinding("synthetic-instance", "synthetic-human", "synthetic-client",
+        "synthetic-source", "source-key", "synthetic-decision", "decision-key")
+    unused_authority = UnusedAuthority()
+    amendments = AmendmentService(connection=connection, source_verifier=unused_authority,
+        human_amendment_authority=unused_authority,
+        binding=AmendmentBinding(binding, "synthetic-edit", "edit-key"), clock=lambda: 1)
+    absent_amendment_refused = False
+    try:
+        amendments.get_status("synthetic-missing-amendment")
+    except AmendmentError:
+        absent_amendment_refused = True
+    assert connection.execute("SELECT COUNT(*) FROM transactions").fetchone()[0] == 0
+    assert unused_authority.calls == 0
 
 runtime_refused = False
 try:
@@ -304,11 +390,12 @@ print(json.dumps({{
     "live_refused": live_refused,
     "live_created": __import__("pathlib").Path(live_database).exists(),
     "external_workspace": str(_validate_workspace_path({str(external_workspace)!r})),
+    "absent_amendment_refused": absent_amendment_refused,
 }}))
 """
     completed = subprocess.run(
         [str(runtime_python), "-I", "-c", program],
-        check=True,
+        check=False,
         cwd=outside_dir,
         env={
             "FINANCE_RUNTIME_ROOT": str(runtime_root),
@@ -317,6 +404,7 @@ print(json.dumps({{
         capture_output=True,
         text=True,
     )
+    assert completed.returncode == 0, completed.stderr
     return json.loads(completed.stdout)
 
 
@@ -414,7 +502,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.6"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 56
+        assert payload["migration_count"] == 57
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
@@ -442,6 +530,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
             "live_refused": True,
             "live_created": False,
             "external_workspace": str(external_workspace),
+            "absent_amendment_refused": True,
         }
 
         missing_runtime = subprocess.run(

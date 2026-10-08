@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable
 
+from finance_core.bookkeeping_metadata import read_receipt_bookkeeping_metadata
 from finance_core.calculation.authoritative_snapshot import (
     SnapshotVerificationError,
     verify_snapshot_binding,
@@ -912,7 +913,11 @@ def _require_live_receipt_identity(
         identity.source_channel,
         identity.currency,
     )
-    if live != expected:
+    if (
+        live != expected
+        or read_receipt_bookkeeping_metadata(conn, identity.receipt_public_id)
+        != identity.bookkeeping_metadata
+    ):
         raise FinalizationAuthorizationError(
             f"Receipt {identity.receipt_public_id!r} facts {live!r} no longer match the "
             f"identity hash-bound into the authorized snapshot {expected!r}",
@@ -2324,6 +2329,21 @@ def _require_replay_canonical_transaction(
             "Replay canonical transaction drifted from the recorded finalization",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
+    # Verify metadata from the exact snapshot identity as well as the original fields.
+    metadata = (
+        fin_input.confirmed_receipt_identity.bookkeeping_metadata
+        if fin_input.confirmed_receipt_identity is not None
+        else None
+    )
+    if metadata is not None:
+        values = conn.execute(
+            "SELECT description,category FROM transactions WHERE public_id=?", (txn_public_id,)
+        ).fetchone()
+        if values is None or tuple(values) != (metadata.description, metadata.category):
+            raise FinalizationIdempotencyError(
+                "Replay canonical transaction bookkeeping metadata drifted",
+                reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
+            )
     # FIX-02: verify merchant, source_channel, date, status, intent.
     identity = fin_input.confirmed_receipt_identity
     if identity is not None:
@@ -2786,6 +2806,13 @@ def _insert_canonical_transaction(
             f"Receipt finalization for {fin_input.receipt_group_public_id}",
         ),
     )
+
+    if receipt_identity is not None and receipt_identity.bookkeeping_metadata is not None:
+        metadata = receipt_identity.bookkeeping_metadata
+        conn.execute(
+            "UPDATE transactions SET description=?,category=? WHERE public_id=?",
+            (metadata.description, metadata.category, public_id),
+        )
 
 
 def _derive_transaction_date(

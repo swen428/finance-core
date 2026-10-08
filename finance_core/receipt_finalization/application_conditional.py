@@ -22,6 +22,7 @@ from finance_core.application.posting_contract import (
     posting_review_sha256,
     require_posting_schema,
 )
+from finance_core.bookkeeping_metadata import build_application_receipt_projection
 from finance_core.calculation.authoritative_snapshot import (
     canonical_json_text,
     canonical_json_value,
@@ -33,7 +34,6 @@ from finance_core.calculators.receipt_split_calculator import calculate_receipt_
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.repository import ParserProposalRepository
-from finance_core.receipt_finalization.d2_conditional import build_d2_receipt_projection
 from finance_core.receipt_finalization.models import FinalizationInput, to_settlement_obligations
 from finance_core.receipt_finalization.persistence import read_fact_set_binding_evidence
 from finance_core.receipt_finalization.snapshot_authority import read_snapshot_bound_authority
@@ -168,6 +168,13 @@ def require_application_receipt_acceptance(
             raise ApplicationConditionalAuthorityError("Accepted proposal is missing")
         _payload, _completion, version = resolve_effective_payload(conn, proposal)
         content_hash = compute_effective_proposal_content_hash(conn, {"id": proposal["id"]})
+        from finance_core.parser_proposals.amendment_lineage import (
+            verify_independent_amendment_descendant,
+        )
+
+        verify_independent_amendment_descendant(
+            conn, proposal, content_hash=content_hash, proposal_version=version
+        )
         if (
             review["schema"] != POSTING_REVIEW_SCHEMA
             or review["posting_path"] != "personal_receipt"
@@ -394,7 +401,8 @@ def require_application_conditional_authority(
                 "Independent receipt snapshot differs from Python calculation"
             )
         evidence = acceptance["receipt_evidence"]
-        actual = build_d2_receipt_projection(
+        actual = build_application_receipt_projection(
+            bookkeeping_metadata=snapshot.confirmed_receipt_identity.bookkeeping_metadata,
             merchant=snapshot.confirmed_receipt_identity.merchant,
             receipt_date=snapshot.confirmed_receipt_identity.receipt_date,
             currency=snapshot.currency,

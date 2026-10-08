@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from typing import Any, Callable
 
 from finance_core.parser_proposals.decision_owner import (
     CONVERTED_TRANSACTION_PUBLIC_ID_PREFIX,
@@ -14,8 +14,24 @@ from finance_core.parser_proposals.decision_owner import (
     ProposalConversionError,
     StaleProposalConfirmationError,
     UnsupportedProposalTypeError,
-    convert_confirmed_parser_proposal,
+    _require_legacy_conversion_target,
 )
+from finance_core.parser_proposals.decision_owner import (
+    convert_confirmed_parser_proposal as _convert_confirmed_parser_proposal_owner,
+)
+
+
+def convert_confirmed_parser_proposal(
+    conn: sqlite3.Connection,
+    parser_output_id: int,
+    *,
+    persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Preserve the compatibility signature and refuse independent amendment authority."""
+    _require_legacy_conversion_target(conn, parser_output_id)
+    return _convert_confirmed_parser_proposal_owner(
+        conn, parser_output_id, persistence_effect=persistence_effect
+    )
 
 
 def convert_confirmed_proposal_to_transaction(

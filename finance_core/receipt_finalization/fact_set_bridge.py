@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from finance_core.application.review import review_snapshot
+from finance_core.bookkeeping_metadata import build_application_receipt_projection
 from finance_core.calculation.authoritative_snapshot import (
     AuthoritativeCalculationSnapshot,
     AuthoritativeSnapshotRepository,
@@ -316,6 +317,7 @@ def prepare_receipt_calculation(
         receipt_date=projection.receipt_date,
         source_channel=projection.receipt_source_channel,
         currency=currency,
+        bookkeeping_metadata=projection.bookkeeping_metadata,
     )
 
     calc_result = calculate_receipt_split(projection.calculator_input)
@@ -1230,7 +1232,8 @@ def authorize_application_conditional_receipt_finalization(
         binding = _require_snapshot_bound_authority(
             conn, prepared, output_payload=fin_input.calculation_snapshot
         )
-        projection = build_d2_receipt_projection(
+        projection = build_application_receipt_projection(
+            bookkeeping_metadata=prepared.confirmed_receipt_identity.bookkeeping_metadata,
             merchant=prepared.confirmed_receipt_identity.merchant,
             receipt_date=prepared.confirmed_receipt_identity.receipt_date,
             currency=prepared.currency,

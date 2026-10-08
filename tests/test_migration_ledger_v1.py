@@ -891,10 +891,10 @@ def test_migration_ledger_tests_never_target_live_database(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_authoritative_manifest_contains_migration_001_through_056_in_order() -> None:
-    """The current authoritative manifest has ordered migration IDs 001–056
+def test_authoritative_manifest_contains_migration_001_through_057_in_order() -> None:
+    """The current authoritative manifest has ordered migration IDs 001–057
     with no gaps, duplicates or reordered entries."""
-    assert len(TEMP_DB_MIGRATION_PATHS) == 56
+    assert len(TEMP_DB_MIGRATION_PATHS) == 57
     assert tuple(TEMP_DB_MIGRATION_PATHS.paths) == tuple(
         path
         for mid, path in sorted(
@@ -923,15 +923,15 @@ def test_migration_030_is_sql_only_with_no_preflight_binding() -> None:
     assert spec_030.preflight_bytes is None
 
 
-def test_fresh_migration_001_through_056_replay_is_deterministic() -> None:
-    """A fresh temporary database must apply 001–056, record all ledger rows
+def test_fresh_migration_001_through_057_replay_is_deterministic() -> None:
+    """A fresh temporary database must apply 001–057, record all ledger rows
     in order, pass history verification, and remain unchanged on replay."""
     conn = _connection()
     try:
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS, clock=_clock)
         rows = migration_ledger_rows(conn)
-        assert len(rows) == 56
-        assert rows[-1]["migration_id"] == "056"
+        assert len(rows) == 57
+        assert rows[-1]["migration_id"] == "057"
         assert all(row["adoption_mode"] == "applied" for row in rows)
         verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
