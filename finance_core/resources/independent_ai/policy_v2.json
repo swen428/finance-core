@@ -1,0 +1,15 @@
+{
+  "amount_owner": "deterministic_python",
+  "basis": "full_card_ai_expense_v1",
+  "dates": [
+    "absolute_date",
+    "day_offset",
+    "calendar_week_weekday",
+    "previous_or_next_weekday"
+  ],
+  "max_coverage": 64,
+  "max_evidence": 8,
+  "max_operations": 6,
+  "max_questions": 6,
+  "schema": "finance-independent-ai-policy-v2"
+}

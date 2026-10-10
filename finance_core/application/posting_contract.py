@@ -11,11 +11,15 @@ from finance_core.calculation.authoritative_snapshot import canonical_json_text
 
 POSTING_REVIEW_SCHEMA = "finance-application-posting-review-v1"
 POSTING_DECISION_SCHEMA = "finance-application-posting-human-decision-v1"
+POSTING_REVIEW_SCHEMA_V2 = "finance-application-posting-review-v2"
+POSTING_DECISION_SCHEMA_V2 = "finance-application-posting-human-decision-v2"
 
 
 def posting_review_sha256(material: Mapping[str, object]) -> str:
     return hashlib.sha256(
-        canonical_json_text({"schema": POSTING_REVIEW_SCHEMA, "review": dict(material)}).encode()
+        canonical_json_text(
+            {"schema": material.get("schema", POSTING_REVIEW_SCHEMA), "review": dict(material)}
+        ).encode()
     ).hexdigest()
 
 

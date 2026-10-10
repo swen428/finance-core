@@ -113,6 +113,8 @@ def review_ambiguity_indicators(
     conn: sqlite3.Connection,
     proposal: dict[str, Any],
     payload: dict[str, Any],
+    *,
+    aggregate_score_applies: bool = True,
 ) -> list[str]:
     indicators: list[str] = []
 
@@ -132,7 +134,7 @@ def review_ambiguity_indicators(
     if not _present(payload.get("merchant")) and not _present(payload.get("description")):
         indicators.append("missing_merchant_or_description")
     confidence = proposal.get("confidence_score")
-    if confidence is None or float(confidence) < 0.8:
+    if aggregate_score_applies and (confidence is None or float(confidence) < 0.8):
         indicators.append("low_confidence")
     if has_receipt_ocr_proposal_link(conn, int(proposal["id"])):
         receipt_flags = payload.get("ambiguity_flags")
@@ -307,7 +309,14 @@ def project_proposal_review(
         "description", payload.get("description")
     )
     category, category_truncated = _bounded_review_scalar("category", payload.get("category"))
-    ambiguity_indicators = review_ambiguity_indicators(conn, proposal, payload)
+    aggregate_score_applies = not (
+        ai_lineage is not None
+        and ai_lineage.get("proposal_origin") == "independent_ai"
+        and ai_lineage.get("text_readiness", {}).get("generic_score_applies") is False
+    )
+    ambiguity_indicators = review_ambiguity_indicators(
+        conn, proposal, payload, aggregate_score_applies=aggregate_score_applies
+    )
     if merchant_truncated or description_truncated or category_truncated or account_truncated:
         ambiguity_indicators = sorted([*ambiguity_indicators, "oversized_display_field"])
     if classification_unknown:
@@ -337,7 +346,9 @@ def project_proposal_review(
         "classification": classification,
         "source_type": proposal["source_type"],
         "ambiguity_indicators": ambiguity_indicators,
-        "proposal_origin": "ai_fallback" if ai_origin else "deterministic",
+        "proposal_origin": ai_lineage.get("proposal_origin", "ai_fallback")
+        if ai_lineage is not None
+        else "deterministic",
         "ai_source_kind": None if ai_lineage is None else ai_lineage["ai_source_kind"],
         "confirm_available": not ai_origin or not ambiguity_indicators,
         "final_transaction_created": False,

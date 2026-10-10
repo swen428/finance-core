@@ -100,14 +100,25 @@ def _safe_archive_name(name: str) -> PurePosixPath:
 
 def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
     prefix = "finance_core/resources/migrations/"
-    migrations = {
-        PurePosixPath(name).name: body
-        for name, body in payloads.items()
-        if name.startswith(prefix) and name.endswith(".sql")
-    }
+    migrations: dict[str, bytes] = {}
+    for name, body in payloads.items():
+        if not name.startswith(prefix) or not name.endswith(".sql"):
+            continue
+        filename = name.removeprefix(prefix)
+        if (
+            not filename
+            or "/" in filename
+            or "\\" in filename
+            or filename in migrations
+            or len(filename) < 9
+            or not filename[:3].isdigit()
+            or filename[3] != "_"
+        ):
+            raise ValueError("wheel must contain the exact migration inventory 001-059")
+        migrations[filename] = body
     observed_numbers = [int(name[:3]) for name in sorted(migrations)]
-    if observed_numbers != list(range(1, 58)):
-        raise ValueError("wheel must contain the exact migration inventory 001-057")
+    if observed_numbers != list(range(1, 60)):
+        raise ValueError("wheel must contain the exact migration inventory 001-059")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]

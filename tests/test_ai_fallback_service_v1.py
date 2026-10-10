@@ -519,6 +519,14 @@ def test_successful_child_repoints_intake_and_replays_exactly(tmp_path: Path) ->
         ).fetchone()
         assert child is not None
         _payload, _completion_id, version = resolve_effective_payload(conn, child)
+        assert isinstance(child, sqlite3.Row)
+        tables = [
+            row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        ]
+        before_proof = {
+            table: [tuple(row) for row in conn.execute('SELECT * FROM "' + table + '"')]
+            for table in tables
+        }
         lineage = verify_ai_fallback_child(
             conn,
             child,
@@ -527,6 +535,20 @@ def test_successful_child_repoints_intake_and_replays_exactly(tmp_path: Path) ->
             require_resolved=False,
         )
         assert lineage is not None
+        assert (
+            verify_ai_fallback_child(
+                conn,
+                dict(child),
+                content_hash=compute_effective_proposal_content_hash(conn, child),
+                proposal_version=version,
+                require_resolved=False,
+            )
+            == lineage
+        )
+        assert {
+            table: [tuple(row) for row in conn.execute('SELECT * FROM "' + table + '"')]
+            for table in tables
+        } == before_proof
         assert (
             conn.execute(
                 """

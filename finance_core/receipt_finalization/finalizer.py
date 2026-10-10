@@ -181,6 +181,8 @@ def finalize_receipt_split(
     *,
     clock: Callable[[], str] | None = None,
     persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> FinalizationOutput:
     """Finalize a calculated receipt split -- atomic, authorized, durably idempotent.
 
@@ -224,6 +226,8 @@ def finalize_receipt_split(
             fin_input=fin_input,
             fingerprint=fingerprint,
             persistence_effect=persistence_effect,
+            ai_lineage_authority=ai_lineage_authority,
+            receipt_posting_authorization=receipt_posting_authorization,
             recheck=lambda: _check_idempotency(conn, fin_input.idempotency_key, fingerprint),
         )
         if replay is not None:
@@ -244,6 +248,8 @@ def finalize_receipt_split(
             fin_input=fin_input,
             fingerprint=fingerprint,
             persistence_effect=persistence_effect,
+            ai_lineage_authority=ai_lineage_authority,
+            receipt_posting_authorization=receipt_posting_authorization,
             recheck=lambda: _check_existing_finalization(
                 conn, fin_input.receipt_group_public_id, fingerprint
             ),
@@ -261,6 +267,9 @@ def finalize_receipt_split(
     conn.execute("BEGIN IMMEDIATE")
 
     try:
+        _require_ai_finalization_authority(
+            conn, fin_input, ai_lineage_authority, receipt_posting_authorization
+        )
         # A competing finalizer can commit after the optimistic pre-check but
         # before this connection acquires the write lock. Recheck inside the
         # serialized transaction so an identical concurrent command replays
@@ -517,8 +526,27 @@ def finalize_receipt_split(
     return result
 
 
+def _require_ai_finalization_authority(
+    conn, fin_input, authority, receipt_posting_authorization=None
+):
+    from finance_core.parser_proposals.independent_ai_authority import require_receipt_ai_authority
+
+    bound = _require_snapshot_bound_authority(conn, fin_input)
+    if bound is not None and bound.active_fact_set_binding is not None:
+        require_receipt_ai_authority(
+            conn,
+            bound.active_fact_set_binding.receipt_public_id,
+            authority,
+            receipt_posting_authorization,
+        )
+
+
 def verify_finalized_receipt_split(
-    conn: sqlite3.Connection, fin_input: FinalizationInput
+    conn: sqlite3.Connection,
+    fin_input: FinalizationInput,
+    *,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> FinalizationOutput:
     """Read-only verification of a completed finalization's full durable graph."""
     require_staging_database(conn)
@@ -530,6 +558,8 @@ def verify_finalized_receipt_split(
         fin_input=fin_input,
         fingerprint=fingerprint,
         recheck=lambda: _check_idempotency(conn, fin_input.idempotency_key, fingerprint),
+        ai_lineage_authority=ai_lineage_authority,
+        receipt_posting_authorization=receipt_posting_authorization,
     )
     if result is None:
         raise FinalizationIdempotencyError(
@@ -546,6 +576,8 @@ def _verify_replay_in_coherent_snapshot(
     fingerprint: str,
     recheck: Callable[[], FinalizationOutput | None],
     persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> FinalizationOutput | None:
     """Verify a durable replay under one coherent read snapshot (R3-04).
 
@@ -562,6 +594,9 @@ def _verify_replay_in_coherent_snapshot(
     if not replay_in_caller_txn:
         conn.execute("BEGIN DEFERRED")
     try:
+        _require_ai_finalization_authority(
+            conn, fin_input, ai_lineage_authority, receipt_posting_authorization
+        )
         inner = recheck()
         if inner is None:
             if not replay_in_caller_txn:

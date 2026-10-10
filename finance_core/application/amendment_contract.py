@@ -135,5 +135,8 @@ def require_amendment_schema(conn: sqlite3.Connection) -> None:
     digest = hashlib.sha256(
         json.dumps([tuple(row) for row in rows], separators=(",", ":"), ensure_ascii=False).encode()
     ).hexdigest()
-    if digest != _AMENDMENT_SCHEMA_HASH:
+    if digest not in {
+        _AMENDMENT_SCHEMA_HASH,
+        "693331ca5c3fac20504c10cbbd83f0f6d4894bb4259dbc2d7eab125d789e76c2",
+    }:
         raise AmendmentError("Independent amendment migration 057 is absent or changed")

@@ -1,0 +1,29 @@
+{
+  "historical_read_only": [
+    "finance-independent-ai-input-v1"
+  ],
+  "methods": [
+    "prepare_initial",
+    "prepare_edit",
+    "prepare_clarification",
+    "get_clarification",
+    "prepare_followup",
+    "claim",
+    "invoke",
+    "record_outcome",
+    "publish",
+    "cancel",
+    "get_status",
+    "recover"
+  ],
+  "minimum_migration": "059",
+  "schema": "finance-independent-ai-feature-v2",
+  "subschemas": [
+    "finance-independent-ai-input-v2",
+    "finance-independent-ai-result-v2",
+    "finance-independent-ai-publication-v2",
+    "finance-independent-ai-interpretation-input-v2",
+    "finance-application-posting-review-v2",
+    "finance-application-posting-human-decision-v2"
+  ]
+}

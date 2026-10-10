@@ -42,12 +42,16 @@ def supersede_text_proposal(
     amendment_id: str,
     actor: str,
     amendment_authority: AmendmentPublicationAuthority,
+    ai_lineage_authority=None,
     clock: Callable[[], str],
 ) -> dict[str, Any]:
     require_staging_database(conn)
     _acquire_write_transaction(conn)
     try:
         parent = _require_full_proposal(conn, parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, parent, ai_lineage_authority)
         edge = conn.execute(
             "SELECT * FROM parser_text_amendment_revisions WHERE publication_public_id=?",
             (publication_public_id,),

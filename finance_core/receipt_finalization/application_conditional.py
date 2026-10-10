@@ -17,7 +17,9 @@ from typing import Any
 from finance_core.application.admission import SOURCE_SCHEMA
 from finance_core.application.posting_contract import (
     POSTING_DECISION_SCHEMA,
+    POSTING_DECISION_SCHEMA_V2,
     POSTING_REVIEW_SCHEMA,
+    POSTING_REVIEW_SCHEMA_V2,
     PostingContractError,
     posting_review_sha256,
     require_posting_schema,
@@ -176,10 +178,15 @@ def require_application_receipt_acceptance(
             conn, proposal, content_hash=content_hash, proposal_version=version
         )
         if (
-            review["schema"] != POSTING_REVIEW_SCHEMA
+            review["schema"] not in {POSTING_REVIEW_SCHEMA, POSTING_REVIEW_SCHEMA_V2}
             or review["posting_path"] != "personal_receipt"
             or not hmac.compare_digest(posting_review_sha256(review), str(values["review_hash"]))
-            or decision["schema"] != POSTING_DECISION_SCHEMA
+            or decision["schema"]
+            != (
+                POSTING_DECISION_SCHEMA_V2
+                if review["schema"] == POSTING_REVIEW_SCHEMA_V2
+                else POSTING_DECISION_SCHEMA
+            )
             or decision["action"] != "confirm"
             or decision["consumed"] is not False
             or decision["decision_id"] != values["decision_id"]

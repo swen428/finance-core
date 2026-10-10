@@ -36,6 +36,18 @@ signing/redemption/posting/recovery services continue to own that authority. The
 and its own Python receipt-calculation projection to a separately verified
 human decision; this read-only review entry still grants no write authority.
 
+For the separate [independent AI domain](independent_ai_invocation_v2.md),
+read-only review reconstructs structural invocation/publication ancestry.
+This view is not authentication of a provider observation. Owning amendment,
+posting, conversion and recovery require their fixed lineage authority to
+authenticate that evidence in the actual snapshot, including mixed human/AI
+descendants. Legacy compatibility receipts cannot qualify the new domain.
+
+The generic review's historical indicators and `confirm_available` do not
+grant the new full-card posting basis. PostingReview v2 binds its own complete
+assessment and deterministic projection; actual delivery and a fresh exact
+human decision must be verified through every financial stage.
+
 The financial rules exist once. Existing Bridge callers of proposal lookup,
 effective state, ambiguity and classification delegate to the same helpers;
 financial error messages and protocol mapping remain compatible. Neither the

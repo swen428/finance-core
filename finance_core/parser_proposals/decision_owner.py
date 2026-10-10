@@ -160,6 +160,7 @@ def confirm_parser_proposal(
     decision_authority: DecisionAuthority,
     clock: Callable[[], str] | None = None,
     _caller_owns_transaction: bool = False,
+    ai_lineage_authority=None,
 ) -> dict[str, Any]:
     """Atomically persist an authoritative human decision and lifecycle change.
 
@@ -184,12 +185,29 @@ def confirm_parser_proposal(
         proposals = ParserProposalRepository(conn)
         authorizations = ParserAuthorizationRepository(conn)
         proposal = _require_proposal(proposals, parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, proposal, ai_lineage_authority)
         content_hash = compute_effective_proposal_content_hash(conn, proposal)
         proposal_version = resolve_effective_payload(conn, proposal)[2]
         amendment = verify_independent_amendment_descendant(
             conn, proposal, content_hash=content_hash, proposal_version=proposal_version
         )
-        if amendment is not None:
+        from finance_core.application.ai_expense_assessment import assess_independent_ai_expense_v2
+
+        ai_assessment = assess_independent_ai_expense_v2(conn, proposal, {})
+        if ai_assessment is not None:
+            from finance_core.application.posting import PostingService, _AcceptedDecisionAuthority
+
+            if (
+                type(decision_authority) is not _AcceptedDecisionAuthority
+                or type(decision_authority.service) is not PostingService
+                or decision_authority.service._conn is not conn
+            ):
+                raise ParserConfirmationError(
+                    "V2 full-card confirmation requires fixed accepted Posting composition"
+                )
+        if amendment is not None or ai_assessment is not None:
             review = _read_accepted_posting_review(
                 conn,
                 proposal=proposal,
@@ -214,7 +232,7 @@ def confirm_parser_proposal(
                 proposal,
                 content_hash=content_hash,
                 proposal_version=resolve_effective_payload(conn, proposal)[2],
-                require_resolved=(decision == "confirmed"),
+                require_resolved=(decision == "confirmed" and ai_assessment is None),
             )
             if requires_deterministic_intent_policy(proposal):
                 verify_deterministic_intent_policy(proposal)
@@ -337,6 +355,8 @@ def convert_confirmed_parser_proposal(
     parser_output_id: int,
     *,
     persistence_effect: Callable[[sqlite3.Connection, dict[str, Any]], None] | None = None,
+    ai_lineage_authority=None,
+    text_posting_authorization=None,
 ) -> dict[str, Any]:
     """Atomically convert a persisted, authoritative confirmation to one transaction."""
     require_staging_database(conn)
@@ -346,25 +366,43 @@ def convert_confirmed_parser_proposal(
         authorizations = ParserAuthorizationRepository(conn)
         conversions = ParserConversionRepository(conn)
         proposal = _require_proposal(proposals, parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, proposal, ai_lineage_authority)
         if proposal["parse_status"] != CONFIRMED:
             raise InvalidProposalStatusError(
                 f"Only confirmed parser proposals can be converted: {proposal['parse_status']}"
             )
         content_hash = compute_effective_proposal_content_hash(conn, proposal)
+        authorization = _require_active_authorization(
+            authorizations.get_for_proposal(parser_output_id), parser_output_id, content_hash
+        )
+        from finance_core.application.text_posting_authorization import (
+            require_text_posting_authority,
+        )
+
+        _, _, version = resolve_effective_payload(conn, proposal)
+        full_card_basis = (
+            require_text_posting_authority(
+                conn,
+                proposal,
+                authorization,
+                text_posting_authorization,
+            )
+            is not None
+        )
         try:
             verify_ai_fallback_child(
                 conn,
                 proposal,
                 content_hash=content_hash,
-                proposal_version=resolve_effective_payload(conn, proposal)[2],
+                proposal_version=version,
+                require_resolved=not full_card_basis,
             )
             if requires_deterministic_intent_policy(proposal):
                 verify_deterministic_intent_policy(proposal)
         except AiFallbackServiceError as exc:
             raise StaleProposalConfirmationError(str(exc)) from exc
-        authorization = _require_active_authorization(
-            authorizations.get_for_proposal(parser_output_id), parser_output_id, content_hash
-        )
         # B4.0 mutual exclusion: receipt proposals with persisted OCR link
         # evidence are owned by the guarded receipt conversion boundary and
         # must never enter this narrow simple-expense converter, not even as
@@ -478,7 +516,11 @@ def convert_confirmed_parser_proposal(
 
 
 def verify_converted_parser_proposal(
-    conn: sqlite3.Connection, parser_output_id: int
+    conn: sqlite3.Connection,
+    parser_output_id: int,
+    *,
+    ai_lineage_authority=None,
+    text_posting_authorization=None,
 ) -> dict[str, Any]:
     """Verify one completed text conversion using SELECTs only.
 
@@ -491,6 +533,9 @@ def verify_converted_parser_proposal(
         conn.execute("BEGIN DEFERRED")
     try:
         proposal = _require_proposal(ParserProposalRepository(conn), parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, proposal, ai_lineage_authority)
         if proposal["parse_status"] != CONFIRMED:
             raise InvalidProposalStatusError(
                 f"Only confirmed parser proposals can be verified: {proposal['parse_status']}"
@@ -501,6 +546,11 @@ def verify_converted_parser_proposal(
             parser_output_id,
             content_hash,
         )
+        from finance_core.application.text_posting_authorization import (
+            require_text_posting_authority,
+        )
+
+        require_text_posting_authority(conn, proposal, authorization, text_posting_authorization)
         conversion = ParserConversionRepository(conn).get_for_proposal(parser_output_id)
         if conversion is None:
             raise ProposalConversionError("Confirmed parser proposal has no conversion")
@@ -616,7 +666,9 @@ def _read_accepted_posting_review(
         return None
     from finance_core.application.posting_contract import (
         POSTING_DECISION_SCHEMA,
+        POSTING_DECISION_SCHEMA_V2,
         POSTING_REVIEW_SCHEMA,
+        POSTING_REVIEW_SCHEMA_V2,
         posting_review_sha256,
         require_posting_schema,
     )
@@ -648,7 +700,7 @@ def _read_accepted_posting_review(
         if (
             canonical_json_text(review) != row["material_json"]
             or canonical_json_text(decision) != row["decision_json"]
-            or review["schema"] != POSTING_REVIEW_SCHEMA
+            or review["schema"] not in {POSTING_REVIEW_SCHEMA, POSTING_REVIEW_SCHEMA_V2}
             or posting_review_sha256(review) != row["review_hash"]
             or row["review_id"] != "apr_" + row["review_hash"]
             or row["parser_output_id"] != proposal["id"]
@@ -664,7 +716,12 @@ def _read_accepted_posting_review(
             or frozen["proposal_version"] != proposal_version
             or frozen["effective_content_hash"] != content_hash
             or not review["prepared_at"] <= row["accepted_at"] < review["expires_at"]
-            or decision["schema"] != POSTING_DECISION_SCHEMA
+            or decision["schema"]
+            != (
+                POSTING_DECISION_SCHEMA_V2
+                if review["schema"] == POSTING_REVIEW_SCHEMA_V2
+                else POSTING_DECISION_SCHEMA
+            )
             or decision["namespace"] != row["decision_namespace"]
             or decision["namespace"] != binding["decision_namespace"]
             or decision["key_id"] != binding["decision_key_id"]

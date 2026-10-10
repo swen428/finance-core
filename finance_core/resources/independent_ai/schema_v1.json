@@ -1,0 +1,1 @@
+{"schema":"finance-independent-ai-result-v1","kinds":["initial","patch","clarification","unsupported"],"fields":["amount","currency","transaction_date","merchant","description","category"],"evidence_ref":["source","reply","context","source_context"],"image_to_model":0,"max_response_bytes":16384,"money":"positive decimal string and explicit ISO currency","extra_keys":false}

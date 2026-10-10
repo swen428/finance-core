@@ -1,6 +1,6 @@
 {
   "schema": "finance-core-migration-contract-v1",
-  "migration_ledger_digest": "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4",
+  "migration_ledger_digest": "888821f03d706ea751029aabe5c5f7a8bb3d7e9c923e3dff10aab99c149c4b22",
   "migration_filenames": [
     "001_create_core_schema.sql",
     "002_receipt_split_schema.sql",
@@ -58,6 +58,8 @@
     "054_d3_result_reply_outbox.sql",
     "055_d3_interaction_routes.sql",
     "056_independent_posting.sql",
-    "057_independent_amendments.sql"
+    "057_independent_amendments.sql",
+    "058_independent_ai_invocations.sql",
+    "059_independent_ai_clarification.sql"
   ]
 }

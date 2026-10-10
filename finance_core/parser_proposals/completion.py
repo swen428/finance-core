@@ -139,6 +139,7 @@ def complete_proposal(
     clock: Callable[[], str] | None = None,
     transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
     amendment_authority: AmendmentPublicationAuthority | None = None,
+    ai_lineage_authority=None,
 ) -> dict[str, Any]:
     """Complete a parser proposal with authenticated non-monetary field updates.
 
@@ -163,6 +164,9 @@ def complete_proposal(
     try:
         proposals = ParserProposalRepository(conn)
         proposal = _require_proposal(proposals, parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, proposal, ai_lineage_authority)
 
         current_hash = _effective_proposal_content_hash(conn, proposal)
 

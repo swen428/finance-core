@@ -296,6 +296,7 @@ class AmendmentService:
         human_amendment_authority: HumanAmendmentAuthority,
         binding: AmendmentBinding,
         clock: Callable[[], int],
+        ai_lineage_authority=None,
     ) -> None:
         if type(binding) is not AmendmentBinding or any(
             not _reference(v) or unicodedata.normalize("NFC", v) != v
@@ -313,6 +314,27 @@ class AmendmentService:
             binding,
             clock,
         )
+
+        self._ai_lineage_authority = ai_lineage_authority
+
+    def _ai_kwargs(self):
+        return (
+            {"ai_lineage_authority": self._ai_lineage_authority}
+            if self._ai_lineage_authority is not None
+            else {}
+        )
+
+    def _verify_ai(self, proposal_id: str) -> None:
+        from finance_core.application.ai_invocation_contract import AiInvocationError
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        proposal = ParserProposalRepository(self._conn).get_by_public_id(proposal_id)
+        if proposal is None:
+            raise AmendmentError("AI lineage proposal is absent")
+        try:
+            require_ai_authority(self._conn, proposal, self._ai_lineage_authority)
+        except AiInvocationError as exc:
+            raise AmendmentError(str(exc)) from exc
 
     def _now(self) -> int:
         now = self._clock()
@@ -335,7 +357,10 @@ class AmendmentService:
             "edited_pending_confirmation",
         }:
             raise AmendmentError("Only a current unconfirmed proposal can be edited")
+        # Preserve native review diagnostics inside this same owning snapshot;
+        # fixed AI authority still precedes all material/card persistence.
         view = get_proposal_review(self._conn, proposal_id)
+        self._verify_ai(proposal_id)
         payload, _, version = resolve_effective_payload(self._conn, proposal)
         lineage = verify_independent_amendment_descendant(
             self._conn,
@@ -589,6 +614,7 @@ class AmendmentService:
             row["resulting_parser_output_id"]
         )
         assert proposal is not None
+        self._verify_ai(proposal["public_id"])
         payload, _, version = resolve_effective_payload(self._conn, proposal)
         verify_independent_amendment_descendant(
             self._conn,
@@ -689,6 +715,7 @@ class AmendmentService:
                 "expected_content_hash": review["proposal_review"]["effective_content_hash"],
                 "clock": clock,
                 "amendment_authority": authority,
+                **self._ai_kwargs(),
             }
             if kind == "completion":
                 complete_proposal(

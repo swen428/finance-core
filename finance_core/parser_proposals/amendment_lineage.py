@@ -416,6 +416,21 @@ def _verify_owner_history(
 def verify_independent_amendment_descendant(
     conn: sqlite3.Connection, proposal: Any, *, content_hash: str, proposal_version: int
 ) -> dict[str, Any] | None:
+    from finance_core.application.ai_invocation_contract import AiInvocationError
+    from finance_core.parser_proposals.independent_ai_lineage import verify_independent_ai_lineage
+
+    try:
+        ai = verify_independent_ai_lineage(
+            conn,
+            proposal,
+            content_hash=content_hash,
+            proposal_version=proposal_version,
+            require_resolved=False,
+        )
+    except AiInvocationError as exc:
+        raise AmendmentLineageError(str(exc)) from exc
+    if ai is not None:
+        return ai
     result = _verify_revision_ancestry(
         conn, proposal, content_hash=content_hash, proposal_version=proposal_version
     )
@@ -608,6 +623,12 @@ def _verify_revision_ancestry(
 
 
 def refuse_legacy_amendment(conn: sqlite3.Connection, proposal: Any) -> None:
+    from finance_core.parser_proposals.independent_ai_lineage import has_independent_ai_ancestry
+
+    if has_independent_ai_ancestry(conn, proposal):
+        raise AmendmentLineageError(
+            "Independent AI proposals require their independent decision owner"
+        )
     if (
         has_amendment_schema(conn)
         and conn.execute(
@@ -642,29 +663,39 @@ def require_independent_source_edit_history(
         if schema
         else None
     )
-    if full["parent_parser_output_id"] is not None and seal is None:
-        ai = conn.execute(
-            "SELECT 1 FROM ai_fallback_proposal_links WHERE parser_output_id=?", (full["id"],)
-        ).fetchone()
-        if ai is None:
-            raise AmendmentLineageError("Unsealed legacy child cannot gain independent authority")
-        from finance_core.parser_proposals.ai_fallback import verify_ai_fallback_child
+    from finance_core.parser_proposals.independent_ai_lineage import (
+        has_independent_ai_ancestry,
+        verify_independent_ai_lineage,
+    )
+
+    if has_independent_ai_ancestry(conn, full):
         from finance_core.parser_proposals.content_hash import (
             compute_effective_proposal_content_hash,
         )
         from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 
-        if (
-            verify_ai_fallback_child(
-                conn,
-                full,
-                content_hash=compute_effective_proposal_content_hash(conn, full),
-                proposal_version=resolve_effective_payload(conn, full)[2],
-                require_resolved=False,
-            )
-            is None
-        ):
-            raise AmendmentLineageError("Independent AI source does not verify")
+        verify_independent_ai_lineage(
+            conn,
+            full,
+            content_hash=compute_effective_proposal_content_hash(conn, full),
+            proposal_version=resolve_effective_payload(conn, full)[2],
+            require_resolved=False,
+        )
+    elif full["parent_parser_output_id"] is not None and seal is None:
+        ai = conn.execute(
+            "SELECT 1 FROM ai_fallback_proposal_links WHERE parser_output_id=?", (full["id"],)
+        ).fetchone()
+        if ai is None:
+            raise AmendmentLineageError("Unsealed legacy child cannot gain independent authority")
+        from finance_core.parser_proposals.ai_fallback import _verify_legacy_ai_creation_edge
+        from finance_core.parser_proposals.independent_ai_revision import ordered_revision_proof
+
+        # This is a source-history proof, not current admission. Use the
+        # immutable owner first and then actual ordered HUMAN revisions;
+        # never recurse through the live AI/HUMAN domain dispatcher.
+        creation = _verify_legacy_ai_creation_edge(conn, full)
+        ordered_revision_proof(conn, full, creation)
+
     for owner_table, identity, kind in (
         ("parser_proposal_completions", "completion_public_id", "completion"),
         ("receipt_proposal_revisions", "correction_public_id", "receipt_supersession"),

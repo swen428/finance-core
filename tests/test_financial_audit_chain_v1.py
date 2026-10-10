@@ -564,3 +564,31 @@ def test_unrelated_trigger_integrity_errors_stay_unmapped(
         append_financial_audit_event_atomically(conn, _command())
     conn.execute("DROP TRIGGER temp.trg_test_unrelated_audit_block")
     assert not conn.in_transaction
+
+
+@pytest.mark.parametrize("factory_kind", ["row", "tuple", "dict"])
+def test_targeted_audit_readers_preserve_row_tuple_mapping_contract(
+    migrated_temp_db_connection, factory_kind
+):
+    conn = migrated_temp_db_connection
+    event, _ = append_financial_audit_event_atomically(conn, _command())
+
+    def dict_factory(cursor, row):
+        return dict(zip((column[0] for column in cursor.description), row, strict=True))
+
+    factory = (
+        sqlite3.Row if factory_kind == "row" else None if factory_kind == "tuple" else dict_factory
+    )
+    conn.row_factory = factory
+    try:
+        repo = FinancialAuditRepository(conn)
+        assert repo.fetch(event.event_public_id) == event
+        assert repo.head(event.aggregate_type, event.aggregate_public_id) == event
+        assert repo.list_chain(event.aggregate_type, event.aggregate_public_id) == [event]
+        chain = verify_financial_audit_chain(
+            conn, aggregate_type=event.aggregate_type, aggregate_public_id=event.aggregate_public_id
+        )
+        assert chain.valid and chain.event_count == 1
+        assert conn.row_factory is factory and not conn.in_transaction
+    finally:
+        conn.row_factory = sqlite3.Row

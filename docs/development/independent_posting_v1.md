@@ -1,5 +1,10 @@
 # Independent single-entry posting
 
+New independent-AI full-card posting uses review/decision v2 and the explicit
+`full_card_ai_expense_v1` basis in the [AI v2 contract](independent_ai_invocation_v2.md).
+Existing v1/HUMAN receipt rules keep their meanings; the new basis is verified
+through conversion, finalization and recovery.
+
 The independent Application posting boundary owns one personal text expense or
 one total-only personal receipt from a precise human decision through guarded
 posting and verified result recovery. Parser, OCR and AI material remain
@@ -31,6 +36,28 @@ caller transaction; a refusal never commits or rolls back caller-owned work.
 when present and attention reason when applicable. Owning financial guards and
 verification errors remain refusals; a failed call cannot be interpreted as
 permission to retry with different authority.
+
+An independent-AI ancestor additionally requires the constructor-fixed
+`ai_lineage_authority`, authenticated on the actual SQLite snapshot at review,
+submission, financial write, historical readback and recovery. Omission refuses
+that origin, including later human descendants. Stored acceptance or structural
+hash validation cannot replace the original observation authentication. Direct
+conversion/finalization APIs retain the same default refusal. See the
+[independent AI contract](independent_ai_invocation_v1.md); legacy AI stays in
+its original compatibility domain.
+
+V2-origin text conversion, replay and result verification also require the
+separate fixed `TextPostingAuthorization` defined in
+`finance_core.application.text_posting_authorization`. PostingService creates it
+for the exact accepted attempt in `_text_kwargs(attempt_id)` and supplies it to
+both `decision_owner.convert_confirmed_parser_proposal` and
+`decision_owner.verify_converted_parser_proposal`. Those neutral entry points
+keep `text_posting_authorization=None` for source compatibility, but a verified
+v2 ancestry cannot use that omission to fall back to the legacy converter.
+The gate rechecks the actual accepted human source, delivered display, reply and
+decision in the same financial snapshot as conversion or readback; AI lineage
+is independently reauthenticated as well. V1-only AI and receipt flows keep
+their existing authority paths.
 
 Service construction fixes its SQLite connection, source verifier, human
 principal and service-instance binding, human-decision authority and clock.

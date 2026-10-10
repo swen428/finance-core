@@ -48,7 +48,56 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
+EXPECTED_LEDGER_DIGEST = "888821f03d706ea751029aabe5c5f7a8bb3d7e9c923e3dff10aab99c149c4b22"
+EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
+EXPECTED_LEDGER_PREFIX_057 = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
+EXPECTED_AI_FEATURE_CONSTANTS = {
+    "AI_INPUT_SCHEMA": "finance-independent-ai-input-v1",
+    "AI_RESULT_SCHEMA": "finance-independent-ai-result-v1",
+    "AI_PUBLICATION_SCHEMA": "finance-independent-ai-publication-v1",
+    "AI_INTERPRETATION_SCHEMA": "finance-independent-ai-interpretation-input-v1",
+}
+EXPECTED_AI_ASSET_HASHES = {
+    "prompt_v1.txt": "351cff1db65d8c3aa56a7a73ff2b72753f41b7fce5fb187a3ae35025c47dfe40",
+    "schema_v1.json": "84e46f4efcb9eb8100553815b0244a78cb141ce1aaa061fa9b125f90054ef1b0",
+    "policy_v1.json": "7ca7503569947ed09fbf2b5ab31b8d333b24b4bfb83d4235baafac94b57e4d8a",
+    "text_readiness_v1.json": "3cc43eb20b7f317632da2d59044a0e14918b84ffc986df58663c3d2927c10cd6",
+}
+EXPECTED_AI_REGISTRY_SHA256 = "e60958d34099c366ac33399fa6e6b92c111e00a8e7885fc929dc8d238364e66f"
+EXPECTED_AI_V2_REGISTRY_SHA256 = "7d1f5430c1cd00892b0eb764adfd03ca210ee22ee6fdbd3263da87c88bdbd9f8"
+EXPECTED_AI_V2_ASSET_HASHES = {
+    "feature_v2.json": "a74c8b112df8c0b4641203b10ad341ec10038eecfbf03ab221d507971adcd036",
+    "policy_v2.json": "cf6dcb6d606c7a48b5cf63623272306cbbcad889a738fb255caa77679d894fef",
+    "prompt_v2.txt": "72bd6c06e85c83bcf942b731ba9325a372add5766d21eca21f5971ae1741d8a9",
+    "schema_v2.json": "18c1cdfe00e0fd670e2c5d5d1048fab1a2a32ecb8b8194797dc53f4e89535f60",
+}
+EXPECTED_AI_V2_FEATURE = {
+    "historical_read_only": ["finance-independent-ai-input-v1"],
+    "methods": [
+        "prepare_initial",
+        "prepare_edit",
+        "prepare_clarification",
+        "get_clarification",
+        "prepare_followup",
+        "claim",
+        "invoke",
+        "record_outcome",
+        "publish",
+        "cancel",
+        "get_status",
+        "recover",
+    ],
+    "minimum_migration": "059",
+    "schema": "finance-independent-ai-feature-v2",
+    "subschemas": [
+        "finance-independent-ai-input-v2",
+        "finance-independent-ai-result-v2",
+        "finance-independent-ai-publication-v2",
+        "finance-independent-ai-interpretation-input-v2",
+        "finance-application-posting-review-v2",
+        "finance-application-posting-human-decision-v2",
+    ],
+}
 
 
 def _load_bridge_distribution_verifier(script: Path):
@@ -95,13 +144,13 @@ def _bridge_migration_payloads() -> dict[str, bytes]:
     }
 
 
-def _synthetic_057_migration_payloads() -> dict[str, bytes]:
+def _synthetic_059_migration_payloads() -> dict[str, bytes]:
     payloads = {
         path: body
         for path, body in _bridge_migration_payloads().items()
-        if int(PurePosixPath(path).name[:3]) <= 56
+        if int(PurePosixPath(path).name[:3]) <= 58
     }
-    payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"] = (
+    payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
     return payloads
@@ -117,32 +166,32 @@ def _payload_ledger_digest(payloads: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def test_bridge_distribution_inventory_accepts_synthetic_complete_057(
+def test_bridge_distribution_inventory_accepts_synthetic_complete_059(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
+    payloads = _synthetic_059_migration_payloads()
 
-    assert len(payloads) == 57
+    assert len(payloads) == 59
     assert bridge_distribution_verifier._migration_digest(payloads) == _payload_ledger_digest(
         payloads
     )
 
 
-def test_bridge_distribution_inventory_rejects_missing_synthetic_057(
+def test_bridge_distribution_inventory_rejects_missing_synthetic_059(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
-    del payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"]
+    payloads = _synthetic_059_migration_payloads()
+    del payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"]
 
     with pytest.raises(ValueError, match="migration inventory"):
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_rejects_extra_synthetic_058(
+def test_bridge_distribution_inventory_rejects_extra_synthetic_060(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
-    payloads["finance_core/resources/migrations/058_synthetic_inventory.sql"] = (
+    payloads = _synthetic_059_migration_payloads()
+    payloads["finance_core/resources/migrations/060_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
@@ -150,27 +199,27 @@ def test_bridge_distribution_inventory_rejects_extra_synthetic_058(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_057(
+def test_bridge_distribution_inventory_accepts_reviewed_complete_059(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 57
+    assert len(payloads) == 59
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing_057", "missing_middle", "extra_058", "duplicate_055"]
+    "mutation", ["missing_059", "missing_middle", "extra_060", "duplicate_055"]
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
 ) -> None:
     payloads = _bridge_migration_payloads()
-    if mutation in {"missing_057", "missing_middle"}:
-        sequence = "057_" if mutation == "missing_057" else "028_"
+    if mutation in {"missing_059", "missing_middle"}:
+        sequence = "059_" if mutation == "missing_059" else "028_"
         missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
         del payloads[missing]
     else:
-        sequence = "058" if mutation == "extra_058" else "055"
+        sequence = "060" if mutation == "extra_060" else "055"
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -182,7 +231,7 @@ def test_bridge_distribution_inventory_byte_change_cannot_match_pinned_ledger(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("057_"))
+    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("059_"))
     payloads[migration] += b"\n-- synthetic byte change, never written to source\n"
     observed = bridge_distribution_verifier._migration_digest(payloads)
     assert observed != EXPECTED_LEDGER_DIGEST
@@ -214,11 +263,19 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 57
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 58))
+    assert len(paths) == 59
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 60))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
+    assert _ledger_digest(paths[:58]) == EXPECTED_LEDGER_PREFIX_058
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
+
+
+def test_previous_migration_bytes_remain_unchanged_through_057() -> None:
+    paths = migration_resource_paths()
+
+    assert len(paths) == 59
+    assert _ledger_digest(paths[:57]) == EXPECTED_LEDGER_PREFIX_057
 
 
 def test_migration_runtime_authority_reloads_the_non_executable_contract(
@@ -230,9 +287,26 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 57
+    assert len(paths) == 59
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
+
+
+def test_migration_runtime_rejects_reordered_contract_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest, filenames = resource_runtime._load_migration_contract()
+    monkeypatch.setattr(
+        resource_runtime,
+        "_load_migration_contract",
+        lambda: (digest, tuple(reversed(filenames))),
+    )
+    migration_resource_paths.cache_clear()
+    try:
+        with pytest.raises(resource_runtime.MigrationResourceError, match="inventory has drifted"):
+            migration_resource_paths()
+    finally:
+        migration_resource_paths.cache_clear()
 
 
 def test_migration_runtime_consumes_the_package_resources() -> None:
@@ -282,18 +356,63 @@ def _probe_installed_package(
             "-S",
             "-c",
             (
-                "import importlib.util, json, sys; "
+                "import hashlib, importlib.util, json, sys; "
                 f"sys.path.insert(0, {str(install_dir)!r}); "
                 "import finance_core; "
+                "import dataclasses; "
+                "from finance_core.application.ai_invocation import AiInvocationService; "
+                "import finance_core.application.ai_invocation_contract as ai_contract; "
+                "from finance_core.application.ai_invocation_contract import ("
+                "ClarificationReview, ClarificationStatus, ExpectedInterpretationInputV2, "
+                "VerifiedInterpretationInputV2); "
+                "from finance_core.application.ai_invocation_v2 import CLARIFICATION_SCHEMA; "
+                "from finance_core.parser_proposals.independent_ai_validation import assets; "
                 "from finance_core.resources import ("
                 "MIGRATION_LEDGER_DIGEST, MIGRATION_PREFLIGHT_SHA256, "
                 "migration_preflight_path, migration_resource_paths); "
                 "from decimal import Decimal; "
                 "from importlib.metadata import distribution; "
+                "from importlib.resources import files; "
                 "dist = distribution('finance-core'); "
+                "ai_root = files('finance_core.resources').joinpath('independent_ai'); "
+                "ai_assets = assets(); "
+                "ai_asset_hashes = {name: hashlib.sha256("
+                "ai_root.joinpath(name).read_bytes()).hexdigest() for name in ai_assets}; "
+                "ai_assets_v2 = assets('v2'); "
+                "ai_asset_hashes_v2 = {name: hashlib.sha256("
+                "ai_root.joinpath(name).read_bytes()).hexdigest() for name in ai_assets_v2}; "
+                "v2_feature = json.loads(ai_root.joinpath('feature_v2.json').read_text()); "
+                "v2_types = (ClarificationReview, ClarificationStatus, "
+                "ExpectedInterpretationInputV2, VerifiedInterpretationInputV2); "
                 "print(json.dumps({"
                 "'api': finance_core.API_CONTRACT_VERSION, "
                 "'canonical': finance_core.canonical_money_str(Decimal('12.3'), 'SGD'), "
+                "'ai_service_module': AiInvocationService.__module__, "
+                "'ai_contract_module': ai_contract.__name__, "
+                "'ai_feature_constants': {name: getattr(ai_contract, name + '_V1') for name in ("
+                "'AI_INPUT_SCHEMA', 'AI_RESULT_SCHEMA', 'AI_PUBLICATION_SCHEMA', "
+                "'AI_INTERPRETATION_SCHEMA')}, "
+                "'interpretation_policy': vars(ai_contract.InterpretationPolicy('UTC', 'SGD')), "
+                "'ai_asset_hashes': ai_asset_hashes, "
+                "'ai_asset_paths': [str(ai_root.joinpath(name)) for name in ai_assets], "
+                "'ai_registry_path': str(ai_root.joinpath('registry_v1.json')), "
+                "'ai_registry_sha256': hashlib.sha256("
+                "ai_root.joinpath('registry_v1.json').read_bytes()).hexdigest(), "
+                "'ai_v2_feature_constants': {name: getattr(ai_contract, name) for name in ("
+                "'AI_INPUT_SCHEMA', 'AI_RESULT_SCHEMA', 'AI_PUBLICATION_SCHEMA', "
+                "'AI_INTERPRETATION_SCHEMA')}, "
+                "'ai_v2_asset_hashes': ai_asset_hashes_v2, "
+                "'ai_v2_asset_paths': [str(ai_root.joinpath(name)) for name in ai_assets_v2], "
+                "'ai_v2_registry_path': str(ai_root.joinpath('registry_v2.json')), "
+                "'ai_v2_registry_sha256': hashlib.sha256("
+                "ai_root.joinpath('registry_v2.json').read_bytes()).hexdigest(), "
+                "'ai_v2_feature': v2_feature, "
+                "'ai_v2_clarification_schema': CLARIFICATION_SCHEMA, "
+                "'ai_v2_methods': {name: callable(getattr(AiInvocationService, name, None)) "
+                "for name in v2_feature['methods']}, "
+                "'ai_v2_type_modules': {item.__name__: item.__module__ for item in v2_types}, "
+                "'ai_v2_type_fields': {item.__name__: [field.name for field in "
+                "dataclasses.fields(item)] for item in v2_types}, "
                 "'distribution_name': dist.metadata['Name'], "
                 "'distribution_version': dist.version, "
                 "'money_module': finance_core.Money.__module__, "
@@ -301,6 +420,7 @@ def _probe_installed_package(
                 "'migration_count': len(migration_resource_paths()), "
                 "'migration_digest': MIGRATION_LEDGER_DIGEST, "
                 "'migration_paths': [str(path) for path in migration_resource_paths()], "
+                "'migration_filenames': [path.name for path in migration_resource_paths()], "
                 "'preflight_path': str(migration_preflight_path()), "
                 "'preflight_sha256': MIGRATION_PREFLIGHT_SHA256, "
                 "'broad_modules': all(importlib.util.find_spec(name) is not None for name in ("
@@ -499,10 +619,87 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir)
         assert payload["api"] == "finance-core-api-v1"
         assert payload["canonical"] == "12.30"
+        assert payload["ai_service_module"] == "finance_core.application.ai_invocation"
+        assert payload["ai_contract_module"] == "finance_core.application.ai_invocation_contract"
+        assert payload["ai_feature_constants"] == EXPECTED_AI_FEATURE_CONSTANTS
+        assert payload["interpretation_policy"] == {"timezone": "UTC", "default_currency": "SGD"}
+        assert payload["ai_asset_hashes"] == EXPECTED_AI_ASSET_HASHES
+        assert payload["ai_registry_sha256"] == EXPECTED_AI_REGISTRY_SHA256
+        assert payload["ai_v2_feature_constants"] == {
+            "AI_INPUT_SCHEMA": "finance-independent-ai-input-v2",
+            "AI_RESULT_SCHEMA": "finance-independent-ai-result-v2",
+            "AI_PUBLICATION_SCHEMA": "finance-independent-ai-publication-v2",
+            "AI_INTERPRETATION_SCHEMA": "finance-independent-ai-interpretation-input-v2",
+        }
+        assert payload["ai_v2_asset_hashes"] == EXPECTED_AI_V2_ASSET_HASHES
+        assert payload["ai_v2_registry_sha256"] == EXPECTED_AI_V2_REGISTRY_SHA256
+        assert payload["ai_v2_feature"] == EXPECTED_AI_V2_FEATURE
+        assert (
+            payload["ai_v2_clarification_schema"]
+            == "finance-independent-ai-clarification-review-v2"
+        )
+        assert payload["ai_v2_methods"] == {
+            name: True for name in EXPECTED_AI_V2_FEATURE["methods"]
+        }
+        assert payload["ai_v2_type_modules"] == {
+            "ClarificationReview": "finance_core.application.ai_invocation_contract",
+            "ClarificationStatus": "finance_core.application.ai_invocation_contract",
+            "ExpectedInterpretationInputV2": "finance_core.application.ai_invocation_contract",
+            "VerifiedInterpretationInputV2": "finance_core.application.ai_invocation_contract",
+        }
+        assert payload["ai_v2_type_fields"] == {
+            "ClarificationReview": ["request_id", "request_hash", "projection", "expires_at"],
+            "ClarificationStatus": ["request_id", "state", "projection", "expires_at"],
+            "ExpectedInterpretationInputV2": [
+                "binding",
+                "source",
+                "interaction_kind",
+                "interaction_id",
+                "interaction_projection_hash",
+                "proposal_public_id",
+                "proposal_version",
+                "proposal_content_hash",
+                "checked_at",
+                "historical",
+            ],
+            "VerifiedInterpretationInputV2": [
+                "schema",
+                "instance_id",
+                "human_principal_id",
+                "evidence_id",
+                "evidence_digest",
+                "source_evidence_id",
+                "source_evidence_digest",
+                "interaction_kind",
+                "interaction_id",
+                "interaction_projection_hash",
+                "proposal_public_id",
+                "proposal_version",
+                "proposal_content_hash",
+                "display_id",
+                "display_evidence_digest",
+                "reply_to_display_id",
+                "text",
+                "observed_at",
+                "expires_at",
+                "revoked",
+            ],
+        }
+        assert all(
+            Path(path).resolve().is_relative_to(install_dir.resolve())
+            for path in [
+                *payload["ai_asset_paths"],
+                payload["ai_registry_path"],
+                *payload["ai_v2_asset_paths"],
+                payload["ai_v2_registry_path"],
+            ]
+        )
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.6"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 57
+        assert payload["migration_count"] == 59
+        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 60))
+        assert payload["migration_filenames"][-1] == "059_independent_ai_clarification.sql"
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
@@ -553,11 +750,12 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert "FINANCE_RUNTIME_ROOT is required" in missing_runtime.stderr
 
     distribution_prefix = "finance_core-0.1.6.dist-info"
-    expected_package_members = {
-        path.relative_to(REPOSITORY_ROOT).as_posix()
+    expected_package_payloads = {
+        path.relative_to(REPOSITORY_ROOT).as_posix(): path.read_bytes()
         for path in (REPOSITORY_ROOT / "finance_core").rglob("*")
         if path.is_file() and path.suffix in {".json", ".py", ".sql", ".txt"}
     }
+    expected_package_members = set(expected_package_payloads)
     expected_metadata_members = {
         f"{distribution_prefix}/METADATA",
         f"{distribution_prefix}/RECORD",
@@ -570,6 +768,8 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
     with zipfile.ZipFile(wheels[0]) as archive:
         assert set(archive.namelist()) == expected_package_members | expected_metadata_members
         assert archive.read(f"{distribution_prefix}/top_level.txt") == b"finance_core\n"
+        for name, expected_payload in expected_package_payloads.items():
+            assert archive.read(name) == expected_payload
         _assert_safe_text_payloads([archive.read(name) for name in archive.namelist()])
 
     expected_sdist_metadata = {
@@ -599,8 +799,14 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         expected_source_files = {PurePosixPath(path).parts for path in expected_package_members}
         assert observed_files == expected_source_files | expected_sdist_metadata
         payloads = []
+        observed_source_payloads: dict[str, bytes] = {}
         for member in files:
             extracted = archive.extractfile(member)
             assert extracted is not None
-            payloads.append(extracted.read())
+            payload = extracted.read()
+            payloads.append(payload)
+            relative_path = PurePosixPath(member.name).parts[1:]
+            observed_source_payloads[PurePosixPath(*relative_path).as_posix()] = payload
+        for name, expected_payload in expected_package_payloads.items():
+            assert observed_source_payloads[name] == expected_payload
         _assert_safe_text_payloads(payloads)
