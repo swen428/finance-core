@@ -49,9 +49,10 @@ image hash. That hash may differ from both the locally normalized attachment
 hash and the raw-intake marker hash. Core always checks the retained raw input
 against its own hash; only text selection requires the verified source hash to
 equal that raw-input hash. OCR selection still requires the same intake and
-lineage, verified local extraction, complete OCR blocks and qualified receipt
-TOTAL before reconstructing the deny-only source text. None of these hashes is
-substituted for another.
+lineage, verified local extraction and complete OCR blocks, and runs the existing
+receipt TOTAL qualification checks when reconstructing the deny-only source
+text. Incomplete or ambiguous money remains unresolved for clarification. None
+of these hashes is substituted for another.
 At most six unique-field set operations affect amount/currency/transaction_date/
 merchant/description/category. Non-date operations use operation_id/op/field/
 value/evidence; date operations substitute date_expression for value. Money is a
