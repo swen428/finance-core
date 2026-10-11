@@ -308,3 +308,110 @@ def test_real_ai_target_and_same_source_sibling_keep_exact_owner_and_fixed_port(
         assert connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
     finally:
         connection.close()
+
+
+def _native_058(tmp_path):
+    connection, parser_id, request = _native(tmp_path, 54)
+    apply_migration_paths(connection, TEMP_DB_MIGRATION_PATHS[:58])
+    return connection, parser_id, request
+
+
+def test_native_058_receipt_retains_conversion_replay_and_downstream_guard(tmp_path):
+    connection, parser_id, request = _native_058(tmp_path)
+    try:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='independent_ai_attempts'"
+        ).fetchone()
+        assert not connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name LIKE 'independent_ai_clarification_%' "
+            "OR name LIKE 'independent_ai_followup_%'"
+        ).fetchall()
+        proposal = ParserProposalRepository(connection).get_lineage_row_by_id(parser_id)
+        before = _snapshot(connection)
+        assert has_independent_ai_ancestry(connection, proposal) is False
+        assert require_conversion_authority(connection, request, None, None) is None
+        assert _snapshot(connection) == before
+        result = convert(connection, request)
+        before = _snapshot(connection)
+        assert require_receipt_posting_authority(connection, result.receipt_public_id, None) is None
+        replay = convert(connection, request)
+        assert replay.receipt_public_id == result.receipt_public_id
+        assert replay.conversion_result_hash == result.conversion_result_hash
+        assert _snapshot(connection) == before
+        assert connection.execute("SELECT count(*) FROM receipts").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def _damage_clarification_schema(connection, fault):
+    if fault == "clarification-fragment":
+        connection.execute("CREATE TABLE independent_ai_clarification_orphan (value TEXT)")
+    elif fault == "followup-fragment":
+        connection.execute("CREATE VIEW independent_ai_followup_orphan AS SELECT 1 AS value")
+    else:
+        assert fault in {"missing-trigger", "changed-trigger"}
+        connection.execute("DROP TRIGGER independent_ai_followup_links_no_update")
+        if fault == "changed-trigger":
+            connection.execute(
+                "CREATE TRIGGER independent_ai_followup_links_no_update "
+                "BEFORE UPDATE ON independent_ai_followup_links "
+                "BEGIN SELECT RAISE(ABORT, 'changed immutable guard'); END"
+            )
+    connection.commit()
+
+
+@pytest.mark.parametrize("guard", ["conversion", "receipt"])
+@pytest.mark.parametrize(
+    ("schema", "fault"),
+    [
+        (58, "clarification-fragment"),
+        (58, "followup-fragment"),
+        (59, "missing-trigger"),
+        (59, "changed-trigger"),
+    ],
+)
+def test_partial_clarification_schema_never_selects_native_exemption(
+    tmp_path, schema, guard, fault
+):
+    connection, _, request = _native_058(tmp_path) if schema == 58 else _native(tmp_path, schema)
+    try:
+        result = convert(connection, request) if guard == "receipt" else None
+        _damage_clarification_schema(connection, fault)
+        before = _snapshot(connection)
+        with pytest.raises(AiInvocationError, match="migration 059 absent or changed"):
+            if result is None:
+                require_conversion_authority(connection, request, None, None)
+            else:
+                require_receipt_posting_authority(connection, result.receipt_public_id, None)
+        assert _snapshot(connection) == before
+        assert connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("guard", ["conversion", "receipt"])
+def test_real_ai_receipt_rejects_damaged_clarification_schema(tmp_path, monkeypatch, guard):
+    connection, _, owner, attempt, request, provider = _accepted_ai_receipt(tmp_path, monkeypatch)
+    try:
+        authority = _AcceptedReceiptPostingAuthorization(owner, attempt)
+        receipt = None
+        if guard == "receipt":
+            assert owner.resume_post(attempt).state == "finalized"
+            receipt = connection.execute("SELECT public_id FROM receipts").fetchone()[0]
+        _damage_clarification_schema(connection, "missing-trigger")
+        connection.execute("BEGIN IMMEDIATE")
+        before = _snapshot(connection)
+        with pytest.raises(AiInvocationError, match="migration 059 absent or changed"):
+            if receipt is None:
+                require_conversion_authority(connection, request, None, authority)
+            else:
+                require_receipt_posting_authority(connection, receipt, authority)
+        assert _snapshot(connection) == before
+        assert connection.execute("SELECT count(*) FROM transactions").fetchone()[0] == (
+            0 if receipt is None else 1
+        )
+        assert provider.calls == 1
+        connection.rollback()
+    finally:
+        connection.close()

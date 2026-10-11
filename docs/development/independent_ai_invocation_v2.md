@@ -237,8 +237,11 @@ finalization creates facts and recovery preserves one approved economic event.
 
 Receipt conversion and downstream receipt guards select the actual proposal's
 verified owning lineage before querying independent-AI tables. Native receipts
-on the unchanged 054 schema and fully migrated 059 schema retain their native
-authority checks. Any partial independent schema, or an independent-AI origin
+on the unchanged 054 schema, complete 058 schema without any 059 namespace,
+and fully migrated 059 schema retain their native authority checks. If any
+clarification/followup schema object exists, the shared lineage selector requires
+the existing strict 059 fingerprint before selecting native or AI authority.
+Any partial independent schema, or an independent-AI origin
 with missing schema or owner evidence, fails closed. Same-source siblings cannot
 supply or remove the target's authority. Actual v2 receipts still require the fixed accepted
 full-card port at conversion, replay and every downstream financial boundary.

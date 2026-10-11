@@ -73,6 +73,14 @@ def has_independent_ai_ancestry(conn: sqlite3.Connection, proposal: Any) -> bool
     )
     if has_schema:
         require_ai_schema(conn)
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name LIKE 'independent_ai_clarification_%' "
+                "OR name LIKE 'independent_ai_followup_%' LIMIT 1"
+            ).fetchone()
+            is not None
+        ):
+            require_clarification_schema(conn)
     current = repository.get_lineage_row_by_id(proposal["id"])
     visited: set[int] = set()
     while current is not None:
