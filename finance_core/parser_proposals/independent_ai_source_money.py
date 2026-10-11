@@ -279,15 +279,13 @@ def _v2_intent_source_text(conn, material):
         if retained is None or not isinstance(retained["raw_input"], str):
             raise ValueError("intent_source_absent")
         digest = hashlib.sha256(retained["raw_input"].encode("utf-8")).hexdigest()
-        if (
-            source["source_content_hash"] != digest
-            or retained["source_content_hash"] != "sha256:" + digest
-        ):
+        if retained["source_content_hash"] != "sha256:" + digest:
             raise ValueError("intent_source_hash")
         if projection["selection"]["kind"] == "text":
             text = retained["raw_input"]
             if (
-                parent["attachment_id"] is not None
+                source["source_content_hash"] != digest
+                or parent["attachment_id"] is not None
                 or parent["raw_text"] != text
                 or projection["selection"]
                 != {"kind": "text", "source_public_id": parent["source_public_id"]}
