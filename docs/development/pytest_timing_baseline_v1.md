@@ -51,3 +51,9 @@ the pytest job limit is 90 minutes. Four single-process shards, all ten
 required jobs, complete test inventory, source trust and acceptance remain
 unchanged. The larger bound is not proof of completion; only a complete
 successful exact-head run supplies authoritative validation.
+
+As of October 11, 2026, the pytest job timeout is 120 minutes. This change is
+limited to that job-level timeout; the four single-process shards, test
+inventory, required jobs and acceptance remain unchanged. The timeout is an
+upper bound, not an expected duration or proof of completion; only a complete
+successful exact-head run supplies authoritative validation.
