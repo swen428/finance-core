@@ -3266,6 +3266,218 @@ def test_v2_initial_bounded_merchant_date_words_remain_literal(merchant, quoted)
     assert result["payload"]["merchant"] == merchant
 
 
+def _reply_owner_obligation_cases():
+    from finance_core.parser_proposals.independent_ai_validation import canonical_text
+
+    cases = []
+
+    def add(label, text, fields, evidence, *, pending=(), expected="VALID", target=None):
+        cases.append(
+            pytest.param(
+                {
+                    "text": text,
+                    "fields": fields,
+                    "evidence": evidence,
+                    "pending": pending,
+                    "expected": expected,
+                    "target": target,
+                },
+                id=label,
+            )
+        )
+
+    owners = [
+        ("merchant:", "merchant", "New Cafe"),
+        ("description:", "description", "Dinner"),
+        ("category:", "category", "drinks"),
+        ("at", "merchant", "New Cafe"),
+    ]
+    for head, field, value in owners:
+        for variant in (
+            "omit",
+            "full",
+            "keep_conflict",
+            "duplicate_conflict",
+            "duplicate_consistent",
+            "keep_alone",
+            "keep_consistent",
+        ):
+            text = f'{head} "{value}"; change amount to SGD 15.00'
+            fields = {"amount": "15.00"}
+            evidence = {"amount": [cite(text, "15.00", "reply")]}
+            pending = ()
+            expected = "NEEDS_CLARIFICATION" if variant == "omit" else "VALID"
+            if variant == "full":
+                fields[field] = value
+                evidence[field] = [cite(text, value, "reply")]
+            elif variant in {"keep_conflict", "keep_alone", "keep_consistent"}:
+                text = f"Keep {field}"
+                if variant != "keep_alone":
+                    selected = value if variant == "keep_conflict" else ORIGINAL[field]
+                    text = f'{head} "{selected}"; {text}'
+                fields, pending = {field: ORIGINAL[field]}, (field,)
+                evidence = {field: [cite(text, ref="reply")]}
+                if variant == "keep_conflict":
+                    expected = "NEEDS_CLARIFICATION"
+            elif variant in {"duplicate_conflict", "duplicate_consistent"}:
+                second = "Other Value" if variant == "duplicate_conflict" else value
+                text = f'{head} "{value}"; {head} "{second}"'
+                fields = {field: value}
+                evidence = {field: [cite(text, value, "reply")]}
+                if variant == "duplicate_conflict":
+                    expected = "NEEDS_CLARIFICATION"
+            add(
+                head + "/" + variant,
+                text,
+                fields,
+                evidence,
+                pending=pending,
+                expected=expected,
+                target=field,
+            )
+
+    for kind in ("ordinary", "pending"):
+        for second in ("New Cafe", "Other Cafe"):
+            text = f'at "New Cafe"; merchant: "{second}"'
+            add(
+                "mixed-heads/" + kind + "/" + second,
+                text,
+                {"merchant": second},
+                {"merchant": [cite(text, ref="reply")]},
+                pending=("merchant",) if kind == "pending" else (),
+                expected="VALID" if second == "New Cafe" else "NEEDS_CLARIFICATION",
+                target="merchant",
+            )
+
+    for field in ("description", "category"):
+        for kind in ("ordinary", "pending"):
+            text = f'{field}: "Note"; Clear {field}'
+            add(
+                "clear-conflict/" + field + "/" + kind,
+                text,
+                {field: None},
+                {field: [cite(text, ref="reply")]},
+                pending=(field,) if kind == "pending" else (),
+                expected="NEEDS_CLARIFICATION",
+                target=field,
+            )
+
+    for kind in ("ordinary", "pending"):
+        for outside in (False, True):
+            text = 'category: "currency: USD"; currency: USD'
+            citation = cite(text, "USD", "reply")
+            if outside:
+                citation = {**citation, "start": text.rindex("USD"), "end": len(text)}
+            add(
+                "currency/" + kind + ("/outside" if outside else "/inner"),
+                text,
+                {"category": "currency: USD", "currency": "USD"},
+                {"currency": [citation]},
+                pending=("currency",) if kind == "pending" else (),
+                expected="VALID" if outside else "NEEDS_CLARIFICATION",
+                target="currency",
+            )
+
+    for kind in ("ordinary", "pending"):
+        text = "Use $ 15.00"
+        add(
+            "dollar/" + kind,
+            text,
+            {"amount": "15.00", "currency": "SGD"},
+            {"amount": [cite(text, "15.00", "reply")], "currency": [cite(text, "$", "reply")]},
+            pending=("currency",) if kind == "pending" else (),
+            expected="VALID" if kind == "ordinary" else "NEEDS_CLARIFICATION",
+            target="currency",
+        )
+
+    text = "Use SGD 15.00"
+    add(
+        "currency/context-only-retained",
+        text,
+        {"amount": "15.00", "currency": "SGD"},
+        {
+            "amount": [cite(text, "15.00", "reply")],
+            "currency": [cite(canonical_text(ORIGINAL), "SGD", "context", "retained_value")],
+        },
+    )
+    return cases
+
+
+@pytest.mark.parametrize("case", _reply_owner_obligation_cases())
+def test_v2_reply_owner_obligation_inventory(case):
+    result = _v2_rule_validate(
+        "clarification_followup" if case["pending"] else "card_edit",
+        case["text"],
+        case["fields"],
+        evidence=case["evidence"],
+        unresolved_fields=case["pending"],
+    )
+    assert result["state"] == case["expected"], result
+    if case["expected"] == "NEEDS_CLARIFICATION":
+        assert _reply_literal_pending(result) == {case["target"]}, result
+        assert result["draft_values"][case["target"]] == ORIGINAL[case["target"]], result
+    else:
+        assert {field: result["payload"][field] for field in case["fields"]} == case["fields"], (
+            result
+        )
+
+
+def test_v2_reply_owner_service_omitted_quoted_at_requires_merchant_before_single_post(
+    migrated_temp_db_connection,
+):
+    c = migrated_temp_db_connection
+    ai, provider, initial = published_text(c, "owner-omitted-at")
+    owner = posting(c, ai)
+    old_card = owner.prepare(initial.proposal_public_id)
+    original_publications = c.execute(
+        "SELECT count(*) FROM independent_ai_publications"
+    ).fetchone()[0]
+    text = 'at "New Cafe"; change amount to SGD 15.00'
+    proof = persist_reply(c, old_card, text, identity="owner-omitted-at-reply")
+    provider.response = wire(
+        text, {"amount": "15.00"}, ref="reply", evidence={"amount": [cite(text, "15.00", "reply")]}
+    )
+    edit = ai.prepare_edit(old_card.review_id, proof, "owner-omitted-at-edit")
+    assert ai.invoke(edit.attempt_id).state == "NEEDS_CLARIFICATION"
+    question = ai.prepare_clarification(edit.attempt_id)
+    assert {field for q in question.projection["unresolved"] for field in q["fields"]} == {
+        "merchant"
+    }
+    assert question.projection["draft_values"]["amount"] == "15.00"
+    assert question.projection["draft_values"]["merchant"] == ORIGINAL["merchant"]
+    assert question.projection["confirm_available"] is False
+    with pytest.raises(AiInvocationError):
+        ai.publish(edit.attempt_id)
+    assert (
+        c.execute("SELECT count(*) FROM independent_ai_publications").fetchone()[0]
+        == original_publications
+    )
+    assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM application_posting_attempts").fetchone()[0] == 0
+
+    answer = "merchant: New Cafe"
+    proof = persist_reply(c, question, answer, identity="owner-real-merchant-reply")
+    provider.response = wire(answer, {"merchant": "New Cafe"}, ref="reply")
+    followup = ai.prepare_followup(question.request_id, proof, "owner-real-merchant-followup")
+    assert ai.invoke(followup.attempt_id).state == "VALID"
+    published = ai.publish(followup.attempt_id)
+    final_card, final = finish_post(c, ai, published, "owner-real-merchant-confirm")
+    assert final_card.review_hash != old_card.review_hash
+    assert final_card.projection["proposal_review"]["confirm_available"] is True
+    assert final_card.projection["expense_assessment"]["canonical_fields"]["amount"] == "15.00"
+    assert final_card.projection["expense_assessment"]["canonical_fields"]["merchant"] == "New Cafe"
+    assert tuple(
+        c.execute(
+            "SELECT amount,currency,merchant,description,category,public_id FROM transactions"
+        ).fetchone()
+    ) == (15.0, "SGD", "New Cafe", "Lunch", "food", final.transaction_public_id)
+    assert owner.get_status(final.attempt_id).transaction_public_id == final.transaction_public_id
+    assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM application_posting_attempts").fetchone()[0] == 1
+    assert c.execute("SELECT count(*) FROM application_posting_decisions").fetchone()[0] == 1
+    assert provider.calls == 3
+
+
 _REPLY_LITERAL_CASES = [
     ("amount", "description", "15.00", "amount: SGD 15.00"),
     ("currency", "category", "USD", "currency: USD"),
@@ -6493,11 +6705,8 @@ def test_v2_rule_contract_quoted_at_money_followup_keeps_real_category_question(
     )
     assert isinstance(first.get("draft_values"), dict), first
     failures = []
-    first_pending = tuple(
-        field
-        for field in ("amount", "currency", "category")
-        if field in _quoted_at_unresolved_fields(first)
-    )
+    first_pending = tuple(sorted(_quoted_at_unresolved_fields(first)))
+    assert "merchant" in first_pending, first
     if first.get("state") != "NEEDS_CLARIFICATION":
         failures.append(("quoted-at reply was not clarification", first))
     if "category" not in first_pending:
@@ -6505,11 +6714,11 @@ def test_v2_rule_contract_quoted_at_money_followup_keeps_real_category_question(
     if first["draft_values"].get("category") != ORIGINAL["category"]:
         failures.append(("first draft did not preserve category", first))
 
-    money_text = "amount SGD 12.50"
+    money_text = "amount SGD 12.50; Keep merchant"
     money = _v2_rule_validate(
         "clarification_followup",
         money_text,
-        {"amount": "12.50", "currency": "SGD"},
+        {"amount": "12.50", "currency": "SGD", "merchant": ORIGINAL["merchant"]},
         current_values=ORIGINAL,
         base=ORIGINAL,
         unresolved_fields=first_pending,
@@ -6517,6 +6726,7 @@ def test_v2_rule_contract_quoted_at_money_followup_keeps_real_category_question(
         evidence={
             "amount": [cite(money_text, ref="reply")],
             "currency": [cite(money_text, ref="reply")],
+            "merchant": [cite(money_text, "Keep merchant", "reply")],
         },
     )
     money_pending = _quoted_at_unresolved_fields(money)
@@ -6577,16 +6787,20 @@ def test_v2_rule_service_quoted_at_clear_requires_real_clear_before_single_post(
     assert "category" in {
         field for item in question.projection["unresolved"] for field in item["fields"]
     }, question.projection
+    assert "merchant" in {
+        field for item in question.projection["unresolved"] for field in item["fields"]
+    }, question.projection
     assert question.projection["draft_values"]["category"] == ORIGINAL["category"]
     assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
     assert c.execute("SELECT count(*) FROM application_posting_attempts").fetchone()[0] == 0
 
-    money_reply = "amount SGD 12.50"
+    money_reply = "amount SGD 12.50; Keep merchant"
     money_proof = persist_reply(c, question, money_reply, identity="quoted-at-clear-money-reply")
     provider.response = wire(
         money_reply,
-        {"amount": "12.50", "currency": "SGD"},
+        {"amount": "12.50", "currency": "SGD", "merchant": ORIGINAL["merchant"]},
         ref="reply",
+        evidence={"merchant": [cite(money_reply, "Keep merchant", "reply")]},
     )
     money_attempt = ai.prepare_followup(
         question.request_id,

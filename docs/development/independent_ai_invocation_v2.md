@@ -140,6 +140,12 @@ a nested same-field label or a shortened part of that value. An identical value
 outside a literal needs its own exact outside citation. Unsupported answers
 retain their pre-patch canonical value and outstanding question across followups;
 independently supported partial answers still carry forward.
+The existing three named assignment heads and quoted `at` merchant head each
+create a same-field reply obligation even when the model omits that field's
+operation. Every assignment for the same field must be closed and agree with
+the selected complete value. A conflicting duplicate assignment, keep instruction
+or optional clear cannot discharge that obligation; consistent repeated values,
+a supported single assignment and an unopposed explicit keep remain valid.
 Amount/currency/date support must survive the existing explicit text-literal and
 verified date masking. Currency needs an explicit current-reply currency code;
 a bare symbol inherited from context cannot settle its pending choice. Text
@@ -147,6 +153,10 @@ fields need a same-field named assignment outside another field's assigned
 literal in the actual reply; its fresh citation may cover only the assigned
 value. An exact bare value can answer only one pending text field when no
 monetary/date cue makes that answer ambiguous.
+Ordinary explicit currency-code replacements also require an exact citation
+covering the matching currency token outside text literals. An identical code
+inside a literal cannot borrow support from a separate outside token. Existing
+ordinary bare-symbol and context-only currency retention semantics are unchanged.
 Bounded keep/retain/保持/保留 plus the same field name may choose its actual
 current nonnull value. A second same-field instruction or conflicting money/date
 cannot hide behind that choice. A retained date masks only its verified field

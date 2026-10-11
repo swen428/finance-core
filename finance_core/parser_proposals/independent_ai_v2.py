@@ -257,7 +257,28 @@ def _reply_instruction_text(text, assignments):
     return text
 
 
+def _reply_assignment_compatible(field, value, text, assignments):
+    """Every actual same-field owner constrains the answer, including quoted-at."""
+    return all(
+        item["closed"]
+        and unicodedata.normalize("NFC", text[item["value_start"] : item["value_end"]]) == value
+        for item in assignments
+        if item["field"] == field
+    )
+
+
+def _explicit_currency_citation_supported(value, evidence, assessment):
+    return any(
+        token.kind == "currency"
+        and token.currency == value
+        and any(c["start"] <= token.start and token.end <= c["end"] for c in evidence)
+        for token in assessment.partition
+    )
+
+
 def _reply_text_assignment_supported(field, value, evidence, text, assignments, *, named_only):
+    if not _reply_assignment_compatible(field, value, text, assignments):
+        return False
     for item in assignments:
         if item["field"] != field or not item["closed"] or named_only and not item["named"]:
             continue
@@ -339,7 +360,7 @@ def _pending_answer_supported(
         for citation in evidence
         if citation["ref"] == "reply" and citation["role"] == "replacement_value"
     ]
-    if not replacement:
+    if not replacement or not _reply_assignment_compatible(field, value, text, assignments):
         return False
     if value is None:
         return _explicit_optional_clear(field, replacement, instruction_text)
@@ -363,15 +384,7 @@ def _pending_answer_supported(
     if field == "currency":
         # A bare symbol may inherit current currency for a normal edit, but it
         # cannot answer an outstanding currency choice without a fresh code.
-        return any(
-            token.kind == "currency"
-            and token.currency == value
-            and any(
-                citation["start"] <= token.start and token.end <= citation["end"]
-                for citation in replacement
-            )
-            for token in assessment.partition
-        )
+        return _explicit_currency_citation_supported(value, replacement, assessment)
     if field == "transaction_date":
         return any(
             instruction_text[citation["start"] + start : citation["start"] + end]
@@ -934,6 +947,11 @@ def validate_response_v2(
             if text_ref == "reply"
             else _literal_instruction_text(text, text_ref, operations)
         )
+        requested_fields = {item["field"] for item in reply_assignments} | {
+            field
+            for field, pattern in _EDIT_CUES.items()
+            if re.search(pattern, instruction_text, re.I)
+        }
         canonical_patch = _canonical_fields(patch, complete=False)
         retention_spans = {
             field: _fresh_retention_spans(
@@ -1227,14 +1245,14 @@ def validate_response_v2(
         ):
             blockers.add("unanswered_transaction_date")
         if projection["interaction_kind"] != "initial":
-            for field, pattern in _EDIT_CUES.items():
+            for field in _EDIT_CUES:
                 retained_null = (
                     field in {"description", "category"}
                     and field in patch
                     and patch[field] is None
                     and current[field] is None
                     and field not in prior_fields
-                    and not re.search(pattern, instruction_text, re.I)
+                    and field not in requested_fields
                     and bool(evidences.get(field))
                     and all(
                         c["ref"] == "context" and c["role"] == "retained_value"
@@ -1277,10 +1295,24 @@ def validate_response_v2(
                         for c in replacement
                     )
                 )
+                supported_literal = supported_literal and _reply_assignment_compatible(
+                    field, canonical_patch[field], text, reply_assignments
+                )
+                if (
+                    field == "currency"
+                    and field not in retained_pending
+                    and replacement
+                    and any(token.kind == "currency" for token in assessment.partition)
+                ):
+                    # An ordinary explicit-code replacement cites its actual outside
+                    # token too. Bare-dollar and context-only retention stay unchanged.
+                    supported_literal = _explicit_currency_citation_supported(
+                        canonical_patch[field], replacement, assessment
+                    )
                 if (
                     not retained_null
                     and (
-                        re.search(pattern, instruction_text, re.I)
+                        field in requested_fields
                         or field in patch
                         and (patch[field] is None or replacement)
                     )
@@ -1318,7 +1350,12 @@ def validate_response_v2(
                     targets.update(
                         field
                         for field, pattern in _EDIT_CUES.items()
-                        if re.search(pattern, text, re.I) and field not in patch
+                        if (
+                            field in requested_fields
+                            if text_ref == "reply"
+                            else re.search(pattern, text, re.I)
+                        )
+                        and field not in patch
                     )
             covered_fields = {field for question in questions for field in question["fields"]}
             question_ids = {question["question_id"] for question in questions}
