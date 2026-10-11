@@ -157,12 +157,9 @@ def _unsupported_intent(texts):
     return False
 
 
-def _explicit_optional_clear(field, evidence, text, operations):
-    """Require a freshly cited same-field instruction outside assigned literals."""
-    if field not in {"description", "category"}:
-        return False
+def _optional_clear_pattern(field):
     name = _EDIT_CUES[field]
-    instruction = re.compile(
+    return re.compile(
         r"(?:"
         + _CLEAR_CUE
         + r")\s*(?:the\s+)?(?:"
@@ -175,16 +172,23 @@ def _explicit_optional_clear(field, evidence, text, operations):
         + r")(?=\s*(?:$|[;；,，.!！？。\r\n]|\band\b|并且|然后|并))",
         re.I,
     )
-    instruction_text = _literal_instruction_text(
-        text, "reply", [op for op in operations if op["field"] != field]
+
+
+def _reply_assignments(text):
+    """Read top-level literal owners from raw reply syntax, never model choices."""
+    names = "|".join(
+        "(?P<" + field + ">" + _EDIT_CUES[field] + ")"
+        for field in ("merchant", "description", "category")
     )
-    names = "|".join(_EDIT_CUES[name] for name in ("merchant", "description", "category"))
     assignment = re.compile(
-        r"(?:" + names + r")\s*(?:to|as|改为|改成|为|成|是|[:：])\s*|\bat\s*(?=[\"“'])", re.I
+        r"(?:" + names + r")\s*(?:to|as|改为|改成|为|成|是|[:：])\s*"
+        r"|(?P<at>\bat)\s*(?=[\"“'])",
+        re.I,
     )
     all_names = "|".join(_EDIT_CUES.values()) + r"|日期|时间|\bdate\b"
     boundary = re.compile(
-        r"[;；,，.!！？。\r\n]|(?:\band\b|并且|然后|和|并)\s*(?:"
+        r"[;；,，!?！？。\r\n]|(?<![0-9])\.|\.(?![0-9])"
+        r"|(?:\band\b|并且|然后|和|并)\s*(?:(?:\bset\b|\bchange\b)\s+)?(?:"
         + all_names
         + r"|(?:"
         + _CLEAR_CUE
@@ -194,25 +198,33 @@ def _explicit_optional_clear(field, evidence, text, operations):
         re.I,
     )
     quote_pairs = {'"': '"', "'": "'", "“": "”"}
-    # Isolate actual assignments even if another operation is absent or its
-    # selected value is incomplete. Keep offsets in the original reply.
+    result = []
+    consumed = 0
     for match in assignment.finditer(text):
-        if instruction_text[match.start() : match.end()] != text[match.start() : match.end()]:
+        if match.start() < consumed:
             continue
+        field = "merchant" if match.group("at") else match.lastgroup
         # Field-first "category: clear" is an instruction, not a literal value.
-        if instruction.match(text, match.start()):
+        if field in {"description", "category"} and _optional_clear_pattern(field).match(
+            text, match.start()
+        ):
             continue
         start = match.end()
         if start == len(text):
             continue
+        value_start, value_end, closed = start, len(text), True
         if text[start] in quote_pairs:
             close = quote_pairs[text[start]]
+            value_start = start + 1
             end = start + 1
+            closed = False
             while end < len(text):
                 if text[end] == "\\":
                     end += 2
                 elif text[end] == close:
+                    value_end = end
                     end += 1
+                    closed = True
                     break
                 else:
                     end += 1
@@ -220,13 +232,53 @@ def _explicit_optional_clear(field, evidence, text, operations):
         else:
             cut = boundary.search(text, start)
             end = cut.start() if cut else len(text)
-        instruction_text = instruction_text[:start] + " " * (end - start) + instruction_text[end:]
+            value_end = end
+            while value_end > value_start and text[value_end - 1].isspace():
+                value_end -= 1
+        consumed = end
+        result.append(
+            {
+                "field": field,
+                "start": start,
+                "end": end,
+                "value_start": value_start,
+                "value_end": value_end,
+                "closed": closed,
+                "named": not bool(match.group("at")),
+            }
+        )
+    return result
+
+
+def _reply_instruction_text(text, assignments):
+    for item in assignments:
+        start, end = item["start"], item["end"]
+        text = text[:start] + " " * (end - start) + text[end:]
+    return text
+
+
+def _reply_text_assignment_supported(field, value, evidence, text, assignments, *, named_only):
+    for item in assignments:
+        if item["field"] != field or not item["closed"] or named_only and not item["named"]:
+            continue
+        start, end = item["value_start"], item["value_end"]
+        if unicodedata.normalize("NFC", text[start:end]) != value:
+            continue
+        if any(c["start"] <= start and end <= c["end"] for c in evidence):
+            return True
+    return False
+
+
+def _explicit_optional_clear(field, evidence, instruction_text):
+    """Require a freshly cited same-field instruction outside assigned literals."""
+    if field not in {"description", "category"}:
+        return False
     return any(
         citation["ref"] == "reply"
         and citation["role"] == "replacement_value"
         and citation["start"] <= match.start()
         and match.end() <= citation["end"]
-        for match in instruction.finditer(instruction_text)
+        for match in _optional_clear_pattern(field).finditer(instruction_text)
         for citation in evidence
     )
 
@@ -277,7 +329,7 @@ def _pending_answer_supported(
     instruction_text,
     assessment,
     retention,
-    operations,
+    assignments,
 ):
     """One content predicate for all six authenticated pending obligations."""
     if operation is None:
@@ -290,7 +342,7 @@ def _pending_answer_supported(
     if not replacement:
         return False
     if value is None:
-        return _explicit_optional_clear(field, replacement, text, operations)
+        return _explicit_optional_clear(field, replacement, instruction_text)
     if retention:
         if field == "amount":
             return all(
@@ -327,37 +379,10 @@ def _pending_answer_supported(
             for citation in replacement
             for start, end in date_evidence_spans(operation["date_expression"], citation["quote"])
         )
-    # Preserve this field's value but mask every other field's assigned literal.
-    # Words inside a category value cannot impersonate a merchant assignment.
-    field_instruction_text = _literal_instruction_text(
-        text, "reply", [op for op in operations if op["field"] != field]
-    )
-    # Explicit names distinguish text fields even when their values coincide.
-    name = _EDIT_CUES[field]
-    literal = (
-        r"(?:"
-        + name
-        + r")\s*(?:to|as|改为|改成|为|成|是|[:：])\s*[\"“']?"
-        + r"(?P<value>"
-        + re.escape(value)
-        + r")[\"”']?(?=$|[;；,，.!！？。\r\n]|\s+(?:\band\b|并且|然后|和))"
-    )
-    normalized_instruction = unicodedata.normalize("NFC", field_instruction_text)
-    # The field name may be outside the citation. Its actual reply assignment
-    # establishes the field; the fresh exact quote must cover its value span.
-    # Normalize only the matching projection, retaining raw evidence offsets.
-    raw_offsets = None
-    if normalized_instruction != field_instruction_text:
-        raw_offsets = {
-            len(unicodedata.normalize("NFC", field_instruction_text[:index])): index
-            for index in range(len(field_instruction_text) + 1)
-        }
-    for match in re.finditer(literal, normalized_instruction, re.I):
-        start, end = match.span("value")
-        if raw_offsets is not None:
-            start, end = raw_offsets[start], raw_offsets[end]
-        if any(c["start"] <= start and end <= c["end"] for c in replacement):
-            return True
+    if _reply_text_assignment_supported(
+        field, value, replacement, text, assignments, named_only=True
+    ):
+        return True
     return (
         len(prior_fields & {"merchant", "description", "category"}) == 1
         and unicodedata.normalize("NFC", text.strip()) == value
@@ -415,6 +440,8 @@ def _literal_instruction_text(
     These are field-bound value spans, not a natural-language date parser.
     All instructions outside each literal remain subject to monetary/date checks.
     """
+    if text_ref == "reply":
+        return _reply_instruction_text(text, _reply_assignments(text))
     spans = []
     for op in operations:
         field, value = op["field"], op.get("value")
@@ -901,7 +928,12 @@ def validate_response_v2(
                     "restrictions": ["unsupported_intent"],
                 },
             }
-        instruction_text = _literal_instruction_text(text, text_ref, operations)
+        reply_assignments = _reply_assignments(text) if text_ref == "reply" else []
+        instruction_text = (
+            _reply_instruction_text(text, reply_assignments)
+            if text_ref == "reply"
+            else _literal_instruction_text(text, text_ref, operations)
+        )
         canonical_patch = _canonical_fields(patch, complete=False)
         retention_spans = {
             field: _fresh_retention_spans(
@@ -918,7 +950,21 @@ def validate_response_v2(
                 c["role"] != "previous_value"
                 and (
                     c["ref"] in {"context", "source_context"}
-                    or date_evidence_supported(date_operation["date_expression"], c["quote"], value)
+                    or (
+                        date_evidence_supported(
+                            date_operation["date_expression"], c["quote"], value
+                        )
+                        and (
+                            text_ref != "reply"
+                            or any(
+                                instruction_text[c["start"] + a : c["start"] + b]
+                                == text[c["start"] + a : c["start"] + b]
+                                for a, b in date_evidence_spans(
+                                    date_operation["date_expression"], c["quote"]
+                                )
+                            )
+                        )
+                    )
                 )
                 for c in evidence
             ):
@@ -936,6 +982,9 @@ def validate_response_v2(
                             for a, b in date_evidence_spans(
                                 date_operation["date_expression"], citation["quote"]
                             )
+                            if text_ref != "reply"
+                            or instruction_text[citation["start"] + a : citation["start"] + b]
+                            == text[citation["start"] + a : citation["start"] + b]
                         )
                 date_spans.extend(retention_spans.get("transaction_date", []))
         canonical = _canonical_fields({**base, **carry, **patch}, complete=False)
@@ -1050,11 +1099,14 @@ def validate_response_v2(
                 instruction_text,
                 assessment,
                 retention_spans.get(field, []),
-                operations,
+                reply_assignments,
             )
         }
         unanswered = prior_fields - supported_pending
         blockers.update("unanswered_" + field for field in unanswered)
+        unchanged = _canonical_fields({**base, **carry}, complete=False)
+        for field in unanswered:
+            canonical[field] = unchanged[field]
         retained_pending = {field for field in supported_pending if retention_spans.get(field)}
         if projection["interaction_kind"] != "initial":
             if (
@@ -1116,6 +1168,8 @@ def validate_response_v2(
                 for span in assessment.spans
             ):
                 blockers.add("unsupported_amount")
+                if text_ref == "reply":
+                    canonical["amount"] = unchanged["amount"]
         if "currency" in patch and not assessment.currencies:
             if projection["interaction_kind"] == "initial":
                 if canonical["currency"] != projection["interpretation_context"][
@@ -1127,6 +1181,7 @@ def validate_response_v2(
                 for c in evidences["currency"]
             ):
                 blockers.add("unsupported_currency_evidence")
+                canonical["currency"] = unchanged["currency"]
         if (
             "currency" in patch
             and assessment.currencies
@@ -1197,31 +1252,45 @@ def validate_response_v2(
                     or any(
                         (
                             isinstance(patch.get(field), str)
-                            and patch[field] in unicodedata.normalize("NFC", c["quote"])
+                            and (
+                                _reply_text_assignment_supported(
+                                    field,
+                                    canonical_patch[field],
+                                    replacement,
+                                    text,
+                                    reply_assignments,
+                                    named_only=False,
+                                )
+                                or (
+                                    not any(item["field"] == field for item in reply_assignments)
+                                    and canonical_patch[field]
+                                    in unicodedata.normalize(
+                                        "NFC", instruction_text[c["start"] : c["end"]]
+                                    )
+                                )
+                            )
                         )
                         or (
                             patch.get(field) is None
-                            and _explicit_optional_clear(field, replacement, text, operations)
+                            and _explicit_optional_clear(field, replacement, instruction_text)
                         )
                         for c in replacement
                     )
                 )
                 if (
                     not retained_null
-                    and (re.search(pattern, text, re.I) or field in patch and patch[field] is None)
+                    and (
+                        re.search(pattern, instruction_text, re.I)
+                        or field in patch
+                        and (patch[field] is None or replacement)
+                    )
                     and (field not in patch or not replacement or not supported_literal)
                 ):
                     blockers.add("unanswered_" + field)
-                    if (
-                        field in {"description", "category"}
-                        and field in patch
-                        and patch[field] is None
-                    ):
-                        # An unsupported clear remains a question, never an
-                        # applied null in the draft shown for clarification.
-                        canonical[field] = _canonical_fields({**base, **carry}, complete=False)[
-                            field
-                        ]
+                    # A model-only answer remains a question, never a solved
+                    # draft value that a later unrelated reply could carry.
+                    if field in patch:
+                        canonical[field] = unchanged[field]
         if questions or any(c["label"] == "unresolved_instruction" for c in response["coverage"]):
             blockers.add("unresolved_instruction")
         if outcome == "clarification" or blockers:

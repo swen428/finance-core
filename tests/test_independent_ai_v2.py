@@ -3266,6 +3266,257 @@ def test_v2_initial_bounded_merchant_date_words_remain_literal(merchant, quoted)
     assert result["payload"]["merchant"] == merchant
 
 
+_REPLY_LITERAL_CASES = [
+    ("amount", "description", "15.00", "amount: SGD 15.00"),
+    ("currency", "category", "USD", "currency: USD"),
+    ("transaction_date", "description", "2026-10-09", "date: 2026-10-09"),
+    ("merchant", "description", "Cafe", "merchant: Cafe"),
+    ("description", "category", "Dinner", "description: Dinner"),
+    ("category", "description", "drinks", "category: drinks"),
+]
+
+
+def _reply_literal_pending(result):
+    return {field for question in result.get("unresolved", []) for field in question["fields"]}
+
+
+def _reply_literal_last_citation(text, quote):
+    start = text.rindex(quote)
+    return {
+        "ref": "reply",
+        "start": start,
+        "end": start + len(quote),
+        "quote": quote,
+        "role": "replacement_value",
+    }
+
+
+@pytest.mark.parametrize("field,outer,value,inner", _REPLY_LITERAL_CASES)
+@pytest.mark.parametrize("outer_operation", ["omitted", "mismatched", "shortened"])
+@pytest.mark.parametrize("kind", ["card_edit", "clarification_followup"])
+def test_v2_reply_literal_owned_text_cannot_answer_another_field(
+    field, outer, value, inner, outer_operation, kind
+):
+    text = f'{outer}: "{inner}"'
+    fields = {field: value}
+    if outer_operation != "omitted":
+        fields[outer] = "Unrelated" if outer_operation == "mismatched" else inner.split(":")[0]
+    result = _v2_rule_validate(
+        kind,
+        text,
+        fields,
+        unresolved_fields=(field,) if kind == "clarification_followup" else (),
+        evidence={field: [cite(text, value, "reply")]},
+    )
+    assert result["state"] == "NEEDS_CLARIFICATION", result
+    assert field in _reply_literal_pending(result), result
+    assert result["draft_values"][field] == ORIGINAL[field], result
+    assert outer in _reply_literal_pending(result), result
+
+
+@pytest.mark.parametrize("field,outer,value,inner", _REPLY_LITERAL_CASES)
+@pytest.mark.parametrize("cite_outside", [False, True])
+def test_v2_reply_literal_genuine_outside_answer_needs_outside_evidence(
+    field, outer, value, inner, cite_outside
+):
+    text = f'{outer}: "{inner}"; {inner}'
+    evidence = (
+        _reply_literal_last_citation(text, value) if cite_outside else cite(text, value, "reply")
+    )
+    result = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: value, outer: inner},
+        unresolved_fields=(field,),
+        evidence={field: [evidence]},
+    )
+    if cite_outside:
+        assert result["state"] == "VALID", result
+        assert result["payload"][field] == value, result
+    else:
+        assert result["state"] == "NEEDS_CLARIFICATION", result
+        assert field in _reply_literal_pending(result), result
+        assert result["draft_values"][field] == ORIGINAL[field], result
+
+
+@pytest.mark.parametrize("field", ["merchant", "description", "category"])
+def test_v2_reply_literal_nested_same_field_is_not_a_shorter_assignment(field):
+    text = f'{field}: "{field}: Cafe"'
+    short = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: "Cafe"},
+        unresolved_fields=(field,),
+        evidence={field: [cite(text, "Cafe", "reply")]},
+    )
+    assert short["state"] == "NEEDS_CLARIFICATION", short
+    assert field in _reply_literal_pending(short), short
+    assert short["draft_values"][field] == ORIGINAL[field], short
+    complete = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: f"{field}: Cafe"},
+        unresolved_fields=(field,),
+    )
+    assert complete["state"] == "VALID", complete
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "description: 'merchant: Cafe'",
+        "description: “merchant: Cafe”",
+        r'description: "note \"merchant: Cafe\" end"',
+        'description: "note;\nmerchant: Cafe"',
+        'description: "merchant: Cafe',
+        "description: merchant: Cafe",
+        "备注：“商户：Cafe”",
+        'at "merchant: Cafe"',
+    ],
+)
+@pytest.mark.parametrize("field,value", [("merchant", "Cafe"), ("transaction_date", "2026-10-09")])
+def test_v2_reply_literal_finite_boundaries_keep_nested_answer_pending(text, field, value):
+    if field == "transaction_date":
+        text = text.replace("merchant: Cafe", "date: 2026-10-09").replace(
+            "商户：Cafe", "日期：2026-10-09"
+        )
+    result = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: value},
+        unresolved_fields=(field,),
+        evidence={field: [cite(text, value, "reply")]},
+    )
+    assert result["state"] == "NEEDS_CLARIFICATION", result
+    assert field in _reply_literal_pending(result), result
+    assert result["draft_values"][field] == ORIGINAL[field], result
+
+
+@pytest.mark.parametrize("field,outer,value,inner", _REPLY_LITERAL_CASES)
+def test_v2_reply_literal_keep_inside_text_cannot_answer_pending(field, outer, value, inner):
+    name = "date" if field == "transaction_date" else field
+    text = f'{outer}: "Keep {name}"'
+    result = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: ORIGINAL[field]},
+        unresolved_fields=(field,),
+        evidence={field: [cite(text, ref="reply")]},
+    )
+    assert result["state"] == "NEEDS_CLARIFICATION", result
+    assert field in _reply_literal_pending(result), result
+
+
+@pytest.mark.parametrize("field,outer,value,inner", _REPLY_LITERAL_CASES)
+def test_v2_reply_literal_two_step_carry_retains_the_real_question(field, outer, value, inner):
+    text = f'{outer}: "{inner}"'
+    first = _v2_rule_validate(
+        "clarification_followup",
+        text,
+        {field: value},
+        unresolved_fields=(field,),
+        evidence={field: [cite(text, value, "reply")]},
+    )
+    assert field in _reply_literal_pending(first), first
+    # Answer only the outer instruction, not the field falsely cited from its value.
+    second_text = f"{outer}: Note"
+    second = _v2_rule_validate(
+        "clarification_followup",
+        second_text,
+        {outer: "Note"},
+        unresolved_fields=tuple(_reply_literal_pending(first)),
+        draft_values=first["draft_values"],
+    )
+    assert second["state"] == "NEEDS_CLARIFICATION", second
+    assert field in _reply_literal_pending(second), second
+    assert second["draft_values"][field] == ORIGINAL[field], second
+    final = _v2_rule_validate(
+        "clarification_followup",
+        inner,
+        {field: value},
+        unresolved_fields=tuple(_reply_literal_pending(second)),
+        draft_values=second["draft_values"],
+    )
+    assert final["state"] == "VALID", final
+    assert final["payload"][field] == value, final
+    assert final["payload"][outer] == "Note", final
+
+
+def test_v2_reply_literal_false_clear_has_no_phantom_money_question():
+    text = 'Set category to "Clear description"'
+    first = _v2_rule_validate("card_edit", text, {"description": None})
+    assert _reply_literal_pending(first) == {"description", "category"}, first
+    actual = 'Set category to "Clear description"; Remove the description'
+    final = _v2_rule_validate(
+        "clarification_followup",
+        actual,
+        {"category": "Clear description", "description": None},
+        unresolved_fields=tuple(_reply_literal_pending(first)),
+        draft_values=first["draft_values"],
+    )
+    assert final["state"] == "VALID", final
+
+
+def test_v2_reply_literal_service_requires_real_answer_before_one_post(migrated_temp_db_connection):
+    c = migrated_temp_db_connection
+    _, _, _, intake, *_ = subject(c, "owned-literal")
+    source = "Lunch SGD 12.50 at Example Cafe 2026-10-08"
+    question = {
+        "question_id": "q_merchant",
+        "fields": ["merchant"],
+        "reason": "ambiguous",
+        "candidates": ["Example Cafe", "Other Cafe"],
+        "evidence": [cite(source)],
+    }
+    ai, provider = service_v2(c, wire(source, {}, unresolved=[question], outcome="clarification"))
+    initial = ai.prepare_initial(intake["public_id"], "owned-literal-initial")
+    assert ai.invoke(initial.attempt_id).state == "NEEDS_CLARIFICATION"
+    card = ai.prepare_clarification(initial.attempt_id)
+    replies = [
+        ('description: "merchant: Cafe"', {"merchant": "Cafe"}),
+        (
+            "Use SGD 12.50; description: Note",
+            {"amount": "12.50", "currency": "SGD", "description": "Note"},
+        ),
+    ]
+    for index, (text, fields) in enumerate(replies):
+        proof = persist_reply(c, card, text, identity=f"owned-literal-reply-{index}")
+        provider.response = wire(text, fields, ref="reply")
+        attempt = ai.prepare_followup(card.request_id, proof, f"owned-literal-op-{index}")
+        assert ai.invoke(attempt.attempt_id).state == "NEEDS_CLARIFICATION"
+        card = ai.prepare_clarification(attempt.attempt_id)
+        pending = {field for q in card.projection["unresolved"] for field in q["fields"]}
+        assert "merchant" in pending, card.projection
+        assert card.projection["draft_values"]["merchant"] == ORIGINAL["merchant"]
+        assert card.projection["confirm_available"] is False
+        with pytest.raises(AiInvocationError):
+            ai.publish(attempt.attempt_id)
+        assert c.execute("SELECT count(*) FROM independent_ai_publications").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+    text = "merchant: Cafe"
+    proof = persist_reply(c, card, text, identity="owned-literal-real-reply")
+    provider.response = wire(text, {"merchant": "Cafe"}, ref="reply")
+    answer = ai.prepare_followup(card.request_id, proof, "owned-literal-real-op")
+    assert ai.invoke(answer.attempt_id).state == "VALID"
+    published = ai.publish(answer.attempt_id)
+    final_card, final = finish_post(c, ai, published, "owned-literal-confirm")
+    assert final_card.projection["expense_assessment"]["canonical_fields"]["merchant"] == "Cafe"
+    assert tuple(
+        c.execute("SELECT amount,currency,merchant,description FROM transactions").fetchone()
+    ) == (
+        12.5,
+        "SGD",
+        "Cafe",
+        "Note",
+    )
+    assert (
+        posting(c, ai).get_status(final.attempt_id).transaction_public_id
+        == final.transaction_public_id
+    )
+    assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+    assert provider.calls == 4
+
+
 _V2_RULE_CONTEXT = {
     "anchor_timestamp": 1791504000,
     "timezone": "UTC",

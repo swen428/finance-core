@@ -128,6 +128,18 @@ context or the existence of a set operation cannot discharge a still-unresolved
 amount, currency or date. A fresh reply may explicitly choose the old value.
 All six pending fields use one fresh-content predicate: an exact reply citation
 must support that field's selected value, not merely carry a replacement role.
+Reply text-literal ownership comes from the authenticated reply's existing
+top-level merchant/description/category assignment syntax, independently of
+omitted, mismatched or shortened model operations. Nested field labels and
+money/date/keep/clear words inside those values cannot answer another field or
+create unrelated questions. The actual outer request remains visible. The same
+raw-offset ownership view serves pending answers, ordinary edits, date evidence,
+money checks, retention and optional clear; initial-source date grammar is
+unchanged. A text answer must match its complete top-level assigned value, not
+a nested same-field label or a shortened part of that value. An identical value
+outside a literal needs its own exact outside citation. Unsupported answers
+retain their pre-patch canonical value and outstanding question across followups;
+independently supported partial answers still carry forward.
 Amount/currency/date support must survive the existing explicit text-literal and
 verified date masking. Currency needs an explicit current-reply currency code;
 a bare symbol inherited from context cannot settle its pending choice. Text
