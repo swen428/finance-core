@@ -30,7 +30,9 @@ from finance_core.application.admission import (
 )
 from finance_core.application.posting_contract import (
     POSTING_DECISION_SCHEMA,
+    POSTING_DECISION_SCHEMA_V2,
     POSTING_REVIEW_SCHEMA,
+    POSTING_REVIEW_SCHEMA_V2,
     posting_review_sha256,
     require_posting_schema,
 )
@@ -257,6 +259,130 @@ class _AcceptedReceiptMetadataAuthority:
             raise PostingError("Receipt metadata seal identity conflict")
 
 
+class _AcceptedReceiptPostingAuthorization:
+    def __init__(self, service, attempt_id):
+        self.service, self.attempt_id = service, attempt_id
+
+    def verify_in_transaction(self, connection, expected):
+        from finance_core.application.ai_expense_assessment import BASIS
+        from finance_core.application.receipt_posting_authorization import (
+            VerifiedReceiptPostingAuthorization,
+        )
+        from finance_core.parser_proposals.independent_ai_validation import sha
+
+        if connection is not self.service._conn or not connection.in_transaction:
+            raise PostingError("Full-card receipt authority requires actual financial transaction")
+        row, review, decision = self.service._accepted(self.attempt_id)
+        projection = review["financial_projection"]
+        command = expected.command
+        if (
+            review["schema"] != POSTING_REVIEW_SCHEMA_V2
+            or review["posting_path"] != "personal_receipt"
+            or expected.proposal_public_id != review["proposal_public_id"]
+            or expected.proposal_version != review["proposal_version"]
+            or expected.proposal_content_hash != review["effective_content_hash"]
+            or expected.confirmation_public_id != row["confirmation_public_id"]
+            or expected.source_event_key != row["source_event_key"]
+            or expected.authenticated_actor_id != decision.human_principal_id
+            or expected.payer_participant_public_id != review["payer_participant_public_id"]
+            or expected.participants != ((expected.payer_participant_public_id, 1),)
+            or expected.reconstructed_projection_hash != sha(projection)
+            or command["command_public_id"] != "rpfc_application_" + _sha([self.attempt_id])[:24]
+            or command["channel"] != "independent_application"
+        ):
+            raise PostingError("Receipt authorization differs from accepted full card")
+        if expected.existing_conversion is not None and (
+            expected.existing_conversion["confirmation_public_id"]
+            != expected.confirmation_public_id
+            or expected.existing_conversion["proposal_content_hash"]
+            != expected.proposal_content_hash
+        ):
+            raise PostingError("Receipt replay authorization differs")
+        return VerifiedReceiptPostingAuthorization(
+            expected,
+            BASIS,
+            self.attempt_id,
+            row["review_id"],
+            posting_review_sha256(review),
+            decision.decision_id,
+            decision.decision_digest,
+            decision.display_evidence_digest,
+            sha(review["expense_assessment"]),
+        )
+
+
+class _AcceptedTextPostingAuthorization:
+    def __init__(self, service, attempt_id):
+        self.service, self.attempt_id = service, attempt_id
+
+    def verify_in_transaction(self, connection, expected):
+        from finance_core.application.ai_expense_assessment import BASIS
+        from finance_core.application.text_posting_authorization import (
+            VerifiedTextPostingAuthorization,
+        )
+        from finance_core.parser_proposals.independent_ai_validation import sha
+
+        if (
+            connection is not self.service._conn
+            or not connection.in_transaction
+            or expected.accepted_attempt_id != self.attempt_id
+        ):
+            raise PostingError("Full-card text authority requires actual owning snapshot")
+        row, review, decision = PostingService._accepted(
+            self.service,
+            self.attempt_id,
+            verify_confirmation=True,
+        )
+        proposal_row = connection.execute(
+            "SELECT parser_output_id FROM application_posting_reviews WHERE review_id=?",
+            (row["review_id"],),
+        ).fetchone()
+        if (
+            review["schema"] != POSTING_REVIEW_SCHEMA_V2
+            or review["posting_path"] != "text"
+            or review["payer_participant_public_id"] is not None
+            or review["financial_projection"]["account"] != "unspecified"
+            or expected.parser_output_id != proposal_row[0]
+            or expected.proposal_public_id != review["proposal_public_id"]
+            or expected.proposal_version != review["proposal_version"]
+            or expected.proposal_content_hash != review["effective_content_hash"]
+            or expected.confirmation_public_id != row["confirmation_public_id"]
+            or expected.authenticated_actor_id != decision.human_principal_id
+            or expected.confirmation_channel != "independent_application"
+            or expected.intake_public_id != row["intake_public_id"]
+            or expected.intake_public_id != review["source"]["intake_public_id"]
+            or expected.source_event_key != row["source_event_key"]
+            or expected.accepted_attempt_id != row["attempt_id"]
+            or expected.posting_review_id != row["review_id"]
+            or expected.posting_review_hash != posting_review_sha256(review)
+            or expected.decision_id != decision.decision_id
+            or expected.decision_digest != decision.decision_digest
+            or expected.reconstructed_projection_hash != sha(review["financial_projection"])
+            or expected.eligibility_digest != sha(review["expense_assessment"])
+        ):
+            raise PostingError("Text authorization differs from accepted full card")
+        existing = expected.existing_conversion
+        if existing is not None and (
+            existing["parser_output_id"] != expected.parser_output_id
+            or existing["transaction_public_id"] != expected.expected_transaction_public_id
+            or existing["confirmation_public_id"] != expected.confirmation_public_id
+            or existing["proposal_content_hash"] != expected.proposal_content_hash
+            or existing["authenticated_actor_id"] != expected.authenticated_actor_id
+        ):
+            raise PostingError("Text replay authorization differs")
+        return VerifiedTextPostingAuthorization(
+            expected,
+            BASIS,
+            row["attempt_id"],
+            row["review_id"],
+            posting_review_sha256(review),
+            decision.decision_id,
+            decision.decision_digest,
+            decision.display_evidence_digest,
+            sha(review["expense_assessment"]),
+        )
+
+
 class PostingService:
     def __init__(
         self,
@@ -266,6 +392,7 @@ class PostingService:
         human_decision_authority: PostingHumanDecisionAuthority,
         binding: TrustedBinding,
         clock: Callable[[], int],
+        ai_lineage_authority=None,
     ) -> None:
         # Admission validates fixed trusted binding while retaining PR03 semantics.
         self._admission = AdmissionService(
@@ -279,6 +406,39 @@ class PostingService:
             raise PostingError("Posting trust identifiers must be Unicode NFC")
         self._conn, self._source_port = connection, source_verifier
         self._decision_port, self._binding, self._clock = human_decision_authority, binding, clock
+
+        self._ai_lineage_authority = ai_lineage_authority
+
+    def _ai_kwargs(self):
+        return (
+            {"ai_lineage_authority": self._ai_lineage_authority}
+            if self._ai_lineage_authority is not None
+            else {}
+        )
+
+    def _text_kwargs(self, attempt_id):
+        return {
+            **self._ai_kwargs(),
+            "text_posting_authorization": _AcceptedTextPostingAuthorization(self, attempt_id),
+        }
+
+    def _receipt_kwargs(self, attempt_id):
+        return {
+            **self._ai_kwargs(),
+            "receipt_posting_authorization": _AcceptedReceiptPostingAuthorization(self, attempt_id),
+        }
+
+    def _verify_ai(self, proposal_id: str) -> None:
+        from finance_core.application.ai_invocation_contract import AiInvocationError
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        proposal = ParserProposalRepository(self._conn).get_by_public_id(proposal_id)
+        if proposal is None:
+            raise PostingError("AI lineage proposal is absent")
+        try:
+            require_ai_authority(self._conn, proposal, self._ai_lineage_authority)
+        except AiInvocationError as exc:
+            raise PostingError(str(exc)) from exc
 
     def _now(self) -> int:
         now = self._clock()
@@ -334,7 +494,15 @@ class PostingService:
             "edited_pending_confirmation",
         }:
             raise PostingError("Posting requires a current pending proposal")
+        self._verify_ai(proposal_id)
         view = get_proposal_review(self._conn, proposal_id)
+        from finance_core.application.ai_expense_assessment import assess_independent_ai_expense_v2
+
+        assessment = assess_independent_ai_expense_v2(
+            self._conn, proposal, vars(self._source(view["intake_public_id"]))
+        )
+        if assessment is not None and assessment["hard_blockers"]:
+            raise PostingError("Full-card expense assessment has unresolved blockers")
         payload, _, version = resolve_effective_payload(self._conn, proposal)
         independent_lineage = verify_independent_amendment_descendant(
             self._conn,
@@ -352,7 +520,14 @@ class PostingService:
         require_independent_source_edit_history(self._conn, proposal)
         if view["classification"] != "personal" or view["account_status"] != "absent":
             raise PostingError("Only personal expenses with an unspecified account are supported")
-        if not view["confirm_available"]:
+        if (
+            assessment is None
+            and not view["confirm_available"]
+            and not (
+                view["proposal_origin"] == "independent_ai"
+                and has_receipt_ocr_proposal_link(self._conn, int(proposal["id"]))
+            )
+        ):
             raise PostingError("Unresolved proposal ambiguity cannot be prepared for posting")
         if payload.get("intent") not in {
             None,
@@ -388,10 +563,11 @@ class PostingService:
             route = "personal_receipt"
             # OCR flags remain in the signed display as historical evidence.
             # Monetary/date resolution remains owned by the conversion guard.
-            _require_flags_resolved(self._conn, proposal, payload)
+            if assessment is None:
+                _require_flags_resolved(self._conn, proposal, payload)
             historical_flags = _AMOUNT_FLAGS | _CURRENCY_FLAGS | _DATE_FLAGS
             remaining = set(view["ambiguity_indicators"]) - historical_flags
-            if remaining:
+            if remaining and assessment is None:
                 if remaining - _HISTORICAL_RECEIPT_INDICATORS:
                     raise PostingError("Receipt posting requires resolved complete inputs")
                 self._require_complete_human_receipt(
@@ -438,7 +614,8 @@ class PostingService:
             fields = decision_owner.resolve_simple_expense_conversion_fields(self._conn, proposal)
             financial = {**fields, "account": "unspecified"}
         return {
-            "schema": POSTING_REVIEW_SCHEMA,
+            "schema": POSTING_REVIEW_SCHEMA_V2 if assessment is not None else POSTING_REVIEW_SCHEMA,
+            **({"expense_assessment": assessment} if assessment is not None else {}),
             "binding": vars(self._binding),
             "source": vars(source),
             "proposal_review": view,
@@ -578,7 +755,7 @@ class PostingService:
             raise PostingError("Posting review is unavailable")
         material = _material(row)
         if (
-            material.get("schema") != POSTING_REVIEW_SCHEMA
+            material.get("schema") not in {POSTING_REVIEW_SCHEMA, POSTING_REVIEW_SCHEMA_V2}
             or posting_review_sha256(material) != row["review_hash"]
             or review_id != "apr_" + row["review_hash"]
         ):
@@ -612,7 +789,12 @@ class PostingService:
         )
         decision = self._decision_port.verify_persisted(self._conn, decision_id, expected)
         if type(decision) is not VerifiedPostingDecision or (
-            decision.schema != POSTING_DECISION_SCHEMA
+            decision.schema
+            != (
+                POSTING_DECISION_SCHEMA_V2
+                if material["schema"] == POSTING_REVIEW_SCHEMA_V2
+                else POSTING_DECISION_SCHEMA
+            )
             or decision.namespace != self._binding.decision_namespace
             or decision.key_id != self._binding.decision_key_id
             or decision.instance_id != self._binding.instance_id
@@ -632,6 +814,8 @@ class PostingService:
             or not _positive_int(decision.issued_at)
             or not _positive_int(decision.expires_at)
             or not decision.issued_at <= checked_at < decision.expires_at
+            or material["schema"] == POSTING_REVIEW_SCHEMA_V2
+            and decision.issued_at < material["prepared_at"]
             or type(decision.consumed) is not bool
             or decision.consumed
             or not _digest(decision.decision_digest)
@@ -695,6 +879,7 @@ class PostingService:
                 decision_authority=_AcceptedDecisionAuthority(self, attempt_id),
                 clock=lambda: datetime.fromtimestamp(now, UTC).isoformat(),
                 _caller_owns_transaction=True,
+                **self._ai_kwargs(),
             )
             self._conn.execute(
                 "INSERT INTO application_posting_events"
@@ -745,6 +930,7 @@ class PostingService:
         proposal = ParserProposalRepository(self._conn).get(int(review_row["parser_output_id"]))
         if proposal is None:
             raise PostingError("Accepted proposal is unavailable")
+        self._verify_ai(proposal["public_id"])
         payload, _, version = resolve_effective_payload(self._conn, proposal)
         lineage = verify_independent_amendment_descendant(
             self._conn,
@@ -759,11 +945,41 @@ class PostingService:
             != material["effective_content_hash"]
         ):
             raise PostingError("Accepted financial content changed")
-        if material["posting_path"] == "personal_receipt" and (
-            set(material["proposal_review"]["ambiguity_indicators"])
-            & _HISTORICAL_RECEIPT_INDICATORS
+        if (
+            material["schema"] != POSTING_REVIEW_SCHEMA_V2
+            and material["posting_path"] == "personal_receipt"
+            and (
+                set(material["proposal_review"]["ambiguity_indicators"])
+                & _HISTORICAL_RECEIPT_INDICATORS
+            )
         ):
             self._require_complete_human_receipt(proposal, payload, lineage, material["source"])
+        if material["schema"] == POSTING_REVIEW_SCHEMA_V2:
+            from finance_core.application.ai_expense_assessment import (
+                assess_independent_ai_expense_v2,
+            )
+            from finance_core.application.receipt_posting_authorization import receipt_projection
+
+            fresh = assess_independent_ai_expense_v2(self._conn, proposal, material["source"])
+            if fresh != material["expense_assessment"] or fresh is None or fresh["hard_blockers"]:
+                raise PostingError("Accepted complete-card eligibility changed")
+            if material["posting_path"] == "personal_receipt":
+                fields = resolve_independent_receipt_payload_fields(self._conn, payload)
+                metadata = (
+                    ReceiptBookkeepingMetadata(fields["description"], fields["category"])
+                    if fields["description"] is not None or fields["category"] is not None
+                    else None
+                )
+                actual = receipt_projection(
+                    fields, material["payer_participant_public_id"], metadata
+                )
+            else:
+                actual = {
+                    **decision_owner.resolve_simple_expense_conversion_fields(self._conn, proposal),
+                    "account": "unspecified",
+                }
+            if actual != material["financial_projection"]:
+                raise PostingError("Accepted full financial projection changed")
         if verify_confirmation:
             authorization = self._conn.execute(
                 "SELECT * FROM parser_proposal_authorizations WHERE confirmation_public_id=?",
@@ -946,6 +1162,7 @@ class PostingService:
                     ).fetchone()[0]
                 ),
                 persistence_effect=bind_text,
+                **self._text_kwargs(attempt_id),
             )
             _inject("after_text_conversion_commit")
             self._advance(
@@ -1006,6 +1223,7 @@ class PostingService:
                     command,
                     persistence_effect=bind_conversion,
                     metadata_authority=_AcceptedReceiptMetadataAuthority(self, attempt_id),
+                    **self._receipt_kwargs(attempt_id),
                 )
                 _inject("after_conversion_commit")
                 self._advance(attempt_id, "conversion_persisted", converted.command_public_id)
@@ -1069,6 +1287,7 @@ class PostingService:
                     self._conn,
                     command_facts,
                     persistence_effect=bind_facts,
+                    **self._receipt_kwargs(attempt_id),
                 )
                 _inject("after_fact_set_commit")
                 self._advance(attempt_id, "fact_set_persisted", facts.fact_set_public_id)
@@ -1095,6 +1314,7 @@ class PostingService:
                 actor_type="system",
                 actor_id="independent-posting-owner",
                 persistence_effect=bind_snapshot,
+                **self._receipt_kwargs(attempt_id),
             )
             if stage == "fact_set_persisted":
                 _inject("after_snapshot_commit")
@@ -1132,6 +1352,7 @@ class PostingService:
                 prepared,
                 attempt_id=attempt_id,
                 persistence_effect=bind_authorization,
+                **self._receipt_kwargs(attempt_id),
             )
             if stage == "snapshot_persisted":
                 self._begin()
@@ -1161,7 +1382,10 @@ class PostingService:
                 continue
             if stage == "conditional_authorization_persisted":
                 final = fact_set_bridge.finalize_prepared_receipt(
-                    self._conn, authorization, persistence_effect=bind_finalization
+                    self._conn,
+                    authorization,
+                    persistence_effect=bind_finalization,
+                    **self._receipt_kwargs(attempt_id),
                 )
                 _inject("after_receipt_finalization_commit")
                 self._advance(
@@ -1194,7 +1418,7 @@ class PostingService:
                 ).fetchone()
                 if converted is not None:
                     result = decision_owner.verify_converted_parser_proposal(
-                        self._conn, proposal_row[0]
+                        self._conn, proposal_row[0], **self._text_kwargs(attempt_id)
                     )
                     transaction = result["transaction_public_id"]
                     self._verify_parser_audit(
@@ -1311,7 +1535,9 @@ class PostingService:
                         ).fetchone()
                         if result_row is not None:
                             final = fact_set_bridge.verify_finalized_prepared_receipt(
-                                self._conn, loaded.authorization_id
+                                self._conn,
+                                loaded.authorization_id,
+                                **self._receipt_kwargs(attempt_id),
                             )
                             transaction = final.transaction_public_id
             if (

@@ -278,6 +278,8 @@ def prepare_receipt_calculation(
     persistence_effect: (
         Callable[[sqlite3.Connection, AuthoritativeCalculationSnapshot], None] | None
     ) = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> PreparedReceiptCalculation:
     """Project, calculate, and persist an authoritative snapshot for a receipt.
 
@@ -300,6 +302,13 @@ def prepare_receipt_calculation(
     require_foreign_keys_enabled(conn)
     created_at = _now(clock)
 
+    from finance_core.application.review import review_snapshot
+    from finance_core.parser_proposals.independent_ai_authority import require_receipt_ai_authority
+
+    with review_snapshot(conn):
+        require_receipt_ai_authority(
+            conn, receipt_public_id, ai_lineage_authority, receipt_posting_authorization
+        )
     projection = project_receipt_calculator_input(conn, receipt_public_id)
     binding = ActiveFactSetBinding(
         receipt_public_id=receipt_public_id,
@@ -358,6 +367,8 @@ def prepare_receipt_calculation(
         actor_id=actor_id,
         created_at=created_at,
         persistence_effect=persistence_effect,
+        ai_lineage_authority=ai_lineage_authority,
+        receipt_posting_authorization=receipt_posting_authorization,
     )
 
     return PreparedReceiptCalculation(
@@ -503,6 +514,8 @@ def _persist_prepare_authority(
     persistence_effect: (
         Callable[[sqlite3.Connection, AuthoritativeCalculationSnapshot], None] | None
     ) = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> tuple[str, bool]:
     """Persist the complete prepare-stage authority in one Unit of Work.
 
@@ -531,6 +544,13 @@ def _persist_prepare_authority(
     )
     conn.execute("BEGIN IMMEDIATE")
     try:
+        from finance_core.parser_proposals.independent_ai_authority import (
+            require_receipt_ai_authority,
+        )
+
+        require_receipt_ai_authority(
+            conn, binding.receipt_public_id, ai_lineage_authority, receipt_posting_authorization
+        )
         try:
             snapshot_hash, idempotent_replay = _write_prepare_authority(
                 conn,
@@ -818,6 +838,11 @@ def authorize_receipt_finalization(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        from finance_core.parser_proposals.independent_ai_authority import (
+            require_receipt_ai_authority,
+        )
+
+        require_receipt_ai_authority(conn, prepared.receipt_public_id, None)
         conn.execute(
             """
             INSERT OR IGNORE INTO receipt_finalization_confirmations (
@@ -945,6 +970,11 @@ def authorize_d2_conditional_receipt_finalization(
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        from finance_core.parser_proposals.independent_ai_authority import (
+            require_receipt_ai_authority,
+        )
+
+        require_receipt_ai_authority(conn, prepared.receipt_public_id, None)
         binding = _require_snapshot_bound_authority(
             conn, prepared, output_payload=fin_input.calculation_snapshot
         )
@@ -1203,6 +1233,8 @@ def authorize_application_conditional_receipt_finalization(
     attempt_id: str,
     persistence_effect: Callable[[sqlite3.Connection, ReceiptFinalizationAuthorization], None],
     clock: Callable[[], str] | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> ReceiptFinalizationAuthorization:
     """Bind an independent accepted review to exact authoritative receipt truth.
 
@@ -1217,6 +1249,13 @@ def authorize_application_conditional_receipt_finalization(
     conn.execute("BEGIN IMMEDIATE")
     try:
         acceptance = require_application_receipt_acceptance(conn, attempt_id)
+        from finance_core.parser_proposals.independent_ai_authority import (
+            require_receipt_ai_authority,
+        )
+
+        require_receipt_ai_authority(
+            conn, prepared.receipt_public_id, ai_lineage_authority, receipt_posting_authorization
+        )
         review = acceptance["review"]
         actor_id = str(review["binding"]["human_principal_id"])
         fin_input = _build_finalization_input(
@@ -1578,6 +1617,8 @@ def finalize_prepared_receipt(
     *,
     clock: Callable[[], str] | None = None,
     persistence_effect: Callable[[sqlite3.Connection, FinalizationOutput], None] | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> FinalizationOutput:
     """Run the guarded finalizer for an authorized prepared receipt.
 
@@ -1596,12 +1637,21 @@ def finalize_prepared_receipt(
         actor_id=authorization.actor_id,
     )
     return finalize_receipt_split(
-        conn, fin_input, clock=clock, persistence_effect=persistence_effect
+        conn,
+        fin_input,
+        clock=clock,
+        persistence_effect=persistence_effect,
+        ai_lineage_authority=ai_lineage_authority,
+        receipt_posting_authorization=receipt_posting_authorization,
     )
 
 
 def verify_finalized_prepared_receipt(
-    conn: sqlite3.Connection, authorization_id: str
+    conn: sqlite3.Connection,
+    authorization_id: str,
+    *,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> FinalizationOutput:
     """Recover and verify a completed prepared receipt without writing."""
     authorization = load_persisted_receipt_finalization_authorization(conn, authorization_id)
@@ -1610,7 +1660,12 @@ def verify_finalized_prepared_receipt(
         actor_type=authorization.actor_type,
         actor_id=authorization.actor_id,
     )
-    return verify_finalized_receipt_split(conn, fin_input)
+    return verify_finalized_receipt_split(
+        conn,
+        fin_input,
+        ai_lineage_authority=ai_lineage_authority,
+        receipt_posting_authorization=receipt_posting_authorization,
+    )
 
 
 # ---------------------------------------------------------------------------

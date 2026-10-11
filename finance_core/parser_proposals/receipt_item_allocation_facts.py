@@ -553,6 +553,8 @@ def persist_receipt_item_allocation_facts(
     clock: Callable[[], str] | None = None,
     persistence_effect: Callable[[sqlite3.Connection, ReceiptItemAllocationFactsResult], None]
     | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
 ) -> ReceiptItemAllocationFactsResult:
     """Atomically persist one authorized item/allocation fact set (create).
 
@@ -568,6 +570,9 @@ def persist_receipt_item_allocation_facts(
     _require_staging(conn)  # guards 2-3
     _acquire_write_transaction(conn)  # guard 4
     try:
+        _require_ai_evidence_lineage(
+            conn, command.receipt_public_id, ai_lineage_authority, receipt_posting_authorization
+        )
         material_hash = _command_material_hash(command, spec)
 
         existing = _get_registry_row(conn, command.command_public_id)
@@ -752,6 +757,8 @@ def supersede_receipt_item_allocation_facts(
     _require_staging(conn)  # guards 2-3
     _acquire_write_transaction(conn)  # guard 4
     try:
+        # New independent AI receipts have no posted-correction route here.
+        _require_ai_evidence_lineage(conn, command.receipt_public_id, None)
         material_hash = _supersession_command_material_hash(command, spec)
 
         existing = _get_registry_row(conn, command.command_public_id)
@@ -1569,6 +1576,20 @@ def _validate_manual_adjustment_participants(
 # ---------------------------------------------------------------------------
 # Guards 2-4: staging database, foreign keys, transaction acquisition
 # ---------------------------------------------------------------------------
+
+
+def _require_ai_evidence_lineage(
+    conn, receipt_public_id, authority, receipt_posting_authorization=None
+) -> None:
+    from finance_core.application.ai_invocation_contract import AiInvocationError
+    from finance_core.parser_proposals.independent_ai_authority import require_receipt_ai_authority
+
+    try:
+        require_receipt_ai_authority(
+            conn, receipt_public_id, authority, receipt_posting_authorization
+        )
+    except AiInvocationError as exc:
+        raise ItemFactsEvidenceLineageError(str(exc)) from exc
 
 
 def _require_staging(conn: sqlite3.Connection) -> None:

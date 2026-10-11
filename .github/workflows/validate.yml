@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   classify:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       bridge: ${{ steps.scope.outputs.bridge }}
@@ -64,14 +64,14 @@ jobs:
           fi
           changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
           git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
-          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_))|tests/(test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_|independent_ai_)|resources/independent_ai/)|tests/(test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
           fi
 
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out candidate
@@ -126,8 +126,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [0, 1, 2, 3]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - name: Check out candidate
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -1381,7 +1381,7 @@ jobs:
   pytest-report:
     needs: pytest
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out candidate
@@ -1435,7 +1435,7 @@ jobs:
   validate:
     if: ${{ always() }}
     needs: [classify, quality, pytest, bridge, pytest-report]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check out candidate

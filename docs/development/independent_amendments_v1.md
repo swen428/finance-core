@@ -137,6 +137,14 @@ refuse. Generated Bridge provenance binds the changed verifier. A fresh
 wheel/sdist installation outside checkout verifies real packaged bytes; a local
 source import alone does not prove an installed combination.
 
+The later [independent AI contract](independent_ai_invocation_v1.md) adds its
+own migration and publication domain. Its current installed inventory includes
+that additive migration; the 001–057 identity above describes this amendment
+feature's original delivery. Independent AI descendants require the fixed
+lineage authority throughout amendment and posting. AI publication supplies no
+human amendment record or material HUMAN field witness; the six-field human
+receipt-qualification rule retains its original meaning.
+
 Focused validation covers six fields, mixed invalid patches, chained edits,
 missing values, stale/wrong/expired/UNKNOWN display and reply evidence, replay,
 concurrent edit/confirmation, interruption at owner commit boundaries, immutable

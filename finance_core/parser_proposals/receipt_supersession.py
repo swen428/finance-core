@@ -192,6 +192,7 @@ def supersede_receipt_total_proposal(
     clock: Callable[[], str] | None = None,
     transaction_guard: Callable[[sqlite3.Connection], None] | None = None,
     amendment_authority: AmendmentPublicationAuthority | None = None,
+    ai_lineage_authority=None,
 ) -> dict[str, Any]:
     """Supersede a receipt total proposal with an authenticated monetary correction.
 
@@ -216,6 +217,9 @@ def supersede_receipt_total_proposal(
     _acquire_write_transaction(conn)
     try:
         parent = _require_full_proposal(conn, parser_output_id)
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+
+        require_ai_authority(conn, parent, ai_lineage_authority)
 
         existing = _get_revision_by_correction_id(conn, correction_public_id)
         if amendment_authority is not None:
@@ -317,6 +321,7 @@ def supersede_receipt_total_proposal(
             completion_provenance,
             canonical_amount=canonical_amount,
             canonical_currency=canonical_currency,
+            evidence_conn=conn,
         )
         child_payload_json = _canonical_json(child_payload)
         now = _now(clock)
@@ -1119,7 +1124,37 @@ def _build_replacement_payload(
     *,
     canonical_amount: str,
     canonical_currency: str,
+    evidence_conn: sqlite3.Connection | None = None,
 ) -> dict[str, Any]:
+    if (
+        evidence_conn is not None
+        and evidence_conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='independent_ai_publications'"
+        ).fetchone()
+        is not None
+        and evidence_conn.execute(
+            "SELECT 1 FROM independent_ai_publications WHERE child_parser_output_id=?",
+            (parent["id"],),
+        ).fetchone()
+        is not None
+    ):
+        from finance_core.parser_proposals.independent_ai_lineage import (
+            verify_publication_creation_record,
+        )
+
+        edge = evidence_conn.execute(
+            "SELECT * FROM independent_ai_publications WHERE child_parser_output_id=?",
+            (parent["id"],),
+        ).fetchone()
+        if edge is None:
+            raise ReceiptSupersessionError("Inherited AI receipt creation absent")
+        creation = verify_publication_creation_record(evidence_conn, edge)
+        effective_payload = dict(effective_payload)
+        effective_payload["field_evidence"] = [
+            {**item, "confidence": item["confidence_score"]}
+            for item in creation.seal["fields"]
+            if item["proposed_value"] == effective_payload.get(item["field_name"])
+        ]
     corrected_fields = sorted(applied_updates.keys())
     completed_fields = {
         name: provenance
@@ -1310,6 +1345,12 @@ def _insert_replacement_field_evidence(
                     "its correction or completion provenance"
                 )
             notes = None
+        elif source_type == "ai_model":
+            ai_reference = item.get("evidence_reference")
+            if not isinstance(ai_reference, str) or not ai_reference.startswith("independent-ai:"):
+                raise ReceiptSupersessionError("Inherited AI field reference is invalid")
+            reference = ai_reference
+            notes = item.get("notes")
         else:
             reference = _canonical_json(
                 {

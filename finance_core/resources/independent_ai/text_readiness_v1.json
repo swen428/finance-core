@@ -1,0 +1,38 @@
+{
+  "schema": "finance-independent-ai-text-readiness-v1",
+  "deny_intent_tokens": [
+    "reimbursement",
+    "reimburse",
+    "chargeback",
+    "charge back",
+    "adjustment",
+    "third-party",
+    "third party",
+    "payer",
+    "shared",
+    "split",
+    "transfer",
+    "repay",
+    "income",
+    "refund",
+    "settlement",
+    "共享",
+    "分摊",
+    "转账",
+    "还款",
+    "收入",
+    "退款",
+    "报销",
+    "代付",
+    "第三方",
+    "冲正"
+  ],
+  "maximum_money_candidates": 1,
+  "maximum_currency_candidates": 1,
+  "maximum_date_candidates": 1,
+  "aggregate_parser_score_is_historical": true,
+  "receipt_exemption": false,
+  "deny_intent_patterns": [
+    "(?<!\\w)refund(?:s|ed|ing)?(?!\\w)"
+  ]
+}

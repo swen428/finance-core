@@ -20,6 +20,8 @@ import pytest
 from finance_core.application import admission
 from finance_core.application.posting_contract import (
     POSTING_DECISION_SCHEMA,
+    POSTING_DECISION_SCHEMA_V2,
+    POSTING_REVIEW_SCHEMA_V2,
     posting_review_sha256,
 )
 from finance_core.intake.raw_text_repository import create_raw_intake_record, save_parser_proposal
@@ -263,7 +265,12 @@ class _DurablePostingDecisionAuthority:
         ):
             raise ValueError("Display is not the exact current signed posting review")
         if (
-            decision["schema"] != POSTING_DECISION_SCHEMA
+            decision["schema"]
+            != (
+                POSTING_DECISION_SCHEMA_V2
+                if expected.review_projection["schema"] == POSTING_REVIEW_SCHEMA_V2
+                else POSTING_DECISION_SCHEMA
+            )
             or decision["namespace"] != expected.binding.decision_namespace
             or decision["key_id"] != expected.binding.decision_key_id
             or decision["instance_id"] != expected.binding.instance_id
@@ -308,7 +315,9 @@ def _decision_material(review, proposal_public_id: str, decision_id: str) -> tup
         "projection": projection,
     }
     decision = {
-        "schema": POSTING_DECISION_SCHEMA,
+        "schema": POSTING_DECISION_SCHEMA_V2
+        if projection["schema"] == POSTING_REVIEW_SCHEMA_V2
+        else POSTING_DECISION_SCHEMA,
         "namespace": BINDING.decision_namespace,
         "key_id": BINDING.decision_key_id,
         "instance_id": BINDING.instance_id,
@@ -325,7 +334,9 @@ def _decision_material(review, proposal_public_id: str, decision_id: str) -> tup
         "display_id": display_id,
         "display_evidence_digest": _digest(display),
         "action": "confirm",
-        "issued_at": NOW - 1,
+        "issued_at": projection["prepared_at"]
+        if projection["schema"] == POSTING_REVIEW_SCHEMA_V2
+        else NOW - 1,
         "expires_at": review.expires_at,
         "consumed": False,
     }
@@ -347,7 +358,9 @@ def _reply_material(decision: dict) -> dict:
         "origin": "human",
         "direct": True,
         "private": True,
-        "created_at": NOW,
+        "created_at": decision["issued_at"]
+        if decision["schema"] == POSTING_DECISION_SCHEMA_V2
+        else NOW,
     }
 
 
@@ -477,6 +490,14 @@ def _prepare_receipt_subject(
     suffix: str = "receipt",
     *,
     merchant_text: str = "EXAMPLE CAFE",
+    ocr_confidence_scaled: int = 9500,
+    prepare_review: bool = True,
+    retain_synthetic_authority: bool = True,
+    extra_amounts: tuple[tuple[str, str], ...] = (),
+    total_label: str = "TOTAL",
+    total_currency: str | None = "SGD",
+    total_amount: str = "12.50",
+    date_text: str | None = "2026-10-08",
 ):
     """Prepare a real local-file receipt custody chain with signed synthetic authority."""
     from finance_core.application.posting import PostingService
@@ -541,17 +562,27 @@ def _prepare_receipt_subject(
                     height=10,
                     page_width=800,
                     page_height=600,
-                    confidence_scaled=9500,
+                    confidence_scaled=ocr_confidence_scaled,
                 )
 
+            source_blocks = [block(0, merchant_text, 0, 10)]
+            if date_text is not None:
+                source_blocks.append(block(len(source_blocks), date_text, 1, 10))
+            source_blocks.append(block(len(source_blocks), total_label, 2, 10))
+            if total_currency is not None:
+                source_blocks.append(block(len(source_blocks), total_currency, 2, 80))
+            source_blocks.append(block(len(source_blocks), total_amount, 2, 140))
+            base_blocks = tuple(source_blocks)
             return ReceiptOcrEngineResult(
                 status=ReceiptOcrExtractionStatus.SUCCEEDED,
-                blocks=(
-                    block(0, merchant_text, 0, 10),
-                    block(1, "2026-10-08", 1, 10),
-                    block(2, "TOTAL", 2, 10),
-                    block(3, "SGD", 2, 80),
-                    block(4, "12.50", 2, 140),
+                blocks=base_blocks
+                + tuple(
+                    item
+                    for index, (label, amount) in enumerate(extra_amounts)
+                    for item in (
+                        block(len(base_blocks) + index * 2, label, 3 + index, 10),
+                        block(len(base_blocks) + index * 2 + 1, amount, 3 + index, 140),
+                    )
                 ),
                 outcome_code="synthetic_success",
             )
@@ -578,6 +609,20 @@ def _prepare_receipt_subject(
     if raw_row is None:
         raise AssertionError("Local receipt intake did not persist its raw source")
     intake_public_id = str(raw_row["public_id"])
+    if not retain_synthetic_authority:
+        return (
+            connection,
+            workspace,
+            manifest,
+            None,
+            None,
+            proposal,
+            intake_public_id,
+            None,
+            None,
+            None,
+            None,
+        )
     source = {
         "schema": admission.SOURCE_SCHEMA,
         "namespace": BINDING.source_namespace,
@@ -614,6 +659,20 @@ def _prepare_receipt_subject(
         binding=BINDING,
         clock=lambda: NOW,
     )
+    if not prepare_review:
+        return (
+            connection,
+            workspace,
+            manifest,
+            service,
+            None,
+            proposal,
+            intake_public_id,
+            None,
+            None,
+            source_verifier,
+            decision_authority,
+        )
     review = service.prepare(proposal)
     decision_id = f"synthetic-posting-decision-{suffix}"
     display, decision = _decision_material(review, proposal, decision_id)
@@ -1870,6 +1929,7 @@ def test_local_receipt_source_drift_inside_conversion_owner_rolls_back_receipt_f
         *,
         clock=None,
         metadata_authority=None,
+        receipt_posting_authorization=None,
         persistence_effect=None,
     ):
         def replace_source_before_application_effect(inner_connection, result):
@@ -1889,6 +1949,7 @@ def test_local_receipt_source_drift_inside_conversion_owner_rolls_back_receipt_f
             command,
             clock=clock,
             metadata_authority=metadata_authority,
+            receipt_posting_authorization=receipt_posting_authorization,
             persistence_effect=replace_source_before_application_effect,
         )
 
@@ -1960,6 +2021,7 @@ def test_snapshot_owner_lock_revalidates_signed_authority_and_payer_atomically(
         actor_type="system",
         actor_id=None,
         clock=None,
+        receipt_posting_authorization=None,
         persistence_effect=None,
     ):
         def mutate_before_revalidation(inner_connection, snapshot):
@@ -2001,6 +2063,7 @@ def test_snapshot_owner_lock_revalidates_signed_authority_and_payer_atomically(
             actor_type=actor_type,
             actor_id=actor_id,
             clock=clock,
+            receipt_posting_authorization=receipt_posting_authorization,
             persistence_effect=mutate_before_revalidation,
         )
 

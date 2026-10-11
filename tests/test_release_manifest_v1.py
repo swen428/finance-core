@@ -19,9 +19,7 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "build_release_manifest.py"
-MIGRATION_DIGEST = json.loads(
-    (REPOSITORY_ROOT / "finance_core/resources/migration-contract-v1.json").read_text()
-)["migration_ledger_digest"]
+MIGRATION_DIGEST = "888821f03d706ea751029aabe5c5f7a8bb3d7e9c923e3dff10aab99c149c4b22"
 
 
 def _load_release_manifest_builder() -> ModuleType:
@@ -31,14 +29,14 @@ def _load_release_manifest_builder() -> ModuleType:
     return module
 
 
-def _synthetic_057_migration_payloads() -> dict[str, bytes]:
+def _synthetic_059_migration_payloads() -> dict[str, bytes]:
     migration_root = REPOSITORY_ROOT / "finance_core/resources/migrations"
     payloads = {
         f"finance_core/resources/migrations/{path.name}": path.read_bytes()
         for path in sorted(migration_root.glob("*.sql"))
-        if path.name[:3].isdigit() and int(path.name[:3]) <= 56
+        if path.name[:3].isdigit() and int(path.name[:3]) <= 58
     }
-    payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"] = (
+    payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
     return payloads
@@ -59,37 +57,65 @@ def release_manifest_builder() -> ModuleType:
     return _load_release_manifest_builder()
 
 
-def test_release_manifest_migration_inventory_accepts_synthetic_057(
+def test_release_manifest_migration_inventory_accepts_synthetic_059(
     release_manifest_builder: ModuleType,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
+    payloads = _synthetic_059_migration_payloads()
 
-    assert len(payloads) == 57
+    assert len(payloads) == 59
     assert release_manifest_builder._migration_ledger_digest(payloads) == _payload_ledger_digest(
         payloads
     )
 
 
-def test_release_manifest_migration_inventory_rejects_missing_synthetic_057(
+def test_release_manifest_migration_inventory_rejects_missing_synthetic_059(
     release_manifest_builder: ModuleType,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
-    del payloads["finance_core/resources/migrations/057_synthetic_inventory.sql"]
+    payloads = _synthetic_059_migration_payloads()
+    del payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"]
 
     with pytest.raises(ValueError, match="migration inventory"):
         release_manifest_builder._migration_ledger_digest(payloads)
 
 
-def test_release_manifest_migration_inventory_rejects_extra_synthetic_058(
+def test_release_manifest_migration_inventory_rejects_extra_synthetic_060(
     release_manifest_builder: ModuleType,
 ) -> None:
-    payloads = _synthetic_057_migration_payloads()
-    payloads["finance_core/resources/migrations/058_synthetic_inventory.sql"] = (
+    payloads = _synthetic_059_migration_payloads()
+    payloads["finance_core/resources/migrations/060_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
     with pytest.raises(ValueError, match="migration inventory"):
         release_manifest_builder._migration_ledger_digest(payloads)
+
+
+def test_release_manifest_migration_inventory_rejects_duplicate_sequence(
+    release_manifest_builder: ModuleType,
+) -> None:
+    payloads = _synthetic_059_migration_payloads()
+    payloads["finance_core/resources/migrations/057_synthetic_duplicate.sql"] = b"-- test\n"
+
+    with pytest.raises(ValueError, match="migration inventory"):
+        release_manifest_builder._migration_ledger_digest(payloads)
+
+
+def test_release_manifest_migration_inventory_changes_when_bytes_are_tampered(
+    release_manifest_builder: ModuleType,
+) -> None:
+    payloads = _synthetic_059_migration_payloads()
+    original = release_manifest_builder._migration_ledger_digest(payloads)
+    migration = "finance_core/resources/migrations/059_synthetic_inventory.sql"
+    payloads[migration] += b"-- synthetic byte change\n"
+
+    assert release_manifest_builder._migration_ledger_digest(payloads) != original
+
+
+def _reordered_migration_contract(payload: bytes) -> bytes:
+    contract = json.loads(payload)
+    filenames = contract["migration_filenames"]
+    filenames[0], filenames[1] = filenames[1], filenames[0]
+    return (json.dumps(contract, indent=2) + "\n").encode()
 
 
 def _manifest_command(
@@ -581,9 +607,13 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
         lambda payload: payload.replace(
-            b'    "056_independent_posting.sql",\n    "057_independent_amendments.sql"\n',
-            b'    "056_independent_posting.sql"\n',
+            (
+                b'    "058_independent_ai_invocations.sql",\n'
+                b'    "059_independent_ai_clarification.sql"\n'
+            ),
+            b'    "058_independent_ai_invocations.sql"\n',
         ),
+        _reordered_migration_contract,
     ],
 )
 def test_release_manifest_rejects_stale_wheel_migration_contract(
@@ -597,6 +627,31 @@ def test_release_manifest_rejects_stale_wheel_migration_contract(
     mutated = mutate(contract)
     assert mutated != contract
     _rewrite_wheel(wheel, {contract_name: mutated})
+
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert "wheel migration contract does not match its migration payload" in completed.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    assert not (artifacts / "SHA256SUMS").exists()
+
+
+def test_release_manifest_rejects_tampered_wheel_migration_bytes(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
+    migration_name = "finance_core/resources/migrations/059_independent_ai_clarification.sql"
+    with zipfile.ZipFile(wheel) as archive:
+        migration_payload = archive.read(migration_name)
+    _rewrite_wheel(wheel, {migration_name: migration_payload + b"\n-- tampered\n"})
 
     completed = subprocess.run(
         _manifest_command(

@@ -21,6 +21,12 @@ have a skipped Bridge job; a required Bridge may never be skipped. All Actions
 remain pinned and all fork execution uses read-only permissions without secrets
 or persisted checkout credentials.
 
+All required Linux control and Python validation jobs select Ubuntu 24.04
+explicitly, matching the existing platform assertion. This prevents a moving
+`ubuntu-latest` label from selecting a different operating-system release.
+The Bridge retains its established `bridge (ubuntu-latest)` display name and
+explicit Ubuntu 24.04 runner mapping; required jobs and acceptance stay unchanged.
+
 The required `validate` job depends on classification, quality, Python tests,
 Bridge and the aggregate report. A failed, cancelled or missing required result
 blocks validation. Reporting is required because downstream consumers verify
@@ -33,6 +39,11 @@ commit/tree, workflow ref/commit/content digest, Bridge scope and all grouped
 required results. Every source/build/provenance check uses the same candidate
 head. Changes to the Application review or its compatibility export packages
 also require both Bridge systems.
+
+Independent AI parser/lineage/validation modules and their packaged
+`resources/independent_ai/` policies also require both Bridge systems, including
+modification, deletion and rename. The workflow and independent candidate
+verifier classify the same paths; a policy-only edit cannot skip that matrix.
 
 One successful attempt-1 complete PR run for that frozen candidate is the
 normal authoritative V2. Immediately before protected merge, use the reviewed

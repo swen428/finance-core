@@ -374,6 +374,8 @@ def convert_confirmed_receipt_proposal_to_facts(
     *,
     clock: Callable[[], str] | None = None,
     metadata_authority: ReceiptMetadataAuthority | None = None,
+    ai_lineage_authority=None,
+    receipt_posting_authorization=None,
     persistence_effect: Callable[[sqlite3.Connection, ReceiptFactsConversionResult], None]
     | None = None,
 ) -> ReceiptFactsConversionResult:
@@ -389,14 +391,12 @@ def convert_confirmed_receipt_proposal_to_facts(
     _require_staging(conn)  # guard 2
     _acquire_write_transaction(conn)  # guard 3
     try:
+        from finance_core.parser_proposals.independent_ai_authority import require_ai_authority
+        from finance_core.parser_proposals.repository import ParserProposalRepository
+
         material_hash = _command_material_hash(command, entries)
 
         existing = _get_registry_row(conn, command.command_public_id)
-        metadata = (
-            metadata_authority.verify_in_transaction(conn, command=command, existing=existing)
-            if metadata_authority is not None
-            else None
-        )
         if metadata_authority is None:
             from finance_core.parser_proposals.amendment_lineage import refuse_legacy_amendment
         if existing is not None:  # guard 4
@@ -405,6 +405,22 @@ def convert_confirmed_receipt_proposal_to_facts(
             # evidence rows were destroyed out-of-band.
             _require_replay_material(existing, material_hash, command)
             _verify_replay_integrity(conn, existing)
+            marker = ParserProposalRepository(conn).get_by_public_id(command.proposal_public_id)
+            if marker is not None:
+                require_ai_authority(conn, marker, ai_lineage_authority)
+            metadata = (
+                metadata_authority.verify_in_transaction(conn, command=command, existing=existing)
+                if metadata_authority is not None
+                else None
+            )
+            from finance_core.application.receipt_posting_authorization import (
+                require_conversion_authority,
+            )
+
+            posting_proof = require_conversion_authority(
+                conn, command, existing, receipt_posting_authorization, metadata
+            )
+
             if metadata_authority is None:
                 refuse_legacy_amendment(conn, _require_proposal(conn, command.proposal_public_id))
             result = _replay_result(existing)
@@ -414,6 +430,22 @@ def convert_confirmed_receipt_proposal_to_facts(
             return result
 
         proposal = _require_proposal(conn, command.proposal_public_id)  # guard 5
+        marker = ParserProposalRepository(conn).get_by_public_id(command.proposal_public_id)
+        if marker is not None:
+            require_ai_authority(conn, marker, ai_lineage_authority)
+        metadata = (
+            metadata_authority.verify_in_transaction(conn, command=command, existing=existing)
+            if metadata_authority is not None
+            else None
+        )
+        from finance_core.application.receipt_posting_authorization import (
+            require_conversion_authority,
+        )
+
+        posting_proof = require_conversion_authority(
+            conn, command, existing, receipt_posting_authorization, metadata
+        )
+
         if metadata_authority is None:
             refuse_legacy_amendment(conn, proposal)
         parser_output_id = int(proposal["id"])
@@ -431,7 +463,8 @@ def convert_confirmed_receipt_proposal_to_facts(
             conn, proposal, link, raw_intake, effective
         )
         _require_source_binding(conn, proposal, raw_intake, extraction, attachment)
-        _require_flags_resolved(conn, proposal, effective)  # guard 13
+        if posting_proof is None:
+            _require_flags_resolved(conn, proposal, effective)  # old basis guard 13
         facts = _require_complete_inputs(
             conn, command, entries, effective, bookkeeping_metadata=metadata
         )  # guard 14
@@ -523,6 +556,7 @@ def convert_confirmed_receipt_proposal_to_facts(
             now=now,
             chain_ids=chain_ids,
             chain_root_id=chain_root_id,
+            receipt_posting_authorization=receipt_posting_authorization,
         )
 
         result = ReceiptFactsConversionResult(
@@ -1381,6 +1415,23 @@ def _require_evidence_lineage(
                 "An AI fallback OCR proposal requires a valid immutable AI lineage edge"
             )
 
+    if str(link["link_role"]) == "independent_ai":
+        from finance_core.parser_proposals.independent_ai_lineage import (
+            verify_independent_ai_lineage,
+        )
+
+        try:
+            verified = verify_independent_ai_lineage(
+                conn,
+                proposal,
+                content_hash=compute_effective_proposal_content_hash(conn, proposal),
+                proposal_version=resolve_effective_payload(conn, proposal)[2],
+                require_resolved=False,
+            )
+            if verified is None:
+                raise ValueError("Missing independent AI receipt lineage")
+        except ValueError as exc:
+            raise ConversionEvidenceLineageError(str(exc)) from exc
     _require_monetary_evidence_consistency(conn, proposal, effective)
     return extraction, attachment
 
@@ -1721,6 +1772,286 @@ def _require_flags_resolved(
         )
 
 
+def _mixed_ai_resolution_provenance(
+    conn: sqlite3.Connection,
+    proposal: dict[str, Any],
+    effective: dict[str, Any],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Track current HUMAN bindings separately from verified AI field values.
+
+    The legacy prefix retains its original owner. Every later physical edge
+    and same-ID completion consumes the preceding full, authenticated state.
+    A material AI overwrite permanently removes that HUMAN binding until a
+    new genuine material HUMAN transition establishes it.
+    """
+    from finance_core.parser_proposals.amendment_lineage import (
+        payload_hash,
+        verify_amendment_record,
+    )
+    from finance_core.parser_proposals.independent_ai_lineage import (
+        verify_independent_ai_lineage,
+        verify_publication,
+    )
+    from finance_core.parser_proposals.independent_ai_revision import _revisions
+    from finance_core.parser_proposals.independent_ai_validation import FIELDS, canonical_text
+    from finance_core.parser_proposals.repository import ParserProposalRepository
+
+    try:
+        lineage = verify_independent_ai_lineage(
+            conn,
+            proposal,
+            content_hash=compute_effective_proposal_content_hash(conn, proposal),
+            proposal_version=resolve_effective_payload(conn, proposal)[2],
+            require_resolved=False,
+        )
+        if lineage is None:
+            raise ConversionEvidenceLineageError("Mixed receipt owning graph is absent")
+        path = _supersession_path(conn, int(proposal["id"]))
+        repository = ParserProposalRepository(conn)
+        edges = {
+            node_id: conn.execute(
+                "SELECT * FROM independent_ai_publications WHERE child_parser_output_id=?",
+                (node_id,),
+            ).fetchone()
+            for node_id in path
+        }
+        first = next((i for i, node_id in enumerate(path) if edges[node_id] is not None), None)
+        if first is None or first == 0:
+            raise ConversionEvidenceLineageError("Mixed receipt has no authenticated AI edge")
+        previous_id = path[first - 1]
+        prefix = repository.get_lineage_row_by_id(previous_id)
+        if prefix is None:
+            raise ConversionEvidenceLineageError("Mixed receipt prefix is absent")
+        prefix_revisions = _revisions(conn, prefix)
+        previous, previous_version = prefix_revisions[-1], len(prefix_revisions) - 1
+        first_edge = edges[path[first]]
+        if first_edge is None:
+            raise ConversionEvidenceLineageError("First incoming AI publication is absent")
+        boundary = verify_publication(conn, first_edge)
+        if (
+            first_edge["parent_parser_output_id"] != previous_id
+            or boundary["parent_id"] != previous_id
+            or boundary["parent_public_id"] != prefix["public_id"]
+            or boundary["intake_public_id"] != prefix["source_public_id"]
+            or prefix["source_public_id"] != proposal["source_public_id"]
+            or boundary["parent_version"] != previous_version
+            or boundary["parent_content_hash"] != payload_hash(conn, prefix, previous)
+            or canonical_text(boundary["base_payload"]) != canonical_text(previous)
+        ):
+            raise ConversionEvidenceLineageError("First AI publication consumed a different prefix")
+        expected_audit = derive_audit_event_public_id(
+            aggregate_type="parser_proposal",
+            aggregate_public_id=prefix["public_id"],
+            event_type="independent_ai_proposal_published",
+            causation_public_id=first_edge["publication_id"],
+        )
+        # Static graph verification above and the financial entry's fixed AI
+        # authority remain required. Domain markers are never erased: only
+        # this exact authenticated outgoing edge explains the old prefix.
+        for prefix_id in path[:first]:
+            prefix_node = repository.get_lineage_row_by_id(prefix_id)
+            if prefix_node is None:
+                raise ConversionEvidenceLineageError("Prefix ancestry is absent")
+            if (
+                edges[prefix_id] is not None
+                or prefix_node["parser_name"] == "independent_finance_ai"
+                or prefix_node["public_id"].startswith("aipo_")
+                or conn.execute(
+                    "SELECT 1 FROM receipt_ocr_proposal_links WHERE parser_output_id=? "
+                    "AND link_role='independent_ai'",
+                    (prefix_id,),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM parser_proposal_field_evidence WHERE parser_output_id=? "
+                    "AND evidence_reference LIKE 'independent-ai:%'",
+                    (prefix_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise ConversionEvidenceLineageError("Prefix has unexplained incoming AI origin")
+            outgoing = conn.execute(
+                "SELECT publication_id,child_parser_output_id FROM independent_ai_publications "
+                "WHERE parent_parser_output_id=?",
+                (prefix_id,),
+            ).fetchall()
+            expected_outgoing = (
+                [(first_edge["publication_id"], first_edge["child_parser_output_id"])]
+                if prefix_id == previous_id
+                else []
+            )
+            if [tuple(row) for row in outgoing] != expected_outgoing:
+                raise ConversionEvidenceLineageError("Prefix outgoing AI edges are unexplained")
+            audits = conn.execute(
+                "SELECT event_public_id,causation_public_id FROM financial_audit_events "
+                "WHERE aggregate_public_id=? AND event_type='independent_ai_proposal_published'",
+                (prefix_node["public_id"],),
+            ).fetchall()
+            expected_audits = (
+                [(expected_audit, first_edge["publication_id"])] if prefix_id == previous_id else []
+            )
+            if [tuple(row) for row in audits] != expected_audits:
+                raise ConversionEvidenceLineageError("Prefix outgoing AI audit is unexplained")
+            lifecycle = []
+            for event in conn.execute(
+                "SELECT event_reason,event_payload FROM parser_proposal_events "
+                "WHERE parser_output_id=?",
+                (prefix_id,),
+            ).fetchall():
+                event_payload = json.loads(event["event_payload"])
+                publication = (
+                    event_payload.get("publication_id") if isinstance(event_payload, dict) else None
+                )
+                if str(event["event_reason"]).startswith("aipub_") or (
+                    isinstance(publication, str) and publication.startswith("aipub_")
+                ):
+                    lifecycle.append((event["event_reason"], canonical_text(event_payload)))
+            expected_lifecycle = (
+                [
+                    (
+                        first_edge["publication_id"],
+                        canonical_text(
+                            {
+                                "publication_id": first_edge["publication_id"],
+                                "attempt_id": first_edge["attempt_id"],
+                                "actor_type": "ai",
+                            }
+                        ),
+                    )
+                ]
+                if prefix_id == previous_id
+                else []
+            )
+            if lifecycle != expected_lifecycle:
+                raise ConversionEvidenceLineageError("Prefix outgoing AI lifecycle is unexplained")
+        corrected, completed = _legacy_resolution_provenance(conn, prefix, previous)
+        witnesses: dict[str, tuple[str, Any, str | None]] = {
+            field: ("completed" if field in completed else "corrected", previous.get(field), None)
+            for field in corrected | completed
+            if field in FIELDS
+        }
+        prefix_claims = previous.get("field_evidence", [])
+        for node_id in path[first:]:
+            node = repository.get_lineage_row_by_id(node_id)
+            if node is None:
+                raise ConversionEvidenceLineageError("Mixed receipt ancestry is absent")
+            revisions = _revisions(conn, node)
+            initial = revisions[0]
+            edge = edges[node_id]
+            if edge is not None:
+                material = verify_publication(conn, edge)
+                if (
+                    material["parent_id"] != previous_id
+                    or material["parent_version"] != previous_version
+                    or canonical_text(material["base_payload"]) != canonical_text(previous)
+                ):
+                    raise ConversionEvidenceLineageError(
+                        "AI receipt transition changed its full base"
+                    )
+                for field in FIELDS:
+                    if not _field_values_equal(field, previous.get(field), initial.get(field)):
+                        witnesses.pop(field, None)
+            else:
+                records = conn.execute(
+                    "SELECT * FROM application_amendment_records "
+                    "WHERE resulting_parser_output_id=? AND publication_kind!='completion'",
+                    (node_id,),
+                ).fetchall()
+                if len(records) != 1:
+                    raise ConversionEvidenceLineageError("Mixed receipt HUMAN edge is not unique")
+                record = records[0]
+                material = verify_amendment_record(conn, record)
+                if (
+                    record["base_parser_output_id"] != previous_id
+                    or record["base_version"] != previous_version
+                    or record["resulting_version"] != 0
+                    or material["accepted_proof"]["intake_public_id"]
+                    != proposal["source_public_id"]
+                    or canonical_text(json.loads(material["base_payload_json"]))
+                    != canonical_text(previous)
+                    or canonical_text(json.loads(material["result_payload_json"]))
+                    != canonical_text(initial)
+                ):
+                    raise ConversionEvidenceLineageError("Mixed receipt HUMAN full state changed")
+                for field, value in material["material_patch"].items():
+                    if not _field_values_equal(field, value, initial.get(field)):
+                        raise ConversionEvidenceLineageError(
+                            "HUMAN material field is not its current value"
+                        )
+                    witnesses[field] = ("corrected", value, record["publication_public_id"])
+            previous = initial
+            records = conn.execute(
+                "SELECT * FROM application_amendment_records WHERE resulting_parser_output_id=? "
+                "AND publication_kind='completion' ORDER BY resulting_version",
+                (node_id,),
+            ).fetchall()
+            for record, current in zip(records, revisions[1:], strict=True):
+                material = verify_amendment_record(conn, record)
+                for field, value in material["material_patch"].items():
+                    if not _field_values_equal(field, value, current.get(field)):
+                        raise ConversionEvidenceLineageError(
+                            "HUMAN completion field is not current"
+                        )
+                    witnesses[field] = ("completed", value, record["publication_public_id"])
+                previous = current
+            previous_id, previous_version = node_id, len(revisions) - 1
+        if canonical_text(previous) != canonical_text(effective):
+            raise ConversionEvidenceLineageError("Mixed receipt latest full state differs")
+        revision_index, public_ids = (
+            _chain_revision_index(conn, path),
+            _proposal_public_ids(conn, path),
+        )
+        for item in effective.get("field_evidence", []):
+            if (
+                not isinstance(item, dict)
+                or item.get("evidence_source_type") not in _HUMAN_EVIDENCE_SOURCE_TYPES
+            ):
+                continue
+            field = str(item.get("field_name"))
+            if item.get("completion_public_id") is not None:
+                _verify_inherited_completion_evidence(conn, item, field, path, public_ids)
+            elif item.get("correction_public_id") is not None:
+                if str(item["correction_public_id"]) in revision_index:
+                    _verify_inherited_correction_evidence(item, field, revision_index, public_ids)
+                elif not isinstance(prefix_claims, list) or item not in prefix_claims:
+                    raise ConversionEvidenceLineageError(
+                        "Mixed receipt correction claim is unverified"
+                    )
+            else:
+                raise ConversionEvidenceLineageError("Mixed receipt HUMAN claim has no provenance")
+            witness = witnesses.get(field)
+            if witness is None or not _field_values_equal(field, witness[1], effective.get(field)):
+                raise ConversionEvidenceLineageError(
+                    "Obsolete HUMAN claim is not a current field binding"
+                )
+            if not _field_values_equal(
+                field, item.get("proposed_value"), effective.get(field)
+            ) and (
+                field not in {"transaction_date", "merchant", "description", "category"}
+                or witness[0] != "completed"
+                or witness[2]
+                in (item.get("completion_public_id"), item.get("correction_public_id"))
+            ):
+                raise ConversionEvidenceLineageError(
+                    "Historical HUMAN claim has no later material completion"
+                )
+        if any(
+            not _field_values_equal(field, value, effective.get(field))
+            for field, (_, value, _) in witnesses.items()
+        ):
+            raise ConversionEvidenceLineageError("Current HUMAN binding differs from receipt value")
+        return (
+            frozenset(field for field, (kind, _, _) in witnesses.items() if kind == "corrected"),
+            frozenset(field for field, (kind, _, _) in witnesses.items() if kind == "completed"),
+        )
+    except (ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        if isinstance(exc, ConversionEvidenceLineageError):
+            raise
+        raise ConversionEvidenceLineageError(
+            "Mixed receipt owning history does not verify"
+        ) from exc
+
+
 def _durable_resolution_provenance(
     conn: sqlite3.Connection,
     proposal: dict[str, Any],
@@ -1735,6 +2066,19 @@ def _durable_resolution_provenance(
     parent path.  Missing, contradictory, or forged claims fail closed as
     ``ConversionEvidenceLineageError`` before any write.
     """
+    from finance_core.parser_proposals.independent_ai_lineage import has_independent_ai_ancestry
+
+    if has_independent_ai_ancestry(conn, proposal):
+        return _mixed_ai_resolution_provenance(conn, proposal, effective)
+    return _legacy_resolution_provenance(conn, proposal, effective)
+
+
+def _legacy_resolution_provenance(
+    conn: sqlite3.Connection,
+    proposal: dict[str, Any],
+    effective: dict[str, Any],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Existing receipt evidence owner, internally selected after domain authentication."""
     path = _supersession_path(conn, int(proposal["id"]))
     try:
         _payload, _completion_id, proposal_version = resolve_effective_payload(conn, proposal)
@@ -1763,6 +2107,22 @@ def _durable_resolution_provenance(
         )
         row = cursor.fetchone()
         if row is None:
+            from finance_core.parser_proposals.independent_ai_lineage import verify_publication
+
+            ai = (
+                conn.execute(
+                    "SELECT * FROM independent_ai_publications WHERE child_parser_output_id=? "
+                    "AND parent_parser_output_id=?",
+                    (child_id, parent_id),
+                ).fetchone()
+                if conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='independent_ai_publications'"
+                ).fetchone()
+                else None
+            )
+            if ai is not None:
+                verify_publication(conn, ai)
+                continue
             if _is_valid_d1_nonmonetary_publication_edge(conn, parent_id, child_id):
                 continue
             raise ConversionEvidenceLineageError(
@@ -2814,6 +3174,7 @@ def _verify_persisted(
     now: str,
     chain_ids: Sequence[int],
     chain_root_id: int,
+    receipt_posting_authorization=None,
 ) -> None:
     """Complete pre-commit revalidation (Section 5.5).
 
@@ -2962,6 +3323,7 @@ def _verify_persisted(
             effective_hash=effective_hash,
             chain_ids=chain_ids,
             chain_root_id=chain_root_id,
+            receipt_posting_authorization=receipt_posting_authorization,
         )
     except ConversionPersistenceError:
         raise
@@ -3084,6 +3446,7 @@ def _revalidate_before_commit(
     effective_hash: str,
     chain_ids: Sequence[int],
     chain_root_id: int,
+    receipt_posting_authorization=None,
 ) -> None:
     """Re-run guards 5-14 against in-transaction state; nothing is cached."""
     fresh_proposal = _require_proposal(conn, command.proposal_public_id)
@@ -3149,7 +3512,19 @@ def _revalidate_before_commit(
     _require_source_binding(
         conn, fresh_proposal, fresh_raw_intake, fresh_extraction, fresh_attachment
     )
-    _require_flags_resolved(conn, fresh_proposal, fresh_effective)
+    from finance_core.application.receipt_posting_authorization import require_conversion_authority
+
+    posting_proof = require_conversion_authority(
+        conn,
+        command,
+        _get_registry_row(conn, command.command_public_id),
+        receipt_posting_authorization,
+        read_receipt_bookkeeping_metadata(
+            conn, derive_receipt_public_id(command.command_public_id)
+        ),
+    )
+    if posting_proof is None:
+        _require_flags_resolved(conn, fresh_proposal, fresh_effective)
     live_metadata = read_receipt_bookkeeping_metadata(
         conn, derive_receipt_public_id(command.command_public_id)
     )

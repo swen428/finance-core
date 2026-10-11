@@ -1,0 +1,444 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "coverage": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "label": {
+            "enum": [
+              "resolved_instruction",
+              "unresolved_instruction",
+              "non_instruction",
+              "confirmation_request"
+            ]
+          },
+          "operation_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "question_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 6,
+            "type": "array"
+          },
+          "start": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "label",
+          "operation_ids",
+          "question_ids"
+        ],
+        "type": "object"
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "type": "array"
+    },
+    "intent": {
+      "enum": [
+        "personal_expense",
+        "refund",
+        "income",
+        "transfer",
+        "shared_expense",
+        "unknown"
+      ]
+    },
+    "operations": {
+      "items": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "evidence": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "end": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "quote": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "ref": {
+                      "enum": [
+                        "source",
+                        "reply",
+                        "context",
+                        "source_context"
+                      ]
+                    },
+                    "role": {
+                      "enum": [
+                        "replacement_value",
+                        "previous_value",
+                        "retained_value"
+                      ]
+                    },
+                    "start": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "ref",
+                    "start",
+                    "end",
+                    "quote",
+                    "role"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 8,
+                "minItems": 1,
+                "type": "array"
+              },
+              "field": {
+                "enum": [
+                  "amount",
+                  "currency",
+                  "merchant",
+                  "description",
+                  "category"
+                ]
+              },
+              "op": {
+                "const": "set"
+              },
+              "operation_id": {
+                "maxLength": 64,
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 512,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "operation_id",
+              "op",
+              "field",
+              "value",
+              "evidence"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "date_expression": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "day": {
+                        "maximum": 31,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "const": "absolute_date"
+                      },
+                      "month": {
+                        "maximum": 12,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "year": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "year",
+                      "month",
+                      "day"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "days": {
+                        "maximum": 366,
+                        "minimum": -366,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "const": "day_offset"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "days"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "iso_weekday": {
+                        "maximum": 7,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "const": "calendar_week_weekday"
+                      },
+                      "week_offset": {
+                        "enum": [
+                          -1,
+                          0,
+                          1
+                        ]
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "week_offset",
+                      "iso_weekday"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "direction": {
+                        "enum": [
+                          "previous",
+                          "next"
+                        ]
+                      },
+                      "iso_weekday": {
+                        "maximum": 7,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "kind": {
+                        "const": "previous_or_next_weekday"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "direction",
+                      "iso_weekday"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "evidence": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "end": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "quote": {
+                      "maxLength": 2048,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "ref": {
+                      "enum": [
+                        "source",
+                        "reply",
+                        "context",
+                        "source_context"
+                      ]
+                    },
+                    "role": {
+                      "enum": [
+                        "replacement_value",
+                        "previous_value",
+                        "retained_value"
+                      ]
+                    },
+                    "start": {
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "ref",
+                    "start",
+                    "end",
+                    "quote",
+                    "role"
+                  ],
+                  "type": "object"
+                },
+                "maxItems": 8,
+                "minItems": 1,
+                "type": "array"
+              },
+              "field": {
+                "const": "transaction_date"
+              },
+              "op": {
+                "const": "set"
+              },
+              "operation_id": {
+                "maxLength": 64,
+                "type": "string"
+              }
+            },
+            "required": [
+              "operation_id",
+              "op",
+              "field",
+              "date_expression",
+              "evidence"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "maxItems": 6,
+      "type": "array"
+    },
+    "outcome": {
+      "enum": [
+        "proposal",
+        "clarification",
+        "unsupported"
+      ]
+    },
+    "schema": {
+      "const": "finance-independent-ai-result-v2"
+    },
+    "unresolved": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "items": {
+              "maxLength": 512,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "maxItems": 8,
+            "type": "array"
+          },
+          "evidence": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "end": {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "quote": {
+                  "maxLength": 2048,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "ref": {
+                  "enum": [
+                    "source",
+                    "reply",
+                    "context",
+                    "source_context"
+                  ]
+                },
+                "role": {
+                  "enum": [
+                    "replacement_value",
+                    "previous_value",
+                    "retained_value"
+                  ]
+                },
+                "start": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "ref",
+                "start",
+                "end",
+                "quote",
+                "role"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "fields": {
+            "items": {
+              "enum": [
+                "amount",
+                "currency",
+                "transaction_date",
+                "merchant",
+                "description",
+                "category"
+              ]
+            },
+            "maxItems": 6,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "question_id": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "missing",
+              "ambiguous",
+              "unsupported_expression"
+            ]
+          }
+        },
+        "required": [
+          "question_id",
+          "fields",
+          "reason",
+          "candidates",
+          "evidence"
+        ],
+        "type": "object"
+      },
+      "maxItems": 6,
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema",
+    "outcome",
+    "intent",
+    "operations",
+    "coverage",
+    "unresolved"
+  ],
+  "type": "object"
+}

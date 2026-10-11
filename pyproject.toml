@@ -34,6 +34,8 @@ namespaces = false
     "preflight/*.py",
     "finance_ai/*.json",
     "finance_ai/*.txt",
+    "independent_ai/*.json",
+    "independent_ai/*.txt",
 ]
 
 [tool.ruff]

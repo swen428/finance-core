@@ -25,6 +25,15 @@ def test_public_workflow_has_read_only_top_level_permissions() -> None:
     assert "id-token: write" not in source
 
 
+@pytest.mark.parametrize("job", ["classify", "quality", "pytest", "pytest-report", "validate"])
+def test_required_linux_jobs_pin_the_declared_validation_platform(job: str) -> None:
+    source = WORKFLOW.read_text(encoding="utf-8")
+    section = source.split(f"\n  {job}:\n", 1)[1]
+    header = section.split("    steps:\n", 1)[0]
+    assert re.search(r"^    runs-on: ubuntu-24\.04$", header, re.MULTILINE)
+    assert "runs-on: ubuntu-latest" not in header
+
+
 def test_public_ci_security_guards_run_before_required_pytest_shards() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
     quality = source.split("\n  quality:\n", 1)[1].split("\n  pytest:\n", 1)[0]
@@ -285,6 +294,10 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "finance_core/intake/macos_vision_receipt_ocr.py",
         "finance_core/parser_proposals/__init__.py",
         "finance_core/parser_proposals/ai_example.py",
+        "finance_core/parser_proposals/independent_ai_lineage.py",
+        "finance_core/parser_proposals/independent_ai_validation.py",
+        "finance_core/resources/independent_ai/policy_v1.json",
+        "finance_core/resources/independent_ai/prompt_v1.txt",
         "finance_core/intake/receipt_ocr_evidence.py",
         "finance_core/intake/tesseract_resources.py",
         "finance_core/intake/receipt_media.py",

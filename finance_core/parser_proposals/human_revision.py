@@ -220,6 +220,7 @@ def _build_d1_receipt_payload(
         _latest_completion_provenance(conn, parent_row),
         canonical_amount=canonical_amount,
         canonical_currency=canonical_currency,
+        evidence_conn=conn,
     )
     evidence = payload.get("field_evidence")
     if not isinstance(evidence, list):
@@ -1495,6 +1496,12 @@ def _expected_receipt_relational_evidence(
             else:
                 raise HumanRevisionLineageError("receipt revision human evidence is invalid")
             notes = None
+        elif source_type == "ai_model":
+            ai_reference = item.get("evidence_reference")
+            if not isinstance(ai_reference, str) or not ai_reference.startswith("independent-ai:"):
+                raise HumanRevisionLineageError("receipt revision AI evidence is invalid")
+            reference = ai_reference
+            notes = item.get("notes")
         else:
             reference = _receipt_canonical_json(
                 {
@@ -1624,6 +1631,7 @@ def _verify_public_receipt_revision_edge(
             _latest_completion_provenance(conn, parent),
             canonical_amount=canonical_amount,
             canonical_currency=canonical_currency,
+            evidence_conn=conn,
         )
     except Exception as exc:
         raise HumanRevisionLineageError("receipt revision no longer validates") from exc

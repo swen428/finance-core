@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
@@ -134,6 +134,12 @@ class AuditChainVerification:
     legacy_without_chain: bool = False
 
 
+def _audit_row_values(row: Any, description: Any) -> dict[str, Any]:
+    if isinstance(row, (sqlite3.Row, Mapping)):
+        return dict(row)
+    return dict(zip((column[0] for column in description), row, strict=True))
+
+
 class FinancialAuditRepository:
     """Transaction-neutral SQL operations; no update/delete or commit API."""
 
@@ -157,31 +163,37 @@ class FinancialAuditRepository:
         )
 
     def fetch(self, event_public_id: str) -> FinancialAuditEvent | None:
-        row = self._conn.execute(
+        cursor = self._conn.execute(
             "SELECT * FROM financial_audit_events WHERE event_public_id = ?",
             (event_public_id,),
-        ).fetchone()
-        return None if row is None else _row_to_event(row)
+        )
+        row = cursor.fetchone()
+        values = None if row is None else _audit_row_values(row, cursor.description)
+        return None if values is None else _row_to_event(values)
 
     def head(self, aggregate_type: str, aggregate_public_id: str) -> FinancialAuditEvent | None:
-        row = self._conn.execute(
+        cursor = self._conn.execute(
             """SELECT * FROM financial_audit_events
             WHERE aggregate_type = ? AND aggregate_public_id = ?
             ORDER BY sequence_number DESC LIMIT 1""",
             (aggregate_type, aggregate_public_id),
-        ).fetchone()
-        return None if row is None else _row_to_event(row)
+        )
+        row = cursor.fetchone()
+        values = None if row is None else _audit_row_values(row, cursor.description)
+        return None if values is None else _row_to_event(values)
 
     def list_chain(
         self, aggregate_type: str, aggregate_public_id: str
     ) -> list[FinancialAuditEvent]:
-        rows = self._conn.execute(
+        cursor = self._conn.execute(
             """SELECT * FROM financial_audit_events
             WHERE aggregate_type = ? AND aggregate_public_id = ?
             ORDER BY sequence_number ASC""",
             (aggregate_type, aggregate_public_id),
-        ).fetchall()
-        return [_row_to_event(row) for row in rows]
+        )
+        return [
+            _row_to_event(_audit_row_values(row, cursor.description)) for row in cursor.fetchall()
+        ]
 
 
 def derive_audit_event_public_id(
@@ -310,12 +322,13 @@ def verify_financial_audit_chain(
     aggregate_type: str,
     aggregate_public_id: str,
 ) -> AuditChainVerification:
-    rows = conn.execute(
+    cursor = conn.execute(
         """SELECT * FROM financial_audit_events
         WHERE aggregate_type = ? AND aggregate_public_id = ?
         ORDER BY sequence_number ASC""",
         (aggregate_type, aggregate_public_id),
-    ).fetchall()
+    )
+    rows = [_audit_row_values(row, cursor.description) for row in cursor.fetchall()]
     if not rows:
         return AuditChainVerification(
             valid=True,

@@ -399,13 +399,24 @@ def _literal_api_contract(package_init: bytes) -> str:
 
 def _migration_digest(payloads: dict[str, bytes]) -> str:
     prefix = "finance_core/resources/migrations/"
-    migrations = {
-        PurePosixPath(name).name: body
-        for name, body in payloads.items()
-        if name.startswith(prefix) and name.endswith(".sql")
-    }
-    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 58)):
-        raise ValueError("installed Finance Core migration inventory is not 001-057")
+    migrations: dict[str, bytes] = {}
+    for name, body in payloads.items():
+        if not name.startswith(prefix) or not name.endswith(".sql"):
+            continue
+        filename = name.removeprefix(prefix)
+        if (
+            not filename
+            or "/" in filename
+            or "\\" in filename
+            or filename in migrations
+            or len(filename) < 9
+            or not filename[:3].isdigit()
+            or filename[3] != "_"
+        ):
+            raise ValueError("installed Finance Core migration inventory is not 001-059")
+        migrations[filename] = body
+    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 60)):
+        raise ValueError("installed Finance Core migration inventory is not 001-059")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]

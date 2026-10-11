@@ -16,6 +16,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -4456,7 +4457,61 @@ def verify_ai_fallback_child(
     _skip_human: bool = False,
     _human_descendant_parser_output_id: int | None = None,
 ) -> dict[str, Any] | None:
-    """Verify the immutable AI edge before a human or conversion reader proceeds."""
+    """Dispatch separate AI domains without weakening legacy evidence failures."""
+    from finance_core.application.ai_invocation_contract import AiInvocationError
+    from finance_core.parser_proposals.independent_ai_lineage import verify_independent_ai_lineage
+
+    try:
+        independent = verify_independent_ai_lineage(
+            conn,
+            proposal,
+            content_hash=content_hash,
+            proposal_version=proposal_version,
+            require_resolved=require_resolved,
+        )
+    except AiInvocationError as exc:
+        # A damaged shared OCR/lineage guard can fail the new schema check
+        # before the old reader sees its own tampered evidence. Preserve that
+        # old domain's concrete refusal when it independently finds one.
+        # A successful diagnostic never waives the mandatory schema refusal.
+        if conn.execute(
+            "SELECT 1 FROM ai_fallback_proposal_links WHERE parser_output_id=?", (proposal["id"],)
+        ).fetchone():
+            _verify_legacy_ai_fallback_child(
+                conn,
+                proposal,
+                content_hash=content_hash,
+                proposal_version=proposal_version,
+                require_resolved=require_resolved,
+                _skip_human=True,
+            )
+        raise AiFallbackServiceError(
+            "AI_FALLBACK_CONFLICT", "AI fallback lineage escaped or corrupted: " + str(exc)
+        ) from exc
+    if independent is not None:
+        return independent
+    return _verify_legacy_ai_fallback_child(
+        conn,
+        proposal,
+        content_hash=content_hash,
+        proposal_version=proposal_version,
+        require_resolved=require_resolved,
+        _skip_human=_skip_human,
+        _human_descendant_parser_output_id=_human_descendant_parser_output_id,
+    )
+
+
+def _verify_legacy_ai_fallback_child(
+    conn: sqlite3.Connection,
+    proposal: Mapping[str, Any],
+    *,
+    content_hash: str,
+    proposal_version: int,
+    require_resolved: bool = True,
+    _skip_human: bool = False,
+    _human_descendant_parser_output_id: int | None = None,
+) -> dict[str, Any] | None:
+    """Legacy OpenClaw custody owner; never authenticates the new AI domain."""
     if not _skip_human:
         from finance_core.parser_proposals.amendment_lineage import (
             AmendmentLineageError,
@@ -4571,6 +4626,105 @@ def verify_ai_fallback_child(
                 "Current proposal escaped its sealed AI fallback lineage.",
             )
         return None
+    creation = _verify_legacy_ai_creation_edge(conn, proposal)
+    intake, child, attempt = creation.intake, creation.child, creation.attempt
+    if intake["parser_output_id"] != (
+        child["id"]
+        if _human_descendant_parser_output_id is None
+        else _human_descendant_parser_output_id
+    ):
+        raise AiFallbackServiceError(
+            "AI_FALLBACK_CONFLICT", "AI child source or attribution fields do not verify."
+        )
+    _assert_fallback_raw_intake_lineage(
+        conn,
+        attempt=attempt,
+        child_parser_output_id=int(child["id"]),
+        current_parser_output_id=_human_descendant_parser_output_id,
+    )
+    if (
+        creation.creation_content_hash != content_hash
+        or creation.creation_version != proposal_version
+    ):
+        raise AiFallbackServiceError(
+            "AI_FALLBACK_CONFLICT", "AI proposal lineage is stale or inconsistent."
+        )
+    if require_resolved and creation.requires_resolution:
+        raise AiFallbackServiceError(
+            "AI_FALLBACK_CONFLICT", "AI proposal ambiguity remains unresolved."
+        )
+    return {
+        key: getattr(creation, key)
+        for key in (
+            "proposal_origin",
+            "ai_source_kind",
+            "ambiguity_flags",
+            "requires_resolution",
+        )
+    }
+
+
+@dataclass(frozen=True)
+class LegacyAiCreation:
+    """Authenticated immutable creation snapshot, never current admission."""
+
+    proposal_origin: str
+    ai_source_kind: str
+    ambiguity_flags: tuple[str, ...]
+    requires_resolution: bool
+    creation_payload: dict[str, Any]
+    creation_content_hash: str
+    creation_version: int
+    attempt: dict[str, Any]
+    child: dict[str, Any]
+    intake: dict[str, Any]
+
+
+def _verify_legacy_ai_creation_edge(
+    conn: sqlite3.Connection,
+    proposal: Mapping[str, Any],
+) -> LegacyAiCreation:
+    """Authenticate immutable old creation records, never current admission.
+
+    Historical consumers reconstruct genuine HUMAN completions separately.
+    This owner has no call to a current domain/HUMAN/whole-lineage dispatcher.
+    """
+    from finance_core.parser_proposals.content_hash import compute_proposal_content_hash
+
+    try:
+        proposal_id = proposal["id"]
+    except (KeyError, IndexError, TypeError):
+        proposal_id = None
+    if type(proposal_id) is not int or proposal_id < 1:
+        raise AiFallbackServiceError("AI_FALLBACK_CONFLICT", "Old creation identity is invalid.")
+    links = conn.execute(
+        "SELECT * FROM ai_fallback_proposal_links WHERE parser_output_id=?",
+        (proposal_id,),
+    ).fetchall()
+    if len(links) != 1:
+        raise AiFallbackServiceError("AI_FALLBACK_CONFLICT", "Old creation has no unique link.")
+    link = links[0]
+    for table, condition in (
+        ("independent_ai_publications", "child_parser_output_id=?"),
+        (
+            "application_amendment_records",
+            "resulting_parser_output_id=? AND publication_kind!='completion'",
+        ),
+    ):
+        if (
+            conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            is not None
+            and conn.execute(
+                "SELECT 1 FROM " + table + " WHERE " + condition,
+                (proposal_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise AiFallbackServiceError(
+                "AI_FALLBACK_CONFLICT", "Old creation incoming owner is contradictory."
+            )
     result = conn.execute(
         "SELECT * FROM ai_fallback_results WHERE id = ?", (link["result_id"],)
     ).fetchone()
@@ -4602,12 +4756,6 @@ def verify_ai_fallback_child(
     if (
         child["source_type"] != parent["source_type"]
         or child["source_public_id"] != intake["public_id"]
-        or intake["parser_output_id"]
-        != (
-            child["id"]
-            if _human_descendant_parser_output_id is None
-            else _human_descendant_parser_output_id
-        )
         or child["attachment_id"] != parent["attachment_id"]
         or child["parser_name"] != "finance_ai_proposal"
         or child["parser_version"] != "finance-ai-proposal-v1"
@@ -4620,15 +4768,17 @@ def verify_ai_fallback_child(
         raise AiFallbackServiceError(
             "AI_FALLBACK_CONFLICT", "AI child source or attribution fields do not verify."
         )
-    _assert_fallback_raw_intake_lineage(
+    payload = _verify_ai_provenance_material(
         conn,
-        attempt=attempt,
-        child_parser_output_id=int(child["id"]),
-        current_parser_output_id=_human_descendant_parser_output_id,
+        attempt=dict(attempt),
+        claim=dict(claim),
+        result=dict(result),
+        link=dict(link),
+        child=dict(child),
     )
     if (
-        link["effective_content_hash"] != content_hash
-        or int(link["proposal_version"]) != proposal_version
+        link["effective_content_hash"] != compute_proposal_content_hash(conn, dict(child))
+        or int(link["proposal_version"]) != 0
         or result["result_status"] != "proposal_created"
         or child["parent_parser_output_id"] != attempt["parent_parser_output_id"]
         or result["claim_id"] != claim["id"]
@@ -4638,14 +4788,6 @@ def verify_ai_fallback_child(
             "AI_FALLBACK_CONFLICT",
             "AI proposal lineage is stale or inconsistent.",
         )
-    payload = _verify_ai_provenance_material(
-        conn,
-        attempt=dict(attempt),
-        claim=dict(claim),
-        result=dict(result),
-        link=dict(link),
-        child=dict(child),
-    )
     if not isinstance(payload, dict):
         raise AiFallbackServiceError(
             "AI_FALLBACK_CONFLICT",
@@ -4670,17 +4812,18 @@ def verify_ai_fallback_child(
         child["confidence_score"] is None
         or float(child["confidence_score"]) < AI_CONFIRMATION_CONFIDENCE_THRESHOLD
     )
-    if require_resolved and (ambiguity_flags or confidence_requires_resolution):
-        raise AiFallbackServiceError(
-            "AI_FALLBACK_CONFLICT",
-            "AI proposal ambiguity remains unresolved.",
-        )
-    return {
-        "proposal_origin": "ai_fallback",
-        "ai_source_kind": attempt["source_kind"],
-        "ambiguity_flags": tuple(ambiguity_flags),
-        "requires_resolution": bool(ambiguity_flags or confidence_requires_resolution),
-    }
+    return LegacyAiCreation(
+        proposal_origin="ai_fallback",
+        ai_source_kind=attempt["source_kind"],
+        ambiguity_flags=tuple(ambiguity_flags),
+        requires_resolution=bool(ambiguity_flags or confidence_requires_resolution),
+        creation_payload=payload,
+        creation_content_hash=link["effective_content_hash"],
+        creation_version=int(link["proposal_version"]),
+        attempt=dict(attempt),
+        child=dict(child),
+        intake=dict(intake),
+    )
 
 
 __all__ = [
