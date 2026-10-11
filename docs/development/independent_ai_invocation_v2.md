@@ -235,6 +235,14 @@ reverify the accepted basis. Old rules remain for old basis. Existing immutable
 Posting JSON/decision/evidence retain v2 authority; only guarded conversion/
 finalization creates facts and recovery preserves one approved economic event.
 
+Receipt conversion and downstream receipt guards select the actual proposal's
+verified owning lineage before querying independent-AI tables. Native receipts
+on the unchanged 054 schema and fully migrated 059 schema retain their native
+authority checks. Any partial independent schema, or an independent-AI origin
+with missing schema or owner evidence, fails closed. Same-source siblings cannot
+supply or remove the target's authority. Actual v2 receipts still require the fixed accepted
+full-card port at conversion, replay and every downstream financial boundary.
+
 V2-origin text conversion has a separate fixed `TextPostingAuthorization`,
 defined in `finance_core.application.text_posting_authorization`. The neutral
 `decision_owner.convert_confirmed_parser_proposal` and

@@ -13,6 +13,7 @@ from finance_core.bookkeeping_metadata import (
     read_receipt_bookkeeping_metadata,
 )
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
+from finance_core.parser_proposals.independent_ai_lineage import has_independent_ai_ancestry
 from finance_core.parser_proposals.independent_ai_validation import sha
 from finance_core.parser_proposals.repository import ParserProposalRepository
 
@@ -91,6 +92,12 @@ def require_conversion_authority(conn, command, existing, authority, metadata=No
     proposal = ParserProposalRepository(conn).get_lineage_row_by_id(
         _require_proposal(conn, command.proposal_public_id)["id"]
     )
+    if proposal is None:
+        raise AiInvocationError("Receipt posting proposal absent")
+    # Select the actual owning domain before accessing its optional schema.
+    # Marker or partial-schema damage still fails closed in this verifier.
+    if not has_independent_ai_ancestry(conn, proposal):
+        return None
     # Use the sealed invocation source; fixed port must reauthenticate it.
     row = conn.execute(
         "SELECT a.material_json FROM independent_ai_attempts a JOIN "
@@ -180,6 +187,11 @@ def require_receipt_posting_authority(conn, receipt_id, authority):
         (receipt_id,),
     ).fetchone()
     if row is None:
+        return
+    proposal = ParserProposalRepository(conn).get_by_public_id(row[2])
+    if proposal is None:
+        raise AiInvocationError("Receipt posting proposal absent")
+    if not has_independent_ai_ancestry(conn, proposal):
         return
     import json
 
