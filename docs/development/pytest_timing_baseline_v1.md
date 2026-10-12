@@ -57,3 +57,79 @@ limited to that job-level timeout; the four single-process shards, test
 inventory, required jobs and acceptance remain unchanged. The timeout is an
 upper bound, not an expected duration or proof of completion; only a complete
 successful exact-head run supplies authoritative validation.
+
+## October 12, 2026 baseline refresh and operating guidance
+
+The refreshed manifest was built with the existing `build-baseline` command
+from three verified, successful first-attempt protected-main push runs. Their
+run and head identities are:
+
+| Run | Head |
+| --- | --- |
+| `38111411851` | `c5e881141b6ca8a326de1f1382601d51521130ce` |
+| `38130916170` | `ff1a36db4db01987a9dc61d8408a40447c23326b` |
+| `38169383980` | `0a41c1566da7a843eceb3d28d4a8e4c3653a3ebb` |
+
+The complete manifest contains all 258 current test files, 12,247 test cases
+and 36,739 per-test timing samples. The current production plan reports zero
+unknown files. The manifest's `unknown_file_weight_seconds` value of 178.068
+seconds is the P95 fallback weight reserved for a future file without timing;
+it is not an unknown-file count. The builder still takes each test's median
+from the available source samples and sums those medians by file. The source
+minimum, 30-day freshness limit, 5% unknown-file limit, P95 fallback, four
+single-process shards, deterministic LPT assignment and exact once-only test
+inventory remain unchanged.
+
+Historical replay used the same 258-file inventory. The latest two runs had
+identical 12,247-case inventories; their replayed longest-shard cumulative
+test durations were 30.09% and 11.44% below the prior assignments. Across all
+three runs, the replayed maximum-to-mean shard ratios were 1.0403, 1.0267 and
+1.0738. The replays place the new longest shards at roughly 58–72 minutes of
+cumulative test duration. These are forecasts from historical test timings,
+not measurements of hosted job wall time or promised work reduction.
+
+### Reading the timing summary
+
+The timing summary is a human-readable view of the validated plan and timing
+artifact. It does not change the stable planner or aggregator command line,
+`pytest-timing-v1` JSON schema, or success and failure exit codes.
+
+- Per-shard forecast duration is the sum of assigned file weights. Actual
+  duration is the sum of measured test durations in a complete timing
+  artifact. Counts identify how many files and test cases contributed.
+- Duration deviation is actual minus forecast, with the percentage calculated
+  against a positive forecast. A missing, null, failed, incomplete, or
+  zero-denominator value is not evaluable; it must not be shown as zero or
+  treated as a pass.
+- The maximum-to-mean ratio is the longest shard's cumulative test duration
+  divided by the arithmetic mean across the four shards. Top-ten file and case
+  rows show each measured contribution and its share of the total measured
+  test duration across all four shards.
+- The total test time is the sum of shard test durations. Dividing it by four
+  gives the ideal balanced-shard lower bound on the longest shard's test work;
+  it is not a wall-time guarantee. Setup, scheduling, runner variation and
+  resource contention are outside that lower bound.
+- Unknown actual cost is measured from tests whose file has no baseline
+  weight. The plan applies the P95 fallback weight to each such file. Keep the
+  unknown-file count, measured unknown cost and fallback estimate distinct.
+
+The following are review hints, not CI gates: maximum-to-mean above 1.20
+suggests shard imbalance; actual total test time divided by forecast total
+above 1.25 suggests that the overall forecast was low; and any individual
+unknown file's actual cost divided by its positive fallback estimate above 2
+suggests that the baseline deserves review. Unknown-file costs are not summed
+and divided by one file's fallback for this hint. Missing or incomplete
+evidence makes the affected hint not evaluable.
+
+Prepare a manual baseline review only after the same warning appears in two
+consecutive qualified samples. A qualified sample is a complete, successful,
+first-attempt `validate.yml` protected-main push with the full required job
+set and a valid aggregate timing artifact. The review may prepare a refresh
+from three verified eligible sources. It does not automatically edit the
+manifest, change workflow state, start a workflow, or rerun a job.
+
+For a candidate PR and the resulting landed-main measurement, the target
+maximum-to-mean ratio is at most 1.20, assessed separately from correctness
+and complete test coverage. Preserve and evaluate a failed run or a performance
+miss as observed; do not select a later, faster retry as the result. The
+120-minute timeout remains an upper bound, not a duration target.
