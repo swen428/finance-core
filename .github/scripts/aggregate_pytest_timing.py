@@ -31,6 +31,9 @@ import json
 import math
 import re
 import sys
+import unicodedata
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -86,6 +89,16 @@ class AggregationError(ValueError):
     def __init__(self, message: str, *, error_code: str = "timing_aggregation_failed"):
         super().__init__(message)
         self.error_code = error_code
+
+
+@dataclass(frozen=True)
+class ValidatedPlan:
+    """Plan values retained from one successful validation pass."""
+
+    shards: tuple[tuple[str, ...], ...]
+    expected_seconds: tuple[float, ...]
+    unknown_files: frozenset[str]
+    unknown_file_fallback_seconds: float
 
 
 def _sanitize(value: str) -> str:
@@ -332,7 +345,7 @@ def _load_plan(
     expected_shard_count: int | None = None,
     *,
     now: datetime | None = None,
-) -> list[list[str]]:
+) -> ValidatedPlan:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -372,6 +385,7 @@ def _load_plan(
         raise AggregationError("shard plan count mismatch", error_code="plan_count_mismatch")
 
     shards: list[list[str]] = []
+    expected_seconds: list[float] = []
     all_files: list[str] = []
     for expected_index, shard in enumerate(raw_shards):
         if not isinstance(shard, dict) or set(shard) != _PLAN_SHARD_KEYS:
@@ -416,6 +430,7 @@ def _load_plan(
         for file in files:
             _validate_plan_path(file)
         shards.append(files)
+        expected_seconds.append(float(estimated_weight))
         all_files.extend(files)
 
     if not all_files:
@@ -513,7 +528,12 @@ def _load_plan(
         )
     if payload.get("digest") != _plan_digest(shard_count, shards):
         raise AggregationError("shard plan digest mismatch", error_code="plan_digest_mismatch")
-    return shards
+    return ValidatedPlan(
+        shards=tuple(tuple(files) for files in shards),
+        expected_seconds=tuple(expected_seconds),
+        unknown_files=frozenset(new_files),
+        unknown_file_fallback_seconds=float(unknown_weight),
+    )
 
 
 def _map_test_id_to_file(test_id: str, module_map: dict[str, str]) -> str:
@@ -638,26 +658,411 @@ def aggregate_shard_reports(
     }
 
 
-def build_step_summary(report: dict[str, Any], shard_count: int) -> str:
+def _empty_performance_diagnostics(reason: str, plan: ValidatedPlan | None) -> dict[str, Any]:
+    expected_seconds = sum(plan.expected_seconds) if plan is not None else None
+    return {
+        "evaluable": False,
+        "reason": reason,
+        "expected_seconds": expected_seconds,
+        "actual_seconds": None,
+        "max_mean_ratio": None,
+        "actual_expected_ratio": None,
+        "ideal_lower_bound_seconds": None,
+        "shards": [],
+        "top_files": [],
+        "top_files_remaining_count": 0,
+        "top_cases": [],
+        "top_cases_remaining_count": 0,
+        "unknown_file_count": len(plan.unknown_files) if plan is not None else None,
+        "unknown_fallback_seconds": (
+            len(plan.unknown_files) * plan.unknown_file_fallback_seconds
+            if plan is not None
+            else None
+        ),
+        "unknown_actual_seconds": None,
+        "max_unknown_file_actual_fallback_ratio": None,
+        "top_unknown_files": [],
+        "top_unknown_files_remaining_count": 0,
+        "hints": [],
+    }
+
+
+def build_performance_diagnostics(
+    shard_reports: list[dict[str, Any]] | None,
+    plan: ValidatedPlan | None,
+) -> dict[str, Any]:
+    """Calculate bounded-report inputs from the already validated plan and reports."""
+    if plan is None:
+        return _empty_performance_diagnostics("missing validated plan", plan)
+    if shard_reports is None:
+        return _empty_performance_diagnostics("missing shard reports", plan)
+    if len(shard_reports) != len(plan.shards):
+        return _empty_performance_diagnostics("report count does not match plan", plan)
+
+    expected_total = sum(plan.expected_seconds)
+    if not math.isfinite(expected_total):
+        return _empty_performance_diagnostics("invalid expected timing", plan)
+
+    all_files = {file for shard in plan.shards for file in shard}
+    module_map = {
+        file[: -len(".py")].replace("/", "."): file for file in all_files if file.endswith(".py")
+    }
+    file_shards = {file: index for index, shard in enumerate(plan.shards) for file in shard}
+    file_actual: defaultdict[str, float] = defaultdict(float)
+    case_actual: list[tuple[str, float]] = []
+    shard_actual: list[float] = []
+    shard_test_counts: list[int] = []
+    covered_files: set[str] = set()
+
+    for index, report in enumerate(shard_reports):
+        if (
+            not isinstance(report, dict)
+            or report.get("schema") != TIMING_SCHEMA
+            or report.get("complete") is not True
+            or report.get("error") is not None
+            or report.get("pytest_exit_code") != 0
+        ):
+            return _empty_performance_diagnostics("reports incomplete or failed", plan)
+        counts = report.get("counts")
+        tests = report.get("tests")
+        if (
+            not isinstance(counts, dict)
+            or not isinstance(tests, list)
+            or report.get("total_tests") != len(tests)
+            or counts.get("failed", 0) != 0
+            or counts.get("error", 0) != 0
+        ):
+            return _empty_performance_diagnostics("reports incomplete or failed", plan)
+
+        total = 0.0
+        for entry in tests:
+            if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                return _empty_performance_diagnostics("invalid test timing", plan)
+            duration = entry.get("duration_seconds")
+            if duration is None:
+                return _empty_performance_diagnostics("missing duration", plan)
+            if (
+                not isinstance(duration, (int, float))
+                or isinstance(duration, bool)
+                or not math.isfinite(float(duration))
+                or float(duration) < 0
+            ):
+                return _empty_performance_diagnostics("invalid duration", plan)
+            test_id = entry["id"]
+            try:
+                file = _map_test_id_to_file(test_id, module_map)
+            except AggregationError:
+                return _empty_performance_diagnostics("test id is outside the plan", plan)
+            if file_shards.get(file) != index:
+                return _empty_performance_diagnostics("test id is assigned to another shard", plan)
+            elapsed = float(duration)
+            total += elapsed
+            file_actual[file] += elapsed
+            case_actual.append((test_id, elapsed))
+            covered_files.add(file)
+        shard_actual.append(total)
+        shard_test_counts.append(len(tests))
+
+    if covered_files != all_files:
+        return _empty_performance_diagnostics("test reports do not cover the plan", plan)
+
+    actual_total = sum(shard_actual)
+    if not math.isfinite(actual_total) or actual_total <= 0:
+        return _empty_performance_diagnostics("zero total duration", plan)
+
+    shard_rows = []
+    for index, (expected, actual, test_count) in enumerate(
+        zip(plan.expected_seconds, shard_actual, shard_test_counts, strict=True)
+    ):
+        deviation = ((actual - expected) / expected) if expected > 0 else None
+        deviation_percent = deviation * 100 if deviation is not None else None
+        if deviation_percent is not None and not math.isfinite(deviation_percent):
+            return _empty_performance_diagnostics("invalid computed ratio", plan)
+        shard_rows.append(
+            {
+                "index": index,
+                "expected_seconds": expected,
+                "actual_seconds": actual,
+                "test_count": test_count,
+                "deviation_percent": deviation_percent,
+            }
+        )
+
+    def ranked_items(items: list[tuple[str, float]]) -> tuple[list[dict[str, Any]], int]:
+        ordered = sorted(items, key=lambda item: (-item[1], item[0]))
+        rows = [
+            {"name": name, "actual_seconds": elapsed, "share": elapsed / actual_total}
+            for name, elapsed in ordered[:10]
+        ]
+        return rows, max(0, len(ordered) - len(rows))
+
+    top_files, top_files_remaining = ranked_items(list(file_actual.items()))
+    top_cases, top_cases_remaining = ranked_items(case_actual)
+    unknown_actual = {file: file_actual.get(file, 0.0) for file in plan.unknown_files}
+    unknown_actual_total = sum(unknown_actual.values())
+    unknown_fallback_total = len(plan.unknown_files) * plan.unknown_file_fallback_seconds
+    if not math.isfinite(unknown_fallback_total):
+        return _empty_performance_diagnostics("invalid fallback timing", plan)
+    unknown_ratios = [
+        elapsed / plan.unknown_file_fallback_seconds
+        for elapsed in unknown_actual.values()
+        if plan.unknown_file_fallback_seconds > 0
+    ]
+    if any(not math.isfinite(value) for value in unknown_ratios):
+        return _empty_performance_diagnostics("invalid computed ratio", plan)
+    unknown_ratio_by_file = {
+        file: elapsed / plan.unknown_file_fallback_seconds
+        if plan.unknown_file_fallback_seconds > 0
+        else None
+        for file, elapsed in unknown_actual.items()
+    }
+    top_unknown_files = [
+        {
+            "name": file,
+            "actual_seconds": elapsed,
+            "fallback_seconds": plan.unknown_file_fallback_seconds,
+            "actual_fallback_ratio": unknown_ratio_by_file[file],
+            "share": elapsed / actual_total,
+        }
+        for file, elapsed in sorted(unknown_actual.items(), key=lambda item: (-item[1], item[0]))[
+            :10
+        ]
+    ]
+    unknown_remaining = max(0, len(unknown_actual) - len(top_unknown_files))
+
+    mean_actual = actual_total / len(shard_actual) if shard_actual else 0.0
+    max_mean_ratio = max(shard_actual) / mean_actual if mean_actual > 0 else None
+    actual_expected_ratio = actual_total / expected_total if expected_total > 0 else None
+    if actual_expected_ratio is not None and not math.isfinite(actual_expected_ratio):
+        return _empty_performance_diagnostics("invalid computed ratio", plan)
+    ideal_lower_bound = actual_total / len(shard_actual)
+    max_unknown_ratio = max(unknown_ratios) if unknown_ratios else None
+
+    hints = []
+    if max_mean_ratio is not None and max_mean_ratio > 1.20:
+        hints.append("imbalance")
+    if actual_expected_ratio is not None and actual_expected_ratio > 1.25:
+        hints.append("overall_slower")
+    if any(ratio > 2.0 for ratio in unknown_ratios):
+        hints.append("refresh_unknown_weights")
+
+    return {
+        "evaluable": True,
+        "reason": None,
+        "expected_seconds": expected_total,
+        "actual_seconds": actual_total,
+        "max_mean_ratio": max_mean_ratio,
+        "actual_expected_ratio": actual_expected_ratio,
+        "ideal_lower_bound_seconds": ideal_lower_bound,
+        "shards": shard_rows,
+        "top_files": top_files,
+        "top_files_remaining_count": top_files_remaining,
+        "top_cases": top_cases,
+        "top_cases_remaining_count": top_cases_remaining,
+        "unknown_file_count": len(plan.unknown_files),
+        "unknown_fallback_seconds": unknown_fallback_total,
+        "unknown_actual_seconds": unknown_actual_total,
+        "max_unknown_file_actual_fallback_ratio": max_unknown_ratio,
+        "top_unknown_files": top_unknown_files,
+        "top_unknown_files_remaining_count": unknown_remaining,
+        "hints": hints,
+    }
+
+
+def _markdown_code(value: str, *, max_length: int = 160) -> str:
+    cleaned = "".join(ch for ch in value if unicodedata.category(ch) not in {"Cc", "Cf", "Cs"})
+    cleaned = html.escape(cleaned, quote=True).replace("|", "\uff5c")
+    if len(cleaned) > max_length:
+        cleaned = cleaned[: max_length - 1] + "…"
+    runs = re.findall(r"`+", cleaned)
+    fence = "`" * (max((len(run) for run in runs), default=0) + 1)
+    return f"{fence} {cleaned} {fence}"
+
+
+def _format_performance_diagnostics(diagnostics: dict[str, Any]) -> str:
+    if not diagnostics.get("evaluable"):
+        reason = diagnostics.get("reason") or "metrics unavailable"
+        return "\n".join(
+            [
+                "### Performance diagnostics",
+                "",
+                f"Metrics: not evaluable ({reason}).",
+                "No timing-threshold hint generated.",
+            ]
+        )
+
+    def seconds(value: float | None) -> str:
+        return f"{value:.1f}s" if value is not None else "not evaluable"
+
+    def ratio(value: float | None) -> str:
+        return f"{value:.2f}x" if value is not None else "not evaluable"
+
+    def share(value: float | None) -> str:
+        return f"{value:.1%}" if value is not None else "not evaluable"
+
+    lines = [
+        "### Performance diagnostics",
+        "",
+        "| Shard | Expected | Actual | Tests | Deviation |",
+        "|-------|----------|--------|-------|-----------|",
+    ]
+    for row in diagnostics["shards"]:
+        deviation = row["deviation_percent"]
+        deviation_text = f"{deviation:+.1f}%" if deviation is not None else "not evaluable"
+        lines.append(
+            f"| {row['index']} | {seconds(row['expected_seconds'])} | "
+            f"{seconds(row['actual_seconds'])} | {row['test_count']} | {deviation_text} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"- Max/mean actual shard time: {ratio(diagnostics['max_mean_ratio'])}.",
+            f"- Total actual/expected test time: {ratio(diagnostics['actual_expected_ratio'])}.",
+            f"- Total expected / actual test time: {seconds(diagnostics['expected_seconds'])} / "
+            f"{seconds(diagnostics['actual_seconds'])}.",
+            f"- Ideal lower bound: {seconds(diagnostics['ideal_lower_bound_seconds'])} "
+            "(test-time lower bound; not a wall-time guarantee).",
+            "",
+            "Top files by actual test time (share of this run's measured test time):",
+            "",
+            "| File | Actual | Share |",
+            "|------|--------|-------|",
+        ]
+    )
+    for row in diagnostics["top_files"]:
+        lines.append(
+            f"| {_markdown_code(row['name'])} | {seconds(row['actual_seconds'])} | "
+            f"{share(row['share'])} |"
+        )
+    if diagnostics["top_files_remaining_count"]:
+        lines.append(f"({diagnostics['top_files_remaining_count']} more files omitted.)")
+    lines.extend(
+        [
+            "",
+            "Top test cases by actual test time (share of this run's measured test time):",
+            "",
+            "| Test case | Actual | Share |",
+            "|-----------|--------|-------|",
+        ]
+    )
+    for row in diagnostics["top_cases"]:
+        lines.append(
+            f"| {_markdown_code(row['name'])} | {seconds(row['actual_seconds'])} | "
+            f"{share(row['share'])} |"
+        )
+    if diagnostics["top_cases_remaining_count"]:
+        lines.append(f"({diagnostics['top_cases_remaining_count']} more test cases omitted.)")
+    unknown_count = diagnostics["unknown_file_count"]
+    if unknown_count:
+        fallback_text = seconds(diagnostics["unknown_fallback_seconds"])
+        actual_text = seconds(diagnostics["unknown_actual_seconds"])
+        lines.extend(
+            [
+                "",
+                f"Unknown files: {unknown_count}; fallback estimate {fallback_text}; "
+                f"actual test time {actual_text}; "
+                "maximum per-file actual/fallback ratio "
+                f"{ratio(diagnostics['max_unknown_file_actual_fallback_ratio'])}.",
+                "",
+                "| Unknown file | Actual | Fallback | Actual/fallback | Share |",
+                "|--------------|--------|----------|----------------|-------|",
+            ]
+        )
+        for row in diagnostics["top_unknown_files"]:
+            lines.append(
+                f"| {_markdown_code(row['name'])} | {seconds(row['actual_seconds'])} | "
+                f"{seconds(row['fallback_seconds'])} | {ratio(row['actual_fallback_ratio'])} | "
+                f"{share(row['share'])} |"
+            )
+        if diagnostics["top_unknown_files_remaining_count"]:
+            lines.append(
+                f"({diagnostics['top_unknown_files_remaining_count']} more unknown files omitted.)"
+            )
+    else:
+        lines.extend(["", "Unknown files: none; no fallback comparison is applicable."])
+
+    hint_labels = {
+        "imbalance": "Manual review: shard max/mean is strictly above 1.20.",
+        "overall_slower": "Manual review: actual/expected total test time is strictly above 1.25.",
+        "refresh_unknown_weights": (
+            "Manual review: at least one unknown file's actual/fallback estimate "
+            "is strictly above 2."
+        ),
+    }
+    lines.extend(["", "Non-blocking hints (manual assessment only; no automatic action or rerun):"])
+    if diagnostics["hints"]:
+        lines.extend(f"- {hint_labels[hint]}" for hint in diagnostics["hints"])
+    else:
+        lines.append("- None.")
+    return "\n".join(lines)
+
+
+def _summary_duration_is_evaluable(report: dict[str, Any]) -> bool:
+    counts = report.get("counts")
+    tests = report.get("tests")
+    duration = report.get("total_duration_seconds")
+    return (
+        report.get("complete") is True
+        and report.get("pytest_exit_code") == 0
+        and isinstance(counts, dict)
+        and counts.get("failed", 0) == 0
+        and counts.get("error", 0) == 0
+        and isinstance(tests, list)
+        and all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("duration_seconds"), (int, float))
+            and not isinstance(entry.get("duration_seconds"), bool)
+            and math.isfinite(float(entry["duration_seconds"]))
+            and float(entry["duration_seconds"]) >= 0
+            for entry in tests
+        )
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(float(duration))
+        and float(duration) > 0
+    )
+
+
+def build_step_summary(
+    report: dict[str, Any],
+    shard_count: int,
+    diagnostics: dict[str, Any] | None = None,
+) -> str:
     exit_code = int(report.get("pytest_exit_code", 1))
-    status = "\u2705" if exit_code == 0 else "\u274c"
     counts = report.get("counts", {})
+    duration_evaluable = _summary_duration_is_evaluable(report)
+    failed_count = counts.get("failed", 0) if isinstance(counts, dict) else 0
+    error_count = counts.get("error", 0) if isinstance(counts, dict) else 0
+    if duration_evaluable:
+        status = "\u2705"
+        result = f"{status} exit code {exit_code}"
+        duration = f"{float(report['total_duration_seconds']):.1f}s"
+    elif exit_code != 0 or failed_count or error_count:
+        status = "\u274c"
+        result = f"{status} exit code {exit_code}; timing metrics not evaluable"
+        duration = "not evaluable"
+    else:
+        status = "\u26a0\ufe0f"
+        result = f"{status} exit code {exit_code}; timing metrics not evaluable"
+        duration = "not evaluable"
     lines = [
         "## Pytest aggregate timing report",
         "",
         "| Metric | Value |",
         "|--------|-------|",
         f"| Shards aggregated | {shard_count} |",
-        f"| Aggregate result | {status} exit code {exit_code} |",
+        f"| Aggregate result | {result} |",
         f"| Complete | {report.get('complete')} |",
         f"| Total tests | {report.get('total_tests', 0)} |",
         f"| Passed | {counts.get('passed', 0)} |",
-        f"| Failed | {counts.get('failed', 0)} |",
+        f"| Failed | {failed_count} |",
         f"| Skipped | {counts.get('skipped', 0)} |",
-        f"| Errors | {counts.get('error', 0)} |",
-        f"| Total duration | {report.get('total_duration_seconds', 0):.1f}s |",
+        f"| Errors | {error_count} |",
+        f"| Total duration | {duration} |",
         "",
     ]
+    diagnostics = diagnostics or _empty_performance_diagnostics("missing validated plan", None)
+    lines.append(_format_performance_diagnostics(diagnostics))
     return "\n".join(lines)
 
 
@@ -677,10 +1082,14 @@ def main(argv: list[str] | None = None) -> int:
 
     shard_dir = Path(args.shard_dir)
     output_path = Path(args.output)
+    validated_plan: ValidatedPlan | None = None
+    shard_reports: list[dict[str, Any]] | None = None
+    aggregation_succeeded = False
 
     try:
         validation_time = _parse_utc_timestamp(args.now, field="now") if args.now else None
-        plan_shards = _load_plan(Path(args.plan), args.expected_shard_count, now=validation_time)
+        validated_plan = _load_plan(Path(args.plan), args.expected_shard_count, now=validation_time)
+        plan_shards = [list(shard) for shard in validated_plan.shards]
         plan_digest = _plan_digest(len(plan_shards), plan_shards)
         shard_count = len(plan_shards)
         discovered_reports = {
@@ -703,6 +1112,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         report = aggregate_shard_reports(shard_reports, plan_shards)
         exit_code = int(report["pytest_exit_code"])
+        aggregation_succeeded = True
     except AggregationError as exc:
         report = {
             "schema": TIMING_SCHEMA,
@@ -723,9 +1133,19 @@ def main(argv: list[str] | None = None) -> int:
     output_path.write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
+    summary_shard_count = (
+        len(validated_plan.shards)
+        if validated_plan is not None
+        else (args.expected_shard_count or 0)
+    )
     summary_text = build_step_summary(
         report,
-        len(plan_shards) if "plan_shards" in locals() else (args.expected_shard_count or 0),
+        summary_shard_count,
+        (
+            build_performance_diagnostics(shard_reports, validated_plan)
+            if aggregation_succeeded
+            else _empty_performance_diagnostics("aggregation failed", validated_plan)
+        ),
     )
     if args.summary:
         with open(args.summary, "a", encoding="utf-8") as handle:
