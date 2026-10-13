@@ -94,10 +94,12 @@ def _use_snapshot_bridge_workspace(
     )
 
 
-def _create_sealed_ai_root(tmp_path: Path) -> tuple[sqlite3.Connection, str, dict[str, object]]:
+def _create_sealed_ai_root(
+    tmp_path: Path, *, pre_business_observer=None
+) -> tuple[sqlite3.Connection, str, dict[str, object]]:
     raw_text = "paid SGD 12.34 at Cafe on 2026-08-13"
     _workspace, connection, intake_public_id, parent_id = _captured_text_proposal(
-        tmp_path, raw_text
+        tmp_path, raw_text, pre_business_observer=pre_business_observer
     )
     _set_parent_payload_fields(
         connection,

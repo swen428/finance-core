@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
+import sqlite3
+from contextlib import closing, contextmanager
+from pathlib import Path
 
 import pytest
 from test_application_amendment_v1 import _apply
@@ -1698,86 +1703,283 @@ def test_systemic_old_creation_completion_and_new_producer_fault_refuses(tmp_pat
         c.close()
 
 
-@pytest.mark.parametrize("prefix_kind", ["root", "human", "independent", "legacy"])
-@pytest.mark.parametrize(
-    "marker",
-    [
-        "orphan_audit",
-        "unknown_audit",
-        "duplicate_audit",
-        "unknown_lifecycle",
-        "wrong_node_lifecycle",
-        "unknown_parser",
-        "unknown_field",
-        "payload_only_audit",
-        "references_only_audit",
-        "wrong_node_audit",
-        "wrong_node_field",
-    ],
+@dataclasses.dataclass(frozen=True)
+class _CloseoutMigrationBaseline:
+    path: Path
+    canonical_schema_json: str
+    raw_schema: tuple
+    ledger: tuple
+
+
+@dataclasses.dataclass(frozen=True)
+class _CloseoutSeed:
+    """Closed real history; serialized values cannot retain mutable authority."""
+
+    path: Path
+    prefix_kind: str
+    baseline: _CloseoutMigrationBaseline
+    canonical_schema_json: str
+    root: Path
+    prefix: str
+    phase: str
+    publication_json: str
+    card_json: str
+    accepted_json: str | None
+    status_json: str
+    provider_json: str
+    workspace_json: str | None
+    manifest_bytes: bytes | None
+    rows: tuple
+    schema: tuple
+    fingerprint: tuple
+
+
+def _closeout_business_rows(c):
+    return tuple(
+        (table, tuple(rows))
+        for table, rows in _cancel_all_rows(c).items()
+        if table != "_staging_authorization"
+    )
+
+
+def _closeout_schema(c):
+    return tuple(
+        tuple(row)
+        for row in c.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+    )
+
+
+_CLOSEOUT_SYNTHETIC_TABLES = (
+    "synthetic_sources",
+    "synthetic_displays",
+    "synthetic_decisions",
+    "synthetic_replies",
+    "synthetic_display_closures",
+    "synthetic_ai_receipts",
+    "synthetic_interpretation_replies",
+    "synthetic_interpretation_displays",
 )
-@pytest.mark.parametrize("phase", ["before_facts", "accepted_replay"])
-def test_closeout_all_creation_prefix_markers_refuse_cached_card_and_replay(
-    tmp_path, prefix_kind, marker, phase
-):
+_CLOSEOUT_AMENDMENT_TABLES = (
+    "synthetic_amendment_displays_v1",
+    "synthetic_amendment_replies_v1",
+    "synthetic_amendment_evidence_v1",
+)
+
+
+def _closeout_canonical_schema(c):
+    from finance_core.reconciliation.migrations import canonical_schema_payload
+
+    return json.dumps(canonical_schema_payload(c), sort_keys=True)
+
+
+def _closeout_ledger(c):
+    return tuple(
+        tuple(row)
+        for row in c.execute("SELECT * FROM schema_migrations ORDER BY migration_sequence")
+    )
+
+
+def _closeout_observe_migrations(c):
+    from finance_core.reconciliation.migrations import (
+        TEMP_DB_MIGRATION_PATHS,
+        verify_migration_history,
+    )
+    from finance_core.staging_guard import require_staging_database
+
+    require_staging_database(c)
+    verify_migration_history(c, TEMP_DB_MIGRATION_PATHS, require_complete=True)
+    assert not c.in_transaction and c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert not c.execute("SELECT name FROM sqlite_master WHERE name LIKE 'synthetic_%'").fetchall()
+    return _CloseoutMigrationBaseline(
+        Path(c.execute("PRAGMA database_list").fetchone()[2]).resolve(),
+        _closeout_canonical_schema(c),
+        _closeout_schema(c),
+        _closeout_ledger(c),
+    )
+
+
+def _verify_closeout_preparation_delta(c, baseline, prefix_kind):
+    """Preserve genuine migrated schema/ledger, allowing only exact authority DDL."""
+    assert _closeout_ledger(c) == baseline.ledger, "STOP_PREPARED_LEDGER_CHANGED"
+    names = _CLOSEOUT_SYNTHETIC_TABLES + (
+        _CLOSEOUT_AMENDMENT_TABLES if prefix_kind in {"human", "legacy"} else ()
+    )
+    # This bounded, fixed DDL describes synthetic signatures only, never business rows.
+    with closing(sqlite3.connect(":memory:")) as expected:
+        for name in names:
+            expected.execute(
+                f"CREATE TABLE {name} "
+                "(id TEXT PRIMARY KEY, material TEXT NOT NULL, signature TEXT NOT NULL)"
+            )
+        expected_payload = json.loads(baseline.canonical_schema_json)
+        extensions = json.loads(_closeout_canonical_schema(expected))
+        expected_payload["tables"] = sorted(
+            expected_payload["tables"] + extensions["tables"], key=lambda table: table["name"]
+        )
+        expected_payload["objects"] = sorted(
+            expected_payload["objects"] + extensions["objects"],
+            key=lambda item: (item["type"], item["name"]),
+        )
+        assert json.loads(_closeout_canonical_schema(c)) == expected_payload, (
+            "STOP_PREPARED_SCHEMA_CHANGED"
+        )
+        expected_raw = tuple(
+            sorted(
+                baseline.raw_schema + _closeout_schema(expected), key=lambda row: (row[0], row[1])
+            )
+        )
+        assert _closeout_schema(c) == expected_raw, "STOP_PREPARED_RAW_SCHEMA_CHANGED"
+
+
+def _verify_closeout_prepared_database(c, seed):
+    from finance_core.staging_guard import require_staging_database
+
+    require_staging_database(c)
+    assert c.row_factory is sqlite3.Row and not c.in_transaction
+    assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    _verify_closeout_preparation_delta(c, seed.baseline, seed.prefix_kind)
+    assert _closeout_schema(c) == seed.schema, "STOP_PREPARED_CLONE_SCHEMA_CHANGED"
+    assert _closeout_canonical_schema(c) == seed.canonical_schema_json
+    assert _closeout_business_rows(c) == seed.rows, "STOP_PREPARED_CLONE_ROWS_CHANGED"
+
+
+def _clone_closeout_prepared_seed(seed, target_path):
+    from migrated_staging_snapshot_v1 import (
+        _AUTHORIZATION_COLUMNS,
+        _backup_database,
+        _invalidate_staging_authorization,
+    )
+
+    from finance_core.staging_guard import create_staging_database
+
+    _assert_closeout_seed(seed)
+    assert target_path.resolve() != seed.path
+    assert seed.path.is_file() and not seed.path.is_symlink()
+    assert not seed.path.stat().st_mode & 0o222
+    target = None
+    try:
+        with closing(sqlite3.connect(f"{seed.path.as_uri()}?mode=ro", uri=True)) as source:
+            source.row_factory = sqlite3.Row
+            source.execute("PRAGMA foreign_keys=ON")
+            _verify_closeout_prepared_database(source, seed)
+            target = create_staging_database(target_path, migration_paths=None)
+            columns = ", ".join(_AUTHORIZATION_COLUMNS)
+            authorization = tuple(
+                target.execute(f"SELECT {columns} FROM _staging_authorization").fetchone()
+            )
+            target.execute("DELETE FROM _staging_authorization")
+            target.commit()
+            _backup_database(source, target)
+            target.execute("DELETE FROM _staging_authorization")
+            target.execute(
+                f"INSERT INTO _staging_authorization ({columns}) VALUES (?, ?, ?, ?)", authorization
+            )
+            target.commit()
+            assert (
+                tuple(target.execute(f"SELECT {columns} FROM _staging_authorization").fetchone())
+                == authorization
+            )
+            _verify_closeout_prepared_database(target, seed)
+            return target
+    except BaseException:
+        if target is not None:
+            _invalidate_staging_authorization(target)
+            target.close()
+            target = None
+        raise
+    finally:
+        try:
+            _assert_closeout_seed(seed)
+        except BaseException:
+            if target is not None:
+                _invalidate_staging_authorization(target)
+                target.close()
+            raise
+
+
+def _closeout_fingerprint(root):
+    """Bind paths, bytes, inode and permissions, without reading signing keys."""
+    entries = []
+    for path in (root, *sorted(root.rglob("*"))):
+        assert not path.is_symlink(), "STOP_SHARED_SEED_SYMLINK"
+        info = path.stat()
+        digest = None
+        if path.is_file() and "runtime" not in path.relative_to(root).parts:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        entries.append(
+            (
+                str(path),
+                info.st_dev,
+                info.st_ino,
+                info.st_mode,
+                info.st_size,
+                info.st_mtime_ns,
+                digest,
+            )
+        )
+    return tuple(entries)
+
+
+def _assert_closeout_seed(seed):
+    assert _closeout_fingerprint(seed.root) == seed.fingerprint, "STOP_SHARED_SEED_MUTATION"
+
+
+def _build_closeout_seed(tmp_path, prefix_kind, phase):
     from test_application_amendment_ai_v1 import _create_sealed_ai_root, _persist_application_source
 
-    from finance_core.application.posting import PostingError
-    from finance_core.financial_audit import AuditEventCommand, append_financial_audit_event
-    from finance_core.parser_proposals.ai_fallback import AiFallbackServiceError
-    from finance_core.parser_proposals.amendment_lineage import AmendmentLineageError
-    from finance_core.parser_proposals.human_revision import HumanRevisionLineageError
+    observations = []
 
-    owner_errors = (
-        PostingError,
-        AiInvocationError,
-        AiFallbackServiceError,
-        AmendmentLineageError,
-        HumanRevisionLineageError,
-    )
-    if prefix_kind == "legacy":
-        c, intake, parent = _create_sealed_ai_root(tmp_path)
-        _persist_application_source(c, intake)
-        ai, provider = service(c)
-        human, post = amendment(c, ai), posting(c, ai)
-        for table in (
-            "synthetic_displays",
-            "synthetic_decisions",
-            "synthetic_replies",
-            "synthetic_display_closures",
-        ):
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS "
-                + table
-                + " (id TEXT PRIMARY KEY, material TEXT NOT NULL, signature TEXT NOT NULL)"
-            )
-        c.commit()
-        prefix = parent["public_id"]
-        _mixed_human(
-            c,
-            human,
-            prefix,
-            {"transaction_date": "2026-08-13", "description": "Lunch", "category": "food"},
-            "prefix-legacy-complete",
-        )
-    else:
-        c, ai, provider, human, post, parent, _ = _mixed_receipt(tmp_path)
-        prefix = parent
-        if prefix_kind == "human":
-            prefix = _mixed_human(
-                c, human, prefix, {"amount": "15.00"}, "prefix-human"
-            ).proposal_public_id
-        if prefix_kind == "independent":
-            prefix = _mixed_edit(
+    def observe(c):
+        observations.append(_closeout_observe_migrations(c))
+        assert len(observations) == 1
+
+    c = None
+    try:
+        if prefix_kind == "legacy":
+            c, intake, parent = _create_sealed_ai_root(tmp_path, pre_business_observer=observe)
+            _persist_application_source(c, intake)
+            ai, provider = service(c)
+            human, post = amendment(c, ai), posting(c, ai)
+            for table in (
+                "synthetic_displays",
+                "synthetic_decisions",
+                "synthetic_replies",
+                "synthetic_display_closures",
+            ):
+                c.execute(
+                    "CREATE TABLE IF NOT EXISTS "
+                    + table
+                    + " (id TEXT PRIMARY KEY, material TEXT NOT NULL, signature TEXT NOT NULL)"
+                )
+            c.commit()
+            prefix = parent["public_id"]
+            _mixed_human(
                 c,
-                ai,
-                provider,
                 human,
                 prefix,
-                {"amount": "15.00"},
-                "Change amount to SGD 15.00",
-                "prefix-first-ai",
-            ).proposal_public_id
-    try:
+                {"transaction_date": "2026-08-13", "description": "Lunch", "category": "food"},
+                "prefix-legacy-complete",
+            )
+        else:
+            c, ai, provider, human, post, parent, _ = _mixed_receipt(
+                tmp_path, pre_business_observer=observe
+            )
+            prefix = parent
+            if prefix_kind == "human":
+                prefix = _mixed_human(
+                    c, human, prefix, {"amount": "15.00"}, "prefix-human"
+                ).proposal_public_id
+            if prefix_kind == "independent":
+                prefix = _mixed_edit(
+                    c,
+                    ai,
+                    provider,
+                    human,
+                    prefix,
+                    {"amount": "15.00"},
+                    "Change amount to SGD 15.00",
+                    "prefix-first-ai",
+                ).proposal_public_id
         publication = _mixed_edit(
             c,
             ai,
@@ -1805,6 +2007,548 @@ def test_closeout_all_creation_prefix_markers_refuse_cached_card_and_replay(
             _persist_fresh_posting_confirmation(
                 c, card, publication.proposal_public_id, "marker-existing-confirm"
             )
+        healthy_status = ai.get_status(publication.attempt_id)
+        provider_json = json.dumps(
+            {
+                name: getattr(provider, name)
+                for name in (
+                    "response",
+                    "outcome",
+                    "observed_provider",
+                    "observed_model",
+                    "at",
+                    "calls",
+                    "requests",
+                )
+            },
+            sort_keys=True,
+        )
+        source = ai._source_port
+        workspace_json = (
+            json.dumps(dataclasses.asdict(source._workspace), sort_keys=True)
+            if source._workspace is not None
+            else None
+        )
+        manifest_bytes = source._manifest.raw_bytes if source._manifest is not None else None
+        db_path = Path(c.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        c.commit()
+        assert not c.in_transaction
+        assert len(observations) == 1 and observations[0].path == db_path
+        _verify_closeout_preparation_delta(c, observations[0], prefix_kind)
+        canonical_schema_json = _closeout_canonical_schema(c)
+        rows, schema = _closeout_business_rows(c), _closeout_schema(c)
+        publication_json = json.dumps(dataclasses.asdict(publication), sort_keys=True)
+        card_json = json.dumps(dataclasses.asdict(card), sort_keys=True)
+        accepted_json = json.dumps(dataclasses.asdict(accepted)) if accepted else None
+        status_json = json.dumps(dataclasses.asdict(healthy_status), sort_keys=True)
+    finally:
+        if c is not None:
+            c.close()
+    assert not any(Path(str(db_path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal"))
+    db_path.chmod(0o400)
+    # Only source assets lose write bits; runtime/key mode contracts stay intact.
+    asset_dirs = [
+        path
+        for path in tmp_path.rglob("*")
+        if path.is_dir() and (path.name == "attachments" or path.name.startswith("external-"))
+    ]
+    for directory in asset_dirs:
+        for path in directory.rglob("*"):
+            assert path.is_file() and not path.is_symlink()
+            path.chmod(0o400)
+        directory.chmod(0o500)
+    seed = _CloseoutSeed(
+        db_path,
+        prefix_kind,
+        observations[0],
+        canonical_schema_json,
+        tmp_path,
+        prefix,
+        phase,
+        publication_json,
+        card_json,
+        accepted_json,
+        status_json,
+        provider_json,
+        workspace_json,
+        manifest_bytes,
+        rows,
+        schema,
+        _closeout_fingerprint(tmp_path),
+    )
+    # A closed prepared seed must remain admissible through a read-only handle.
+    with closing(sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        _verify_closeout_prepared_database(connection, seed)
+    _assert_closeout_seed(seed)
+    return seed
+
+
+@pytest.fixture(scope="module")
+def closeout_seed_factory(tmp_path_factory):
+    """Lazily build at most the existing four-prefix/two-phase preparations."""
+    seeds = {}
+
+    def get_seed(prefix_kind, phase):
+        assert prefix_kind in {"root", "human", "independent", "legacy"}
+        assert phase in {"before_facts", "accepted_replay"}
+        key = (prefix_kind, phase)
+        if key not in seeds:
+            root = tmp_path_factory.mktemp("closeout-" + prefix_kind + "-" + phase)
+            seeds[key] = _build_closeout_seed(root, prefix_kind, phase)
+        _assert_closeout_seed(seeds[key])
+        return seeds[key]
+
+    yield get_seed
+    for seed in seeds.values():
+        _assert_closeout_seed(seed)
+
+
+def _closeout_ports(c, seed):
+    from test_application_posting_recovery_v1 import (
+        BINDING,
+        NOW,
+        _DurablePostingDecisionAuthority,
+        _DurableSourceVerifier,
+    )
+    from test_independent_ai_invocation_v1 import DurableInputVerifier, DurableProvider
+
+    from finance_core.application.ai_invocation import AiInvocationService
+    from finance_core.application.ai_invocation_contract import InterpretationPolicy
+    from finance_core.application.posting import PostingService
+    from finance_core.receipt_staging_runner.models import RunnerWorkspace, parse_runner_manifest
+
+    saved = json.loads(seed.provider_json)
+    provider = DurableProvider(
+        c, **{key: value for key, value in saved.items() if key not in {"calls", "requests"}}
+    )
+    provider.calls, provider.requests = saved["calls"], saved["requests"]
+    workspace = RunnerWorkspace(**json.loads(seed.workspace_json)) if seed.workspace_json else None
+    manifest = parse_runner_manifest(seed.manifest_bytes) if seed.manifest_bytes else None
+    source = _DurableSourceVerifier(workspace=workspace, manifest=manifest)
+    ai = AiInvocationService(
+        connection=c,
+        binding=BINDING,
+        source_verifier=source,
+        interpretation_input_verifier=DurableInputVerifier(),
+        provider=provider,
+        clock=lambda: NOW,
+        interpretation_policy=InterpretationPolicy("UTC", "SGD"),
+    )
+    post = PostingService(
+        connection=c,
+        source_verifier=source,
+        human_decision_authority=_DurablePostingDecisionAuthority(),
+        binding=BINDING,
+        clock=lambda: NOW,
+        ai_lineage_authority=ai,
+    )
+    return ai, provider, post
+
+
+def _healthy_closeout_case(c, seed, ai, provider, post, publication, card, accepted):
+    from test_application_posting_recovery_v1 import NOW
+
+    from finance_core.application.ai_invocation_contract import AiInvocationStatus
+
+    before, calls, requests = (
+        _closeout_business_rows(c),
+        provider.calls,
+        json.dumps(provider.requests),
+    )
+    assert before == seed.rows and _closeout_schema(c) == seed.schema
+    _verify_closeout_prepared_database(c, seed)
+    assert c.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    assert c.row_factory is sqlite3.Row and not c.in_transaction
+    # Real custody guard reads each clone's original signed source and original asset path.
+    for row in c.execute("SELECT public_id FROM raw_intake_records"):
+        ai._source_port.verify_persisted(c, row[0])
+    assert ai.get_status(publication.attempt_id) == AiInvocationStatus(
+        **json.loads(seed.status_json)
+    )
+    assert card.projection["financial_projection"]["merchant"] == "Cafe Two"
+    if accepted is None:
+        assert post.prepare(publication.proposal_public_id) == card
+        post._decision(card.review_id, card.projection, "marker-existing-confirm", NOW)
+    else:
+        assert accepted.state == "finalized" and accepted.transaction_public_id
+        # Public accepted-history readers reverify retained review/decision signatures and facts.
+        assert (
+            post.get_status(accepted.attempt_id)
+            == post.resume_post(accepted.attempt_id)
+            == accepted
+        )
+        row, material = post._read_review(card.review_id)
+        assert row["review_hash"] == card.review_hash and material == card.projection
+        if seed.workspace_json:
+            for table in (
+                "receipts",
+                "receipt_item_allocation_fact_sets",
+                "authoritative_calculation_snapshots",
+            ):
+                assert c.execute("SELECT count(*) FROM " + table).fetchone()[0] == 1
+        else:
+            assert tuple(
+                c.execute(
+                    "SELECT amount,currency,merchant,description,category FROM transactions"
+                ).fetchone()
+            ) == (12.34, "SGD", "Cafe Two", "Lunch", "food")
+    assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == (1 if accepted else 0)
+    assert _closeout_business_rows(c) == before and provider.calls == calls
+    assert json.dumps(provider.requests) == requests and not c.in_transaction
+    _assert_closeout_seed(seed)
+
+
+@contextmanager
+def _open_closeout_case(seed, tmp_path):
+    from finance_core.application.ai_invocation_contract import AiInvocationStatus
+    from finance_core.application.posting import PostingReview, PostingStatus
+    from finance_core.staging_guard import open_staging_database
+
+    _assert_closeout_seed(seed)
+    c = clone = None
+    owned_identity = None
+    admitted = False
+    operation_error = None
+    try:
+        path = tmp_path / "case.sqlite"
+        clone = _clone_closeout_prepared_seed(seed, path)
+        info = path.stat()
+        owned_identity = (info.st_dev, info.st_ino)
+        clone.close()
+        c = open_staging_database(path)
+        assert path.resolve() != seed.path
+        assert path.stat().st_ino != seed.path.stat().st_ino
+        # The fresh authorization is the sole rowset difference.
+        with closing(sqlite3.connect(f"{seed.path.as_uri()}?mode=ro", uri=True)) as source:
+            assert tuple(c.execute("SELECT * FROM _staging_authorization").fetchone()) != tuple(
+                source.execute("SELECT * FROM _staging_authorization").fetchone()
+            )
+        assert _closeout_business_rows(c) == seed.rows
+        ai, provider, post = _closeout_ports(c, seed)
+        publication = AiInvocationStatus(**json.loads(seed.publication_json))
+        card = PostingReview(**json.loads(seed.card_json))
+        accepted = PostingStatus(**json.loads(seed.accepted_json)) if seed.accepted_json else None
+        case = (c, ai, provider, post, publication, card, accepted)
+        _healthy_closeout_case(c, seed, ai, provider, post, publication, card, accepted)
+        admitted = True
+        yield case
+    except BaseException as error:
+        operation_error = error
+        if not admitted and owned_identity is not None:
+            try:
+                assert not path.is_symlink() and path.resolve() != seed.path
+                info = path.stat()
+                assert (info.st_dev, info.st_ino) == owned_identity
+                # Reopen failure returns no handle. Open only the already owned file;
+                # mode=rw cannot create a replacement or redirect cleanup to the seed.
+                cleanup = c
+                if cleanup is None:
+                    cleanup = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
+                try:
+                    cleanup.rollback()
+                    cleanup.execute("DELETE FROM _staging_authorization")
+                    cleanup.commit()
+                    assert (
+                        cleanup.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0]
+                        == 0
+                    )
+                finally:
+                    if cleanup is not c:
+                        cleanup.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"Closeout authorization cleanup failed: {cleanup_error!r}")
+        raise
+    finally:
+        close_error = None
+        for connection in (c, clone):
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException as error:
+                    if operation_error is not None:
+                        operation_error.add_note(f"Closeout connection close failed: {error!r}")
+                    elif close_error is None:
+                        close_error = error
+        try:
+            _assert_closeout_seed(seed)
+        except BaseException as error:
+            if operation_error is not None:
+                operation_error.add_note(f"Closeout seed fingerprint failed: {error!r}")
+            elif close_error is None:
+                close_error = error
+        if close_error is not None:
+            raise close_error
+
+
+@pytest.mark.parametrize("prefix_kind", ["root", "human", "independent", "legacy"])
+@pytest.mark.parametrize("phase", ["before_facts", "accepted_replay"])
+def test_closeout_seed_positive_isolation(tmp_path, closeout_seed_factory, prefix_kind, phase):
+    """A corrupt clone cannot poison a sibling, reopened authority or frozen evidence."""
+    from finance_core.application.posting import PostingError
+    from finance_core.staging_guard import StagingDatabaseError, open_staging_database
+
+    seed = closeout_seed_factory(prefix_kind, phase)
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    with _open_closeout_case(seed, first) as a, _open_closeout_case(seed, second) as b:
+        c, ai, provider, post, publication, card, accepted = a
+        assert c is not b[0] and ai is not b[1] and provider is not b[2] and post is not b[3]
+        assert provider.requests is not b[2].requests
+        assert ai._source_port is not b[1]._source_port
+        assert ai._input_port is not b[1]._input_port
+        assert post._decision_port is not b[3]._decision_port
+        if seed.workspace_json:
+            from test_application_posting_recovery_v1 import _DurableSourceVerifier
+
+            from finance_core.receipt_staging_runner.local_intake import LocalLineageError
+
+            source = ai._source_port
+            wrong_workspace = dataclasses.replace(source._workspace, attachments_path=str(first))
+            wrong_source = _DurableSourceVerifier(
+                workspace=wrong_workspace, manifest=source._manifest
+            )
+            intake_id = c.execute("SELECT public_id FROM raw_intake_records").fetchone()[0]
+            with pytest.raises(LocalLineageError):
+                wrong_source.verify_persisted(c, intake_id)
+            assert _closeout_business_rows(c) == seed.rows
+        assert (
+            first.joinpath("case.sqlite").stat().st_ino
+            != second.joinpath("case.sqlite").stat().st_ino
+        )
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("UPDATE synthetic_decisions SET signature='invalid'")
+        assert _closeout_business_rows(b[0]) == seed.rows
+        c.rollback()
+        c.close()
+        reopened = open_staging_database(first / "case.sqlite")
+        try:
+            fresh_ai, fresh_provider, fresh_post = _closeout_ports(reopened, seed)
+            _healthy_closeout_case(
+                reopened, seed, fresh_ai, fresh_provider, fresh_post, publication, card, accepted
+            )
+            # Committed corruption stays local and genuine signature checks refuse it.
+            reopened.execute("UPDATE synthetic_decisions SET signature='invalid'")
+            reopened.commit()
+            with pytest.raises((PostingError, ValueError)):
+                if accepted is None:
+                    from test_application_posting_recovery_v1 import NOW
+
+                    fresh_post._decision(
+                        card.review_id, card.projection, "marker-existing-confirm", NOW
+                    )
+                else:
+                    fresh_post.get_status(accepted.attempt_id)
+            _healthy_closeout_case(b[0], seed, *b[1:])
+        finally:
+            reopened.close()
+    # No raw-copy authorization is accepted at a different database identity.
+    copied = tmp_path / "copied-old-authorization.sqlite"
+    copied.write_bytes(seed.path.read_bytes())
+    with pytest.raises(StagingDatabaseError):
+        open_staging_database(copied)
+    _assert_closeout_seed(seed)
+
+
+@pytest.mark.parametrize("fault", ["ledger", "canonical_trigger", "unlisted_table", "row_loss"])
+def test_closeout_prepared_snapshot_refuses_damage(tmp_path, closeout_seed_factory, fault):
+    """Refreshing a file fingerprint cannot bless semantic corruption in a clone."""
+    seed = closeout_seed_factory("root", "before_facts")
+    with _open_closeout_case(seed, tmp_path) as case:
+        c = case[0]
+        if fault == "ledger":
+            c.execute(
+                "UPDATE schema_migrations SET checksum_sha256=? WHERE migration_sequence=1",
+                ("0" * 64,),
+            )
+            reason = "STOP_PREPARED_LEDGER_CHANGED"
+        elif fault == "canonical_trigger":
+            trigger = c.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name LIMIT 1"
+            ).fetchone()[0]
+            c.execute('DROP TRIGGER "' + trigger + '"')
+            reason = "STOP_PREPARED_SCHEMA_CHANGED"
+        elif fault == "unlisted_table":
+            c.execute(
+                "CREATE TABLE synthetic_unlisted "
+                "(id TEXT PRIMARY KEY, material TEXT NOT NULL, signature TEXT NOT NULL)"
+            )
+            reason = "STOP_PREPARED_SCHEMA_CHANGED"
+        else:
+            c.execute("DELETE FROM synthetic_decisions")
+            reason = "STOP_PREPARED_CLONE_ROWS_CHANGED"
+        c.commit()
+        refreshed = dataclasses.replace(
+            seed,
+            path=tmp_path / "case.sqlite",
+            root=tmp_path,
+            fingerprint=_closeout_fingerprint(tmp_path),
+        )
+        _assert_closeout_seed(refreshed)
+        with pytest.raises(AssertionError, match=reason):
+            _verify_closeout_prepared_database(c, refreshed)
+        _assert_closeout_seed(seed)
+
+
+@pytest.mark.parametrize("kind", ["receipt", "legacy"])
+def test_closeout_migration_observer_failure_closes_connection(tmp_path, kind):
+    from test_application_amendment_ai_v1 import _create_sealed_ai_root
+    from test_application_posting_recovery_v1 import _prepare_receipt_subject
+
+    observed = []
+    failure = RuntimeError("Synthetic pre-business observer failure")
+
+    def fail_after_genuine_migrations(c):
+        _closeout_observe_migrations(c)
+        observed.append(c)
+        raise failure
+
+    with pytest.raises(RuntimeError) as caught:
+        if kind == "receipt":
+            _prepare_receipt_subject(tmp_path, pre_business_observer=fail_after_genuine_migrations)
+        else:
+            _create_sealed_ai_root(tmp_path, pre_business_observer=fail_after_genuine_migrations)
+    assert caught.value is failure and len(observed) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        observed[0].execute("SELECT 1")
+
+
+def test_closeout_failed_clone_loses_authorization(tmp_path, closeout_seed_factory, monkeypatch):
+    import migrated_staging_snapshot_v1 as snapshots
+
+    from finance_core.staging_guard import StagingDatabaseError, open_staging_database
+
+    seed = closeout_seed_factory("root", "before_facts")
+    backup = snapshots._backup_database
+
+    def incomplete_backup(source, target):
+        backup(source, target)
+        target.execute("DELETE FROM synthetic_decisions")
+        target.commit()
+
+    # Fault only the test copy operation; original source and all production guards remain real.
+    monkeypatch.setattr(snapshots, "_backup_database", incomplete_backup)
+    target = tmp_path / "failed-clone.sqlite"
+    with pytest.raises(AssertionError, match="STOP_PREPARED_CLONE_ROWS_CHANGED"):
+        _clone_closeout_prepared_seed(seed, target)
+    assert target.exists()
+    with closing(sqlite3.connect(target)) as failed:
+        assert failed.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0] == 0
+    with pytest.raises(StagingDatabaseError):
+        open_staging_database(target)
+    _assert_closeout_seed(seed)
+
+
+@pytest.mark.parametrize("failure_point", ["reopen", "healthy"])
+def test_closeout_pre_yield_failure_revokes_owned_clone(
+    tmp_path, closeout_seed_factory, monkeypatch, failure_point
+):
+    import finance_core.staging_guard as staging
+
+    seed = closeout_seed_factory("root", "before_facts")
+    genuine_open = staging.open_staging_database
+    genuine_healthy = _healthy_closeout_case
+    failure = RuntimeError("Synthetic closeout admission failure")
+    handles = []
+
+    def fail_after_genuine_reopen(path):
+        connection = genuine_open(path)
+        handles.append(connection)
+        connection.close()
+        raise failure
+
+    def fail_after_genuine_healthy(*args):
+        genuine_healthy(*args)
+        handles.append(args[0])
+        raise failure
+
+    if failure_point == "reopen":
+        monkeypatch.setattr(staging, "open_staging_database", fail_after_genuine_reopen)
+    else:
+        monkeypatch.setitem(globals(), "_healthy_closeout_case", fail_after_genuine_healthy)
+    with pytest.raises(RuntimeError) as caught:
+        with _open_closeout_case(seed, tmp_path):
+            pytest.fail("Failed admission must never yield a case")
+    assert caught.value is failure and len(handles) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        handles[0].execute("SELECT 1")
+    target = tmp_path / "case.sqlite"
+    assert target.exists()
+    with closing(sqlite3.connect(target)) as retained:
+        retained.row_factory = sqlite3.Row
+        assert retained.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0] == 0
+        assert _closeout_business_rows(retained) == seed.rows
+    with pytest.raises(staging.StagingDatabaseError):
+        genuine_open(target)
+    _assert_closeout_seed(seed)
+
+
+def test_closeout_post_yield_failure_retains_evidence_authorization(
+    tmp_path, closeout_seed_factory
+):
+    from finance_core.staging_guard import open_staging_database
+
+    seed = closeout_seed_factory("root", "before_facts")
+    failure = RuntimeError("Synthetic case-body failure")
+    with pytest.raises(RuntimeError) as caught:
+        with _open_closeout_case(seed, tmp_path) as case:
+            connection = case[0]
+            authorization = tuple(
+                connection.execute("SELECT * FROM _staging_authorization").fetchone()
+            )
+            raise failure
+    assert caught.value is failure
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+    with closing(open_staging_database(tmp_path / "case.sqlite")) as retained:
+        assert (
+            tuple(retained.execute("SELECT * FROM _staging_authorization").fetchone())
+            == authorization
+        )
+        _verify_closeout_prepared_database(retained, seed)
+    _assert_closeout_seed(seed)
+
+
+@pytest.mark.parametrize("prefix_kind", ["root", "human", "independent", "legacy"])
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "orphan_audit",
+        "unknown_audit",
+        "duplicate_audit",
+        "unknown_lifecycle",
+        "wrong_node_lifecycle",
+        "unknown_parser",
+        "unknown_field",
+        "payload_only_audit",
+        "references_only_audit",
+        "wrong_node_audit",
+        "wrong_node_field",
+    ],
+)
+@pytest.mark.parametrize("phase", ["before_facts", "accepted_replay"])
+def test_closeout_all_creation_prefix_markers_refuse_cached_card_and_replay(
+    tmp_path, closeout_seed_factory, prefix_kind, marker, phase
+):
+    from finance_core.application.posting import PostingError
+    from finance_core.financial_audit import AuditEventCommand, append_financial_audit_event
+    from finance_core.parser_proposals.ai_fallback import AiFallbackServiceError
+    from finance_core.parser_proposals.amendment_lineage import AmendmentLineageError
+    from finance_core.parser_proposals.human_revision import HumanRevisionLineageError
+
+    owner_errors = (
+        PostingError,
+        AiInvocationError,
+        AiFallbackServiceError,
+        AmendmentLineageError,
+        HumanRevisionLineageError,
+    )
+    seed = closeout_seed_factory(prefix_kind, phase)
+    with _open_closeout_case(seed, tmp_path) as case:
+        c, ai, provider, post, publication, card, accepted = case
+        prefix = seed.prefix
         prefix_id = c.execute(
             "SELECT id FROM parser_outputs WHERE public_id=?", (prefix,)
         ).fetchone()[0]
@@ -1945,23 +2689,25 @@ def test_closeout_all_creation_prefix_markers_refuse_cached_card_and_replay(
         # All are read-only re-admission; do not proceed to confirmation/facts.
         with pytest.raises(owner_errors):
             post.prepare(publication.proposal_public_id)
+        assert _cancel_all_rows(c) == before and provider.calls == calls
         for operation in (ai.get_status, ai.recover, ai.publish, ai.invoke, ai.claim):
             with pytest.raises(owner_errors):
                 operation(publication.attempt_id)
+            assert _cancel_all_rows(c) == before and provider.calls == calls
         with pytest.raises(owner_errors):
             post.submit_post(card.review_id, "marker-existing-confirm")
+        assert _cancel_all_rows(c) == before and provider.calls == calls
         if accepted is not None:
             for operation in (post.get_status, post.resume_post):
                 with pytest.raises(owner_errors):
                     operation(accepted.attempt_id)
+                assert _cancel_all_rows(c) == before and provider.calls == calls
         assert _cancel_all_rows(c) == before and provider.calls == calls, (
             "STOP_EVIDENCE_OR_PROVIDER_MUTATION"
         )
         assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == (
             1 if accepted else 0
         ), "STOP_ECONOMIC_EVENT_COUNT"
-    finally:
-        c.close()
 
 
 def test_targeted_independent_then_two_human_receipt_children_preserve_current_evidence(tmp_path):

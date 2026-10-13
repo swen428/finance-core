@@ -498,6 +498,7 @@ def _prepare_receipt_subject(
     total_currency: str | None = "SGD",
     total_amount: str = "12.50",
     date_text: str | None = "2026-10-08",
+    pre_business_observer=None,
 ):
     """Prepare a real local-file receipt custody chain with signed synthetic authority."""
     from finance_core.application.posting import PostingService
@@ -532,6 +533,12 @@ def _prepare_receipt_subject(
     connection = create_staging_database(
         workspace.database_path, migration_paths=TEMP_DB_MIGRATION_PATHS
     )
+    if pre_business_observer is not None:
+        try:
+            pre_business_observer(connection)
+        except BaseException:
+            connection.close()
+            raise
     bootstrap_participants(connection, manifest)
 
     class _SyntheticReceiptEngine:
