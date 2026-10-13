@@ -2207,10 +2207,15 @@ def _open_closeout_case(seed, tmp_path):
     from finance_core.staging_guard import open_staging_database
 
     _assert_closeout_seed(seed)
-    c = None
+    c = clone = None
+    owned_identity = None
+    admitted = False
+    operation_error = None
     try:
         path = tmp_path / "case.sqlite"
         clone = _clone_closeout_prepared_seed(seed, path)
+        info = path.stat()
+        owned_identity = (info.st_dev, info.st_ino)
         clone.close()
         c = open_staging_database(path)
         assert path.resolve() != seed.path
@@ -2227,11 +2232,54 @@ def _open_closeout_case(seed, tmp_path):
         accepted = PostingStatus(**json.loads(seed.accepted_json)) if seed.accepted_json else None
         case = (c, ai, provider, post, publication, card, accepted)
         _healthy_closeout_case(c, seed, ai, provider, post, publication, card, accepted)
+        admitted = True
         yield case
+    except BaseException as error:
+        operation_error = error
+        if not admitted and owned_identity is not None:
+            try:
+                assert not path.is_symlink() and path.resolve() != seed.path
+                info = path.stat()
+                assert (info.st_dev, info.st_ino) == owned_identity
+                # Reopen failure returns no handle. Open only the already owned file;
+                # mode=rw cannot create a replacement or redirect cleanup to the seed.
+                cleanup = c
+                if cleanup is None:
+                    cleanup = sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True)
+                try:
+                    cleanup.rollback()
+                    cleanup.execute("DELETE FROM _staging_authorization")
+                    cleanup.commit()
+                    assert (
+                        cleanup.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0]
+                        == 0
+                    )
+                finally:
+                    if cleanup is not c:
+                        cleanup.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"Closeout authorization cleanup failed: {cleanup_error!r}")
+        raise
     finally:
-        if c is not None:
-            c.close()
-        _assert_closeout_seed(seed)
+        close_error = None
+        for connection in (c, clone):
+            if connection is not None:
+                try:
+                    connection.close()
+                except BaseException as error:
+                    if operation_error is not None:
+                        operation_error.add_note(f"Closeout connection close failed: {error!r}")
+                    elif close_error is None:
+                        close_error = error
+        try:
+            _assert_closeout_seed(seed)
+        except BaseException as error:
+            if operation_error is not None:
+                operation_error.add_note(f"Closeout seed fingerprint failed: {error!r}")
+            elif close_error is None:
+                close_error = error
+        if close_error is not None:
+            raise close_error
 
 
 @pytest.mark.parametrize("prefix_kind", ["root", "human", "independent", "legacy"])
@@ -2390,6 +2438,76 @@ def test_closeout_failed_clone_loses_authorization(tmp_path, closeout_seed_facto
         assert failed.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0] == 0
     with pytest.raises(StagingDatabaseError):
         open_staging_database(target)
+    _assert_closeout_seed(seed)
+
+
+@pytest.mark.parametrize("failure_point", ["reopen", "healthy"])
+def test_closeout_pre_yield_failure_revokes_owned_clone(
+    tmp_path, closeout_seed_factory, monkeypatch, failure_point
+):
+    import finance_core.staging_guard as staging
+
+    seed = closeout_seed_factory("root", "before_facts")
+    genuine_open = staging.open_staging_database
+    genuine_healthy = _healthy_closeout_case
+    failure = RuntimeError("Synthetic closeout admission failure")
+    handles = []
+
+    def fail_after_genuine_reopen(path):
+        connection = genuine_open(path)
+        handles.append(connection)
+        connection.close()
+        raise failure
+
+    def fail_after_genuine_healthy(*args):
+        genuine_healthy(*args)
+        handles.append(args[0])
+        raise failure
+
+    if failure_point == "reopen":
+        monkeypatch.setattr(staging, "open_staging_database", fail_after_genuine_reopen)
+    else:
+        monkeypatch.setitem(globals(), "_healthy_closeout_case", fail_after_genuine_healthy)
+    with pytest.raises(RuntimeError) as caught:
+        with _open_closeout_case(seed, tmp_path):
+            pytest.fail("Failed admission must never yield a case")
+    assert caught.value is failure and len(handles) == 1
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        handles[0].execute("SELECT 1")
+    target = tmp_path / "case.sqlite"
+    assert target.exists()
+    with closing(sqlite3.connect(target)) as retained:
+        retained.row_factory = sqlite3.Row
+        assert retained.execute("SELECT count(*) FROM _staging_authorization").fetchone()[0] == 0
+        assert _closeout_business_rows(retained) == seed.rows
+    with pytest.raises(staging.StagingDatabaseError):
+        genuine_open(target)
+    _assert_closeout_seed(seed)
+
+
+def test_closeout_post_yield_failure_retains_evidence_authorization(
+    tmp_path, closeout_seed_factory
+):
+    from finance_core.staging_guard import open_staging_database
+
+    seed = closeout_seed_factory("root", "before_facts")
+    failure = RuntimeError("Synthetic case-body failure")
+    with pytest.raises(RuntimeError) as caught:
+        with _open_closeout_case(seed, tmp_path) as case:
+            connection = case[0]
+            authorization = tuple(
+                connection.execute("SELECT * FROM _staging_authorization").fetchone()
+            )
+            raise failure
+    assert caught.value is failure
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        connection.execute("SELECT 1")
+    with closing(open_staging_database(tmp_path / "case.sqlite")) as retained:
+        assert (
+            tuple(retained.execute("SELECT * FROM _staging_authorization").fetchone())
+            == authorization
+        )
+        _verify_closeout_prepared_database(retained, seed)
     _assert_closeout_seed(seed)
 
 
