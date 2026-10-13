@@ -5,8 +5,10 @@ import importlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tomllib
 import zipfile
@@ -48,7 +50,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "888821f03d706ea751029aabe5c5f7a8bb3d7e9c923e3dff10aab99c149c4b22"
+EXPECTED_LEDGER_DIGEST = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
 EXPECTED_LEDGER_PREFIX_057 = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
 EXPECTED_AI_FEATURE_CONSTANTS = {
@@ -144,13 +146,13 @@ def _bridge_migration_payloads() -> dict[str, bytes]:
     }
 
 
-def _synthetic_059_migration_payloads() -> dict[str, bytes]:
+def _synthetic_060_migration_payloads() -> dict[str, bytes]:
     payloads = {
         path: body
         for path, body in _bridge_migration_payloads().items()
-        if int(PurePosixPath(path).name[:3]) <= 58
+        if int(PurePosixPath(path).name[:3]) <= 59
     }
-    payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"] = (
+    payloads["finance_core/resources/migrations/060_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
     return payloads
@@ -166,32 +168,32 @@ def _payload_ledger_digest(payloads: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def test_bridge_distribution_inventory_accepts_synthetic_complete_059(
+def test_bridge_distribution_inventory_accepts_synthetic_complete_060(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_059_migration_payloads()
+    payloads = _synthetic_060_migration_payloads()
 
-    assert len(payloads) == 59
+    assert len(payloads) == 60
     assert bridge_distribution_verifier._migration_digest(payloads) == _payload_ledger_digest(
         payloads
     )
 
 
-def test_bridge_distribution_inventory_rejects_missing_synthetic_059(
+def test_bridge_distribution_inventory_rejects_missing_synthetic_060(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_059_migration_payloads()
-    del payloads["finance_core/resources/migrations/059_synthetic_inventory.sql"]
+    payloads = _synthetic_060_migration_payloads()
+    del payloads["finance_core/resources/migrations/060_synthetic_inventory.sql"]
 
     with pytest.raises(ValueError, match="migration inventory"):
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_rejects_extra_synthetic_060(
+def test_bridge_distribution_inventory_rejects_extra_synthetic_061(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_059_migration_payloads()
-    payloads["finance_core/resources/migrations/060_synthetic_inventory.sql"] = (
+    payloads = _synthetic_060_migration_payloads()
+    payloads["finance_core/resources/migrations/061_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
@@ -199,27 +201,27 @@ def test_bridge_distribution_inventory_rejects_extra_synthetic_060(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_059(
+def test_bridge_distribution_inventory_accepts_reviewed_complete_060(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 59
+    assert len(payloads) == 60
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
 
 
 @pytest.mark.parametrize(
-    "mutation", ["missing_059", "missing_middle", "extra_060", "duplicate_055"]
+    "mutation", ["missing_060", "missing_middle", "extra_061", "duplicate_055"]
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
 ) -> None:
     payloads = _bridge_migration_payloads()
-    if mutation in {"missing_059", "missing_middle"}:
-        sequence = "059_" if mutation == "missing_059" else "028_"
+    if mutation in {"missing_060", "missing_middle"}:
+        sequence = "060_" if mutation == "missing_060" else "028_"
         missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
         del payloads[missing]
     else:
-        sequence = "060" if mutation == "extra_060" else "055"
+        sequence = "061" if mutation == "extra_061" else "055"
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -231,7 +233,7 @@ def test_bridge_distribution_inventory_byte_change_cannot_match_pinned_ledger(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("059_"))
+    migration = next(name for name in payloads if PurePosixPath(name).name.startswith("060_"))
     payloads[migration] += b"\n-- synthetic byte change, never written to source\n"
     observed = bridge_distribution_verifier._migration_digest(payloads)
     assert observed != EXPECTED_LEDGER_DIGEST
@@ -263,8 +265,8 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 59
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 60))
+    assert len(paths) == 60
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 61))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert _ledger_digest(paths[:58]) == EXPECTED_LEDGER_PREFIX_058
@@ -274,7 +276,7 @@ def test_migration_resources_have_one_package_owned_source() -> None:
 def test_previous_migration_bytes_remain_unchanged_through_057() -> None:
     paths = migration_resource_paths()
 
-    assert len(paths) == 59
+    assert len(paths) == 60
     assert _ledger_digest(paths[:57]) == EXPECTED_LEDGER_PREFIX_057
 
 
@@ -287,7 +289,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 59
+    assert len(paths) == 60
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 
@@ -348,6 +350,7 @@ def _probe_installed_package(
     runtime_python: Path,
     install_dir: Path,
     outside_dir: Path,
+    runtime_root: Path,
 ) -> dict[str, object]:
     completed = subprocess.run(
         [
@@ -430,6 +433,97 @@ def _probe_installed_package(
                 "'src_visible': importlib.util.find_spec('src') is not None, "
                 "'sys_path': sys.path}))"
             ),
+        ],
+        check=True,
+        cwd=outside_dir,
+        env={
+            "FINANCE_RUNTIME_ROOT": str(runtime_root),
+            "PATH": os.environ.get("PATH", ""),
+        },
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def _probe_installed_correction_flow(
+    runtime_python: Path,
+    install_dir: Path,
+    outside_dir: Path,
+    runtime_root: Path,
+) -> dict[str, object]:
+    """Run real text and receipt correction fixtures against installed bytes only."""
+    helper_root = outside_dir / "independent-correction-fixtures"
+    helper_tests = helper_root / "tests"
+    helper_tests.mkdir(parents=True, exist_ok=True)
+    (helper_tests / "__init__.py").write_text("", encoding="utf-8")
+    # The copied helpers contain the repository's signed synthetic posting
+    # fixtures; the runtime subprocess never adds the checkout to sys.path.
+    shutil.copyfile(
+        REPOSITORY_ROOT / "tests" / "test_application_posting_recovery_v1.py",
+        helper_tests / "test_application_posting_recovery_v1.py",
+    )
+    shutil.copyfile(
+        REPOSITORY_ROOT / "tests" / "test_independent_corrections_v1.py",
+        helper_tests / "test_independent_corrections_v1.py",
+    )
+    (helper_tests / "conftest.py").write_text(
+        "from pathlib import Path\n"
+        "import sqlite3\n"
+        "from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS\n"
+        "from finance_core.staging_guard import create_staging_database\n"
+        "def connect_temp_db(db_path: Path):\n"
+        "    path = db_path.resolve()\n"
+        "    if path.exists():\n"
+        "        connection = sqlite3.connect(str(path))\n"
+        "        connection.row_factory = sqlite3.Row\n"
+        "        connection.execute('PRAGMA foreign_keys=ON')\n"
+        "        return connection\n"
+        "    return create_staging_database(path, migration_paths=TEMP_DB_MIGRATION_PATHS)\n",
+        encoding="utf-8",
+    )
+    # Only decorators are needed while importing the copied helper modules.
+    # This tiny shim allows the same fixtures to load under the intentionally
+    # site-disabled package runtime without installing pytest there.
+    (helper_root / "pytest.py").write_text(
+        "class _Mark:\n"
+        "    @staticmethod\n"
+        "    def parametrize(*args, **kwargs):\n"
+        "        return lambda function: function\n"
+        "mark = _Mark()\n"
+        "class MonkeyPatch: pass\n",
+        encoding="utf-8",
+    )
+    dependency_root = helper_root / "runtime-dependencies"
+    dependency_root.mkdir(exist_ok=True)
+    if not any(dependency_root.iterdir()):
+        dependency_site = Path(sysconfig.get_paths()["purelib"])
+        for name in (
+            "pypdf",
+            "pypdf-6.16.1.dist-info",
+            "typing_extensions.py",
+            "typing_extensions-4.16.0.dist-info",
+        ):
+            source = dependency_site / name
+            if source.is_dir():
+                shutil.copytree(source, dependency_root / name)
+            elif source.is_file():
+                shutil.copyfile(source, dependency_root / name)
+            else:
+                raise AssertionError(f"required pinned runtime dependency is missing: {source}")
+    probe_path = helper_root / "installed_correction_probe.py"
+    shutil.copyfile(REPOSITORY_ROOT / "tests" / "installed_correction_probe.py", probe_path)
+    completed = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-S",
+            str(probe_path),
+            str(install_dir),
+            str(helper_root),
+            str(outside_dir),
+            str(runtime_root),
+            str(REPOSITORY_ROOT),
         ],
         check=True,
         cwd=outside_dir,
@@ -616,7 +710,42 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
     runtime_python = runtime_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
     for install_dir in (wheel_install_dir, sdist_install_dir):
-        payload = _probe_installed_package(runtime_python, install_dir, outside_dir)
+        payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
+        correction_flow = _probe_installed_correction_flow(
+            runtime_python, install_dir, outside_dir, runtime_root
+        )
+        assert (
+            Path(str(correction_flow["module_file"]))
+            .resolve()
+            .is_relative_to(install_dir.resolve())
+        )
+        assert correction_flow["sys_path_has_checkout"] is False
+        assert correction_flow["text"] == {
+            "route": "text",
+            "applied": 0,
+            "current": 2,
+            "fields": {
+                "amount": "18.75",
+                "currency": "SGD",
+                "transaction_date": "2026-10-09",
+                "merchant": "Cafe Two",
+                "description": "Team lunch",
+                "category": "travel",
+            },
+        }
+        assert correction_flow["receipt"] == {
+            "route": "receipt",
+            "applied": 0,
+            "current": 2,
+            "fields": {
+                "amount": "18.75",
+                "currency": "SGD",
+                "transaction_date": "2026-10-09",
+                "merchant": "Cafe Two",
+                "description": "Second receipt memo",
+                "category": "meals",
+            },
+        }
         assert payload["api"] == "finance-core-api-v1"
         assert payload["canonical"] == "12.30"
         assert payload["ai_service_module"] == "finance_core.application.ai_invocation"
@@ -697,9 +826,9 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.6"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 59
-        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 60))
-        assert payload["migration_filenames"][-1] == "059_independent_ai_clarification.sql"
+        assert payload["migration_count"] == 60
+        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 61))
+        assert payload["migration_filenames"][-1] == "060_independent_corrections.sql"
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True

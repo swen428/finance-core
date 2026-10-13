@@ -2202,9 +2202,30 @@ def _healthy_closeout_case(c, seed, ai, provider, post, publication, card, accep
 
 @contextmanager
 def _open_closeout_case(seed, tmp_path):
+    from finance_core.application.admission import VerifiedSource
     from finance_core.application.ai_invocation_contract import AiInvocationStatus
+    from finance_core.application.independent_correction_contract import (
+        IndependentEffectiveTransaction,
+    )
+    from finance_core.application.independent_correction_source import (
+        IndependentCorrectionFields,
+        IndependentOriginalSource,
+    )
     from finance_core.application.posting import PostingReview, PostingStatus
     from finance_core.staging_guard import open_staging_database
+
+    def decode_effective_transaction(raw):
+        if raw is None:
+            return None
+        value = dict(raw)
+        value["fields"] = IndependentCorrectionFields(**value["fields"])
+        original = dict(value["original_source"])
+        original["fields"] = IndependentCorrectionFields(**original["fields"])
+        original["source"] = VerifiedSource(**original["source"])
+        original["evidence_refs"] = tuple(original["evidence_refs"])
+        value["original_source"] = IndependentOriginalSource(**original)
+        value["history"] = tuple(value["history"])
+        return IndependentEffectiveTransaction(**value)
 
     _assert_closeout_seed(seed)
     c = clone = None
@@ -2229,7 +2250,17 @@ def _open_closeout_case(seed, tmp_path):
         ai, provider, post = _closeout_ports(c, seed)
         publication = AiInvocationStatus(**json.loads(seed.publication_json))
         card = PostingReview(**json.loads(seed.card_json))
-        accepted = PostingStatus(**json.loads(seed.accepted_json)) if seed.accepted_json else None
+        if seed.accepted_json:
+            accepted_payload = json.loads(seed.accepted_json)
+            accepted_payload["applied"] = decode_effective_transaction(
+                accepted_payload.get("applied")
+            )
+            accepted_payload["current"] = decode_effective_transaction(
+                accepted_payload.get("current")
+            )
+            accepted = PostingStatus(**accepted_payload)
+        else:
+            accepted = None
         case = (c, ai, provider, post, publication, card, accepted)
         _healthy_closeout_case(c, seed, ai, provider, post, publication, card, accepted)
         admitted = True

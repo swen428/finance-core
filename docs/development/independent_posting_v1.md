@@ -22,6 +22,8 @@ tests; they are not production authentication.
 Import `PostingService` from `finance_core.application.posting`. Supply a
 migrated connection with `sqlite3.Row` and fixed keyword-only
 `source_verifier`, `human_decision_authority`, `binding` and `clock` arguments.
+Supply the fixed optional `correction_decision_authority` to verify retained
+independent corrections. Its approval domain is separate from posting.
 The caller owns connection lifetime. Write operations require no pending
 caller transaction; a refusal never commits or rolls back caller-owned work.
 
@@ -36,6 +38,12 @@ caller transaction; a refusal never commits or rolls back caller-owned work.
 when present and attention reason when applicable. Owning financial guards and
 verification errors remain refusals; a failed call cannot be interpreted as
 permission to retry with different authority.
+
+After financial finalization, `applied` identifies the verified original
+version zero and `current` the verified effective version, both observed in one
+SQLite snapshot. Both are absent before a final transaction exists. Old callers
+can still read uncorrected results without a correction authority; a corrected
+result requires that fixed authority and its retained evidence.
 
 An independent-AI ancestor additionally requires the constructor-fixed
 `ai_lineage_authority`, authenticated on the actual SQLite snapshot at review,
@@ -176,9 +184,13 @@ financial result. Missing, damaged or conflicting evidence refuses rather
 than reporting a successful posting. The coordination row's transaction
 reference cannot substitute for a missing conversion or finalization proof;
 only a verified owning result supplies the returned transaction identity.
-Correction-aware effective results are
-a separate work package; this entry must not claim an original transaction
-is current when unsupported correction material is present.
+The [independent correction owner](independent_corrections_v1.md) verifies the
+complete current chain after original financial verification. Status and replay
+return the original applied result alongside the current version; they never
+rewrite originals or create another economic event. Missing authority, schema,
+versions or orphan correction evidence refuses instead of returning version
+zero as current. Original-only verification is an internal seam for the
+correction owner and is not a public current-read bypass.
 
 Actual capture/ACK, card send, natural-language parsing and reply-send UNKNOWN
 belong to a transport adapter. This boundary supplies a stable verified
@@ -193,7 +205,7 @@ verified six-field edits and fresh review/confirmation for the same source event
 An edited state alone is insufficient: posting requires its complete independent
 lineage, and a changed current leaf/version/content invalidates an old review.
 Confirmed or already accepted posting cannot be edited through this boundary;
-posted correction remains a separate work package.
+posted correction uses the separate [correction owner](independent_corrections_v1.md).
 
 Successful OCR can leave an unparseable receipt whose original confidence and
 merchant indicators remain historical evidence. The independent personal

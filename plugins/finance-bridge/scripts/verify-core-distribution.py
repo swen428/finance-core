@@ -413,10 +413,10 @@ def _migration_digest(payloads: dict[str, bytes]) -> str:
             or not filename[:3].isdigit()
             or filename[3] != "_"
         ):
-            raise ValueError("installed Finance Core migration inventory is not 001-059")
+            raise ValueError("installed Finance Core migration inventory is not 001-060")
         migrations[filename] = body
-    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 60)):
-        raise ValueError("installed Finance Core migration inventory is not 001-059")
+    if [int(name[:3]) for name in sorted(migrations)] != list(range(1, 61)):
+        raise ValueError("installed Finance Core migration inventory is not 001-060")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]

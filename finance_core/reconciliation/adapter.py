@@ -28,15 +28,25 @@ from finance_core.reconciliation.models import InternalCandidate
 
 
 class _EffectiveFields(Protocol):
-    amount: str
-    currency: str
-    transaction_date: str
-    merchant: str | None
+    @property
+    def amount(self) -> str: ...
+
+    @property
+    def currency(self) -> str: ...
+
+    @property
+    def transaction_date(self) -> str: ...
+
+    @property
+    def merchant(self) -> str | None: ...
 
 
 class _EffectiveTransaction(Protocol):
-    target_id: str
-    fields: _EffectiveFields
+    @property
+    def target_id(self) -> str: ...
+
+    @property
+    def fields(self) -> _EffectiveFields: ...
 
 
 @dataclass(frozen=True)

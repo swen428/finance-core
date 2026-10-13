@@ -21,6 +21,29 @@ MIGRATION = Path(__file__).resolve().parents[1] / (
 MIGRATIONS = MIGRATION.parent
 
 
+def test_independent_orphan_audit_cannot_fall_back_to_original() -> None:
+    from finance_core.application.independent_correction_contract import (
+        IndependentCorrectionIntegrityError,
+    )
+
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO financial_audit_events VALUES (?,?,?)",
+            ("transaction", "txn-1", "independent_transaction_correction_applied"),
+        )
+        with pytest.raises(IndependentCorrectionIntegrityError):
+            has_committed_correction(conn, "txn-1")
+    finally:
+        conn.close()
+
+
+def test_pre_correction_schema_without_audit_stays_readable() -> None:
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        assert not has_committed_correction(conn, "original-only")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
