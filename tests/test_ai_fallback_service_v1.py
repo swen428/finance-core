@@ -68,8 +68,18 @@ def _use_snapshot_bridge_workspace(
 def _captured_text_proposal(
     tmp_path: Path,
     text: str = "paid SGD 12.34 at Cafe",
+    *,
+    pre_business_observer=None,
 ) -> tuple[object, sqlite3.Connection, str, int]:
     workspace = support.create_bridge_workspace(tmp_path)
+    if pre_business_observer is not None:
+        from finance_core.staging_guard import open_staging_database
+
+        observation = open_staging_database(workspace.database_path)
+        try:
+            pre_business_observer(observation)
+        finally:
+            observation.close()
     capture = support.run_cli(
         support.make_request(
             "capture",
