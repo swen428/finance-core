@@ -437,8 +437,14 @@ def test_history_pending_real_ocr_human_completion_without_ai_child(tmp_path):
         assert ai.get_status(attempt.attempt_id) == ai.recover(attempt.attempt_id) == pending
         with pytest.raises(PostingError):
             posting_owner.submit_post(old_review.review_id, "history-old-post")
-        with pytest.raises(PostingError):
-            posting_owner.submit_post(fresh.review_id, "history-new-post")
+        # An exact accepted request is historical recovery; the superseded,
+        # unaccepted old card above must still be refused.
+        replayed = posting_owner.submit_post(fresh.review_id, "history-new-post")
+        assert replayed == final
+        assert replayed.applied is not None and replayed.current is not None
+        assert replayed.applied.version == replayed.current.version == 0
+        assert c.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+        assert not c.in_transaction
         assert _owner_rows(c) == before
         assert (
             provider.calls == 0

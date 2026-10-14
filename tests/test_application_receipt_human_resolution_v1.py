@@ -141,9 +141,16 @@ def test_complete_human_receipt_needs_new_confirmation_then_posts_exactly_once(
         assert _count(connection, "receipt_item_allocation_fact_sets") == 1
         assert _count(connection, "authoritative_calculation_snapshots") == 1
         assert posting.resume_post(posted.attempt_id) == posted
-        with pytest.raises(PostingError):
-            posting.submit_post(review.review_id, "new-confirm")
+        changes_before_replay = connection.total_changes
+        replayed = posting.submit_post(review.review_id, "new-confirm")
+        assert replayed == posted
+        assert replayed.applied is not None and replayed.current is not None
+        assert replayed.applied.version == replayed.current.version == 0
+        assert connection.total_changes == changes_before_replay
+        assert not connection.in_transaction
         posting._clock = lambda: NOW + 10_000
+        assert posting.submit_post(review.review_id, "new-confirm") == posted
+        assert connection.total_changes == changes_before_replay
         assert posting.resume_post(posted.attempt_id) == posted
         assert posting.get_status(posted.attempt_id) == posted
         snapshot = canonical_json_value(
