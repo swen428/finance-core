@@ -114,11 +114,11 @@ def _migration_ledger_digest(payloads: dict[str, bytes]) -> str:
             or not filename[:3].isdigit()
             or filename[3] != "_"
         ):
-            raise ValueError("wheel must contain the exact migration inventory 001-059")
+            raise ValueError("wheel must contain the exact migration inventory 001-060")
         migrations[filename] = body
     observed_numbers = [int(name[:3]) for name in sorted(migrations)]
-    if observed_numbers != list(range(1, 60)):
-        raise ValueError("wheel must contain the exact migration inventory 001-059")
+    if observed_numbers != list(range(1, 61)):
+        raise ValueError("wheel must contain the exact migration inventory 001-060")
     digest = hashlib.sha256()
     for filename in sorted(migrations):
         body = migrations[filename]

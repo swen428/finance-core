@@ -891,10 +891,10 @@ def test_migration_ledger_tests_never_target_live_database(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_authoritative_manifest_contains_migration_001_through_059_in_order() -> None:
-    """The current authoritative manifest has ordered migration IDs 001–059
+def test_authoritative_manifest_contains_migration_001_through_060_in_order() -> None:
+    """The current authoritative manifest has ordered migration IDs 001–060
     with no gaps, duplicates or reordered entries."""
-    assert len(TEMP_DB_MIGRATION_PATHS) == 59
+    assert len(TEMP_DB_MIGRATION_PATHS) == 60
     assert tuple(TEMP_DB_MIGRATION_PATHS.paths) == tuple(
         path
         for mid, path in sorted(
@@ -906,9 +906,9 @@ def test_authoritative_manifest_contains_migration_001_through_059_in_order() ->
         )
     )
     # Verify every expected migration ID is present
-    identifiers = [f"{n:03d}" for n in range(1, 60)]
+    identifiers = [f"{n:03d}" for n in range(1, 61)]
     assert identifiers == [p.name.partition("_")[0] for p in TEMP_DB_MIGRATION_PATHS]
-    assert TEMP_DB_MIGRATION_PATHS[-1].name == "059_independent_ai_clarification.sql"
+    assert TEMP_DB_MIGRATION_PATHS[-1].name == "060_independent_corrections.sql"
 
 
 def test_migration_030_is_sql_only_with_no_preflight_binding() -> None:
@@ -924,15 +924,15 @@ def test_migration_030_is_sql_only_with_no_preflight_binding() -> None:
     assert spec_030.preflight_bytes is None
 
 
-def test_fresh_migration_001_through_059_replay_is_deterministic() -> None:
-    """A fresh temporary database must apply 001–059, record all ledger rows
+def test_fresh_migration_001_through_060_replay_is_deterministic() -> None:
+    """A fresh temporary database must apply 001–060, record all ledger rows
     in order, pass history verification, and remain unchanged on replay."""
     conn = _connection()
     try:
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS, clock=_clock)
         rows = migration_ledger_rows(conn)
-        assert len(rows) == 59
-        assert rows[-1]["migration_id"] == "059"
+        assert len(rows) == 60
+        assert rows[-1]["migration_id"] == "060"
         assert all(row["adoption_mode"] == "applied" for row in rows)
         verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
@@ -943,6 +943,47 @@ def test_fresh_migration_001_through_059_replay_is_deterministic() -> None:
         assert migration_ledger_rows(conn) == rows
     finally:
         conn.close()
+
+
+def test_migration_060_upgrades_a_059_database_and_reopens_without_drift(
+    tmp_path: Path,
+) -> None:
+    """The additive correction migration preserves old ledger proof on upgrade/reopen."""
+    database = tmp_path / "migration-059-upgrade.sqlite"
+    conn = _connection(database)
+    try:
+        apply_migration_paths(
+            conn,
+            TEMP_DB_MIGRATION_PATHS[:59],
+            clock=_clock,
+            application_version="finance-v3",
+        )
+        old_rows = migration_ledger_rows(conn)
+        assert len(old_rows) == 59
+        assert old_rows[-1]["migration_id"] == "059"
+        apply_migration_paths(
+            conn,
+            TEMP_DB_MIGRATION_PATHS[59:],
+            clock=_clock,
+            application_version="finance-v3",
+        )
+        upgraded_rows = migration_ledger_rows(conn)
+        assert upgraded_rows[:59] == old_rows
+        assert len(upgraded_rows) == 60
+        assert upgraded_rows[-1]["migration_id"] == "060"
+        assert upgraded_rows[-1]["migration_filename"] == "060_independent_corrections.sql"
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
+    finally:
+        conn.close()
+
+    reopened = _connection(database)
+    try:
+        apply_migration_paths(reopened, TEMP_DB_MIGRATION_PATHS, clock=lambda: "later")
+        assert migration_ledger_rows(reopened) == upgraded_rows
+        assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        reopened.close()
 
 
 def test_incremental_upgrade_029_to_030_preserves_ledger_evidence() -> None:

@@ -11,9 +11,17 @@ import json
 import sqlite3
 import unicodedata
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from finance_core.application.independent_correction_contract import (
+        HumanCorrectionDecisionAuthority,
+    )
+    from finance_core.application.independent_corrections import (
+        IndependentEffectiveTransaction,
+    )
 
 from finance_core.application.admission import (
     AdmissionService,
@@ -144,6 +152,8 @@ class PostingStatus:
     state: str
     transaction_public_id: str | None
     attention_reason: str | None
+    applied: IndependentEffectiveTransaction | None = None
+    current: IndependentEffectiveTransaction | None = None
 
 
 def _posting_reference(value: object) -> bool:
@@ -393,6 +403,7 @@ class PostingService:
         binding: TrustedBinding,
         clock: Callable[[], int],
         ai_lineage_authority=None,
+        correction_decision_authority: HumanCorrectionDecisionAuthority | None = None,
     ) -> None:
         # Admission validates fixed trusted binding while retaining PR03 semantics.
         self._admission = AdmissionService(
@@ -408,6 +419,7 @@ class PostingService:
         self._decision_port, self._binding, self._clock = human_decision_authority, binding, clock
 
         self._ai_lineage_authority = ai_lineage_authority
+        self._correction_decision_port = correction_decision_authority
 
     def _ai_kwargs(self):
         return (
@@ -829,6 +841,28 @@ class PostingService:
         self._begin()
         try:
             row, material = self._read_review(review_id)
+            accepted = self._conn.execute(
+                "SELECT attempts.attempt_id,attempts.review_id FROM application_posting_decisions "
+                "AS decisions JOIN application_posting_attempts AS attempts USING(attempt_id) "
+                "WHERE decisions.decision_namespace=? AND decisions.decision_id=?",
+                (self._binding.decision_namespace, decision_record_id),
+            ).fetchone()
+            if accepted is not None:
+                if accepted["review_id"] != review_id:
+                    raise PostingError("Accepted decision belongs to another posting review")
+                # A repeat is historical recovery, including after expiry or a
+                # later correction. Reauthenticate the exact immutable acceptance
+                # before releasing this lock and using the normal recovery owner.
+                try:
+                    self._accepted(accepted["attempt_id"])
+                    self._conn.rollback()
+                    return self.resume_post(accepted["attempt_id"])
+                except ValueError as exc:
+                    if isinstance(exc, PostingError):
+                        raise
+                    raise PostingError(
+                        "Accepted posting evidence is incomplete or contradictory"
+                    ) from exc
             now = self._now()
             if now >= material["expires_at"]:
                 raise PostingError("Posting review expired")
@@ -1398,6 +1432,21 @@ class PostingService:
             raise PostingError("Receipt posting stage is unsupported")
 
     def get_status(self, attempt_id: str) -> PostingStatus:
+        """Verify the original result and current effective view in one snapshot."""
+        from finance_core.application.independent_corrections import IndependentCorrectionService
+
+        with review_snapshot(self._conn):
+            original = self._get_original_status(attempt_id)
+            if original.transaction_public_id is None:
+                return original
+            reader = IndependentCorrectionService(
+                self, human_decision_authority=self._correction_decision_port
+            )
+            applied, current = reader._read_views_in_snapshot(original.transaction_public_id)
+            return replace(original, applied=applied, current=current)
+
+    def _get_original_status(self, attempt_id: str) -> PostingStatus:
+        """Verify immutable posting truth without following correction history."""
         if not _posting_reference(attempt_id):
             raise PostingError("Attempt reference is invalid")
         require_staging_database(self._conn)
@@ -1540,17 +1589,6 @@ class PostingService:
                                 **self._receipt_kwargs(attempt_id),
                             )
                             transaction = final.transaction_public_id
-            if (
-                transaction is not None
-                and self._conn.execute(
-                    "SELECT 1 FROM correction_targets AS targets "
-                    "JOIN correction_versions AS versions "
-                    "ON versions.target_id=targets.target_id WHERE targets.target_id=? LIMIT 1",
-                    (transaction,),
-                ).fetchone()
-                is not None
-            ):
-                raise PostingError("Corrected transaction requires its effective correction reader")
             if (row["stage"] == "finalized" and transaction is None) or (
                 row["transaction_public_id"] is not None
                 and transaction != row["transaction_public_id"]

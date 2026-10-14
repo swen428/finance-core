@@ -21,6 +21,30 @@ MIGRATION = Path(__file__).resolve().parents[1] / (
 MIGRATIONS = MIGRATION.parent
 
 
+def test_independent_orphan_audit_cannot_fall_back_to_original() -> None:
+    from finance_core.application.independent_correction_contract import (
+        IndependentCorrectionIntegrityError,
+    )
+
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT INTO financial_audit_events(aggregate_type,aggregate_public_id,event_type) "
+            "VALUES (?,?,?)",
+            ("transaction", "txn-1", "independent_transaction_correction_applied"),
+        )
+        with pytest.raises(IndependentCorrectionIntegrityError):
+            has_committed_correction(conn, "txn-1")
+    finally:
+        conn.close()
+
+
+def test_pre_correction_schema_without_audit_stays_readable() -> None:
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        assert not has_committed_correction(conn, "original-only")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -28,7 +52,9 @@ def _db() -> sqlite3.Connection:
         """CREATE TABLE transactions(id INTEGER PRIMARY KEY, public_id TEXT UNIQUE, amount NUMERIC);
         CREATE TABLE authoritative_calculation_snapshots(
             snapshot_public_id TEXT PRIMARY KEY,combined_snapshot_hash TEXT,
-            created_at TEXT,authorization_reference TEXT,previous_snapshot_public_id TEXT);
+            created_at TEXT,authorization_reference TEXT,previous_snapshot_public_id TEXT,
+            algorithm_version TEXT,input_payload_json TEXT,
+            source_references_json TEXT DEFAULT '[]');
         CREATE TABLE d2_posting_attempts(transaction_public_id TEXT,stage TEXT);
         CREATE TABLE parser_proposal_conversion_audit(transaction_id INTEGER);
         CREATE TABLE receipt_finalization_audit(transaction_public_id TEXT,status TEXT);
@@ -45,7 +71,9 @@ def _db() -> sqlite3.Connection:
             migration_id TEXT, migration_filename TEXT,
             migration_sequence INTEGER, checksum_sha256 TEXT);
         CREATE TABLE financial_audit_events(
-            aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
+            aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT,
+            event_payload_json TEXT,source_evidence_refs_json TEXT DEFAULT '[]',
+            authorization_public_id TEXT);
         INSERT INTO transactions VALUES (1,'txn-1',10);"""
     )
     # The 051 triggers protect the real prerequisite audit tables from
@@ -490,7 +518,8 @@ def test_orphan_correction_audit_still_marks_target_as_corrected() -> None:
     conn = _db()
     try:
         conn.execute(
-            "INSERT INTO financial_audit_events VALUES (?,?,?)",
+            "INSERT INTO financial_audit_events(aggregate_type,aggregate_public_id,event_type) "
+            "VALUES (?,?,?)",
             ("transaction", "txn-1", "transaction_correction_applied"),
         )
         assert not conn.execute("SELECT 1 FROM correction_versions").fetchone()
@@ -508,8 +537,11 @@ def test_missing_051_with_retained_audit_refuses_current_claim() -> None:
                    migration_id TEXT, migration_filename TEXT,
                    migration_sequence INTEGER, checksum_sha256 TEXT);
                CREATE TABLE financial_audit_events(
-                   aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT);
-               INSERT INTO financial_audit_events VALUES
+                   aggregate_type TEXT, aggregate_public_id TEXT, event_type TEXT,
+                   event_payload_json TEXT,source_evidence_refs_json TEXT DEFAULT '[]',
+                   authorization_public_id TEXT);
+               INSERT INTO financial_audit_events(aggregate_type,aggregate_public_id,event_type)
+               VALUES
                    ('transaction','txn-1','transaction_correction_applied');"""
         )
         assert not verify_correction_schema(conn)
@@ -524,7 +556,8 @@ def test_deleted_051_ledger_row_with_retained_audit_refuses() -> None:
     conn = _db()
     try:
         conn.execute(
-            "INSERT INTO financial_audit_events VALUES (?,?,?)",
+            "INSERT INTO financial_audit_events(aggregate_type,aggregate_public_id,event_type) "
+            "VALUES (?,?,?)",
             ("transaction", "txn-1", "transaction_correction_applied"),
         )
         conn.execute("DELETE FROM schema_migrations WHERE migration_id = '051'")

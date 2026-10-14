@@ -115,6 +115,9 @@ def verify_correction_schema(conn: sqlite3.Connection) -> bool:
 
 def has_committed_correction(conn: sqlite3.Connection, target_id: str) -> bool:
     """Refuse orphan audit evidence; never expose an older value as current."""
+    from finance_core.application.independent_correction_contract import has_independent_correction
+
+    independent_present = has_independent_correction(conn, target_id)
     audit_exists = (
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='financial_audit_events'"
@@ -139,14 +142,14 @@ def has_committed_correction(conn: sqlite3.Connection, target_id: str) -> bool:
     if not verify_correction_schema(conn):
         if audit_present:
             raise CorrectionSchemaError("Correction audit exists without migration 051")
-        return False
+        return independent_present
     if not audit_exists:
         raise CorrectionSchemaError("Financial audit table is missing")
     if conn.execute(
         "SELECT 1 FROM correction_versions WHERE target_id = ? LIMIT 1", (target_id,)
     ).fetchone():
         return True
-    return audit_present
+    return audit_present or independent_present
 
 
 def has_correction_history(conn: sqlite3.Connection, target_id: str) -> bool:

@@ -349,18 +349,25 @@ def test_unseen_child_refuses_status_prepare_submit_and_resume(tmp_path, monkeyp
             attempt_id = posting.submit_post(fresh.review_id, "fork-confirmation").attempt_id
         leaf = ParserProposalRepository(connection).get_by_public_id(result.proposal_public_id)
         _insert_unsealed_child(connection, leaf["id"])
+        changes_before_refusal = connection.total_changes
         with pytest.raises(AmendmentError):
             service.get_status(result.amendment_id)
         with pytest.raises(PostingError):
             posting.prepare(result.proposal_public_id)
-        with pytest.raises(ReviewUnavailableError if phase == "pending" else PostingError):
+        with pytest.raises(
+            ReviewUnavailableError if phase == "pending" else PostingError
+        ) as refusal:
             posting.submit_post(fresh.review_id, "fork-confirmation")
+        if phase != "pending":
+            assert isinstance(refusal.value.__cause__, AmendmentLineageError)
         if attempt_id is not None:
             with pytest.raises(AmendmentLineageError):
                 posting.get_status(attempt_id)
             with pytest.raises(AmendmentLineageError):
                 posting.resume_post(attempt_id)
         assert _count(connection, "transactions") == (1 if phase == "finalized" else 0)
+        assert connection.total_changes == changes_before_refusal
+        assert not connection.in_transaction
     finally:
         connection.close()
 
