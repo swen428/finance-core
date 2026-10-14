@@ -853,9 +853,16 @@ class PostingService:
                 # A repeat is historical recovery, including after expiry or a
                 # later correction. Reauthenticate the exact immutable acceptance
                 # before releasing this lock and using the normal recovery owner.
-                self._accepted(accepted["attempt_id"])
-                self._conn.rollback()
-                return self.resume_post(accepted["attempt_id"])
+                try:
+                    self._accepted(accepted["attempt_id"])
+                    self._conn.rollback()
+                    return self.resume_post(accepted["attempt_id"])
+                except ValueError as exc:
+                    if isinstance(exc, PostingError):
+                        raise
+                    raise PostingError(
+                        "Accepted posting evidence is incomplete or contradictory"
+                    ) from exc
             now = self._now()
             if now >= material["expires_at"]:
                 raise PostingError("Posting review expired")
