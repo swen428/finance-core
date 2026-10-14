@@ -587,7 +587,10 @@ def _probe_installed_instance_flow(
         env={"PATH": os.environ.get("PATH", "")},
         capture_output=True,
         text=True,
-        timeout=180,
+        # Full per-statement admission performs filesystem and authority checks
+        # throughout the real business graph; keep the complete installed proof
+        # bounded without making its runtime budget a financial acceptance rule.
+        timeout=360,
     )
     return json.loads(completed.stdout)
 

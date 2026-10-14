@@ -47,6 +47,8 @@ def _application_ddl(*, trigger_value: str = "a  b") -> tuple[str, ...]:
         "AFTER INSERT ON synthetic_app_events BEGIN "
         "INSERT INTO synthetic_app_event_audit(event_id, action) "
         f"VALUES(NEW.event_id, '{trigger_value}'); END",
+        "CREATE TABLE synthetic_app_sequence_probe ("
+        "sequence_id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL)",
     )
 
 
@@ -133,6 +135,12 @@ def _expect_read_rejected(config: TrustedInstanceConfig) -> None:
             pytest.fail("schema or ledger drift opened a production read session")
 
 
+def _expect_write_rejected(config: TrustedInstanceConfig) -> None:
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner):
+            pytest.fail("schema or ledger drift opened a production write session")
+
+
 def _read_valid_extension(config: TrustedInstanceConfig) -> tuple[int, str]:
     with acquire_production_owner(config) as owner:
         with production_read_operation(owner) as conn:
@@ -141,6 +149,17 @@ def _read_valid_extension(config: TrustedInstanceConfig) -> tuple[int, str]:
             ).fetchone()
             ledger_count = conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
             return int(ledger_count), f"{row['event_id']}:{row['action']}"
+
+
+def _read_sequence_value(config: TrustedInstanceConfig) -> int:
+    with acquire_production_owner(config) as owner:
+        with production_read_operation(owner) as conn:
+            row = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name=?",
+                ("synthetic_app_sequence_probe",),
+            ).fetchone()
+            assert row is not None
+            return int(row[0])
 
 
 def _write_tamper(database: Path, mutate) -> None:
@@ -185,6 +204,25 @@ def _mutate_core_foreign_key(connection: sqlite3.Connection) -> None:
     connection.execute(
         "UPDATE sqlite_master SET sql=? WHERE type='table' AND name=?",
         (changed_sql, table),
+    )
+    connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+    connection.execute("PRAGMA writable_schema=OFF")
+
+
+def _mutate_sqlite_sequence_schema(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+    ).fetchone()
+    assert row is not None and row[0], "AUTOINCREMENT fixture must create sqlite_sequence"
+    original_sql = str(row[0])
+    assert original_sql.endswith(")"), original_sql
+    changed_sql = original_sql[:-1] + ", pr11_unexpected TEXT)"
+    assert changed_sql != original_sql
+    schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+    connection.execute("PRAGMA writable_schema=ON")
+    connection.execute(
+        "UPDATE sqlite_master SET sql=? WHERE type='table' AND name='sqlite_sequence'",
+        (changed_sql,),
     )
     connection.execute(f"PRAGMA schema_version={schema_version + 1}")
     connection.execute("PRAGMA writable_schema=OFF")
@@ -267,6 +305,10 @@ def _tamper_cases() -> tuple[tuple[str, object], ...]:
                 conn.execute("DROP TRIGGER synthetic_app_events_capture"),
                 conn.execute(_application_ddl(trigger_value="a b")[3]),
             ),
+        ),
+        (
+            "SQLite internal sequence-table columns",
+            _mutate_sqlite_sequence_schema,
         ),
         (
             "hidden staging authorization object",
@@ -452,6 +494,18 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
             )
             conn.commit()
 
+    # sqlite_sequence is mutable AUTOINCREMENT data; a normal increasing value
+    # must remain writable even though the table's declared SQL is sealed.
+    for expected_sequence in (1, 2):
+        with acquire_production_owner(config) as owner:
+            with production_write_operation(owner) as conn:
+                conn.execute(
+                    "INSERT INTO synthetic_app_sequence_probe(payload) VALUES (?)",
+                    (f"sequence-{expected_sequence}",),
+                )
+                conn.commit()
+        assert _read_sequence_value(config) == expected_sequence
+
     # A real owner/connection close and a new owner/session retain the pinned
     # application table, its declared foreign key/index, and its trigger effect.
     assert _read_valid_extension(config) == (60, "event-1:a  b")
@@ -486,6 +540,26 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
             alternate.close()
         assert database.read_bytes() == database_bytes
 
+    # Prove the real internal-table drift is rejected on both ACTIVE read and
+    # write opens. The DB inode and sealed authority record stay unchanged.
+    active_authority_path = config.control_root / STATE_FILENAME
+    active_authority_bytes = active_authority_path.read_bytes()
+    database_identity_before_internal_tamper = (database.stat().st_dev, database.stat().st_ino)
+    _write_tamper(database, _mutate_sqlite_sequence_schema)
+    try:
+        with pytest.raises(InstanceAdmissionError):
+            _expect_read_rejected(config)
+        with pytest.raises(InstanceAdmissionError):
+            _expect_write_rejected(config)
+    finally:
+        _restore_database(database, database_bytes)
+    assert (database.stat().st_dev, database.stat().st_ino) == (
+        database_identity_before_internal_tamper
+    )
+    assert active_authority_path.read_bytes() == active_authority_bytes
+    assert _read_valid_extension(config) == (60, "event-1:a  b")
+    assert _read_sequence_value(config) == 2
+
     # Process death after pending-journal sync produces no successful fence
     # acknowledgement or state publication.
     state_path = config.control_root / STATE_FILENAME
@@ -507,19 +581,32 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
 
     # Exact resume rechecks the current database contract before publication.
     database_before_resume_tamper = database.read_bytes()
-    _write_tamper(
-        database,
-        lambda conn: conn.execute(
-            "ALTER TABLE synthetic_app_events ADD COLUMN pr11_pending_drift TEXT"
+    database_identity_before_resume = (database.stat().st_dev, database.stat().st_ino)
+    for label, mutate in (
+        (
+            "declared application schema drift",
+            lambda conn: conn.execute(
+                "ALTER TABLE synthetic_app_events ADD COLUMN pr11_pending_drift TEXT"
+            ),
         ),
-    )
-    with pytest.raises(InstanceAdmissionError):
-        resume_authority_transition(
-            config, operation_id="schema-fence-pending", approval_ref="approved"
-        )
-    assert state_path.read_bytes() == prior_state
-    assert pending_path.is_file()
-    _restore_database(database, database_before_resume_tamper)
+        ("SQLite internal sequence-table drift", _mutate_sqlite_sequence_schema),
+    ):
+        _write_tamper(database, mutate)
+        try:
+            with pytest.raises(InstanceAdmissionError):
+                resume_authority_transition(
+                    config, operation_id="schema-fence-pending", approval_ref="approved"
+                )
+            assert state_path.read_bytes() == prior_state, label
+            assert pending_path.is_file(), label
+            assert (database.stat().st_dev, database.stat().st_ino) == (
+                database_identity_before_resume
+            ), label
+        finally:
+            _restore_database(database, database_before_resume_tamper)
+        assert (database.stat().st_dev, database.stat().st_ino) == (
+            database_identity_before_resume
+        ), label
     fenced = resume_authority_transition(
         config, operation_id="schema-fence-pending", approval_ref="approved"
     )

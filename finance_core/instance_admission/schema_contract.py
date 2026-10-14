@@ -55,19 +55,64 @@ def _hash(value: object) -> str:
     return hashlib.sha256(_json(value)).hexdigest()
 
 
+class _SchemaReader:
+    """Internal fixed metadata reads on the already owned SQLite handle.
+
+    This object is never issued to an application. Call sites below and the
+    unchanged migration schema/ledger helpers submit only metadata SELECT and
+    PRAGMA reads. Normal production SQL keeps full per-statement admission.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._connection = conn
+
+    def execute(self, sql: str, parameters=()):
+        return sqlite3.Connection.execute(self._connection, sql, parameters)
+
+
 def _inventory(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    return [
-        {
-            "type": row[0],
-            "name": row[1],
-            "table": row[2],
-            "sql": row[3],
-        }
-        for row in conn.execute(
-            "SELECT type,name,tbl_name,sql FROM sqlite_master "
-            "WHERE name NOT GLOB 'sqlite_*' ORDER BY type,name"
+    """Seal every main object, including native SQLite internal structures.
+
+    Data such as sqlite_sequence counters is not schema. Unknown statistics or
+    changed internal table/index shape cannot inherit the Core projection.
+    """
+
+    def quoted(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    inventory = []
+    for row in conn.execute("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"):
+        structure: Any = None
+        if row[0] == "table":
+            indexes = []
+            for index in conn.execute(f"PRAGMA index_list({quoted(row[1])})"):
+                indexes.append(
+                    {
+                        "metadata": tuple(index),
+                        "columns": [
+                            tuple(info)
+                            for info in conn.execute(f"PRAGMA index_xinfo({quoted(index[1])})")
+                        ],
+                    }
+                )
+            structure = {
+                "columns": [
+                    tuple(info) for info in conn.execute(f"PRAGMA table_xinfo({quoted(row[1])})")
+                ],
+                "foreign_keys": [
+                    tuple(info)
+                    for info in conn.execute(f"PRAGMA foreign_key_list({quoted(row[1])})")
+                ],
+                "indexes": indexes,
+            }
+        elif row[0] == "index":
+            structure = [
+                tuple(info) for info in conn.execute(f"PRAGMA index_xinfo({quoted(row[1])})")
+            ]
+        inventory.append(
+            {"type": row[0], "name": row[1], "table": row[2], "sql": row[3], "structure": structure}
         )
-    ]
+    return inventory
 
 
 def _ledger_structure(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -318,20 +363,21 @@ def validate_application_database(
     sealed_ledger_sha256: str,
 ) -> None:
     expected = expected_schema(migration_identity, schema)
-    databases = conn.execute("PRAGMA database_list").fetchall()
+    reader: Any = _SchemaReader(conn)
+    databases = reader.execute("PRAGMA database_list").fetchall()
     if (
         len([row for row in databases if row[1] == "main"]) != 1
         or any(row[1] not in {"main", "temp"} for row in databases)
-        or conn.execute(
+        or reader.execute(
             "SELECT 1 FROM sqlite_temp_master WHERE name NOT GLOB 'sqlite_*'"
         ).fetchone()
     ):
         raise SchemaContractError("Application schema forbids attachments and TEMP shadows")
-    actual = _payload(conn)
+    actual = _payload(reader)
     if (
         _json(actual) != expected.full_json
         or _json(_projection(actual, expected.core_names)) != expected.core_json
-        or _json(_deterministic_ledger(conn)) != expected.ledger_json
-        or ledger_sha256(conn) != sealed_ledger_sha256
+        or _json(_deterministic_ledger(reader)) != expected.ledger_json
+        or ledger_sha256(reader) != sealed_ledger_sha256
     ):
         raise SchemaContractError("Native Core/application schema or sealed full ledger changed")

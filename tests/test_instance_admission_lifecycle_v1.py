@@ -425,6 +425,112 @@ def test_process_owner_stays_exclusive_until_owner_context_closes(
     assert process.exitcode == 0
 
 
+@pytest.mark.skipif("spawn" not in mp.get_all_start_methods(), reason="requires spawn")
+def test_owner_close_cannot_race_a_live_connection_during_operation_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An opening reservation keeps close from releasing the lease mid-connect."""
+    import finance_core.instance_admission.sessions as session_module
+
+    config, _database = _prepare_and_admit(tmp_path, monkeypatch)
+    owner = acquire_production_owner(config)
+    native_connection_ready = threading.Event()
+    allow_connect_return = threading.Event()
+    operation_open = threading.Event()
+    release_operation = threading.Event()
+    operation_finished = threading.Event()
+    opened_connections: list[sqlite3.Connection] = []
+    operation_errors: list[BaseException] = []
+    closed_after_operation: list[bool] = []
+    real_connect = session_module.sqlite3.connect
+
+    def paused_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        assert sqlite3.Connection.execute(connection, "SELECT 1").fetchone()[0] == 1
+        opened_connections.append(connection)
+        if len(opened_connections) == 1:
+            native_connection_ready.set()
+            if allow_connect_return.wait(10):
+                return connection
+            sqlite3.Connection.close(connection)
+            raise TimeoutError("test did not release paused SQLite connect")
+        return connection
+
+    monkeypatch.setattr(session_module.sqlite3, "connect", paused_connect)
+
+    def open_operation() -> None:
+        try:
+            with production_write_operation(owner) as connection:
+                assert connection.execute("SELECT 1").fetchone()[0] == 1
+                operation_open.set()
+                if not release_operation.wait(20):
+                    raise TimeoutError("test did not release live production operation")
+        except BaseException as exc:
+            operation_errors.append(exc)
+        finally:
+            if opened_connections:
+                try:
+                    sqlite3.Connection.execute(opened_connections[0], "SELECT 1")
+                except sqlite3.ProgrammingError:
+                    closed_after_operation.append(True)
+                else:
+                    closed_after_operation.append(False)
+            operation_finished.set()
+
+    thread = threading.Thread(target=open_operation)
+    thread.start()
+    close_refused = False
+    operation_was_live = False
+    competing_owner_result: tuple[str, str | None] | None = None
+    try:
+        assert native_connection_ready.wait(10), "real SQLite handle did not reach open boundary"
+        with pytest.raises(InstanceAdmissionError):
+            with production_read_operation(owner, timeout_seconds=0):
+                pytest.fail("an opening owner issued a nested production operation")
+        try:
+            owner.close()
+        except InstanceAdmissionError:
+            close_refused = True
+        finally:
+            # Release only after close has attempted to cross the opening
+            # boundary. No sleep or scheduler-order assumption controls this.
+            allow_connect_return.set()
+
+        # Schema validation rebuilds the expected 60-migration inventory
+        # before yielding the connection; allow that deterministic work to
+        # finish rather than treating it as a scheduler race.
+        operation_was_live = operation_open.wait(45)
+        if operation_was_live:
+            process, receiver = _start_spawn_process(
+                _owner_attempt, (config.control_root, config.locator_root)
+            )
+            competing_owner_result = _receive(receiver, process)
+        release_operation.set()
+        assert operation_finished.wait(15), "operation thread did not finish cleanup"
+        thread.join(1)
+    finally:
+        allow_connect_return.set()
+        release_operation.set()
+        if thread.is_alive():
+            thread.join(10)
+        if thread.is_alive():
+            pytest.fail("operation thread remained live after both release events")
+        try:
+            owner.close()
+        except InstanceAdmissionError:
+            pass  # The implementation may already have safely closed after an operation.
+
+    assert close_refused, "owner close released a lease while SQLite connect was in progress"
+    assert operation_was_live, f"operation did not publish a live session: {operation_errors!r}"
+    assert competing_owner_result is not None and competing_owner_result[0] == "busy"
+    assert not operation_errors
+    assert closed_after_operation == [True]
+    process, receiver = _start_spawn_process(
+        _owner_attempt, (config.control_root, config.locator_root)
+    )
+    assert _receive(receiver, process)[0] == "acquired"
+
+
 @pytest.mark.skipif("fork" not in mp.get_all_start_methods(), reason="requires POSIX fork")
 def test_fence_waits_for_the_real_write_connection_to_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

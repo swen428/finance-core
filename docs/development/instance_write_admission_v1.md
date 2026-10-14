@@ -50,7 +50,11 @@ migration ledger is sealed alongside that schema contract. A changed schema ID,
 DDL statement, Core or extension object, ledger row, checksum, fingerprint, or
 application time fails closed. Pending authority publication is resumed only
 after the database schema and ledger still match the recorded contract. This
-does not add a Core migration or alter the default Core-only profile.
+includes the declared SQL definition of SQLite's internal `sqlite_sequence`
+table. Ordinary AUTOINCREMENT sequence values remain mutable database data and
+may advance normally; an unexpected change to the table definition fails
+closed. This does not add a Core migration or alter the default Core-only
+profile.
 
 ## Durable authority state
 
@@ -107,13 +111,27 @@ leases for the complete SQLite connection lifetime. The ordered write path is:
 3. shared profile write gate;
 4. SQLite connection and transaction lifetime.
 
-The service owns commit and rollback for its business transaction. Leaving an
-operation rolls back only work that remains uncommitted, then closes the actual
-connection before releasing leases. If connection closure is uncertain, the
-connection and leases remain held until process exit; admission must not claim
-the connection was safely released. An owner cannot be explicitly closed while
-its operation is still active. A forked child cannot close an inherited owner
-to release the parent's lease.
+The service owns commit and rollback for its business transaction. Every
+application-issued `execute()` statement and each `executemany()` item is
+checked against the current issued connection and authority before it reaches
+SQLite. The normal
+service-owned `commit()` and `rollback()` calls remain available; SQL
+`COMMIT`/`END` and an outer `RELEASE` are also checked before SQLite executes
+them. Production `executescript()` is refused. The connection stays at its
+default legacy transaction settings; changing `isolation_level` or
+`autocommit` is refused, and even assigning the same setting requires a current
+admission check. Bound parameters must use supported built-in values and
+containers; custom adapters and callback-driven parameter objects are refused
+so they cannot run Python code after admission checking. The supported service
+flow includes connection `commit()`, `rollback()`, and context-manager
+transaction handling. This is a narrow transaction-control boundary, not a
+general SQL sandbox. Leaving an operation rolls back only work that remains
+uncommitted, then closes the actual connection before releasing leases. If
+connection closure is uncertain, the connection and leases remain held until
+process exit; admission must not claim the connection was safely released. An
+owner cannot be explicitly closed while its operation is opening, active or
+cleaning up. A forked child cannot close an inherited owner to release the
+parent's lease.
 
 Production writes require a connection issued by an active production write
 operation. Production reads use a real SQLite read-only connection. A legitimate

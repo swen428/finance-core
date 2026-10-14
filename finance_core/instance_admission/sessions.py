@@ -5,9 +5,11 @@ from __future__ import annotations
 import fcntl
 import os
 import sqlite3
+import threading
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Self
 
 from finance_core.profile_gate import GateLease, writer_gate
@@ -31,7 +33,7 @@ from .authority import (
 
 _OWNER_TOKEN = object()
 _OWNERS: dict[int, "ProductionOwner"] = {}
-_WITNESSES: dict[sqlite3.Connection, "_Witness"] = {}
+_WITNESSES: dict[int, "_Witness"] = {}
 # Unknown-close handles deliberately remain reachable until process exit.
 _UNCERTAIN: list["_Witness"] = []
 
@@ -54,6 +56,8 @@ class ProductionOwner:
         self.config, self._lease, self._pid = config, lease, os.getpid()
         self._active: _Witness | None = None
         self._uncertain = False
+        self._opening = False
+        self._mutex = threading.RLock()
         _OWNERS[id(self)] = self
         _CONFIG_OWNERS[id(config)] = _CONFIG_OWNERS.get(id(config), 0) + 1
 
@@ -63,16 +67,30 @@ class ProductionOwner:
         self._lease.assert_valid()
 
     def close(self) -> None:
-        self.assert_valid()
-        if self._active is not None:
-            raise InstanceAdmissionError("Owner cannot release before actual operation close")
-        self._lease.close()
-        count = _CONFIG_OWNERS[id(self.config)] - 1
-        if count:
-            _CONFIG_OWNERS[id(self.config)] = count
-        else:
-            _CONFIG_OWNERS.pop(id(self.config), None)
-        _OWNERS.pop(id(self), None)
+        if self._pid != os.getpid():
+            raise InstanceAdmissionError("Cannot release fork-inherited owner")
+        with self._mutex:
+            self.assert_valid()
+            if self._opening or self._active is not None:
+                raise InstanceAdmissionError(
+                    "Owner cannot release before actual operation close/cleanup"
+                )
+            self._lease.close()
+            count = _CONFIG_OWNERS[id(self.config)] - 1
+            if count:
+                _CONFIG_OWNERS[id(self.config)] = count
+            else:
+                _CONFIG_OWNERS.pop(id(self.config), None)
+            _OWNERS.pop(id(self), None)
+
+    def _reserve_operation(self) -> None:
+        if self._pid != os.getpid():
+            raise InstanceAdmissionError("Fork-inherited owner cannot open operations")
+        with self._mutex:
+            self.assert_valid()
+            if self._opening or self._active is not None:
+                raise InstanceAdmissionError("Nested/opening production operations are forbidden")
+            self._opening = True
 
     def __enter__(self) -> Self:
         self.assert_valid()
@@ -119,6 +137,10 @@ class _Witness:
     active: bool = True
     closing: bool = False
     closed: bool = False
+    cursors: weakref.WeakValueDictionary[int, _ProductionCursor] = field(
+        default_factory=weakref.WeakValueDictionary
+    )
+    retained_cursors: tuple[_ProductionCursor, ...] = ()
 
     def preflight(
         self, *, write: bool = False, instance_id: str | None = None, full: bool = True
@@ -129,7 +151,7 @@ class _Witness:
             or self.closed
             or self.closing
             or self.owner._active is not self
-            or _WITNESSES.get(self.connection) is not self
+            or _witness_for(self.connection) is not self
         ):
             raise InstanceAdmissionError("Closed, forked, stale or unissued production session")
         if not full:
@@ -137,6 +159,13 @@ class _Witness:
                 raise InstanceAdmissionError("Production owner is no longer held")
             return
         self.owner.assert_valid()
+        if (
+            self.connection.row_factory is not sqlite3.Row
+            or self.connection.text_factory is not str
+        ):
+            raise InstanceAdmissionError(
+                "Production SQL requires configured SQLite.Row/str factories"
+            )
         self.control.assert_valid()
         self.profile.revalidate()
         self.gate.assert_valid()
@@ -158,8 +187,39 @@ class _Witness:
             raise InstanceAdmissionError("Business binding belongs to another production instance")
 
 
+def _witness_for(conn: sqlite3.Connection) -> _Witness | None:
+    witness = _WITNESSES.get(id(conn))
+    return witness if witness is not None and witness.connection is conn else None
+
+
+def _parameters(parameters):
+    """Materialize finite primitive bindings before full admission, without adapters."""
+
+    def primitive(value):
+        if type(value) not in {type(None), bool, int, float, str, bytes, bytearray, memoryview}:
+            raise InstanceAdmissionError("Production SQL bindings require primitive SQLite values")
+        if (type(value), sqlite3.PrepareProtocol) in sqlite3.adapters:
+            raise InstanceAdmissionError(
+                "Production SQL bindings cannot invoke registered adapters"
+            )
+        return bytes(value) if type(value) in {bytearray, memoryview} else value
+
+    if type(parameters) is dict:
+        if any(type(key) is not str for key in parameters):
+            raise InstanceAdmissionError("Production named SQL bindings require string keys")
+        return {key: primitive(value) for key, value in parameters.items()}
+    if type(parameters) not in {tuple, list, sqlite3.Row}:
+        raise InstanceAdmissionError("Production SQL bindings require tuple/list/dict/sqlite.Row")
+    return tuple(primitive(value) for value in parameters)
+
+
+def _submit_admission(conn: sqlite3.Connection) -> None:
+    witness = _preflight(conn)
+    _require_session(conn, write=not witness.read_only, instance_id=None)
+
+
 def _preflight(conn: sqlite3.Connection, *, write: bool = False) -> _Witness:
-    witness = _WITNESSES.get(conn)
+    witness = _witness_for(conn)
     if witness is None:
         raise InstanceAdmissionError("Production connection was not issued by operation owner")
     witness.preflight(write=write, full=False)
@@ -167,17 +227,38 @@ def _preflight(conn: sqlite3.Connection, *, write: bool = False) -> _Witness:
 
 
 class _ProductionCursor(sqlite3.Cursor):
+    def close(self) -> None:
+        witness = _preflight(self.connection)
+        try:
+            _close_cursor_handle(self)
+        except BaseException as exc:
+            _retain_unknown_close(witness)
+            raise ProductionCloseUncertain(witness) from exc
+        witness.cursors.pop(id(self), None)
+
     def execute(self, sql, parameters=(), /):
-        _preflight(self.connection)
-        return super().execute(sql, parameters)
+        if type(sql) is not str:
+            raise InstanceAdmissionError("Production SQL requires a plain statement string")
+        bindings = _parameters(parameters)
+        _submit_admission(self.connection)
+        return super().execute(sql, bindings)
 
     def executemany(self, sql, seq_of_parameters, /):
-        _preflight(self.connection)
-        return super().executemany(sql, seq_of_parameters)
+        if type(sql) is not str:
+            raise InstanceAdmissionError("Production SQL requires a plain statement string")
+
+        def guarded_rows():
+            for parameters in seq_of_parameters:
+                bindings = _parameters(parameters)
+                _submit_admission(self.connection)
+                yield bindings
+
+        _submit_admission(self.connection)
+        return super().executemany(sql, guarded_rows())
 
     def executescript(self, sql_script, /):
         _preflight(self.connection)
-        return super().executescript(sql_script)
+        raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
 
     def fetchone(self):
         _preflight(self.connection)
@@ -201,6 +282,32 @@ class _ProductionCursor(sqlite3.Cursor):
 
 
 class _ProductionConnection(sqlite3.Connection):
+    @property
+    def isolation_level(self):
+        return sqlite3.Connection.isolation_level.__get__(self)
+
+    @isolation_level.setter
+    def isolation_level(self, value):
+        _submit_admission(self)
+        if type(value) is not str or value != "":
+            raise InstanceAdmissionError(
+                "Production isolation_level is fixed to default legacy mode"
+            )
+        sqlite3.Connection.isolation_level.__set__(self, value)
+
+    @property
+    def autocommit(self):
+        return sqlite3.Connection.autocommit.__get__(self)
+
+    @autocommit.setter
+    def autocommit(self, value):
+        _submit_admission(self)
+        if type(value) is not int or value != sqlite3.LEGACY_TRANSACTION_CONTROL:
+            raise InstanceAdmissionError(
+                "Production autocommit is fixed to legacy transaction control"
+            )
+        sqlite3.Connection.autocommit.__set__(self, value)
+
     def execute(self, sql, parameters=(), /):
         return self.cursor().execute(sql, parameters)
 
@@ -211,10 +318,12 @@ class _ProductionConnection(sqlite3.Connection):
         return self.cursor().executescript(sql_script)
 
     def cursor(self, factory=None):
-        _preflight(self)
+        witness = _preflight(self)
         if factory is not None and factory is not _ProductionCursor:
             raise InstanceAdmissionError("Production cursor factory cannot replace session witness")
-        return super().cursor(_ProductionCursor)
+        cursor = super().cursor(_ProductionCursor)
+        witness.cursors[id(cursor)] = cursor
+        return cursor
 
     def commit(self) -> None:
         witness = _preflight(self)
@@ -227,8 +336,11 @@ class _ProductionConnection(sqlite3.Connection):
 
     def close(self) -> None:
         witness = _preflight(self)
-        super().close()
-        witness.closed = True
+        try:
+            _close_issued_connection(witness)
+        except BaseException as exc:
+            _retain_unknown_close(witness)
+            raise ProductionCloseUncertain(witness) from exc
 
     def __enter__(self) -> Self:
         _preflight(self)
@@ -240,8 +352,38 @@ class _ProductionConnection(sqlite3.Connection):
         return super().__exit__(*args)
 
 
+def _close_cursor_handle(cursor: sqlite3.Cursor) -> None:
+    sqlite3.Cursor.close(cursor)
+
+
+def _retain_unknown_close(witness: _Witness) -> None:
+    with witness.owner._mutex:
+        witness.owner._uncertain = True
+    witness.closing = True
+    # Keep pending statements reachable even when the caller drops its cursor.
+    witness.retained_cursors = tuple(witness.cursors.values())
+    _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+    if not any(retained is witness for retained in _UNCERTAIN):
+        _UNCERTAIN.append(witness)
+
+
+def _close_issued_connection(witness: _Witness) -> None:
+    if witness.closed:
+        return
+    witness.closing = True
+    # Python's Connection.close can leave a SQLite zombie handle when an
+    # escaped cursor has a pending statement. Finalize while the parent is live.
+    for cursor in tuple(witness.cursors.values()):
+        _close_cursor_handle(cursor)
+        witness.cursors.pop(id(cursor), None)
+    if witness.connection.in_transaction:
+        sqlite3.Connection.rollback(witness.connection)
+    _close_sqlite_handle(witness.connection)
+    witness.closed = True
+
+
 def _require_session(conn: sqlite3.Connection, *, write: bool, instance_id: str | None) -> None:
-    witness = _WITNESSES.get(conn)
+    witness = _witness_for(conn)
     if witness is None:
         # Known production connection subclasses must never take staging fallback.
         if isinstance(conn, _ProductionConnection):
@@ -253,7 +395,7 @@ def _require_session(conn: sqlite3.Connection, *, write: bool, instance_id: str 
         databases = sqlite3.Connection.execute(conn, "PRAGMA database_list").fetchall()
         if sqlite3.Connection.execute(
             conn, "SELECT 1 FROM sqlite_temp_master WHERE name NOT GLOB 'sqlite_*'"
-        ).fetchone():
+        ).fetchall():
             raise InstanceAdmissionError("Production session cannot carry TEMP schema shadows")
         main = [row for row in databases if row[1] == "main"]
         if (
@@ -286,10 +428,8 @@ def _operation(
 ) -> Iterator[sqlite3.Connection]:
     from .schema_contract import SchemaContractError, validate_application_database
 
-    owner.assert_valid()
-    if owner._active is not None:
-        raise InstanceAdmissionError("Nested production operations are forbidden")
-    control = _Lock(owner.config, CONTROL_LOCK_FILENAME)
+    owner._reserve_operation()
+    control: _Lock | None = None
     profile: ProductionProfile | None = None
     gate: GateLease | None = None
     conn: sqlite3.Connection | None = None
@@ -298,6 +438,7 @@ def _operation(
     sqlite_began = False
     close_uncertain = False
     try:
+        control = _Lock(owner.config, CONTROL_LOCK_FILENAME)
         control.acquire(fcntl.LOCK_SH, timeout_seconds)
         state = _state(owner.config)
         record = _record(owner.config, state)
@@ -321,8 +462,9 @@ def _operation(
         witness = _Witness(
             owner, conn, control, profile, gate, state["version"], read_only, os.getpid()
         )
-        _WITNESSES[conn] = witness
-        owner._active = witness
+        with owner._mutex:
+            _WITNESSES[id(conn)] = witness
+            owner._active = witness
         configure_sqlite_connection(conn)
         try:
             validate_application_database(
@@ -341,18 +483,22 @@ def _operation(
         if conn is not None:
             try:
                 if witness is not None:
-                    witness.closing = True
-                # No outer transaction is committed on behalf of business services.
-                if not (witness is not None and witness.closed) and conn.in_transaction:
-                    sqlite3.Connection.rollback(conn)
-                _close_sqlite_handle(conn)
+                    if owner._uncertain:
+                        # An explicit cursor/connection close already failed.
+                        # Retrying cannot prove the original actual-close boundary.
+                        raise ProductionCloseUncertain(witness)
+                    _close_issued_connection(witness)
+                else:
+                    if conn.in_transaction:
+                        sqlite3.Connection.rollback(conn)
+                    _close_sqlite_handle(conn)
             except BaseException as exc:
                 close_uncertain = True
+                if witness is not None:
+                    _retain_unknown_close(witness)
+                    raise ProductionCloseUncertain(witness) from exc
                 owner._uncertain = True
                 _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
-                if witness is not None:
-                    _UNCERTAIN.append(witness)
-                    raise ProductionCloseUncertain(witness) from exc
                 raise InstanceAdmissionError(
                     "SQLite close uncertain before session publication"
                 ) from exc
@@ -360,18 +506,29 @@ def _operation(
                 if witness is not None and not close_uncertain:
                     witness.active = False
                     witness.closed = True
-                    _WITNESSES.pop(conn, None)
-                    owner._active = None
+                    _WITNESSES.pop(id(conn), None)
         if not close_uncertain:
-            if sqlite_began:
-                _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
-            if gate is not None:
-                gate.close()
-            if profile is not None:
-                profile.close()
-            control.close()
-        if lifetime:
-            _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
+            try:
+                if sqlite_began:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                if gate is not None:
+                    gate.close()
+                if profile is not None:
+                    profile.close()
+                if control is not None:
+                    control.close()
+                if lifetime:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
+            except BaseException:
+                with owner._mutex:
+                    owner._uncertain = True
+                if witness is not None:
+                    _UNCERTAIN.append(witness)
+                raise
+            else:
+                with owner._mutex:
+                    owner._active = None
+                    owner._opening = False
 
 
 def production_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):

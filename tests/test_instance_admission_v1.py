@@ -1,3 +1,5 @@
+import multiprocessing
+import os
 import sqlite3
 
 import pytest
@@ -203,7 +205,19 @@ def test_internal_history_corruption_fails_closed(tmp_path, monkeypatch):
     config.close()
 
 
-@pytest.mark.parametrize("commit_mode", ["explicit", "sqlite-context"])
+@pytest.mark.parametrize(
+    "commit_mode",
+    [
+        "explicit",
+        "sqlite-context",
+        "sql-commit",
+        "sql-end",
+        "outer-release",
+        "script",
+        "isolation",
+        "autocommit",
+    ],
+)
 @pytest.mark.parametrize("drift", ["permissions", "main-path"])
 def test_main_identity_drift_rejects_actual_commit(tmp_path, monkeypatch, commit_mode, drift):
     from finance_core.profile_paths import ProfilePathError
@@ -214,7 +228,9 @@ def test_main_identity_drift_rejects_actual_commit(tmp_path, monkeypatch, commit
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
             # Synthetic uncommitted schema effect will be rolled back by operation cleanup.
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "SAVEPOINT drift_outer" if commit_mode == "outer-release" else "BEGIN IMMEDIATE"
+            )
             conn.execute("CREATE TABLE drift_commit_probe(value TEXT)")
             conn.execute("INSERT INTO drift_commit_probe VALUES ('never-committed')")
             saved = tmp_path / "pinned-original.sqlite"
@@ -228,8 +244,20 @@ def test_main_identity_drift_rejects_actual_commit(tmp_path, monkeypatch, commit
                 with pytest.raises((InstanceAdmissionError, ProfilePathError)):
                     if commit_mode == "explicit":
                         conn.commit()
-                    else:
+                    elif commit_mode == "sqlite-context":
                         conn.__exit__(None, None, None)
+                    elif commit_mode == "sql-commit":
+                        conn.execute("COMMIT")
+                    elif commit_mode == "sql-end":
+                        conn.execute("END")
+                    elif commit_mode == "outer-release":
+                        conn.execute("RELEASE drift_outer")
+                    elif commit_mode == "script":
+                        conn.executescript("SELECT 1;")
+                    elif commit_mode == "isolation":
+                        conn.isolation_level = None
+                    else:
+                        conn.autocommit = True
                 assert conn.in_transaction
             finally:
                 if drift == "permissions":
@@ -513,3 +541,241 @@ def test_unchanged_maintenance_baseline_ignores_wal_checkpoint_and_binds_evidenc
         )
     profile.close()
     config.close()
+
+
+def test_unissued_lookalike_connection_cannot_inherit_equal_hash_witness(tmp_path, monkeypatch):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+
+            class Lookalike(sqlite3.Connection):
+                def __hash__(self):
+                    return hash(conn)
+
+                def __eq__(self, other):
+                    return True
+
+            raw = sqlite3.connect(profile.live_database, factory=Lookalike)
+            try:
+                assert raw is not conn
+                with pytest.raises(StagingDatabaseError):
+                    require_finance_write_connection(raw)
+            finally:
+                raw.close()
+    profile.close()
+    config.close()
+
+
+def test_guarded_sql_preserves_default_transactions_and_rechecks_each_generator_row(
+    tmp_path, monkeypatch
+):
+    from finance_core.profile_paths import ProfilePathError
+
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            assert conn.isolation_level == ""
+            assert conn.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
+            conn.isolation_level = ""
+            conn.autocommit = sqlite3.LEGACY_TRANSACTION_CONTROL
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('sql-commit','SQL')"
+            )
+            conn.execute("COMMIT")
+            conn.execute("SAVEPOINT supported_outer")
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('sql-release','SQL')"
+            )
+            conn.execute("RELEASE supported_outer")
+            for execute_script in (conn.executescript, conn.cursor().executescript):
+                with pytest.raises(InstanceAdmissionError, match="executescript"):
+                    execute_script("SELECT 1;")
+            for mode, value in (
+                ("isolation_level", None),
+                ("isolation_level", "DEFERRED"),
+                ("autocommit", True),
+                ("autocommit", False),
+            ):
+                with pytest.raises(InstanceAdmissionError, match="fixed"):
+                    setattr(conn, mode, value)
+
+            callback_calls = []
+            conn.row_factory = lambda cursor, row: callback_calls.append(True) or row
+            try:
+                with pytest.raises(InstanceAdmissionError, match="configured"):
+                    conn.execute("COMMIT")
+                assert callback_calls == []
+            finally:
+                conn.row_factory = sqlite3.Row
+            conn.text_factory = bytes
+            try:
+                with pytest.raises(InstanceAdmissionError, match="configured"):
+                    conn.execute("SELECT 1")
+            finally:
+                conn.text_factory = str
+
+            def changes_context_after_first_row():
+                yield ("uncommitted-first", "First")
+                profile.live_database.chmod(0o640)
+                yield ("uncommitted-second", "Second")
+
+            try:
+                with pytest.raises((InstanceAdmissionError, ProfilePathError)):
+                    conn.executemany(
+                        "INSERT INTO participants(public_id,display_name) VALUES (?,?)",
+                        changes_context_after_first_row(),
+                    )
+                assert conn.in_transaction
+            finally:
+                profile.live_database.chmod(0o600)
+        with production_read_operation(owner) as conn:
+            assert [
+                row[0]
+                for row in conn.execute("SELECT public_id FROM participants ORDER BY public_id")
+            ] == ["sql-commit", "sql-release"]
+    profile.close()
+    config.close()
+
+
+@pytest.mark.parametrize("statement", ["select", "returning"])
+@pytest.mark.parametrize("explicit_close", [False, True])
+def test_partial_public_cursor_finalized_before_connection_and_lease_close(
+    tmp_path, monkeypatch, statement, explicit_close
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.executemany(
+                "INSERT INTO participants(public_id,display_name) VALUES (?,?)",
+                [("cursor-first", "First"), ("cursor-second", "Second")],
+            )
+            conn.commit()
+        operation = (
+            production_read_operation if statement == "select" else production_write_operation
+        )
+        with operation(owner) as conn:
+            cursor = conn.cursor()
+            if statement == "select":
+                cursor.execute("SELECT public_id FROM participants ORDER BY public_id")
+            else:
+                cursor.execute(
+                    "INSERT INTO participants(public_id,display_name) "
+                    "VALUES ('returning-first','First'),('returning-second','Second') "
+                    "RETURNING public_id"
+                )
+            assert cursor.fetchone() is not None
+            if explicit_close:
+                conn.close()
+    # A separate actual SQLite handle must be able to acquire its write lock
+    # while the escaped cursor remains strongly referenced by this test.
+    raw = sqlite3.connect(profile.live_database, timeout=0)
+    try:
+        raw.execute("BEGIN EXCLUSIVE")
+        raw.rollback()
+        assert raw.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 2
+    finally:
+        raw.close()
+    for reuse in (cursor.fetchone, cursor.close, lambda: cursor.execute("SELECT 1")):
+        with pytest.raises(InstanceAdmissionError):
+            reuse()
+    profile.close()
+    config.close()
+
+
+def _uncertain_public_cursor_close_worker(tmp_path, close_surface, fault_kind, sender):
+    import finance_core.instance_admission.sessions as sessions
+    from finance_core.instance_admission import ProductionCloseUncertain
+
+    config = synthetic_config(tmp_path, pytest.MonkeyPatch())
+    prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved").close()
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    owner = acquire_production_owner(config)
+    operation = production_read_operation(owner)
+    conn = operation.__enter__()
+    cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
+    assert cursor.fetchone()[0] == 1
+    cursor_close_attempts = []
+    connection_close_attempts = []
+
+    def unknown_cursor_close(_cursor):
+        cursor_close_attempts.append(True)
+        if fault_kind == "cursor":
+            raise sqlite3.OperationalError("synthetic cursor close uncertainty")
+        sqlite3.Cursor.close(_cursor)
+
+    def unexpected_connection_close(_connection):
+        connection_close_attempts.append(True)
+        if fault_kind == "connection":
+            raise sqlite3.OperationalError("synthetic connection close uncertainty")
+        raise AssertionError("connection cannot close after cursor close uncertainty")
+
+    sessions._close_cursor_handle = unknown_cursor_close
+    sessions._close_sqlite_handle = unexpected_connection_close
+    close_call = {
+        "cursor": cursor.close,
+        "connection": conn.close,
+        "operation": lambda: operation.__exit__(None, None, None),
+    }[close_surface]
+    with pytest.raises(ProductionCloseUncertain):
+        close_call()
+    if close_surface != "operation":
+        with pytest.raises(ProductionCloseUncertain):
+            operation.__exit__(None, None, None)
+    with pytest.raises(InstanceAdmissionError):
+        owner.close()
+    with pytest.raises(InstanceAdmissionError):
+        conn.execute("SELECT 1")
+    with pytest.raises(InstanceAdmissionError):
+        config.close()
+    # A separate lease descriptor must still observe the retained owner EX lock.
+    with pytest.raises(InstanceAdmissionError):
+        acquire_production_owner(config, timeout_seconds=0)
+    witness = sessions._witness_for(conn)
+    sender.send(
+        (
+            len(cursor_close_attempts),
+            len(connection_close_attempts),
+            sqlite3.Connection.execute(conn, "SELECT 1").fetchone()[0],
+            witness is not None and any(item is cursor for item in witness.retained_cursors),
+        )
+    )
+    sender.close()
+    os._exit(0)
+
+
+@pytest.mark.parametrize(
+    ("close_surface", "fault_kind"),
+    [
+        ("cursor", "cursor"),
+        ("connection", "cursor"),
+        ("operation", "cursor"),
+        ("connection", "connection"),
+        ("operation", "connection"),
+    ],
+)
+def test_unknown_public_cursor_close_retains_handle_and_leases(tmp_path, close_surface, fault_kind):
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    child = context.Process(
+        target=_uncertain_public_cursor_close_worker,
+        args=(tmp_path, close_surface, fault_kind, sender),
+    )
+    child.start()
+    sender.close()
+    try:
+        assert receiver.poll(30), "isolated close proof did not return"
+        assert receiver.recv() == (1, int(fault_kind == "connection"), 1, fault_kind == "cursor")
+        child.join(10)
+        assert child.exitcode == 0
+    finally:
+        receiver.close()
+        if child.is_alive():
+            child.kill()
+            child.join(10)
