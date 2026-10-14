@@ -31,6 +31,7 @@ from finance_core.application.independent_correction_contract import (
     VerifiedCorrectionDecision,
     correction_hash,
     has_independent_correction,
+    independent_correction_snapshot_inventory,
     require_independent_correction_schema,
 )
 from finance_core.application.independent_correction_receipts import (
@@ -556,24 +557,9 @@ class IndependentCorrectionService:
                 raise IndependentCorrectionIntegrityError(
                     "Correction inventory contains missing or orphan evidence"
                 )
-        observed_snapshots = {
-            r[0]
-            for r in self._conn.execute(
-                "SELECT s.snapshot_public_id FROM authoritative_calculation_snapshots s "
-                "JOIN application_correction_plans p ON s.authorization_reference=p.correction_id "
-                "WHERE p.target_id=?",
-                (transaction_id,),
-            )
-        }
-        snapshot_audit_inventory = {
-            r[0]
-            for r in self._conn.execute(
-                "SELECT e.aggregate_public_id FROM financial_audit_events e "
-                "JOIN application_correction_plans p ON e.authorization_public_id=p.correction_id "
-                "WHERE p.target_id=? AND e.aggregate_type='calculation_snapshot'",
-                (transaction_id,),
-            )
-        }
+        observed_snapshots, snapshot_audit_inventory = independent_correction_snapshot_inventory(
+            self._conn, transaction_id
+        )
         if observed_snapshots != snapshots or snapshot_audit_inventory != snapshots:
             raise IndependentCorrectionIntegrityError("Correction snapshot inventory changed")
         chain = verify_financial_audit_chain(

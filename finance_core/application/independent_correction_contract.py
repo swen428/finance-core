@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 from collections.abc import Mapping
@@ -146,6 +147,75 @@ def require_independent_correction_schema(conn: sqlite3.Connection) -> None:
 HumanCorrectionDecisionAuthority = CorrectionHumanDecisionAuthority
 
 
+def independent_correction_snapshot_inventory(
+    conn: sqlite3.Connection, target_id: str
+) -> tuple[set[str], set[str]]:
+    """Discover retained correction evidence even when its plan owner is absent."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    snapshots: set[str] = set()
+    audits: set[str] = set()
+    reference = f"transaction:{target_id}"
+    if "authoritative_calculation_snapshots" in tables:
+        snapshots.update(
+            r[0]
+            for r in conn.execute(
+                "SELECT snapshot_public_id FROM authoritative_calculation_snapshots "
+                "WHERE (algorithm_version='receipt-independent-correction-personal-total-v1' "
+                "OR CASE WHEN json_valid(input_payload_json) THEN "
+                "json_extract(input_payload_json,'$.value.schema') END="
+                "'independent-correction-personal-receipt-input-v1') "
+                "AND (CASE WHEN json_valid(input_payload_json) THEN "
+                "json_extract(input_payload_json,'$.value.target_id') END=? "
+                "OR EXISTS (SELECT 1 FROM json_each(source_references_json) WHERE value=?))",
+                (target_id, reference),
+            )
+        )
+        if "application_correction_plans" in tables:
+            snapshots.update(
+                r[0]
+                for r in conn.execute(
+                    "SELECT s.snapshot_public_id FROM authoritative_calculation_snapshots s "
+                    "JOIN application_correction_plans p "
+                    "ON s.authorization_reference=p.correction_id WHERE p.target_id=?",
+                    (target_id,),
+                )
+            )
+    if "financial_audit_events" in tables:
+        audits.update(
+            r[0]
+            for r in conn.execute(
+                "SELECT aggregate_public_id FROM financial_audit_events "
+                "WHERE aggregate_type='calculation_snapshot' "
+                "AND aggregate_public_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(snapshots)),),
+            )
+        )
+        audits.update(
+            r[0]
+            for r in conn.execute(
+                "SELECT aggregate_public_id FROM financial_audit_events "
+                "WHERE aggregate_type='calculation_snapshot' AND "
+                "CASE WHEN json_valid(event_payload_json) THEN "
+                "json_extract(event_payload_json,'$.value.algorithm_version') END="
+                "'receipt-independent-correction-personal-total-v1' "
+                "AND EXISTS (SELECT 1 FROM json_each(source_evidence_refs_json) WHERE value=?)",
+                (reference,),
+            )
+        )
+        if "application_correction_plans" in tables:
+            audits.update(
+                r[0]
+                for r in conn.execute(
+                    "SELECT e.aggregate_public_id FROM financial_audit_events e "
+                    "JOIN application_correction_plans p "
+                    "ON e.authorization_public_id=p.correction_id WHERE p.target_id=? "
+                    "AND e.aggregate_type='calculation_snapshot'",
+                    (target_id,),
+                )
+            )
+    return snapshots, audits
+
+
 def has_independent_correction(conn: sqlite3.Connection, target_id: str) -> bool:
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     audit = (
@@ -167,15 +237,16 @@ def has_independent_correction(conn: sqlite3.Connection, target_id: str) -> bool
         ).fetchone()
         is not None
     )
+    snapshots, snapshot_audits = independent_correction_snapshot_inventory(conn, target_id)
     objects = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE name LIKE 'application_correction_%' LIMIT 1"
     ).fetchone()
     if objects is None and not recorded:
-        if audit:
+        if audit or snapshots or snapshot_audits:
             raise IndependentCorrectionIntegrityError("Correction audit exists without schema")
         return False
     require_independent_correction_schema(conn)
-    if audit:
+    if audit or snapshots or snapshot_audits:
         return True
     for table in ("versions", "decisions", "receipt_facts"):
         if (
@@ -186,15 +257,7 @@ def has_independent_correction(conn: sqlite3.Connection, target_id: str) -> bool
             is not None
         ):
             return True
-    return (
-        conn.execute(
-            "SELECT 1 FROM authoritative_calculation_snapshots s "
-            "JOIN application_correction_plans p ON s.authorization_reference=p.correction_id "
-            "WHERE p.target_id=? LIMIT 1",
-            (target_id,),
-        ).fetchone()
-        is not None
-    )
+    return False
 
 
 @dataclass(frozen=True)

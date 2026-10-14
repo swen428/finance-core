@@ -19,7 +19,10 @@ from typing import Any
 
 import pytest
 
-from finance_core.application.correction_schema import CorrectionSchemaError
+from finance_core.application.correction_schema import (
+    CorrectionSchemaError,
+    has_committed_correction,
+)
 from finance_core.application.independent_correction_contract import (
     CORRECTION_DECISION_SCHEMA,
     IndependentCorrectionConflict,
@@ -27,11 +30,22 @@ from finance_core.application.independent_correction_contract import (
     VerifiedCorrectionDecision,
     correction_hash,
 )
+from finance_core.application.independent_correction_receipts import prepare_receipt_material
 from finance_core.application.independent_correction_source import (
     IndependentCorrectionFields,
 )
 from finance_core.application.independent_corrections import IndependentCorrectionService
 from finance_core.application.posting import PostingService
+from finance_core.calculation.authoritative_snapshot import (
+    build_authoritative_snapshot,
+    persist_authoritative_snapshot,
+)
+from finance_core.financial_audit import (
+    AuditEventCommand,
+    append_financial_audit_event,
+    derive_audit_event_public_id,
+    verify_financial_audit_chain,
+)
 from finance_core.reconciliation.adapter import InternalCandidateAdapter
 from tests import test_application_posting_recovery_v1 as posting_fixtures
 from tests.conftest import connect_temp_db
@@ -1193,3 +1207,360 @@ def test_closed_historical_display_replays_after_expiry_but_cannot_authorize_new
     assert status.applied is not None and status.current is not None
     assert status.applied.version == 0
     assert status.current.version == 2
+
+
+def _correction_owner_counts(connection: sqlite3.Connection) -> tuple[int, ...]:
+    return tuple(
+        int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        for table in (
+            "transactions",
+            "application_correction_decisions",
+            "application_correction_versions",
+            "application_correction_receipt_facts",
+            "authoritative_calculation_snapshots",
+            "financial_audit_events",
+        )
+    )
+
+
+def _orphan_receipt_snapshot_material(
+    connection: sqlite3.Connection,
+    original,
+    suffix: str,
+    *,
+    plan_id: str,
+    correction_id: str,
+):
+    created_at = datetime.fromtimestamp(posting_fixtures.NOW + 20, timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    return prepare_receipt_material(
+        connection,
+        original.original_source,
+        replace(original.fields, amount="99.00", description="Retained orphan correction"),
+        f"icfact_orphan_{suffix}",
+        f"icsnap_orphan_{suffix}",
+        correction_id,
+        plan_id,
+        original.snapshot_id,
+        original.snapshot_hash,
+        created_at,
+    )
+
+
+def _append_snapshot_finalization_via_audit_owner(connection: sqlite3.Connection, snapshot) -> None:
+    event_type = "calculation_snapshot_finalized"
+    event_id = derive_audit_event_public_id(
+        aggregate_type="calculation_snapshot",
+        aggregate_public_id=snapshot.snapshot_public_id,
+        event_type=event_type,
+        causation_public_id=snapshot.snapshot_public_id,
+    )
+    connection.execute("BEGIN IMMEDIATE")
+    append_financial_audit_event(
+        connection,
+        AuditEventCommand(
+            event_public_id=event_id,
+            aggregate_type="calculation_snapshot",
+            aggregate_public_id=snapshot.snapshot_public_id,
+            event_type=event_type,
+            event_payload={
+                "calculation_type": snapshot.calculation_type,
+                "calculation_aggregate_public_id": snapshot.aggregate_public_id,
+                "input_hash": snapshot.input_hash,
+                "output_hash": snapshot.output_hash,
+                "rules_hash": snapshot.rules_hash,
+                "combined_snapshot_hash": snapshot.combined_snapshot_hash,
+                "algorithm_version": snapshot.algorithm_version,
+                "money_contract_version": snapshot.money_contract_version,
+                "currency_contract_version": snapshot.currency_contract_version,
+            },
+            previous_state={"finalization_status": "draft"},
+            new_state={
+                "finalization_status": "finalized",
+                "combined_snapshot_hash": snapshot.combined_snapshot_hash,
+            },
+            actor_type=snapshot.actor_type,
+            actor_public_id=(
+                snapshot.actor_public_id or f"calculation-snapshot:{snapshot.actor_type}"
+            ),
+            authorization_public_id=snapshot.authorization_reference,
+            calculation_snapshot_public_id=snapshot.snapshot_public_id,
+            calculation_snapshot_hash=snapshot.combined_snapshot_hash,
+            source_evidence_references=snapshot.source_references,
+            correlation_public_id=snapshot.aggregate_public_id,
+            causation_public_id=snapshot.snapshot_public_id,
+            created_at=snapshot.created_at,
+        ),
+    )
+    connection.commit()
+
+
+def _assert_orphan_correction_evidence_refused(
+    connection: sqlite3.Connection,
+    posting: PostingService,
+    posted,
+    corrections: IndependentCorrectionService,
+) -> None:
+    target_id = posted.transaction_public_id
+    assert has_committed_correction(connection, target_id) is True
+    row_counts_before = _correction_owner_counts(connection)
+    refusal = (ValueError, CorrectionSchemaError, IndependentCorrectionIntegrityError)
+
+    with pytest.raises(refusal):
+        corrections.read_effective(target_id)
+    with pytest.raises(refusal):
+        posting.get_status(posted.attempt_id)
+    with pytest.raises(refusal):
+        InternalCandidateAdapter(connection).fetch_candidates()
+    with pytest.raises(refusal):
+        InternalCandidateAdapter(
+            connection, effective_reader=corrections.read_effective_in_snapshot
+        ).fetch_candidates()
+
+    assert not connection.in_transaction
+    assert _correction_owner_counts(connection) == row_counts_before
+
+
+@pytest.mark.parametrize(
+    "evidence_kind",
+    ["snapshot_and_audit", "audit_without_snapshot"],
+    ids=["orphan-snapshot-and-audit", "orphan-snapshot-audit-only"],
+)
+def test_unowned_independent_receipt_snapshot_or_audit_fails_closed(
+    tmp_path: Path, evidence_kind: str
+) -> None:
+    connection, posting, posted, authority = _posted_receipt(
+        tmp_path, "orphan-snapshot-" + evidence_kind
+    )
+    try:
+        corrections = _correction_service(posting, authority=authority)
+        original = corrections.read_effective(posted.transaction_public_id)
+        assert original.version == 0
+        assert has_committed_correction(connection, posted.transaction_public_id) is False
+        assert len(InternalCandidateAdapter(connection).fetch_candidates()) == 1
+
+        orphan_plan_id = "icplan_missing_owner_" + evidence_kind
+        orphan_correction_id = "ic_missing_owner_" + evidence_kind
+        material = _orphan_receipt_snapshot_material(
+            connection,
+            original,
+            evidence_kind,
+            plan_id=orphan_plan_id,
+            correction_id=orphan_correction_id,
+        )
+        material.snapshot.verify()
+        if evidence_kind == "snapshot_and_audit":
+            persist_authoritative_snapshot(connection, material.snapshot)
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM authoritative_calculation_snapshots WHERE snapshot_public_id=?",
+                    (material.snapshot.snapshot_public_id,),
+                ).fetchone()
+                is not None
+            )
+        else:
+            _append_snapshot_finalization_via_audit_owner(connection, material.snapshot)
+            assert (
+                connection.execute(
+                    "SELECT 1 FROM authoritative_calculation_snapshots WHERE snapshot_public_id=?",
+                    (material.snapshot.snapshot_public_id,),
+                ).fetchone()
+                is None
+            )
+
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+        snapshot_audit = verify_financial_audit_chain(
+            connection,
+            aggregate_type="calculation_snapshot",
+            aggregate_public_id=material.snapshot.snapshot_public_id,
+        )
+        assert snapshot_audit.valid and snapshot_audit.event_count == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM application_correction_plans WHERE plan_id=?",
+                (orphan_plan_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM application_correction_plans WHERE correction_id=?",
+                (orphan_correction_id,),
+            ).fetchone()[0]
+            == 0
+        )
+
+        _assert_orphan_correction_evidence_refused(connection, posting, posted, corrections)
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+
+
+def test_independent_correction_snapshot_authorized_by_another_target_fails_closed(
+    tmp_path: Path,
+) -> None:
+    connection, receipt_posting, posted, authority = _posted_receipt(
+        tmp_path, "wrong-snapshot-plan-target"
+    )
+    try:
+        receipt_corrections = _correction_service(receipt_posting, authority=authority)
+        original = receipt_corrections.read_effective(posted.transaction_public_id)
+
+        other_posting, other_review, _proposal, _intake, other_decision, _display = (
+            posting_fixtures._prepare_text_subject(connection, "other-snapshot-plan-target")
+        )
+        other_posted = other_posting.submit_post(other_review.review_id, other_decision)
+        other_corrections = _correction_service(other_posting, authority=authority)
+        other_plan = other_corrections.prepare_correction(
+            other_posted.transaction_public_id,
+            {"description": "Plan owned by a different target"},
+            "Prepare unrelated correction plan",
+        )
+        assert other_plan.projection["target_id"] == other_posted.transaction_public_id
+        assert other_plan.projection["target_id"] != posted.transaction_public_id
+
+        material = _orphan_receipt_snapshot_material(
+            connection,
+            original,
+            "wrong-target-plan",
+            plan_id=other_plan.plan_id,
+            correction_id=str(other_plan.projection["correction_id"]),
+        )
+        persist_authoritative_snapshot(connection, material.snapshot)
+        assert material.snapshot.authorization_reference == other_plan.projection["correction_id"]
+        assert connection.execute("PRAGMA foreign_key_check").fetchone() is None
+
+        _assert_orphan_correction_evidence_refused(
+            connection, receipt_posting, posted, receipt_corrections
+        )
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+
+
+def test_unrelated_finalized_snapshot_does_not_create_correction_history(
+    migrated_temp_db_connection: sqlite3.Connection,
+) -> None:
+    connection = migrated_temp_db_connection
+    posting, posted, authority = _posted_text(connection, "unrelated-snapshot-domain")
+    corrections = _correction_service(posting, authority=authority)
+    original = corrections.read_effective(posted.transaction_public_id)
+    unrelated = build_authoritative_snapshot(
+        snapshot_public_id="snapshot-unrelated-domain",
+        calculation_type="unrelated-personal-calculation",
+        aggregate_public_id=posted.transaction_public_id,
+        input_payload={
+            "schema": "unrelated-calculation-input-v1",
+            "target_id": original.target_id,
+        },
+        output_payload={
+            "schema": "unrelated-calculation-output-v1",
+            "amount": original.fields.amount,
+        },
+        rules_payload={"schema": "unrelated-calculation-rules-v1"},
+        money_contract_version="money-v1",
+        currency_contract_version="currency-SGD-v1",
+        algorithm_version="unrelated-calculation-algorithm-v1",
+        source_references=(f"transaction:{posted.transaction_public_id}",),
+        actor_type="system",
+        actor_public_id="synthetic-unrelated-calculator",
+        authorization_reference="unrelated-calculation-authority",
+        finalization_status="finalized",
+        created_at=datetime.fromtimestamp(posting_fixtures.NOW + 20, timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    )
+    persist_authoritative_snapshot(connection, unrelated)
+
+    assert has_committed_correction(connection, posted.transaction_public_id) is False
+    effective = corrections.read_effective(posted.transaction_public_id)
+    assert effective.version == 0
+    assert effective.fields == original.fields
+    status = posting.get_status(posted.attempt_id)
+    assert status.current is not None and status.current.version == 0
+    assert len(InternalCandidateAdapter(connection).fetch_candidates()) == 1
+    assert (
+        len(
+            InternalCandidateAdapter(
+                connection, effective_reader=corrections.read_effective_in_snapshot
+            ).fetch_candidates()
+        )
+        == 1
+    )
+
+
+@pytest.mark.parametrize(
+    "evidence_table",
+    [CORRECTION_TABLES[0], CORRECTION_TABLES[1], CORRECTION_TABLES[2]],
+    ids=["display", "reply", "decision"],
+)
+@pytest.mark.parametrize("damage", ["missing", "bad_signature"], ids=["missing", "bad-signature"])
+def test_missing_or_bad_signed_correction_authority_evidence_is_atomic(
+    tmp_path: Path, evidence_table: str, damage: str
+) -> None:
+    table_code = {
+        CORRECTION_TABLES[0]: "display",
+        CORRECTION_TABLES[1]: "reply",
+        CORRECTION_TABLES[2]: "decision",
+    }[evidence_table]
+    damage_code = {"missing": "miss", "bad_signature": "bad"}[damage]
+    connection, posting, posted, authority = _posted_receipt(
+        tmp_path, f"auth-{table_code}-{damage_code}"
+    )
+    database_path = str(connection.execute("PRAGMA database_list").fetchone()[2])
+    try:
+        corrections = _correction_service(posting, authority=authority)
+        assert corrections.read_effective(posted.transaction_public_id).version == 0
+        plan = corrections.prepare_correction(
+            posted.transaction_public_id,
+            {"description": "Only apply with intact signed authority"},
+            "Test a missing or unauthenticated approval row",
+        )
+        decision_id = _persist_correction_approval(
+            connection,
+            plan,
+            decision_id=f"missing-signed-authority-{evidence_table}-{damage}",
+        )
+        decision = _load(connection, CORRECTION_TABLES[2], decision_id)
+        record_id = str(decision_id)
+        if evidence_table == CORRECTION_TABLES[0]:
+            record_id = str(decision["display_id"])
+        elif evidence_table == CORRECTION_TABLES[1]:
+            record_id = str(decision["reply_id"])
+        if damage == "missing":
+            connection.execute(f"DELETE FROM {evidence_table} WHERE id=?", (record_id,))
+        else:
+            connection.execute(
+                f"UPDATE {evidence_table} SET signature=? WHERE id=?",
+                ("0" * 64, record_id),
+            )
+        connection.commit()
+        counts_before = _correction_owner_counts(connection)
+
+        with pytest.raises(
+            (ValueError, CorrectionSchemaError, IndependentCorrectionIntegrityError)
+        ):
+            corrections.submit_correction(plan.plan_id, decision_id)
+        assert not connection.in_transaction
+        assert _correction_owner_counts(connection) == counts_before
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM application_correction_decisions WHERE plan_id=?",
+                (plan.plan_id,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+
+    reopened = sqlite3.connect(database_path)
+    try:
+        assert _correction_owner_counts(reopened) == counts_before
+        assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        reopened.close()
