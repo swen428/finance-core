@@ -779,3 +779,168 @@ def test_unknown_public_cursor_close_retains_handle_and_leases(tmp_path, close_s
         if child.is_alive():
             child.kill()
             child.join(10)
+
+
+@pytest.mark.parametrize("buffer_type", [bytearray, memoryview])
+@pytest.mark.parametrize("adapter_type", ["original", "normalized"])
+def test_binding_adapters_never_run_or_change_caller_transaction(
+    tmp_path, monkeypatch, buffer_type, adapter_type
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    calls = []
+
+    def changes_profile_after_admission(value):
+        calls.append(value)
+        profile.live_database.chmod(0o640)
+        return "adapted-after-check"
+
+    key = (buffer_type if adapter_type == "original" else bytes, sqlite3.PrepareProtocol)
+    monkeypatch.setitem(sqlite3.adapters, key, changes_profile_after_admission)
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            for pending in (False, True):
+                if pending:
+                    conn.execute(
+                        "INSERT INTO participants(public_id,display_name) "
+                        "VALUES ('pending','Owned')"
+                    )
+                before = conn.total_changes
+                for surface in ("connection", "cursor", "many", "named"):
+                    value = buffer_type(b"probe")
+                    sql = (
+                        "WITH p(v) AS (SELECT ?) INSERT INTO participants(public_id,display_name) "
+                        "SELECT 'adapter-event',v FROM p"
+                    )
+                    try:
+                        with pytest.raises(InstanceAdmissionError, match="adapters"):
+                            if surface == "connection":
+                                conn.execute(sql, (value,))
+                            elif surface == "cursor":
+                                conn.cursor().execute(sql, [value])
+                            elif surface == "many":
+                                conn.executemany(sql, [(value,)])
+                            else:
+                                conn.execute(sql.replace("?", ":value"), {"value": value})
+                    finally:
+                        profile.live_database.chmod(0o600)
+                    assert calls == []
+                    assert conn.in_transaction is pending
+                    assert conn.total_changes == before
+                if pending:
+                    row = conn.execute("SELECT display_name FROM participants").fetchone()
+                    assert row[0] == "Owned"
+                    conn.rollback()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def test_blob_handles_refused_without_transaction_or_durable_effects(tmp_path, monkeypatch):
+    from finance_core.instance_admission import ApplicationSchemaContract
+
+    schema = ApplicationSchemaContract(
+        "blob-refusal-v1", ("CREATE TABLE app_blob_probe(id INTEGER PRIMARY KEY,payload BLOB)",)
+    )
+    config = synthetic_config(tmp_path, monkeypatch, application_schema=schema)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("INSERT INTO app_blob_probe VALUES (1,zeroblob(4))")
+            conn.commit()
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
+            )
+            before = conn.total_changes
+            for readonly in (False, True):
+                with pytest.raises(InstanceAdmissionError, match="blobopen"):
+                    conn.blobopen("app_blob_probe", "payload", 1, readonly=readonly)
+                assert conn.in_transaction and conn.total_changes == before
+            conn.rollback()
+        with production_read_operation(owner) as conn:
+            with pytest.raises(InstanceAdmissionError, match="blobopen"):
+                conn.blobopen("app_blob_probe", "payload", 1, readonly=True)
+            assert conn.execute("SELECT payload FROM app_blob_probe").fetchone()[0] == b"\0" * 4
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def test_cursor_result_factories_refuse_callbacks_and_preserve_owned_transaction(
+    tmp_path, monkeypatch
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    calls = []
+
+    def callback(cursor, row):
+        calls.append(row)
+        profile.live_database.chmod(0o640)
+        return row
+
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
+            )
+            before = conn.total_changes
+            cursor = conn.cursor()
+            with pytest.raises(InstanceAdmissionError, match="factories"):
+                cursor.row_factory = callback
+            assert cursor.row_factory is sqlite3.Row
+            for factory in (None, sqlite3.Row):
+                cursor.row_factory = factory
+                row = cursor.execute("SELECT 1").fetchone()
+                assert row[0] == 1 and type(row) is (tuple if factory is None else sqlite3.Row)
+            # SQLite copies the connection factory without using the cursor setter.
+            conn.row_factory = callback
+            try:
+                copied = conn.cursor()
+            finally:
+                conn.row_factory = sqlite3.Row
+            with pytest.raises(InstanceAdmissionError, match="factories"):
+                copied.execute("SELECT 1")
+            assert calls == [] and conn.in_transaction and conn.total_changes == before
+            conn.rollback()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def test_fetchmany_refuses_index_callback_without_consuming_rows(tmp_path, monkeypatch):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    calls = []
+
+    class CallbackSize:
+        def __index__(self):
+            calls.append(True)
+            profile.live_database.chmod(0o640)
+            return 1
+
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
+            )
+            before = conn.total_changes
+            cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
+            try:
+                with pytest.raises(InstanceAdmissionError, match="integer"):
+                    cursor.fetchmany(CallbackSize())
+            finally:
+                profile.live_database.chmod(0o600)
+            assert calls == [] and conn.in_transaction and conn.total_changes == before
+            assert cursor.fetchmany(1)[0][0] == 1
+            assert cursor.fetchmany()[0][0] == 2
+            conn.rollback()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()

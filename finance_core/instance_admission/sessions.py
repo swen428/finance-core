@@ -202,7 +202,12 @@ def _parameters(parameters):
             raise InstanceAdmissionError(
                 "Production SQL bindings cannot invoke registered adapters"
             )
-        return bytes(value) if type(value) in {bytearray, memoryview} else value
+        normalized = bytes(value) if type(value) in {bytearray, memoryview} else value
+        if (type(normalized), sqlite3.PrepareProtocol) in sqlite3.adapters:
+            raise InstanceAdmissionError(
+                "Production SQL bindings cannot invoke registered adapters"
+            )
+        return normalized
 
     if type(parameters) is dict:
         if any(type(key) is not str for key in parameters):
@@ -227,6 +232,27 @@ def _preflight(conn: sqlite3.Connection, *, write: bool = False) -> _Witness:
 
 
 class _ProductionCursor(sqlite3.Cursor):
+    @property
+    def row_factory(self):
+        _preflight(self.connection)
+        return sqlite3.Cursor.row_factory.__get__(self)
+
+    @row_factory.setter
+    def row_factory(self, value):
+        _preflight(self.connection)
+        if value is not None and value is not sqlite3.Row:
+            raise InstanceAdmissionError(
+                "Production cursor factories require configured None/sqlite3.Row"
+            )
+        sqlite3.Cursor.row_factory.__set__(self, value)
+
+    def _result_preflight(self) -> None:
+        factory = self.row_factory
+        if factory is not None and factory is not sqlite3.Row:
+            raise InstanceAdmissionError(
+                "Production cursor factories require configured None/sqlite3.Row"
+            )
+
     def close(self) -> None:
         witness = _preflight(self.connection)
         try:
@@ -237,6 +263,7 @@ class _ProductionCursor(sqlite3.Cursor):
         witness.cursors.pop(id(self), None)
 
     def execute(self, sql, parameters=(), /):
+        self._result_preflight()
         if type(sql) is not str:
             raise InstanceAdmissionError("Production SQL requires a plain statement string")
         bindings = _parameters(parameters)
@@ -244,6 +271,7 @@ class _ProductionCursor(sqlite3.Cursor):
         return super().execute(sql, bindings)
 
     def executemany(self, sql, seq_of_parameters, /):
+        self._result_preflight()
         if type(sql) is not str:
             raise InstanceAdmissionError("Production SQL requires a plain statement string")
 
@@ -261,27 +289,108 @@ class _ProductionCursor(sqlite3.Cursor):
         raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
 
     def fetchone(self):
-        _preflight(self.connection)
+        self._result_preflight()
         return super().fetchone()
 
     def fetchmany(self, size=None):
-        _preflight(self.connection)
+        self._result_preflight()
+        if size is not None and type(size) is not int:
+            raise InstanceAdmissionError("Production fetchmany size requires a plain integer")
         return super().fetchmany() if size is None else super().fetchmany(size)
 
     def fetchall(self):
-        _preflight(self.connection)
+        self._result_preflight()
         return super().fetchall()
 
     def __iter__(self):
-        _preflight(self.connection)
+        self._result_preflight()
         return self
 
     def __next__(self):
-        _preflight(self.connection)
+        self._result_preflight()
         return super().__next__()
+
+    def setinputsizes(self, sizes, /):
+        _preflight(self.connection)
+        return super().setinputsizes(sizes)
+
+    def setoutputsize(self, size, column=None, /):
+        _preflight(self.connection)
+        if column is None:
+            return super().setoutputsize(size)
+        return super().setoutputsize(size, column)
 
 
 class _ProductionConnection(sqlite3.Connection):
+    """Guarded SQL/cursor session; callback and administrative APIs are unsupported."""
+
+    # CPython's cursor execution needs the inherited __call__ compiler seam.
+    # Direct caller borrowing of native Statement objects is outside this API.
+
+    def _unsupported(self, name: str) -> None:
+        _preflight(self)
+        raise InstanceAdmissionError(f"Production {name} is unsupported")
+
+    def blobopen(self, *args, **kwargs):
+        self._unsupported("blobopen")
+
+    def backup(self, *args, **kwargs):
+        self._unsupported("backup")
+
+    def serialize(self, *args, **kwargs):
+        self._unsupported("serialize")
+
+    def deserialize(self, *args, **kwargs):
+        self._unsupported("deserialize")
+
+    def iterdump(self, *args, **kwargs):
+        self._unsupported("iterdump")
+
+    def create_function(self, *args, **kwargs):
+        self._unsupported("create_function")
+
+    def create_aggregate(self, *args, **kwargs):
+        self._unsupported("create_aggregate")
+
+    def create_window_function(self, *args, **kwargs):
+        self._unsupported("create_window_function")
+
+    def create_collation(self, *args, **kwargs):
+        self._unsupported("create_collation")
+
+    def set_authorizer(self, *args, **kwargs):
+        self._unsupported("set_authorizer")
+
+    def set_progress_handler(self, *args, **kwargs):
+        self._unsupported("set_progress_handler")
+
+    def set_trace_callback(self, *args, **kwargs):
+        self._unsupported("set_trace_callback")
+
+    def enable_load_extension(self, *args, **kwargs):
+        self._unsupported("enable_load_extension")
+
+    def load_extension(self, *args, **kwargs):
+        self._unsupported("load_extension")
+
+    def setconfig(self, *args, **kwargs):
+        self._unsupported("setconfig")
+
+    def setlimit(self, *args, **kwargs):
+        self._unsupported("setlimit")
+
+    def getconfig(self, op, /):
+        _preflight(self)
+        return super().getconfig(op)
+
+    def getlimit(self, category, /):
+        _preflight(self)
+        return super().getlimit(category)
+
+    def interrupt(self) -> None:
+        _preflight(self)
+        super().interrupt()
+
     @property
     def isolation_level(self):
         return sqlite3.Connection.isolation_level.__get__(self)
@@ -458,7 +567,7 @@ def _operation(
         _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
         sqlite_began = True
         uri = profile.live_database.as_uri() + ("?mode=ro" if read_only else "?mode=rw")
-        conn = sqlite3.connect(uri, uri=True, factory=_ProductionConnection)
+        conn = sqlite3.connect(uri, uri=True, detect_types=0, factory=_ProductionConnection)
         witness = _Witness(
             owner, conn, control, profile, gate, state["version"], read_only, os.getpid()
         )

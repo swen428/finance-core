@@ -151,6 +151,47 @@ migrations 001–060 unchanged. This change does not redesign SQLite's global
 authorizer or alter financial rules, calculation authority, evidence,
 confirmation, or migrations.
 
+## Issued SQLite capability boundary
+
+An issued production session supports a finite subset of Python 3.12's
+`sqlite3` connection and cursor APIs. This is not a claim of full SQLite API
+compatibility and does not sandbox arbitrary Python already trusted in the
+process.
+
+| Handle or capability | Production-session contract |
+| --- | --- |
+| Connection statements | `execute()` and each `executemany()` item are checked against the current session and authority. `executescript()` is refused. |
+| Connection transactions | `commit()`, `rollback()`, and the default legacy context-manager behavior remain available. `autocommit` and `isolation_level` stay at their configured legacy values; changing either requires a current admission check and a different value is refused. |
+| Connection and cursor lifetime | The operation closes the actual connection before releasing its leases. A cursor is created with the session's real cursor type, and its actual `close()` is allowed. A caller-supplied cursor factory cannot replace the session cursor. |
+| Cursor statements and results | Cursor `execute()` and each `executemany()` item are checked. `fetchone()`, `fetchmany()`, `fetchall()`, and iteration recheck the live session. `fetchmany(size)` accepts only `None` or an exact built-in `int`. Cursor `row_factory` accepts only the actual `None` or `sqlite3.Row` objects. `setinputsizes()` and `setoutputsize()` remain guarded no-op size hints. |
+| Row and text conversion | The connection must use the actual `sqlite3.Row` and `str` factories before SQL runs. Custom row factories and adapters cannot execute as part of a production statement. |
+| Simple diagnostics | `getconfig()`, `getlimit()`, and `interrupt()` require a valid issued session. Native status and metadata attributes such as `in_transaction`, `total_changes`, and cursor metadata are observations only; they do not authorize work or promise session liveness. |
+| Database transfer and serialization | `backup()`, `serialize()`, `deserialize()`, and `iterdump()` are refused. Production does not expose SQLite's incremental blob handle: `blobopen()` is refused for both writable and read-only sessions. Native backup and restore APIs are outside this work package. |
+| Extension and callback registration | `enable_load_extension()`, `load_extension()`, `create_function()`, `create_aggregate()`, `create_window_function()`, `create_collation()`, `set_authorizer()`, `set_progress_handler()`, and `set_trace_callback()` are refused on an issued production session. |
+| SQLite runtime changes | `setconfig()` and `setlimit()` are refused. |
+
+`Connection.__call__` is recorded as an internal compiler entry in the Python
+3.12 capability inventory: the standard library may use it while compiling a
+statement from guarded `execute()`. Calling it directly is outside the
+supported application API, and this boundary does not claim that it is
+technically blocked. The supported application entry remains the guarded
+`execute()` or `executemany()` path. No general SQL parser or alternate callback
+sandbox is part of this boundary.
+
+The actual-close and lease-release guarantee covers a supported operation's
+connection and issued cursors, including a partially consumed issued cursor.
+Direct access to `Connection.__call__`, a returned native statement, base-class
+methods, a native cursor, or connection reinitialization is outside that
+contract. Such unsupported handles have no actual-close or descriptor-release
+promise from instance admission.
+
+These limits apply to connections issued to application callers. The trusted
+admission path may use internal SQLite operations before it publishes a
+session. Legacy `human_drafts.set_authorizer` remains staging/D1-only; it is
+not called on an issued production session. Monetary calculation authority,
+approval verification, maintenance holds, durable history, and operating-system
+privacy checks keep their existing contracts.
+
 ## Public operations
 
 The package exposes explicit operations to prepare a production profile,

@@ -14,6 +14,7 @@ import sqlite3
 import struct
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,94 @@ _CONFIG_IDENTITY = "synthetic-config-v1"
 _CORE_IDENTITY = "synthetic-core-v1"
 _INSTANCE_ID = "synthetic-instance-v1"
 _PROFILE_ID = "synthetic"
+
+# CPython 3.12's native handles have more callable surface than this session
+# intends to expose. This inventory deliberately classifies every public
+# member, plus the protocol methods used for connection/cursor lifetime and
+# iteration. A newly added native API changes this assertion until its policy
+# and regression coverage are reviewed.
+_SQLITE_312_SURFACE = {
+    sqlite3.Connection: {
+        "error_types": frozenset(
+            {
+                "DataError",
+                "DatabaseError",
+                "Error",
+                "IntegrityError",
+                "InterfaceError",
+                "InternalError",
+                "NotSupportedError",
+                "OperationalError",
+                "ProgrammingError",
+                "Warning",
+            }
+        ),
+        "guarded_operations": frozenset(
+            {
+                "__enter__",
+                "__exit__",
+                "close",
+                "commit",
+                "cursor",
+                "execute",
+                "executemany",
+                "rollback",
+            }
+        ),
+        "guarded_configuration": frozenset(
+            {"autocommit", "isolation_level", "row_factory", "text_factory"}
+        ),
+        "guarded_diagnostics": frozenset({"getconfig", "getlimit", "interrupt"}),
+        "observational_attributes": frozenset({"in_transaction", "total_changes"}),
+        "refused_operations": frozenset(
+            {
+                "backup",
+                "blobopen",
+                "create_aggregate",
+                "create_collation",
+                "create_function",
+                "create_window_function",
+                "deserialize",
+                "enable_load_extension",
+                "executescript",
+                "iterdump",
+                "load_extension",
+                "serialize",
+                "set_authorizer",
+                "set_progress_handler",
+                "set_trace_callback",
+                "setconfig",
+                "setlimit",
+            }
+        ),
+        "native_internal_compiler": frozenset({"__call__"}),
+    },
+    sqlite3.Cursor: {
+        "guarded_operations": frozenset(
+            {
+                "__iter__",
+                "__next__",
+                "close",
+                "execute",
+                "executemany",
+                "fetchall",
+                "fetchmany",
+                "fetchone",
+            }
+        ),
+        "guarded_configuration": frozenset({"row_factory"}),
+        "metadata": frozenset({"arraysize", "connection", "description", "lastrowid", "rowcount"}),
+        "guarded_no_op_hints": frozenset({"setinputsizes", "setoutputsize"}),
+        "refused_operations": frozenset({"executescript"}),
+    },
+    sqlite3.Blob: {
+        "unreachable_handle_surface": frozenset(
+            {"close", "read", "seek", "tell", "write", "__enter__", "__exit__"}
+        ),
+    },
+}
+
+_PYTHON_PROTOCOL_MEMBERS = frozenset({"__call__", "__enter__", "__exit__", "__iter__", "__next__"})
 
 
 def _child_config(control_root: Path, locator_root: Path) -> TrustedInstanceConfig:
@@ -373,6 +462,265 @@ def _prepare_and_admit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     profile.close()
     admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
     return config, database
+
+
+def _classified_native_members(native_type: type) -> set[str]:
+    categories = _SQLITE_312_SURFACE[native_type]
+    flattened = [name for names in categories.values() for name in names]
+    assert len(flattened) == len(set(flattened)), f"overlapping {native_type.__name__} categories"
+    return set(flattened)
+
+
+def test_python_312_sqlite_native_surfaces_are_fully_classified() -> None:
+    assert sys.version_info[:2] == (3, 12), "the instance API inventory targets Python 3.12"
+
+    for native_type in (sqlite3.Connection, sqlite3.Cursor, sqlite3.Blob):
+        observed = {
+            name
+            for name in dir(native_type)
+            if not name.startswith("_") or name in _PYTHON_PROTOCOL_MEMBERS
+        }
+        assert observed == _classified_native_members(native_type)
+
+
+def _logical_database_snapshot(database_path: Path) -> tuple[object, ...]:
+    with sqlite3.connect(database_path.as_uri() + "?mode=ro", uri=True) as raw:
+        schema = tuple(
+            tuple(row)
+            for row in raw.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+        )
+        tables = [
+            row[0]
+            for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        rows = []
+        for table in tables:
+            quoted_table = '"' + table.replace('"', '""') + '"'
+            table_rows = tuple(tuple(row) for row in raw.execute(f"SELECT * FROM {quoted_table}"))
+            rows.append((table, table_rows))
+    return schema, tuple(rows)
+
+
+def _serialized_synthetic_database() -> bytes:
+    source = sqlite3.connect(":memory:")
+    try:
+        source.execute("CREATE TABLE synthetic_restore_probe (value TEXT NOT NULL)")
+        return source.serialize()
+    finally:
+        source.close()
+
+
+def _exercise_supported_native_subset(conn: sqlite3.Connection, *, read_only: bool) -> None:
+    assert conn.row_factory is sqlite3.Row
+    assert conn.text_factory is str
+    assert conn.isolation_level == ""
+    assert conn.autocommit == sqlite3.LEGACY_TRANSACTION_CONTROL
+
+    row = conn.execute("SELECT 'supported' AS value").fetchone()
+    assert type(row) is sqlite3.Row and type(row["value"]) is str
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT 1 AS value")
+        assert cursor.fetchone()["value"] == 1
+    finally:
+        cursor.close()
+
+    if read_only:
+        conn.commit()
+        conn.rollback()
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    conn.executemany(
+        "INSERT INTO participants(public_id, display_name) VALUES (?, ?)",
+        [("native-surface-probe", "Synthetic")],
+    )
+    assert conn.in_transaction
+    conn.rollback()
+    assert not conn.in_transaction
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM participants WHERE public_id=?", ("native-surface-probe",)
+        ).fetchone()[0]
+        == 0
+    )
+
+    conn.execute("BEGIN IMMEDIATE")
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    with conn:
+        pass
+    assert not conn.in_transaction
+
+
+def _native_refusal_calls(
+    conn: sqlite3.Connection,
+    *,
+    backup_target: sqlite3.Connection,
+    serialized_source: bytes,
+    callback_calls: list[str],
+    missing_extension: Path,
+) -> dict[str, Callable[[], object]]:
+    def authorizer(*_args) -> int:
+        callback_calls.append("authorizer")
+        return sqlite3.SQLITE_OK
+
+    def scalar() -> int:
+        callback_calls.append("function")
+        return 1
+
+    def collation(_left: str, _right: str) -> int:
+        callback_calls.append("collation")
+        return 0
+
+    class RecordingAggregate:
+        def step(self, _value: int) -> None:
+            callback_calls.append("aggregate.step")
+
+        def finalize(self) -> int:
+            callback_calls.append("aggregate.finalize")
+            return 1
+
+    class RecordingWindow:
+        def step(self, _value: int) -> None:
+            callback_calls.append("window.step")
+
+        def inverse(self, _value: int) -> None:
+            callback_calls.append("window.inverse")
+
+        def value(self) -> int:
+            callback_calls.append("window.value")
+            return 1
+
+        def finalize(self) -> int:
+            callback_calls.append("window.finalize")
+            return 1
+
+    return {
+        "backup": lambda: conn.backup(backup_target),
+        "create_aggregate": lambda: conn.create_aggregate(
+            "pr11_surface_aggregate", 1, RecordingAggregate
+        ),
+        "create_collation": lambda: conn.create_collation("pr11_surface_collation", collation),
+        "create_function": lambda: conn.create_function("pr11_surface_function", 0, scalar),
+        "create_window_function": lambda: conn.create_window_function(
+            "pr11_surface_window", 1, RecordingWindow
+        ),
+        "deserialize": lambda: conn.deserialize(serialized_source),
+        "enable_load_extension": lambda: conn.enable_load_extension(False),
+        "executescript": lambda: conn.executescript("SELECT 1;"),
+        "iterdump": lambda: next(conn.iterdump()),
+        "load_extension": lambda: conn.load_extension(str(missing_extension)),
+        "serialize": lambda: conn.serialize(),
+        "set_authorizer": lambda: conn.set_authorizer(authorizer),
+        "set_progress_handler": lambda: conn.set_progress_handler(
+            lambda: callback_calls.append("progress") or 0, 1
+        ),
+        "set_trace_callback": lambda: conn.set_trace_callback(
+            lambda _statement: callback_calls.append("trace")
+        ),
+        "setconfig": lambda: conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_FKEY, True),
+        "setlimit": lambda: conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1024),
+    }
+
+
+def _assert_native_refusals(
+    conn: sqlite3.Connection,
+    *,
+    backup_target: sqlite3.Connection,
+    serialized_source: bytes,
+    callback_calls: list[str],
+    missing_extension: Path,
+    exercise_callback_probes: bool,
+) -> None:
+    refused = _native_refusal_calls(
+        conn,
+        backup_target=backup_target,
+        serialized_source=serialized_source,
+        callback_calls=callback_calls,
+        missing_extension=missing_extension,
+    )
+    expected = _SQLITE_312_SURFACE[sqlite3.Connection]["refused_operations"] - {"blobopen"}
+    assert set(refused) == expected
+    previous_calls = list(callback_calls)
+    for name, operation in refused.items():
+        with pytest.raises(InstanceAdmissionError):
+            operation()
+        assert callback_calls == previous_calls, f"{name} invoked a Python callback"
+
+    if exercise_callback_probes:
+        # If a callback had been installed before a refusal, the probes below
+        # would run it. Missing callback-backed SQL objects are expected errors.
+        for statement in (
+            "SELECT 1",
+            "SELECT pr11_surface_function()",
+            "SELECT pr11_surface_aggregate(value) FROM (SELECT 1 AS value)",
+            "SELECT pr11_surface_window(value) OVER () FROM (SELECT 1 AS value)",
+            "SELECT 'left' = 'right' COLLATE pr11_surface_collation",
+        ):
+            try:
+                conn.execute(statement).fetchall()
+            except sqlite3.Error:
+                pass
+        assert callback_calls == previous_calls
+
+    assert (
+        backup_target.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
+    )
+
+
+def test_issued_sessions_refuse_unsupported_native_apis_without_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, database = _prepare_and_admit(tmp_path, monkeypatch)
+    before = _logical_database_snapshot(database)
+    serialized_source = _serialized_synthetic_database()
+    callback_calls: list[str] = []
+    backup_target = sqlite3.connect(":memory:")
+    missing_extension = tmp_path / "missing-synthetic-extension.so"
+    stale_connections: list[sqlite3.Connection] = []
+
+    try:
+        with acquire_production_owner(config) as owner:
+            for read_only, operation_factory in (
+                (False, production_write_operation),
+                (True, production_read_operation),
+            ):
+                with operation_factory(owner) as conn:
+                    _exercise_supported_native_subset(conn, read_only=read_only)
+                    transaction_before = conn.in_transaction
+                    changes_before = conn.total_changes
+                    _assert_native_refusals(
+                        conn,
+                        backup_target=backup_target,
+                        serialized_source=serialized_source,
+                        callback_calls=callback_calls,
+                        missing_extension=missing_extension,
+                        exercise_callback_probes=True,
+                    )
+                    assert conn.in_transaction is transaction_before is False
+                    assert conn.total_changes == changes_before
+                    stale_connections.append(conn)
+
+            for conn in stale_connections:
+                before_calls = list(callback_calls)
+                _assert_native_refusals(
+                    conn,
+                    backup_target=backup_target,
+                    serialized_source=serialized_source,
+                    callback_calls=callback_calls,
+                    missing_extension=missing_extension,
+                    exercise_callback_probes=False,
+                )
+                assert callback_calls == before_calls
+    finally:
+        backup_target.close()
+
+    assert _logical_database_snapshot(database) == before
 
 
 @pytest.mark.skipif(
