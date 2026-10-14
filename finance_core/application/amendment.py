@@ -37,6 +37,10 @@ from finance_core.calculation.authoritative_snapshot import (
     canonical_json_text,
     canonical_json_value,
 )
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.money import money_decimal, normalize_currency
 from finance_core.parser_proposals.amendment_lineage import (
     require_independent_source_edit_history,
@@ -58,7 +62,6 @@ from finance_core.parser_proposals.receipt_supersession import supersede_receipt
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.parser_proposals.text_supersession import supersede_text_proposal
 from finance_core.sqlite_connection import require_foreign_keys_enabled
-from finance_core.staging_guard import require_staging_database
 
 EDITABLE_FIELDS = frozenset(
     {"amount", "currency", "transaction_date", "merchant", "description", "category"}
@@ -453,7 +456,7 @@ class AmendmentService:
     def prepare(self, proposal_public_id: str) -> AmendmentReview:
         if not _reference(proposal_public_id):
             raise AmendmentError("Proposal reference is invalid")
-        require_staging_database(self._conn)
+        require_finance_write_connection(self._conn, instance_id=self._binding.binding.instance_id)
         require_foreign_keys_enabled(self._conn)
         if self._conn.in_transaction:
             raise AmendmentError("Prepare requires a connection without caller work")
@@ -660,6 +663,7 @@ class AmendmentService:
             raise AmendmentError("Amendment references are invalid")
         if self._conn.in_transaction:
             raise AmendmentError("Amend requires a connection without caller work")
+        require_finance_write_connection(self._conn, instance_id=self._binding.binding.instance_id)
         try:
             with review_snapshot(self._conn):
                 review = self._read_review(review_id)
@@ -760,6 +764,7 @@ class AmendmentService:
     def get_status(self, amendment_id: str) -> AmendmentResult:
         if not _reference(amendment_id):
             raise AmendmentError("Amendment reference is invalid")
+        require_finance_read_connection(self._conn, instance_id=self._binding.binding.instance_id)
         try:
             with review_snapshot(self._conn):
                 row = self._conn.execute(

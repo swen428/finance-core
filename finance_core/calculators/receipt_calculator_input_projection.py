@@ -56,7 +56,10 @@ from finance_core.calculators.receipt_calculator_readiness import (
     ReceiptCalculatorReadinessError,
     report_receipt_calculator_readiness,
 )
-from finance_core.staging_guard import StagingDatabaseError, require_staging_database
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+)
+from finance_core.staging_guard import StagingDatabaseError
 
 # ---------------------------------------------------------------------------
 # Public errors
@@ -163,7 +166,7 @@ def project_receipt_calculator_input(
     integrity errors unchanged.
     """
     try:
-        require_staging_database(conn)
+        require_finance_read_connection(conn)
     except StagingDatabaseError as exc:
         raise ProjectionStagingDatabaseRejectedError(str(exc)) from exc
 

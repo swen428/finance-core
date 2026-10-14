@@ -16,7 +16,7 @@ from finance_core.calculation.authoritative_snapshot import (
     canonical_json_bytes,
     canonical_json_text,
 )
-from finance_core.staging_guard import require_staging_database
+from finance_core.instance_admission import require_finance_write_connection
 
 AUDIT_SCHEMA_VERSION = "v1"
 SUPPORTED_AUDIT_SCHEMA_VERSIONS = frozenset({AUDIT_SCHEMA_VERSION})
@@ -223,7 +223,7 @@ def append_financial_audit_event(
     command: AuditEventCommand,
 ) -> tuple[FinancialAuditEvent, bool]:
     """Append inside a caller-owned transaction; return (event, idempotent)."""
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     if not conn.in_transaction:
         raise AuditChainTransactionError(
             "Financial audit append requires an active caller-owned transaction"
@@ -302,7 +302,7 @@ def append_financial_audit_event_atomically(
     command: AuditEventCommand,
 ) -> tuple[FinancialAuditEvent, bool]:
     """Own a transaction for a standalone audit append."""
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     if conn.in_transaction:
         raise AuditChainTransactionError("Standalone audit append requires no pending transaction")
     conn.execute("BEGIN IMMEDIATE")

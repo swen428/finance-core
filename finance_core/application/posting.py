@@ -15,6 +15,11 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
+
 if TYPE_CHECKING:
     from finance_core.application.independent_correction_contract import (
         HumanCorrectionDecisionAuthority,
@@ -92,7 +97,6 @@ from finance_core.parser_proposals.receipt_item_allocation_facts import (
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.receipt_finalization import fact_set_bridge
 from finance_core.sqlite_connection import require_foreign_keys_enabled
-from finance_core.staging_guard import require_staging_database
 
 _failure_injection_hook: Callable[[str], None] | None = None
 
@@ -459,7 +463,7 @@ class PostingService:
         return now
 
     def _begin(self) -> None:
-        require_staging_database(self._conn)
+        require_finance_write_connection(self._conn, instance_id=self._binding.instance_id)
         require_foreign_keys_enabled(self._conn)
         if self._conn.in_transaction:
             raise PostingError("Posting requires a connection without caller-owned work")
@@ -1161,7 +1165,7 @@ class PostingService:
     def resume_post(self, attempt_id: str) -> PostingStatus:
         if not _posting_reference(attempt_id):
             raise PostingError("Attempt reference is invalid")
-        require_staging_database(self._conn)
+        require_finance_write_connection(self._conn, instance_id=self._binding.instance_id)
         require_foreign_keys_enabled(self._conn)
         if self._conn.in_transaction:
             raise PostingError("Posting requires a connection without caller-owned work")
@@ -1449,7 +1453,7 @@ class PostingService:
         """Verify immutable posting truth without following correction history."""
         if not _posting_reference(attempt_id):
             raise PostingError("Attempt reference is invalid")
-        require_staging_database(self._conn)
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         with review_snapshot(self._conn):
             require_posting_schema(self._conn)
             row, material, decision = self._accepted(attempt_id)

@@ -43,6 +43,10 @@ from finance_core.application.ai_invocation_contract import (
     VerifiedInterpretationInput,
 )
 from finance_core.calculation.authoritative_snapshot import canonical_json_value
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.independent_ai_publication import publish_in_transaction
@@ -57,7 +61,6 @@ from finance_core.parser_proposals.independent_ai_validation import (
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
 from finance_core.sqlite_connection import ForeignKeysDisabledError, require_foreign_keys_enabled
-from finance_core.staging_guard import require_staging_database
 
 
 def _sealed(row: sqlite3.Row) -> dict[str, Any]:
@@ -128,7 +131,7 @@ class _AiInvocationServiceV1:
         )
 
     def _begin(self) -> None:
-        require_staging_database(self._conn)
+        require_finance_write_connection(self._conn, instance_id=self._binding.instance_id)
         try:
             require_foreign_keys_enabled(self._conn)
         except ForeignKeysDisabledError as exc:
@@ -907,6 +910,7 @@ class _AiInvocationServiceV1:
             raise
 
     def get_status(self, attempt_id: str) -> AiInvocationStatus:
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         from finance_core.application.review import review_snapshot
 
         with review_snapshot(self._conn):
@@ -1050,6 +1054,7 @@ class _AiInvocationServiceV1:
         return self.verify_lineage(expected.proposal_public_id)
 
     def verify_lineage(self, proposal_public_id: str) -> dict[str, Any] | None:
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         from finance_core.application.review import review_snapshot
 
         with review_snapshot(self._conn):

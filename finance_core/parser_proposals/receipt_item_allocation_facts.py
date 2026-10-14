@@ -51,6 +51,10 @@ from finance_core.financial_audit import (
     derive_audit_event_public_id,
     verify_financial_audit_chain,
 )
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.money import (
     MoneyValidationError,
     canonical_money_str,
@@ -64,7 +68,7 @@ from finance_core.parser_proposals.receipt_facts_conversion import (
     derive_receipt_public_id,
 )
 from finance_core.sqlite_connection import ForeignKeysDisabledError, require_foreign_keys_enabled
-from finance_core.staging_guard import StagingDatabaseError, require_staging_database
+from finance_core.staging_guard import StagingDatabaseError
 
 # ---------------------------------------------------------------------------
 # Public errors (Section 17 taxonomy)
@@ -986,7 +990,7 @@ def verify_receipt_item_allocation_fact_set_for_review(
         raise InvalidItemFactsCommandError(
             "fact_set_public_id must be a non-empty, whitespace-trimmed rfs_ identifier"
         )
-    _require_staging(conn)
+    _require_staging(conn, read_only=True)
     cursor = conn.execute(
         "SELECT * FROM receipt_item_allocation_fact_sets WHERE fact_set_public_id = ?",
         (fact_set_public_id,),
@@ -1592,9 +1596,12 @@ def _require_ai_evidence_lineage(
         raise ItemFactsEvidenceLineageError(str(exc)) from exc
 
 
-def _require_staging(conn: sqlite3.Connection) -> None:
+def _require_staging(conn: sqlite3.Connection, *, read_only: bool = False) -> None:
     try:
-        require_staging_database(conn)
+        if read_only:
+            require_finance_read_connection(conn)
+        else:
+            require_finance_write_connection(conn)
     except StagingDatabaseError as exc:
         raise ItemFactsStagingDatabaseRejectedError(str(exc)) from exc
     try:

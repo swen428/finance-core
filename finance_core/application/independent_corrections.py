@@ -59,6 +59,10 @@ from finance_core.financial_audit import (
     verify_financial_audit_chain,
 )
 from finance_core.financial_audit.chain import _normalize_timestamp
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.money import (
     canonical_money_str,
     money_decimal,
@@ -66,7 +70,6 @@ from finance_core.money import (
     validate_amount_for_currency,
 )
 from finance_core.sqlite_connection import require_foreign_keys_enabled
-from finance_core.staging_guard import require_staging_database
 
 _failure_injection_hook: Callable[[str], None] | None = None
 _FIELDS = frozenset(vars(IndependentCorrectionFields("", "", "", None, None, None)))
@@ -159,7 +162,7 @@ class IndependentCorrectionService:
         return value
 
     def _begin(self) -> None:
-        require_staging_database(self._conn)
+        require_finance_write_connection(self._conn, instance_id=self._binding.instance_id)
         require_foreign_keys_enabled(self._conn)
         if self._conn.in_transaction:
             raise IndependentCorrectionError("Correction cannot own caller's existing transaction")
@@ -184,7 +187,7 @@ class IndependentCorrectionService:
         )
 
     def _read_original(self, transaction_id: str) -> IndependentEffectiveTransaction:
-        require_staging_database(self._conn)
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         with review_snapshot(self._conn):
             return self._original(verify_original(self._posting, transaction_id))
 
@@ -661,7 +664,7 @@ class IndependentCorrectionService:
     def read_effective(self, transaction_id: str) -> IndependentEffectiveTransaction:
         if not _reference(transaction_id):
             raise IndependentCorrectionError("Transaction reference is invalid")
-        require_staging_database(self._conn)
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         with review_snapshot(self._conn):
             return self._lookup(transaction_id)[0]
 
@@ -679,7 +682,7 @@ class IndependentCorrectionService:
             raise IndependentCorrectionError("Effective reader requires its owning snapshot")
         if not _reference(transaction_id):
             raise IndependentCorrectionError("Transaction reference is invalid")
-        require_staging_database(connection)
+        require_finance_read_connection(connection, instance_id=self._binding.instance_id)
         return self._lookup(transaction_id)[0]
 
     def prepare_correction(
@@ -909,7 +912,7 @@ class IndependentCorrectionService:
     def recover_correction(self, plan_id: str) -> IndependentCorrectionResult | None:
         if not _reference(plan_id):
             raise IndependentCorrectionError("Plan reference is invalid")
-        require_staging_database(self._conn)
+        require_finance_read_connection(self._conn, instance_id=self._binding.instance_id)
         with review_snapshot(self._conn):
             require_independent_correction_schema(self._conn)
             _, p = self._plan(plan_id)

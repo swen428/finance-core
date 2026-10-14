@@ -9,9 +9,11 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.parser_proposals.lifecycle import SUPERSEDED, validate_transition
 from finance_core.persistence_fingerprint import canonical_fingerprint
-from finance_core.staging_guard import require_staging_database
 
 PENDING_PARSE = "pending_parse"
 PARSED_PENDING_CONFIRMATION = "parsed_pending_confirmation"
@@ -48,7 +50,7 @@ def create_raw_intake_record(
     fingerprint_version: str = "raw-intake-v1",
 ) -> dict[str, Any]:
     """Persist a raw intake record before parser interpretation."""
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     received_at_text = _timestamp_text(received_at)
     intake_public_id = public_id or f"raw_intake_{uuid4()}"
     source_details = _source_details(
@@ -181,7 +183,7 @@ def save_parser_proposal(
     statuses refuse with the typed lifecycle ``ValueError`` instead of a
     bare trigger ``sqlite3.IntegrityError``.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     intake_record = get_raw_intake_record(conn, intake_record_id)
     if intake_record is None:
         raise ValueError(f"Raw intake record not found: {intake_record_id}")

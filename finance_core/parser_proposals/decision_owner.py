@@ -19,6 +19,10 @@ from finance_core.financial_audit import (
     append_financial_audit_event,
     derive_audit_event_public_id,
 )
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.money import (
     MoneyValidationError,
     SignPolicy,
@@ -173,7 +177,7 @@ def confirm_parser_proposal(
     behavior.
     """
     _validate_human_command(authenticated_actor_id, actor_type, decision, confirmation_channel)
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     if _caller_owns_transaction:
         if not conn.in_transaction:
             raise ParserConfirmationError(
@@ -359,7 +363,7 @@ def convert_confirmed_parser_proposal(
     text_posting_authorization=None,
 ) -> dict[str, Any]:
     """Atomically convert a persisted, authoritative confirmation to one transaction."""
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     _begin_immediate(conn)
     try:
         proposals = ParserProposalRepository(conn)
@@ -527,7 +531,7 @@ def verify_converted_parser_proposal(
     The proposal, durable human authorization, conversion audit and canonical
     transaction must still describe the same exact financial projection.
     """
-    require_staging_database(conn)
+    require_finance_read_connection(conn)
     owns_snapshot = not conn.in_transaction
     if owns_snapshot:
         conn.execute("BEGIN DEFERRED")

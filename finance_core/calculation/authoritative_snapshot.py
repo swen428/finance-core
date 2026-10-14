@@ -12,8 +12,10 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.money import canonical_decimal_str
-from finance_core.staging_guard import require_staging_database
 
 CANONICAL_JSON_CONTRACT_VERSION = "finance-canonical-json-v1"
 SNAPSHOT_SCHEMA_VERSION = "v1"
@@ -308,7 +310,7 @@ def persist_authoritative_snapshot(
     snapshot: AuthoritativeCalculationSnapshot,
 ) -> tuple[AuthoritativeCalculationSnapshot, bool]:
     """Persist in one service-owned transaction; return (record, idempotent)."""
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     if conn.in_transaction:
         raise SnapshotConflictError("Snapshot persistence requires no pending transaction")
     conn.execute("BEGIN IMMEDIATE")
@@ -334,7 +336,7 @@ def persist_authoritative_snapshot_in_transaction(
     behind while its calculation run or binding evidence rolled back.  Same
     idempotency and conflict contract as :func:`persist_authoritative_snapshot`.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     if not conn.in_transaction:
         raise SnapshotConflictError(
             "Caller-transaction snapshot persistence requires an open transaction"
