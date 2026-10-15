@@ -426,9 +426,12 @@ class _ProductionCursor(sqlite3.Cursor):
         _submit_admission(self.connection)
         return super().executemany(sql, guarded_rows())
 
-    def executescript(self, sql_script, /):
+    def _refuse_script_execution(self, sql_script, /):
         _preflight(self.connection)
         raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
+
+    # Bind the public script API to an explicit refusal, never native execution.
+    executescript = _refuse_script_execution
 
     def fetchone(self):
         self._result_preflight()
@@ -565,8 +568,12 @@ class _ProductionConnection(sqlite3.Connection):
     def executemany(self, sql, seq_of_parameters, /):
         return self.cursor().executemany(sql, seq_of_parameters)
 
-    def executescript(self, sql_script, /):
-        return self.cursor().executescript(sql_script)
+    def _refuse_script_execution(self, sql_script, /):
+        _preflight(self)
+        raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
+
+    # Refuse directly: no cursor allocation or native script delegation.
+    executescript = _refuse_script_execution
 
     def cursor(self, factory=None):
         witness = _preflight(self)

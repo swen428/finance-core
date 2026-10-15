@@ -729,6 +729,65 @@ def test_guarded_sql_preserves_default_transactions_and_rechecks_each_generator_
     config.close()
 
 
+@pytest.mark.parametrize("surface", ["connection", "cursor"])
+@pytest.mark.parametrize("read_only", [False, True])
+def test_script_api_refusal_preserves_caller_transaction_and_has_no_durable_effect(
+    tmp_path, monkeypatch, surface, read_only
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    payload = (
+        "COMMIT; CREATE TABLE forbidden_script_probe(value TEXT); "
+        "INSERT INTO participants(public_id,display_name) VALUES ('script-effect','Forbidden');"
+    )
+    with acquire_production_owner(config) as owner:
+        operation = production_read_operation if read_only else production_write_operation
+        with operation(owner) as conn:
+            conn.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
+            if not read_only:
+                conn.execute(
+                    "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
+                )
+            script_api = (
+                conn.executescript if surface == "connection" else conn.cursor().executescript
+            )
+            before = conn.total_changes
+            with pytest.raises(InstanceAdmissionError, match="executescript implicit commits"):
+                script_api(payload)
+            assert conn.in_transaction and conn.total_changes == before
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='forbidden_script_probe'"
+                ).fetchone()
+                is None
+            )
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == int(
+                not read_only
+            )
+            conn.rollback()
+            assert not conn.in_transaction
+            conn.close()
+            with pytest.raises(InstanceAdmissionError, match="Closed, forked, stale"):
+                script_api(payload)
+        # Operation cleanup removes the witness; the escaped API must refuse
+        # the now-unissued handle as well as the closed handle checked above.
+        with pytest.raises(InstanceAdmissionError, match="not issued by operation owner"):
+            script_api(payload)
+        # Verify after actual close using the next issued mode=ro operation;
+        # never open another native main handle while the first is active.
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='forbidden_script_probe'"
+                ).fetchone()
+                is None
+            )
+    profile.close()
+    config.close()
+
+
 @pytest.mark.parametrize("statement", ["select", "returning"])
 @pytest.mark.parametrize("explicit_close", [False, True])
 def test_partial_public_cursor_finalized_before_connection_and_lease_close(
