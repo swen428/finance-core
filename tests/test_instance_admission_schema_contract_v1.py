@@ -488,6 +488,7 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
     assert admitted["state"] == "ACTIVE"
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO synthetic_app_events(event_id, payload) VALUES (?, ?)",
                 ("event-1", "synthetic payload"),
@@ -499,6 +500,7 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
     for expected_sequence in (1, 2):
         with acquire_production_owner(config) as owner:
             with production_write_operation(owner) as conn:
+                conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     "INSERT INTO synthetic_app_sequence_probe(payload) VALUES (?)",
                     (f"sequence-{expected_sequence}",),

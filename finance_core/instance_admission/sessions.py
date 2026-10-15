@@ -6,7 +6,6 @@ import fcntl
 import os
 import sqlite3
 import threading
-import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -37,6 +36,116 @@ _WITNESSES: dict[int, "_Witness"] = {}
 # Unknown-close handles deliberately remain reachable until process exit.
 _UNCERTAIN: list["_Witness"] = []
 
+# Fixed native functions from migrations 001-060, approved Core SQL, and the
+# admission metadata query (GLOB). This is deliberately not learned at runtime.
+_SQL_FUNCTIONS = frozenset(
+    {
+        "char",
+        "coalesce",
+        "count",
+        "current_timestamp",
+        "glob",
+        "instr",
+        "json",
+        "json_array_length",
+        "json_extract",
+        "json_type",
+        "json_valid",
+        "length",
+        "like",
+        "lower",
+        "ltrim",
+        "max",
+        "min",
+        "printf",
+        "substr",
+        "sum",
+        "trim",
+        "typeof",
+        "upper",
+        "zeroblob",
+    }
+)
+_SQL_READ_ACTIONS = frozenset(
+    {sqlite3.SQLITE_READ, sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE}
+)
+_SQL_WRITE_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_CREATE_INDEX,
+        sqlite3.SQLITE_CREATE_TABLE,
+        sqlite3.SQLITE_CREATE_TRIGGER,
+        sqlite3.SQLITE_CREATE_VIEW,
+        sqlite3.SQLITE_DROP_INDEX,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_DROP_TRIGGER,
+        sqlite3.SQLITE_DROP_VIEW,
+        sqlite3.SQLITE_ALTER_TABLE,
+        sqlite3.SQLITE_REINDEX,
+        sqlite3.SQLITE_ANALYZE,
+    }
+)
+_SQL_METADATA_PRAGMAS = frozenset(
+    {
+        "table_info",
+        "table_xinfo",
+        "index_list",
+        "index_info",
+        "index_xinfo",
+        "foreign_key_list",
+        "foreign_key_check",
+    }
+)
+
+
+def _install_write_protocol(witness: "_Witness") -> None:
+    """Private compile boundary; no SQL/admission or caller code in this hook."""
+
+    def authorize(action, first, second, database, source):
+        # Cleanup may safely roll back after admission or lifecycle is lost.
+        if action == sqlite3.SQLITE_TRANSACTION and first == "ROLLBACK":
+            return sqlite3.SQLITE_OK
+        if (
+            witness.pid != os.getpid()
+            or not witness.active
+            or witness.closed
+            or witness.closing
+            or witness.owner._uncertain
+        ):
+            return sqlite3.SQLITE_DENY
+        writable_transaction = not witness.read_only and witness.connection.in_transaction
+        if action in _SQL_READ_ACTIONS:
+            return sqlite3.SQLITE_OK
+        if action in _SQL_WRITE_ACTIONS:
+            return sqlite3.SQLITE_OK if writable_transaction else sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_TRANSACTION:
+            return sqlite3.SQLITE_OK if first in {"BEGIN", "COMMIT"} else sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_SAVEPOINT:
+            return (
+                sqlite3.SQLITE_OK
+                if first in {"BEGIN", "RELEASE", "ROLLBACK"}
+                else sqlite3.SQLITE_DENY
+            )
+        if action == sqlite3.SQLITE_FUNCTION:
+            return sqlite3.SQLITE_OK if second in _SQL_FUNCTIONS else sqlite3.SQLITE_DENY
+        if action == sqlite3.SQLITE_PRAGMA:
+            name = first.lower() if first is not None else ""
+            # SQLite already parsed this as an object name for these read-only
+            # PRAGMAs, never a setting or SQL to execute again.
+            if name in _SQL_METADATA_PRAGMAS and (second is None or type(second) is str):
+                return sqlite3.SQLITE_OK
+            if name in {"database_list", "foreign_keys", "busy_timeout"} and second is None:
+                return sqlite3.SQLITE_OK
+            if name == "defer_foreign_keys" and (
+                second is None or (writable_transaction and second.lower() in {"on", "1"})
+            ):
+                return sqlite3.SQLITE_OK
+        return sqlite3.SQLITE_DENY
+
+    sqlite3.Connection.set_authorizer(witness.connection, authorize)
+
 
 class ProductionCloseUncertain(InstanceAdmissionError):
     """Connection close was not proved; the owner and operation remain held."""
@@ -61,9 +170,17 @@ class ProductionOwner:
         _OWNERS[id(self)] = self
         _CONFIG_OWNERS[id(config)] = _CONFIG_OWNERS.get(id(config), 0) + 1
 
-    def assert_valid(self) -> None:
+    def _assert_identity(self) -> None:
         if self._pid != os.getpid() or self._uncertain or _OWNERS.get(id(self)) is not self:
             raise InstanceAdmissionError("Forked or uncertain production owner")
+
+    def _assert_lease_valid(self) -> None:
+        """Owner/lease proof followed by shared config proof in the same admission."""
+        self._assert_identity()
+        self._lease._assert_file_valid()
+
+    def assert_valid(self) -> None:
+        self._assert_identity()
         self._lease.assert_valid()
 
     def close(self) -> None:
@@ -137,9 +254,7 @@ class _Witness:
     active: bool = True
     closing: bool = False
     closed: bool = False
-    cursors: weakref.WeakValueDictionary[int, _ProductionCursor] = field(
-        default_factory=weakref.WeakValueDictionary
-    )
+    cursors: dict[int, _ProductionCursor] = field(default_factory=dict)
     retained_cursors: tuple[_ProductionCursor, ...] = ()
 
     def preflight(
@@ -158,7 +273,12 @@ class _Witness:
             if self.owner._pid != os.getpid() or self.owner._uncertain or self.owner._lease.fd < 0:
                 raise InstanceAdmissionError("Production owner is no longer held")
             return
-        self.owner.assert_valid()
+        if (
+            self.owner._lease.config is not self.owner.config
+            or self.control.config is not self.owner.config
+        ):
+            raise InstanceAdmissionError("Production leases require the same trusted configuration")
+        self.owner._assert_lease_valid()
         if (
             self.connection.row_factory is not sqlite3.Row
             or self.connection.text_factory is not str
@@ -166,9 +286,11 @@ class _Witness:
             raise InstanceAdmissionError(
                 "Production SQL requires configured SQLite.Row/str factories"
             )
-        self.control.assert_valid()
+        self.control._assert_file_valid()
         self.profile.revalidate()
         self.gate.assert_valid()
+        # _state->_read performs the final complete shared-config proof, including
+        # installed migration bytes. No proof survives this admission call.
         state = _state(self.owner.config)
         record = _record(self.owner.config, state)
         if state["version"] != self.authority_version or record["maintenance"] is not None:
@@ -246,15 +368,27 @@ class _ProductionCursor(sqlite3.Cursor):
             )
         sqlite3.Cursor.row_factory.__set__(self, value)
 
-    def _result_preflight(self) -> None:
+    def _factory_preflight(self) -> None:
         factory = self.row_factory
         if factory is not None and factory is not sqlite3.Row:
             raise InstanceAdmissionError(
                 "Production cursor factories require configured None/sqlite3.Row"
             )
+        if (
+            self.connection.row_factory is not sqlite3.Row
+            or self.connection.text_factory is not str
+        ):
+            raise InstanceAdmissionError(
+                "Production SQL requires configured SQLite.Row/str factories"
+            )
+
+    def _result_preflight(self) -> None:
+        self._factory_preflight()
+        _submit_admission(self.connection)
 
     def close(self) -> None:
         witness = _preflight(self.connection)
+        self._result_preflight()
         try:
             _close_cursor_handle(self)
         except BaseException as exc:
@@ -263,7 +397,7 @@ class _ProductionCursor(sqlite3.Cursor):
         witness.cursors.pop(id(self), None)
 
     def execute(self, sql, parameters=(), /):
-        self._result_preflight()
+        self._factory_preflight()
         if type(sql) is not str:
             raise InstanceAdmissionError("Production SQL requires a plain statement string")
         bindings = _parameters(parameters)
@@ -271,7 +405,7 @@ class _ProductionCursor(sqlite3.Cursor):
         return super().execute(sql, bindings)
 
     def executemany(self, sql, seq_of_parameters, /):
-        self._result_preflight()
+        self._factory_preflight()
         if type(sql) is not str:
             raise InstanceAdmissionError("Production SQL requires a plain statement string")
 
@@ -279,6 +413,11 @@ class _ProductionCursor(sqlite3.Cursor):
             for parameters in seq_of_parameters:
                 bindings = _parameters(parameters)
                 _submit_admission(self.connection)
+                if not self.connection.in_transaction:
+                    raise InstanceAdmissionError(
+                        "Production executemany requires an explicit caller transaction "
+                        "for each row"
+                    )
                 yield bindings
 
         _submit_admission(self.connection)
@@ -465,6 +604,10 @@ def _close_cursor_handle(cursor: sqlite3.Cursor) -> None:
     sqlite3.Cursor.close(cursor)
 
 
+def _rollback_sqlite_handle(conn: sqlite3.Connection) -> None:
+    sqlite3.Connection.rollback(conn)
+
+
 def _retain_unknown_close(witness: _Witness) -> None:
     with witness.owner._mutex:
         witness.owner._uncertain = True
@@ -480,13 +623,15 @@ def _close_issued_connection(witness: _Witness) -> None:
     if witness.closed:
         return
     witness.closing = True
+    # Undo the owned transaction BEFORE resetting/finalizing pending statements.
+    # Every pending writer was compiled inside an explicit caller transaction.
+    if witness.connection.in_transaction:
+        _rollback_sqlite_handle(witness.connection)
     # Python's Connection.close can leave a SQLite zombie handle when an
     # escaped cursor has a pending statement. Finalize while the parent is live.
     for cursor in tuple(witness.cursors.values()):
         _close_cursor_handle(cursor)
         witness.cursors.pop(id(cursor), None)
-    if witness.connection.in_transaction:
-        sqlite3.Connection.rollback(witness.connection)
     _close_sqlite_handle(witness.connection)
     witness.closed = True
 
@@ -567,7 +712,9 @@ def _operation(
         _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
         sqlite_began = True
         uri = profile.live_database.as_uri() + ("?mode=ro" if read_only else "?mode=rw")
-        conn = sqlite3.connect(uri, uri=True, detect_types=0, factory=_ProductionConnection)
+        conn = sqlite3.connect(
+            uri, uri=True, detect_types=0, cached_statements=0, factory=_ProductionConnection
+        )
         witness = _Witness(
             owner, conn, control, profile, gate, state["version"], read_only, os.getpid()
         )
@@ -587,6 +734,7 @@ def _operation(
         require_finance_read_connection(conn)
         if not read_only:
             require_finance_write_connection(conn)
+        _install_write_protocol(witness)
         yield conn
     finally:
         if conn is not None:

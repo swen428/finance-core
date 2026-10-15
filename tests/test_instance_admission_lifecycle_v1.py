@@ -382,7 +382,10 @@ def _uncertain_close_worker(tmp_root: Path, sender) -> None:
     finally:
         session_module._close_sqlite_handle = real_close
 
-    retained_query = sqlite3.Connection.execute(conn, "SELECT 1").fetchone()[0]
+    # Unknown-close latches the fixed hook closed to further SQL. This native
+    # observation still requires a live handle (a closed connection raises
+    # ProgrammingError) and does not bypass the hook with a new statement.
+    retained_handle_live = not conn.in_transaction
     owner_close_refused = False
     try:
         owner.close()
@@ -398,7 +401,7 @@ def _uncertain_close_worker(tmp_root: Path, sender) -> None:
             "retained",
             uncertain.connection is conn,
             uncertain.owner is owner,
-            retained_query == 1,
+            retained_handle_live,
             owner_close_refused,
             owner_result[0] == "busy",
         )
@@ -930,11 +933,14 @@ def test_fence_waits_for_the_real_write_connection_to_close(
         assert inspect_instance_admission(config)["state"] == "FENCED"
         with production_read_operation(owner) as read_conn:
             assert read_conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
-            with pytest.raises(sqlite3.OperationalError):
+            # The fixed hook may refuse at compilation before SQLite's native
+            # read-only error; both are DatabaseError and must have no effect.
+            with pytest.raises(sqlite3.DatabaseError):
                 read_conn.execute(
                     "UPDATE schema_migrations SET migration_id=migration_id "
                     "WHERE migration_id='001'"
                 )
+            assert read_conn.total_changes == 0 and not read_conn.in_transaction
         with pytest.raises(InstanceAdmissionError):
             with production_write_operation(owner):
                 pytest.fail("a fenced instance issued a writable SQLite connection")
@@ -1420,6 +1426,7 @@ def test_forked_or_caller_created_connection_is_rejected_before_sql_effects(
     config, database = _prepare_and_admit(tmp_path, monkeypatch)
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("CREATE TABLE lifecycle_fork_probe (value TEXT NOT NULL)")
             conn.commit()
             raw = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)

@@ -10,9 +10,13 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
-from contextlib import ExitStack
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 # Fixed trusted test composition, declared before an empty profile is prepared.
@@ -38,6 +42,60 @@ APPLICATION_EVIDENCE_DDL = tuple(
     f"CREATE TABLE {table} (id TEXT PRIMARY KEY, material TEXT NOT NULL, signature TEXT NOT NULL)"
     for table in APPLICATION_EVIDENCE_TABLES
 )
+
+
+@contextmanager
+def production_fixture_persistence(
+    connection: sqlite3.Connection, *modules: ModuleType
+) -> Iterator[None]:
+    """Give only known synthetic evidence writers explicit short transactions.
+
+    Mixed legacy fixtures commit their source group, invoke a real business
+    owner while idle, then persist another approval group. The provider also
+    checks idle state before retaining its observation. Their existing commits
+    still end each group; ordinary business SQL is never intercepted here.
+    Calls using any other connection retain the original staging behavior.
+    """
+
+    def adapt(original):
+        @wraps(original)
+        def persist(target, *args, **kwargs):
+            owned = target is connection and not target.in_transaction
+            if owned:
+                target.execute("BEGIN IMMEDIATE")
+            try:
+                return original(target, *args, **kwargs)
+            except BaseException:
+                if owned and target.in_transaction:
+                    target.rollback()
+                raise
+
+        return persist
+
+    with ExitStack() as patches:
+        for module in set(modules):
+            patches.enter_context(patch.object(module, "_persist", adapt(module._persist)))
+        yield
+        if connection.in_transaction:
+            raise AssertionError("Production fixture scope must finish idle")
+
+
+def run_production_fixture(
+    connection: sqlite3.Connection, operation: Callable[..., Any], *args, **kwargs
+) -> Any:
+    """Open a fixture-owned group; the legacy helper retains its commit points."""
+    if connection.in_transaction:
+        raise AssertionError("Production fixture cannot take over caller-owned work")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        result = operation(connection, *args, **kwargs)
+        if connection.in_transaction:
+            raise AssertionError("Production fixture must finish its own transaction")
+        return result
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def _copy_initial_receipt_source(source: sqlite3.Connection, target: sqlite3.Connection) -> None:
@@ -215,7 +273,17 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
         ).close()
         admit_production_instance(config, operation_id="admit-business", approval_ref="approved")
         with acquire_production_owner(config) as owner:
-            with production_write_operation(owner) as conn:
+            with (
+                production_write_operation(owner) as conn,
+                production_fixture_persistence(
+                    conn,
+                    posting_fixtures,
+                    correction_fixtures,
+                    amendment_support,
+                    amendment_fixtures,
+                    ai_fixtures,
+                ),
+            ):
                 for table in APPLICATION_EVIDENCE_TABLES:
                     assert (
                         conn.execute(
@@ -240,8 +308,8 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                     _copy_initial_receipt_source(source, conn)
                 finally:
                     source.close()
-                service, review, proposal, intake, decision, _ = (
-                    posting_fixtures._prepare_text_subject(conn, "production-text")
+                service, review, proposal, intake, decision, _ = run_production_fixture(
+                    conn, posting_fixtures._prepare_text_subject, "production-text"
                 )
                 assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
                 posted = service.submit_post(review.review_id, decision)
@@ -267,8 +335,11 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                     correction_fixtures._six_field_patch(),
                     "Synthetic correction",
                 )
-                correction_decision = correction_fixtures._persist_correction_approval(
-                    conn, plan, decision_id="production-correction"
+                correction_decision = run_production_fixture(
+                    conn,
+                    correction_fixtures._persist_correction_approval,
+                    plan,
+                    decision_id="production-correction",
                 )
                 correction = correction_service.submit(plan.plan_id, correction_decision)
                 assert correction.applied.version == correction.current.version == 1
@@ -303,8 +374,12 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                     clock=lambda: posting_fixtures.NOW,
                 )
                 receipt_review = receipt_service.prepare(proposal_id)
-                amendment_fixtures._persist_fresh_posting_confirmation(
-                    conn, receipt_review, proposal_id, "production-receipt-confirm"
+                run_production_fixture(
+                    conn,
+                    amendment_fixtures._persist_fresh_posting_confirmation,
+                    receipt_review,
+                    proposal_id,
+                    "production-receipt-confirm",
                 )
                 assert conn.execute("SELECT count(*) FROM receipts").fetchone()[0] == 0
                 receipt_posted = receipt_service.submit_post(
@@ -327,8 +402,11 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                     correction_fixtures._six_field_patch(),
                     "Synthetic receipt correction",
                 )
-                receipt_decision = correction_fixtures._persist_correction_approval(
-                    conn, receipt_plan, decision_id="production-receipt-correction"
+                receipt_decision = run_production_fixture(
+                    conn,
+                    correction_fixtures._persist_correction_approval,
+                    receipt_plan,
+                    decision_id="production-receipt-correction",
                 )
                 receipt_correction = receipt_corrector.submit(
                     receipt_plan.plan_id, receipt_decision
@@ -347,13 +425,14 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                     == receipt_original_row
                 )
                 # Amendment reissues a complete reviewed child without final facts.
-                edit_service, _, edit_proposal, _, _, _ = posting_fixtures._prepare_text_subject(
-                    conn, "production-amend"
+                edit_service, _, edit_proposal, _, _, _ = run_production_fixture(
+                    conn, posting_fixtures._prepare_text_subject, "production-amend"
                 )
                 amender = amendment_fixtures._amendment_service(conn)
                 edit_review = amender.prepare(edit_proposal["public_id"])
-                edited = amendment_fixtures._apply(
+                edited = run_production_fixture(
                     conn,
+                    amendment_fixtures._apply,
                     amender,
                     edit_review,
                     {"amount": "13.50"},
@@ -362,10 +441,10 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                 )
                 assert amender.get_status(edited.amendment_id) == edited
                 before_ai = conn.execute("SELECT count(*) FROM transactions").fetchone()[0]
-                _oldposting, _oldreview, _parent, ai_intake, *_ = ai_fixtures.subject(
-                    conn, "production-ai"
+                _oldposting, _oldreview, _parent, ai_intake, *_ = run_production_fixture(
+                    conn, ai_fixtures.subject, "production-ai"
                 )
-                ai, provider = ai_fixtures.service(conn)
+                ai, provider = run_production_fixture(conn, ai_fixtures.service)
                 ai_attempt = ai.prepare_initial(ai_intake["public_id"], "production-ai-initial")
                 assert ai.invoke(ai_attempt.attempt_id).state == "VALID"
                 published = ai.publish(ai_attempt.attempt_id)
@@ -374,8 +453,12 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                 # Durable clarification/edit publication still creates no final.
                 ai_edit = ai_fixtures.amendment(conn, ai).prepare(published.proposal_public_id)
                 reply_text = "Actually SGD 5.80 at Cafe Two; change and confirm"
-                reply = ai_fixtures.persist_interpretation_reply(
-                    conn, ai_edit, reply_text, identity="production-ai-reply"
+                reply = run_production_fixture(
+                    conn,
+                    ai_fixtures.persist_interpretation_reply,
+                    ai_edit,
+                    reply_text,
+                    identity="production-ai-reply",
                 )
                 provider.response = ai_fixtures.response(
                     "patch", {"amount": "5.80", "merchant": "Cafe Two"}, reply_text

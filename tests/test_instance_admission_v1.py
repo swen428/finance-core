@@ -1,6 +1,9 @@
 import multiprocessing
 import os
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -51,7 +54,7 @@ def test_fence_is_permanent_and_reads_are_real_readonly(tmp_path, monkeypatch):
             with production_write_operation(owner):
                 pass
         with production_read_operation(owner) as conn:
-            with pytest.raises(sqlite3.OperationalError):
+            with pytest.raises(sqlite3.DatabaseError):
                 conn.execute("DELETE FROM schema_migrations")
 
 
@@ -625,6 +628,7 @@ def test_guarded_sql_preserves_default_transactions_and_rechecks_each_generator_
                 yield ("uncommitted-second", "Second")
 
             try:
+                conn.execute("BEGIN IMMEDIATE")
                 with pytest.raises((InstanceAdmissionError, ProfilePathError)):
                     conn.executemany(
                         "INSERT INTO participants(public_id,display_name) VALUES (?,?)",
@@ -652,6 +656,7 @@ def test_partial_public_cursor_finalized_before_connection_and_lease_close(
     admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.executemany(
                 "INSERT INTO participants(public_id,display_name) VALUES (?,?)",
                 [("cursor-first", "First"), ("cursor-second", "Second")],
@@ -665,6 +670,7 @@ def test_partial_public_cursor_finalized_before_connection_and_lease_close(
             if statement == "select":
                 cursor.execute("SELECT public_id FROM participants ORDER BY public_id")
             else:
+                conn.execute("BEGIN IMMEDIATE")
                 cursor.execute(
                     "INSERT INTO participants(public_id,display_name) "
                     "VALUES ('returning-first','First'),('returning-second','Second') "
@@ -701,11 +707,12 @@ def _uncertain_public_cursor_close_worker(tmp_path, close_surface, fault_kind, s
     conn = operation.__enter__()
     cursor = conn.execute("SELECT 1 UNION ALL SELECT 2")
     assert cursor.fetchone()[0] == 1
+    registered = tuple(sessions._witness_for(conn).cursors.values())
     cursor_close_attempts = []
     connection_close_attempts = []
 
     def unknown_cursor_close(_cursor):
-        cursor_close_attempts.append(True)
+        cursor_close_attempts.append(_cursor)
         if fault_kind == "cursor":
             raise sqlite3.OperationalError("synthetic cursor close uncertainty")
         sqlite3.Cursor.close(_cursor)
@@ -738,11 +745,21 @@ def _uncertain_public_cursor_close_worker(tmp_path, close_surface, fault_kind, s
     with pytest.raises(InstanceAdmissionError):
         acquire_production_owner(config, timeout_seconds=0)
     witness = sessions._witness_for(conn)
+    if fault_kind == "cursor":
+        all_expected_closes = len(cursor_close_attempts) == 1
+    else:
+        # Strong ownership also retains exhausted initialization cursors.
+        # Every issued cursor must be closed once before actual parent close.
+        all_expected_closes = len(cursor_close_attempts) == len(registered) and {
+            id(item) for item in cursor_close_attempts
+        } == {id(item) for item in registered}
     sender.send(
         (
-            len(cursor_close_attempts),
+            all_expected_closes,
             len(connection_close_attempts),
-            sqlite3.Connection.execute(conn, "SELECT 1").fetchone()[0],
+            # Native status raises on an actually closed handle, but cannot
+            # execute SQL after the fixed hook has latched uncertain cleanup.
+            int(not conn.in_transaction),
             witness is not None and any(item is cursor for item in witness.retained_cursors),
         )
     )
@@ -771,7 +788,7 @@ def test_unknown_public_cursor_close_retains_handle_and_leases(tmp_path, close_s
     sender.close()
     try:
         assert receiver.poll(30), "isolated close proof did not return"
-        assert receiver.recv() == (1, int(fault_kind == "connection"), 1, fault_kind == "cursor")
+        assert receiver.recv() == (True, int(fault_kind == "connection"), 1, fault_kind == "cursor")
         child.join(10)
         assert child.exitcode == 0
     finally:
@@ -801,6 +818,9 @@ def test_binding_adapters_never_run_or_change_caller_transaction(
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
             for pending in (False, True):
+                # Both cases are caller-owned transactions: an empty group,
+                # and a group already carrying an unrelated uncommitted row.
+                conn.execute("BEGIN IMMEDIATE")
                 if pending:
                     conn.execute(
                         "INSERT INTO participants(public_id,display_name) "
@@ -826,12 +846,12 @@ def test_binding_adapters_never_run_or_change_caller_transaction(
                     finally:
                         profile.live_database.chmod(0o600)
                     assert calls == []
-                    assert conn.in_transaction is pending
+                    assert conn.in_transaction
                     assert conn.total_changes == before
                 if pending:
                     row = conn.execute("SELECT display_name FROM participants").fetchone()
                     assert row[0] == "Owned"
-                    conn.rollback()
+                conn.rollback()
         with production_read_operation(owner) as conn:
             assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
     profile.close()
@@ -849,8 +869,10 @@ def test_blob_handles_refused_without_transaction_or_durable_effects(tmp_path, m
     admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT INTO app_blob_probe VALUES (1,zeroblob(4))")
             conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
             )
@@ -884,6 +906,7 @@ def test_cursor_result_factories_refuse_callbacks_and_preserve_owned_transaction
 
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
             )
@@ -926,6 +949,7 @@ def test_fetchmany_refuses_index_callback_without_consuming_rows(tmp_path, monke
 
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO participants(public_id,display_name) VALUES ('pending','Owned')"
             )
@@ -944,3 +968,468 @@ def test_fetchmany_refuses_index_callback_without_consuming_rows(tmp_path, monke
             assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
     profile.close()
     config.close()
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "INSERT INTO participants(public_id,display_name) VALUES ('idle','Idle')",
+        "WITH p(v) AS (SELECT 'idle') INSERT INTO participants(public_id,display_name) "
+        "SELECT v,v FROM p RETURNING public_id",
+        "WITH p(v) AS (VALUES ('idle'),('idle-second')) "
+        "INSERT INTO participants(public_id,display_name) SELECT v,v FROM p RETURNING public_id",
+    ],
+)
+def test_idle_writes_refused_before_effect_and_permission_not_cached(
+    tmp_path, monkeypatch, statement
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            assert not conn.in_transaction
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+            with pytest.raises(sqlite3.DatabaseError, match="authorized"):
+                conn.execute(statement)
+            assert not conn.in_transaction and conn.total_changes == 0
+            conn.execute("BEGIN IMMEDIATE")
+            assert conn.in_transaction
+            cursor = conn.execute(statement)
+            cursor.close()
+            conn.rollback()
+            # Identical SQL must compile against the CURRENT native transaction.
+            with pytest.raises(sqlite3.DatabaseError, match="authorized"):
+                conn.execute(statement)
+            assert not conn.in_transaction
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def test_final_shared_config_proof_still_rejects_installed_migration_drift(tmp_path, monkeypatch):
+    from finance_core.instance_admission import authority, sessions
+
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("SELECT 'original-first' UNION ALL SELECT 'original-last'")
+            before = conn.total_changes
+            witness = sessions._witness_for(conn)
+            with monkeypatch.context() as drift:
+                # Synthetic installed-identity drift; real migration resources
+                # and their historical bytes are never modified.
+                drift.setattr(authority, "_migration_contract_digest", lambda: "0" * 64)
+                for attempt in (
+                    owner.assert_valid,
+                    witness.control.assert_valid,
+                    lambda: conn.execute(
+                        "INSERT INTO participants(public_id,display_name) VALUES ('drift','Drift')"
+                    ),
+                    lambda: conn.executemany(
+                        "INSERT INTO participants(public_id,display_name) VALUES (?,?)",
+                        [("drift-many", "Drift")],
+                    ),
+                    cursor.fetchone,
+                    cursor.close,
+                    conn.commit,
+                ):
+                    with pytest.raises(
+                        InstanceAdmissionError, match="Installed migration identity"
+                    ):
+                        attempt()
+                    assert conn.in_transaction and conn.total_changes == before
+            # Rejected fetch/reuse/close must leave the original row unconsumed.
+            assert cursor.fetchone()[0] == "original-first"
+            cursor.close()
+            conn.rollback()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+@pytest.mark.parametrize("lease_role", ["owner", "control"])
+def test_different_config_lease_cannot_borrow_shared_config_proof(
+    tmp_path, monkeypatch, lease_role
+):
+    from finance_core.instance_admission import sessions
+
+    original_root, other_root = tmp_path / "original", tmp_path / "other"
+    original_root.mkdir(mode=0o700)
+    other_root.mkdir(mode=0o700)
+    config = synthetic_config(original_root, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    # Construct another valid trusted composition without preparing/admitting it.
+    # Restore the original runtime binding before touching the issued operation.
+    other = synthetic_config(other_root, monkeypatch)
+    monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(profile.runtime))
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute("SELECT 'original'")
+            witness = sessions._witness_for(conn)
+            lease = owner._lease if lease_role == "owner" else witness.control
+            before = conn.total_changes
+            with monkeypatch.context() as crossed:
+                crossed.setattr(lease, "config", other)
+                for attempt in (
+                    lambda: conn.execute(
+                        "INSERT INTO participants(public_id,display_name) "
+                        "VALUES ('crossed','Crossed')"
+                    ),
+                    cursor.fetchone,
+                    cursor.close,
+                    conn.commit,
+                ):
+                    with pytest.raises(InstanceAdmissionError, match="same trusted configuration"):
+                        attempt()
+                    assert conn.in_transaction and conn.total_changes == before
+            assert cursor.fetchone()[0] == "original"
+            cursor.close()
+            conn.rollback()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    other.close()
+    profile.close()
+    config.close()
+
+
+@pytest.mark.parametrize("transaction_end", ["commit", "rollback"])
+def test_executemany_generator_cannot_write_after_ending_transaction(
+    tmp_path, monkeypatch, transaction_end
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+
+            def rows():
+                yield ("first", "First")
+                getattr(conn, transaction_end)()
+                yield ("second", "Second")
+
+            with pytest.raises(InstanceAdmissionError, match="explicit caller transaction"):
+                conn.executemany(
+                    "INSERT INTO participants(public_id,display_name) VALUES (?,?)", rows()
+                )
+            assert not conn.in_transaction
+        with production_read_operation(owner) as conn:
+            assert [row[0] for row in conn.execute("SELECT public_id FROM participants")] == (
+                ["first"] if transaction_end == "commit" else []
+            )
+    profile.close()
+    config.close()
+
+
+@pytest.mark.parametrize(
+    "surface", ["one", "many", "all", "iter", "next", "close", "reuse", "last"]
+)
+def test_late_text_factory_refused_before_callback_or_result_consumption(
+    tmp_path, monkeypatch, surface
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            cursor = conn.execute("SELECT 'first' UNION ALL SELECT 'second'")
+            expected = "first"
+            if surface == "last":
+                assert cursor.fetchone()[0] == "first"
+                expected = "second"
+            calls = []
+            conn.text_factory = lambda value: calls.append(value) or value.decode()
+            call = {
+                "one": cursor.fetchone,
+                "many": cursor.fetchmany,
+                "all": cursor.fetchall,
+                "iter": lambda: iter(cursor),
+                "next": lambda: next(cursor),
+                "close": cursor.close,
+                "reuse": lambda: cursor.execute("SELECT 'replacement'"),
+                "last": cursor.fetchone,
+            }[surface]
+            try:
+                with pytest.raises(InstanceAdmissionError, match="configured"):
+                    call()
+                assert calls == []
+            finally:
+                conn.text_factory = str
+            assert cursor.fetchone()[0] == expected
+            cursor.close()
+    profile.close()
+    config.close()
+
+
+@pytest.mark.parametrize("surface", ["fetch", "next", "close", "reuse", "drop"])
+def test_pending_explicit_returning_cannot_commit_on_drift_or_cursor_gc(
+    tmp_path, monkeypatch, surface
+):
+    import gc
+    import weakref
+
+    from finance_core.profile_paths import ProfilePathError
+
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "WITH p(v) AS (VALUES ('pending'),('pending-second')) "
+                "INSERT INTO participants(public_id,display_name) "
+                "SELECT v,v FROM p RETURNING public_id"
+            )
+            reference = weakref.ref(cursor)
+            profile.live_database.chmod(0o640)
+            try:
+                if surface == "drop":
+                    del cursor
+                    gc.collect()
+                    assert reference() is not None
+                else:
+                    call = {
+                        "fetch": cursor.fetchall,
+                        "next": lambda: next(cursor),
+                        "close": cursor.close,
+                        "reuse": lambda: cursor.execute("SELECT 1"),
+                    }[surface]
+                    with pytest.raises((InstanceAdmissionError, ProfilePathError)):
+                        call()
+                assert conn.in_transaction
+            finally:
+                profile.live_database.chmod(0o600)
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def test_fixed_compiler_policy_and_explicit_transaction_ownership(tmp_path, monkeypatch):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            assert conn.execute("SELECT CURRENT_TIMESTAMP").fetchone()[0]
+            for pragma in (
+                "database_list",
+                "foreign_keys",
+                "busy_timeout",
+                "table_info(participants)",
+                "table_xinfo(participants)",
+                "index_list(participants)",
+                "index_info(sqlite_autoindex_participants_1)",
+                "index_xinfo(sqlite_autoindex_participants_1)",
+                "foreign_key_list(participants)",
+                "foreign_key_check",
+                "defer_foreign_keys",
+            ):
+                conn.execute("PRAGMA " + pragma).fetchall()
+            for statement in (
+                "PRAGMA journal_mode=WAL",
+                "PRAGMA incremental_vacuum",
+                "PRAGMA writable_schema=ON",
+                "PRAGMA foreign_keys=OFF",
+                "PRAGMA busy_timeout=1",
+                "PRAGMA defer_foreign_keys=ON",
+                "CREATE TEMP TABLE forbidden(value)",
+                "CREATE VIRTUAL TABLE forbidden USING fts5(value)",
+                "ATTACH DATABASE ':memory:' AS forbidden",
+                "SELECT random()",
+                "SELECT load_extension('x')",
+            ):
+                with pytest.raises(sqlite3.DatabaseError):
+                    conn.execute(statement)
+                assert not conn.in_transaction
+            with pytest.raises(InstanceAdmissionError, match="set_authorizer"):
+                conn.set_authorizer(None)
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("PRAGMA defer_foreign_keys=ON")
+            assert conn.execute("PRAGMA defer_foreign_keys").fetchone()[0] == 1
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute("PRAGMA defer_foreign_keys=OFF")
+            conn.execute("CREATE TABLE protocol_ddl(value TEXT)")
+            conn.execute(
+                "CREATE TRIGGER protocol_trigger AFTER INSERT ON protocol_ddl BEGIN "
+                "INSERT INTO participants(public_id,display_name) VALUES (new.value,new.value); END"
+            )
+            conn.execute("INSERT INTO protocol_ddl VALUES ('trigger-write')")
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 1
+            conn.execute("SAVEPOINT inner_owner")
+            conn.execute("INSERT INTO protocol_ddl VALUES ('rolled-to-savepoint')")
+            conn.execute("ROLLBACK TO inner_owner")
+            conn.execute("RELEASE inner_owner")
+            assert conn.in_transaction
+            conn.rollback()
+            assert not conn.in_transaction
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+            assert (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE name='protocol_ddl'").fetchone()
+                is None
+            )
+    profile.close()
+    config.close()
+
+
+def test_pending_returning_busy_commit_rollback_restart_and_context_exception(
+    tmp_path, monkeypatch
+):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            old = conn.execute(
+                "INSERT INTO participants(public_id,display_name) "
+                "VALUES ('old','Old') RETURNING public_id"
+            )
+            with pytest.raises(sqlite3.OperationalError, match="statements in progress"):
+                conn.commit()
+            assert conn.in_transaction
+            conn.rollback()
+            assert not conn.in_transaction
+            with pytest.raises(ValueError, match="synthetic body"):
+                with conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    context_cursor = conn.execute(
+                        "INSERT INTO participants(public_id,display_name) "
+                        "VALUES ('context','Context') "
+                        "RETURNING public_id"
+                    )
+                    raise ValueError("synthetic body")
+            assert not conn.in_transaction
+            old.close()
+            context_cursor.close()
+            conn.execute("BEGIN IMMEDIATE")
+            committed = conn.execute(
+                "INSERT INTO participants(public_id,display_name) "
+                "VALUES ('allowed','Allowed') RETURNING public_id"
+            )
+            assert committed.fetchall()[0][0] == "allowed"
+            conn.commit()
+            assert not conn.in_transaction
+        with production_read_operation(owner) as conn:
+            assert [row[0] for row in conn.execute("SELECT public_id FROM participants")] == [
+                "allowed"
+            ]
+    profile.close()
+    config.close()
+
+
+def test_operation_exception_rolls_back_multiple_pending_cursors(tmp_path, monkeypatch):
+    config = synthetic_config(tmp_path, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with pytest.raises(ValueError, match="operation exception"):
+            with production_write_operation(owner) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursors = [
+                    conn.execute(
+                        "INSERT INTO participants(public_id,display_name) VALUES (?,?) "
+                        "RETURNING public_id",
+                        (value, value),
+                    )
+                    for value in ("exception-first", "exception-second")
+                ]
+                raise ValueError("operation exception")
+        for cursor in cursors:
+            with pytest.raises(InstanceAdmissionError):
+                cursor.fetchone()
+        with production_read_operation(owner) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0
+    profile.close()
+    config.close()
+
+
+def _normal_exit_pending_protocol(tmp_path, fault="none", effect="before"):
+    """Keep all handles alive until normal interpreter teardown, including failures."""
+    import finance_core.instance_admission.sessions as sessions
+    from finance_core.instance_admission import ProductionCloseUncertain
+
+    config = synthetic_config(tmp_path, pytest.MonkeyPatch())
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    owner = acquire_production_owner(config)
+    operation = production_write_operation(owner)
+    conn = operation.__enter__()
+    conn.execute("BEGIN IMMEDIATE")
+    cursors = [
+        conn.execute(
+            "WITH p(v) AS (SELECT ?) INSERT INTO participants(public_id,display_name) "
+            "SELECT v,v FROM p RETURNING public_id",
+            (value,),
+        )
+        for value in ("first-pending", "second-pending")
+    ]
+    assert conn.in_transaction
+    if fault != "none":
+        name = {
+            "rollback": "_rollback_sqlite_handle",
+            "cursor": "_close_cursor_handle",
+            "connection": "_close_sqlite_handle",
+        }[fault]
+        native = getattr(sessions, name)
+
+        def uncertain(handle):
+            if effect == "after":
+                native(handle)
+            raise sqlite3.OperationalError("synthetic unknown " + fault)
+
+        setattr(sessions, name, uncertain)
+        with pytest.raises(ProductionCloseUncertain):
+            operation.__exit__(None, None, None)
+        with pytest.raises(InstanceAdmissionError):
+            owner.close()
+        with pytest.raises(InstanceAdmissionError):
+            with production_write_operation(owner):
+                pytest.fail("uncertain owner issued another operation")
+        with pytest.raises(InstanceAdmissionError):
+            acquire_production_owner(config, timeout_seconds=0)
+    return profile.live_database, config, profile, owner, operation, conn, cursors
+
+
+@pytest.mark.parametrize(
+    ("fault", "effect", "exit_mode"),
+    [
+        ("none", "before", "normal"),
+        ("none", "before", "sys-exit"),
+        ("rollback", "before", "normal"),
+        ("rollback", "after", "normal"),
+        ("cursor", "before", "normal"),
+        ("cursor", "after", "normal"),
+        ("connection", "before", "normal"),
+        ("connection", "after", "normal"),
+    ],
+)
+def test_pending_writes_and_unknown_cleanup_have_no_facts_after_normal_exit(
+    tmp_path, fault, effect, exit_mode
+):
+    code = (
+        "import sys; from pathlib import Path; "
+        "from tests.test_instance_admission_v1 import _normal_exit_pending_protocol; "
+        "pending = _normal_exit_pending_protocol(Path(sys.argv[1]),sys.argv[2],sys.argv[3]); "
+        "print(pending[0], flush=True); " + ("sys.exit(0)" if exit_mode == "sys-exit" else "")
+    )
+    child = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path), fault, effect],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    database = Path(child.stdout.strip())
+    with sqlite3.connect(database, timeout=0) as raw:
+        assert raw.execute("SELECT COUNT(*) FROM participants").fetchone()[0] == 0

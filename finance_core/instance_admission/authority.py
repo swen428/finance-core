@@ -278,6 +278,10 @@ class _Lock:
 
     def assert_valid(self) -> None:
         self.config.assert_valid()
+        self._assert_file_valid()
+
+    def _assert_file_valid(self) -> None:
+        """Lease proof; a shared config must be proved in the same admission."""
         if self.pid != os.getpid() or self.fd < 0:
             raise InstanceAdmissionError("Closed or forked authority lease")
         opened, named = os.fstat(self.fd), (self.config.control_root / self.name).lstat()

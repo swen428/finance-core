@@ -111,27 +111,46 @@ leases for the complete SQLite connection lifetime. The ordered write path is:
 3. shared profile write gate;
 4. SQLite connection and transaction lifetime.
 
-The service owns commit and rollback for its business transaction. Every
-application-issued `execute()` statement and each `executemany()` item is
-checked against the current issued connection and authority before it reaches
-SQLite. The normal
-service-owned `commit()` and `rollback()` calls remain available; SQL
-`COMMIT`/`END` and an outer `RELEASE` are also checked before SQLite executes
-them. Production `executescript()` is refused. The connection stays at its
-default legacy transaction settings; changing `isolation_level` or
-`autocommit` is refused, and even assigning the same setting requires a current
-admission check. Bound parameters must use supported built-in values and
-containers; custom adapters and callback-driven parameter objects are refused
-so they cannot run Python code after admission checking. The supported service
-flow includes connection `commit()`, `rollback()`, and context-manager
-transaction handling. This is a narrow transaction-control boundary, not a
-general SQL sandbox. Leaving an operation rolls back only work that remains
-uncommitted, then closes the actual connection before releasing leases. If
-connection closure is uncertain, the connection and leases remain held until
-process exit; admission must not claim the connection was safely released. An
-owner cannot be explicitly closed while its operation is opening, active or
-cleaning up. A forked child cannot close an inherited owner to release the
-parent's lease.
+The service owns the business transaction. A production write operation
+opens an idle connection; it does not start or own the service transaction.
+The service must issue its existing explicit `BEGIN` (normally
+`BEGIN IMMEDIATE`) before a statement that writes. DML and main-schema writes
+are refused while the connection is idle, including ordinary DML and CTE
+`... RETURNING` statements. Reads may run while idle. This preserves the
+service's transaction boundary and prevents an implicit pending write from
+starting outside it.
+
+Every application-issued `execute()` is checked against the current issued
+connection and authority before SQLite sees it. Each `executemany()` row is
+normalized and receives a fresh full admission check immediately before it is
+passed to SQLite; a row is refused if the service ended its explicit
+transaction after an earlier row. The normal service-owned `commit()` and
+`rollback()` calls remain available. Python `commit()`, context-manager
+commit, SQL `COMMIT`/`END`, and an outer SQL `RELEASE` receive a full current
+admission check before their commit-capable action. Rollback remains available
+to abort work safely when write eligibility has been lost. Production
+`executescript()` is refused. This is a narrow transaction-control boundary,
+not a general SQL sandbox.
+
+The connection stays at its default legacy transaction settings; changing
+`isolation_level` or `autocommit` is refused, and even assigning the same
+setting requires a current admission check. Bound parameters must use
+supported built-in values and containers; custom adapters and callback-driven
+parameter objects are refused so they cannot run Python code after admission
+checking. The supported service flow retains connection `commit()`,
+`rollback()`, and default context-manager behavior; those mechanisms do not
+start a hidden transaction at operation open or permit an idle write.
+
+Operation cleanup latches closing, performs native rollback while a transaction
+is active, closes issued cursors, closes the actual connection, and only then
+releases lifetime and authority leases. If rollback or close is uncertain, the
+connection, cursors, owner and leases remain retained; the operation must not
+claim safe release. Retention protects ownership and blocks a competing owner
+or maintenance drain. The explicit-transaction rule and rollback-before-
+finalize cleanup provide the write-safety boundary; ordinary shutdown is not
+relied on to cancel an implicit pending write. An owner cannot be explicitly
+closed while its operation is opening, active or cleaning up. A forked child
+cannot close an inherited owner to release the parent's lease.
 
 Production writes require a connection issued by an active production write
 operation. Production reads use a real SQLite read-only connection. A legitimate
@@ -142,14 +161,69 @@ closed, stale, replaced, or caller-created connections are refused before
 financial work. These checks do not sandbox hostile code already trusted in
 the process and do not replace SQLite's own transaction rules.
 
+## Production SQL authorization
+
+Each factory-issued production connection uses a fixed private SQLite
+authorizer and `cached_statements=0`. Trusted connection configuration and
+the initial schema and migration-ledger validation happen before the authorizer
+is installed; installation completes before the connection is published to an
+application caller. No application SQL runs in that interval. If installation
+fails, the connection is not issued. The public connection API cannot replace
+or suspend this authorizer.
+
+The authorizer evaluates SQLite's actual compile-time actions rather than
+guessing from SQL text. It allows `SQLITE_READ`, `SQLITE_SELECT`, and
+`SQLITE_RECURSIVE`. `INSERT`, `UPDATE`, `DELETE`, and main-schema DDL actions
+are allowed only on a writable issued connection while SQLite reports an
+explicit transaction is active. This denies all idle writes, including CTE
+DML, without a keyword or substring heuristic. TEMP objects, virtual tables,
+attachments, and detachments are denied. Unknown actions and unsupported
+control verbs are denied; the callback does not use `SQLITE_IGNORE` to rewrite
+a query.
+
+The service remains the transaction owner. Its guarded `BEGIN` is allowed;
+commit-capable Python and SQL entry points receive their full current
+admission check before SQLite executes `COMMIT` or `END`, or an outer
+`RELEASE`. Native rollback is allowed as a safe abort, including cleanup after
+eligibility is lost. Savepoint `BEGIN`, `RELEASE`, and `ROLLBACK` are the
+supported verbs; an outer `RELEASE` gets the same full admission check as
+other commit-capable paths. Unknown verbs are denied. The authorizer itself
+performs a fixed action decision only: it does not issue SQL, consult
+filesystem or authority state, invoke caller callbacks, or recursively perform
+admission.
+
+`PRAGMA` authorization is finite:
+
+| PRAGMA | Caller-available form |
+| --- | --- |
+| `database_list`, `foreign_keys`, `busy_timeout` | Read only, with no argument. |
+| `table_info`, `table_xinfo`, `index_list`, `index_info`, `index_xinfo`, `foreign_key_list`, `foreign_key_check` | Read-only metadata query with either no argument (`None`) or a plain `str` object name. The string is used only as the metadata target. |
+| `defer_foreign_keys` | Getter is allowed. Setter is limited to `ON` or `1` on a writable connection already inside its explicit transaction. |
+| Any other PRAGMA or form | Denied. |
+
+Trusted setup retains its fixed `busy_timeout` and `foreign_keys=ON`
+configuration before authorizer installation. The `SQLITE_FUNCTION` action
+uses this fixed native-function allowlist: `char`, `coalesce`, `count`,
+`current_timestamp`, `glob`, `instr`, `json`, `json_array_length`,
+`json_extract`, `json_type`, `json_valid`, `length`, `like`, `lower`, `ltrim`,
+`max`, `min`, `printf`, `substr`, `sum`, `trim`, `typeof`, `upper`, and
+`zeroblob`. These names cover the installed Core schema, approved business
+queries, and fixed admission queries. The allowlist is an implementation
+compatibility boundary, not a financial rule and not a general SQL or Python
+sandbox. Caller-defined functions, extension loaders, and unlisted or unknown
+function actions are denied. The PRAGMA branches and function set are
+implemented in [`sessions.py`](../../finance_core/instance_admission/sessions.py)
+and must remain aligned with this contract.
+
 The existing staging guard remains valid with its current behavior. Financial
 services accept either their existing staging connection or a connection
 issued through this production admission boundary. Legacy APIs that accept an
 arbitrary path remain staging-only. Production authority is stored in the
 separate fixed control root; it adds no SQLite ledger migration and reuses Core
-migrations 001–060 unchanged. This change does not redesign SQLite's global
-authorizer or alter financial rules, calculation authority, evidence,
-confirmation, or migrations.
+migrations 001–060 unchanged. Its fixed authorizer is limited to
+factory-issued production connections and does not change
+`human_drafts.set_authorizer` or any other staging/D1 authorizer. Financial
+rules, calculation authority, evidence, and confirmation remain unchanged.
 
 ## Issued SQLite capability boundary
 
@@ -160,11 +234,11 @@ process.
 
 | Handle or capability | Production-session contract |
 | --- | --- |
-| Connection statements | `execute()` and each `executemany()` item are checked against the current session and authority. `executescript()` is refused. |
-| Connection transactions | `commit()`, `rollback()`, and the default legacy context-manager behavior remain available. `autocommit` and `isolation_level` stay at their configured legacy values; changing either requires a current admission check and a different value is refused. |
-| Connection and cursor lifetime | The operation closes the actual connection before releasing its leases. A cursor is created with the session's real cursor type, and its actual `close()` is allowed. A caller-supplied cursor factory cannot replace the session cursor. |
-| Cursor statements and results | Cursor `execute()` and each `executemany()` item are checked. `fetchone()`, `fetchmany()`, `fetchall()`, and iteration recheck the live session. `fetchmany(size)` accepts only `None` or an exact built-in `int`. Cursor `row_factory` accepts only the actual `None` or `sqlite3.Row` objects. `setinputsizes()` and `setoutputsize()` remain guarded no-op size hints. |
-| Row and text conversion | The connection must use the actual `sqlite3.Row` and `str` factories before SQL runs. Custom row factories and adapters cannot execute as part of a production statement. |
+| Connection statements | Each `execute()` receives a full current-session check. Every `executemany()` row is normalized and receives a fresh full admission check immediately before native binding/step; it is refused if the explicit write transaction ended. The SQL authorizer also checks SQLite's actual compile-time action. `executescript()` is refused. |
+| Connection transactions | The service explicitly starts its write transaction; admission does not start one. `commit()` and commit-capable context-manager/SQL paths require a full current admission check. `rollback()` remains available to abort safely. The default legacy context-manager behavior remains supported. `autocommit` and `isolation_level` stay at their configured legacy values; changing either requires a current admission check and a different value is refused. |
+| Connection and cursor lifetime | The operation strongly owns each issued cursor until its checked native `close()`. Dropping a caller reference cannot finalize a live cursor behind the owner. Cleanup rolls back before cursor finalization, closes issued cursors, and closes the actual connection before releasing leases. A caller-supplied cursor factory cannot replace the session cursor. |
+| Cursor statements and results | Cursor `execute()` and each `executemany()` item are checked. `fetchone()`, `fetchmany()`, `fetchall()`, iteration, and cursor reuse perform a full current-session check before native result consumption, conversion, or lookahead. `fetchmany(size)` accepts only `None` or an exact built-in `int`. Cursor `row_factory` accepts only the actual `None` or `sqlite3.Row` objects. `setinputsizes()` and `setoutputsize()` remain guarded no-op size hints. |
+| Row and text conversion | Before each result operation, the connection must still use the actual `sqlite3.Row` and `str` factories and the cursor row factory must be allowed. These checks precede conversion and native lookahead. Custom row factories and adapters cannot execute as part of a production statement. |
 | Simple diagnostics | `getconfig()`, `getlimit()`, and `interrupt()` require a valid issued session. Native status and metadata attributes such as `in_transaction`, `total_changes`, and cursor metadata are observations only; they do not authorize work or promise session liveness. |
 | Database transfer and serialization | `backup()`, `serialize()`, `deserialize()`, and `iterdump()` are refused. Production does not expose SQLite's incremental blob handle: `blobopen()` is refused for both writable and read-only sessions. Native backup and restore APIs are outside this work package. |
 | Extension and callback registration | `enable_load_extension()`, `load_extension()`, `create_function()`, `create_aggregate()`, `create_window_function()`, `create_collation()`, `set_authorizer()`, `set_progress_handler()`, and `set_trace_callback()` are refused on an issued production session. |
@@ -178,8 +252,9 @@ technically blocked. The supported application entry remains the guarded
 `execute()` or `executemany()` path. No general SQL parser or alternate callback
 sandbox is part of this boundary.
 
-The actual-close and lease-release guarantee covers a supported operation's
-connection and issued cursors, including a partially consumed issued cursor.
+On successful cleanup, the actual-close and lease-release guarantee covers a
+supported operation's connection and issued cursors, including a partially
+consumed issued cursor.
 Direct access to `Connection.__call__`, a returned native statement, base-class
 methods, a native cursor, or connection reinitialization is outside that
 contract. Such unsupported handles have no actual-close or descriptor-release
