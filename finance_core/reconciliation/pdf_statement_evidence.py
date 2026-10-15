@@ -295,8 +295,7 @@ def validate_canonical_normalized_amount_text(
         amount = money_decimal(value, label="PDF canonical normalized amount")
         if amount.is_zero() and amount.is_signed():
             raise ValueError
-        normalized = amount.normalize()
-        exponent = normalized.as_tuple().exponent
+        exponent = amount.as_tuple().exponent
         if not isinstance(exponent, int) or exponent < -2:
             raise ValueError
         if canonical_decimal_str(amount) != value:
