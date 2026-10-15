@@ -13,9 +13,12 @@ calculation snapshot or finalization permission.
 
 This internal entry is composed by trusted application code. It does not
 register a Telegram bot, transport, provider, network tool or production
-instance. All financial writes retain the existing staging-database and
-foreign-key guards. Synthetic signed adapters prove the port contract in
-tests; they are not production authentication.
+instance. Existing staging connections remain eligible under the staging and
+foreign-key guards. A production write instead requires a currently issued
+session from the [production instance admission boundary](instance_write_admission_v1.md),
+which the financial connection guard verifies. Per-posting confirmation,
+snapshot and evidence checks remain unchanged. Synthetic signed adapters prove
+the port contract in tests; they are not production authentication.
 
 ## Composition and complete review
 
@@ -245,13 +248,19 @@ review and fresh exact human confirmation are mandatory.
 The independent path is additive. Historical D1/D2 source and approval proofs,
 exceptions, conversion identities and financial guards retain their owning
 contracts. The stable public API/Bridge envelope and existing runtime tools
-are not enabled or replaced by this internal entry. Historical migrations
-remain byte-identical; new durable authority uses an appended migration and
-updated packaged migration-ledger identity.
+are not enabled or replaced by this internal entry. In this independent-posting
+and related financial-coordination contract, migrations 056–060 carry the
+append-only application records while earlier migration bytes remain
+unchanged. This describes SQLite financial coordination only. Production
+instance admission instead stores its authority in a separate fixed control
+root, adds no SQLite ledger migration, and reuses Core migrations 001–060
+unchanged; see [production instance write admission](instance_write_admission_v1.md).
 
-Use only synthetic inputs and temporary staging databases. Validation covers
-both routes before/after confirmation, wrong and stale bindings, competing
-approval/source replay, SQLite transaction ownership and concurrency,
+Use only synthetic inputs and temporary staging databases or production-shaped
+synthetic profiles admitted through the trusted API; this does not activate a
+real profile. Validation covers both routes before/after confirmation, wrong
+and stale bindings, competing approval/source replay, SQLite transaction
+ownership and concurrency,
 close/reopen at durable commit boundaries, projection drift, proof tampering,
 verified result recovery and legacy financial regressions. The Application
 dependency guard and a cold-process import must prove that the new entry

@@ -11,6 +11,9 @@ from finance_core.financial_audit import (
     append_financial_audit_event,
     derive_audit_event_public_id,
 )
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.parser_proposals.amendment_lineage import (
     TEXT_AMENDMENT_PARSER,
     TEXT_AMENDMENT_VERSION,
@@ -29,7 +32,6 @@ from finance_core.parser_proposals.receipt_supersession import (
     _require_full_proposal,
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
-from finance_core.staging_guard import require_staging_database
 
 
 def supersede_text_proposal(
@@ -45,7 +47,7 @@ def supersede_text_proposal(
     ai_lineage_authority=None,
     clock: Callable[[], str],
 ) -> dict[str, Any]:
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     _acquire_write_transaction(conn)
     try:
         parent = _require_full_proposal(conn, parser_output_id)

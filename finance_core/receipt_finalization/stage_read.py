@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from finance_core.staging_guard import require_staging_database
+from finance_core.instance_admission import require_finance_read_connection
 
 
 @dataclass(frozen=True)
@@ -58,7 +58,7 @@ def read_receipt_finalization_stage(
     authorization.  Nothing here derives monetary values or allocation
     semantics.
     """
-    require_staging_database(conn)
+    require_finance_read_connection(conn)
     if (
         not isinstance(receipt_public_id, str)
         or not receipt_public_id
@@ -159,7 +159,7 @@ def read_receipt_conversion_registry(
     later stages reconstruct from durable truth (mirroring the B5.1 runner,
     whose finalize stage never re-runs conversion).
     """
-    require_staging_database(conn)
+    require_finance_read_connection(conn)
     if (
         not isinstance(command_public_id, str)
         or not command_public_id

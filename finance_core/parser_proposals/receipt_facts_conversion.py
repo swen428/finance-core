@@ -46,6 +46,9 @@ from finance_core.financial_audit import (
     derive_audit_event_public_id,
     verify_financial_audit_chain,
 )
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
 from finance_core.parser_proposals.ai_fallback import (
     AiFallbackServiceError,
@@ -91,7 +94,7 @@ from finance_core.parser_proposals.receipt_total_parser import (
     FLAG_UNSUPPORTED_CURRENCY_FOR_AMOUNT,
 )
 from finance_core.sqlite_connection import ForeignKeysDisabledError, require_foreign_keys_enabled
-from finance_core.staging_guard import StagingDatabaseError, require_staging_database
+from finance_core.staging_guard import StagingDatabaseError
 
 # ---------------------------------------------------------------------------
 # Public errors (Section 7 taxonomy)
@@ -731,7 +734,7 @@ def _explicit_inclusion(pid: str, value: object) -> int:
 
 def _require_staging(conn: sqlite3.Connection) -> None:
     try:
-        require_staging_database(conn)
+        require_finance_write_connection(conn)
     except StagingDatabaseError as exc:
         raise ConversionStagingDatabaseRejectedError(str(exc)) from exc
     # R4-F1: the conversion write boundary depends on FK enforcement for its

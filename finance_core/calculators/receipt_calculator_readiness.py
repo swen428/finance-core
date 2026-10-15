@@ -75,6 +75,9 @@ from finance_core.calculators.receipt_calculator_input_mapping import (
     build_participant_list,
 )
 from finance_core.calculators.receipt_split_calculator import compute_exact_receipt_shares
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+)
 from finance_core.money import (
     MoneyValidationError,
     canonical_money_str,
@@ -96,7 +99,7 @@ from finance_core.parser_proposals.receipt_item_allocation_facts import (
     ReceiptItemAllocationFactsError,
     verify_receipt_item_allocation_fact_set_for_review,
 )
-from finance_core.staging_guard import StagingDatabaseError, require_staging_database
+from finance_core.staging_guard import StagingDatabaseError
 
 # ---------------------------------------------------------------------------
 # Public errors
@@ -231,7 +234,7 @@ def report_receipt_calculator_readiness(
     ordinary not-ready outcome.
     """
     try:
-        require_staging_database(conn)
+        require_finance_read_connection(conn)
     except StagingDatabaseError as exc:
         raise ReadinessStagingDatabaseRejectedError(str(exc)) from exc
 

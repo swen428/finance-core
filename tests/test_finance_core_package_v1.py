@@ -362,6 +362,7 @@ def _probe_installed_package(
                 "import hashlib, importlib.util, json, sys; "
                 f"sys.path.insert(0, {str(install_dir)!r}); "
                 "import finance_core; "
+                "import finance_core.instance_admission as instance_admission; "
                 "import dataclasses; "
                 "from finance_core.application.ai_invocation import AiInvocationService; "
                 "import finance_core.application.ai_invocation_contract as ai_contract; "
@@ -389,6 +390,16 @@ def _probe_installed_package(
                 "ExpectedInterpretationInputV2, VerifiedInterpretationInputV2); "
                 "print(json.dumps({"
                 "'api': finance_core.API_CONTRACT_VERSION, "
+                "'instance_admission_api': {name: "
+                "callable(getattr(instance_admission, name, None)) "
+                "for name in ("
+                "'prepare_production_profile', 'admit_production_instance', "
+                "'inspect_instance_admission', 'resume_authority_transition', "
+                "'acquire_production_owner', 'production_write_operation', "
+                "'production_read_operation', 'enter_maintenance_hold', "
+                "'inspect_maintenance_hold', 'abort_maintenance_hold', "
+                "'fence_production_instance', 'require_finance_write_connection', "
+                "'require_finance_read_connection')}, "
                 "'canonical': finance_core.canonical_money_str(Decimal('12.3'), 'SGD'), "
                 "'ai_service_module': AiInvocationService.__module__, "
                 "'ai_contract_module': ai_contract.__name__, "
@@ -538,6 +549,50 @@ def _assert_safe_text_payloads(payloads: list[bytes]) -> None:
     combined = b"\n".join(payloads).lower()
     for marker in PRIVATE_ARTIFACT_MARKERS:
         assert marker not in combined
+
+
+def _probe_installed_instance_flow(
+    runtime_python: Path,
+    install_dir: Path,
+    outside_dir: Path,
+    runtime_root: Path,
+) -> dict[str, object]:
+    """Reuse the finite signed fixture/dependency set prepared by the correction probe."""
+    helper_root = outside_dir / "independent-correction-fixtures"
+    assert (helper_root / "runtime-dependencies").is_dir()
+    for name in (
+        "instance_admission_business_support_v1.py",
+        "application_amendment_support_v1.py",
+        "test_application_amendment_v1.py",
+        "test_independent_ai_invocation_v1.py",
+        "independent_ai_candidate_fixture_v2.py",
+    ):
+        shutil.copyfile(REPOSITORY_ROOT / "tests" / name, helper_root / "tests" / name)
+    probe_path = helper_root / "installed_instance_admission_probe.py"
+    shutil.copyfile(REPOSITORY_ROOT / "tests" / probe_path.name, probe_path)
+    completed = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-S",
+            str(probe_path),
+            str(install_dir),
+            str(helper_root),
+            str(outside_dir),
+            str(runtime_root),
+            str(REPOSITORY_ROOT),
+        ],
+        check=True,
+        cwd=outside_dir,
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        # Full per-statement admission performs filesystem and authority checks
+        # throughout the real business graph; keep the complete installed proof
+        # bounded without making its runtime budget a financial acceptance rule.
+        timeout=360,
+    )
+    return json.loads(completed.stdout)
 
 
 def _probe_installed_runtime_boundary(
@@ -714,6 +769,23 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         correction_flow = _probe_installed_correction_flow(
             runtime_python, install_dir, outside_dir, runtime_root
         )
+        instance_flow = _probe_installed_instance_flow(
+            runtime_python, install_dir, outside_dir, runtime_root
+        )
+        assert instance_flow["sys_path_has_checkout"] is False
+        assert instance_flow["business"]["text_posted"] is True
+        assert instance_flow["business"]["receipt_posted"] is True
+        assert instance_flow["business"]["current_versions"] == [1, 1]
+        assert instance_flow["business"]["economic_events"] == 2
+        assert instance_flow["business"]["originals_unchanged"] is True
+        assert instance_flow["business"]["readonly_verified"] is True
+        assert instance_flow["module_files"]
+        assert all(
+            Path(path).resolve().is_relative_to(install_dir.resolve())
+            for path in instance_flow["module_files"].values()
+        )
+        assert len(payload["instance_admission_api"]) == 13
+        assert all(payload["instance_admission_api"].values())
         assert (
             Path(str(correction_flow["module_file"]))
             .resolve()

@@ -120,7 +120,7 @@ from finance_core.parser_proposals.decision_owner import (
     resolve_simple_expense_conversion_fields as resolve_simple_expense_conversion_fields,
 )
 from finance_core.parser_proposals.decision_owner import (
-    verify_converted_parser_proposal as verify_converted_parser_proposal,
+    verify_converted_parser_proposal as _verify_converted_parser_proposal_owner,
 )
 from finance_core.parser_proposals.human_drafts import (
     HumanDraftDecisionBinding,
@@ -130,6 +130,7 @@ from finance_core.parser_proposals.human_drafts import (
     require_current_human_draft_publication_in_transaction,
     require_human_draft_reject_capability_in_transaction,
 )
+from finance_core.staging_guard import require_staging_database
 from finance_core.telegram_source_context import (
     TelegramSourceContext,
     TelegramSourceContextError,
@@ -373,6 +374,8 @@ def confirm_parser_proposal(
     _caller_owns_transaction: bool = False,
 ) -> dict[str, Any]:
     """Preserve the existing legacy authority before neutral owning writes."""
+    _validate_human_command(authenticated_actor_id, actor_type, decision, confirmation_channel)
+    require_staging_database(conn)
     try:
         return decision_owner.confirm_parser_proposal(
             conn,
@@ -397,6 +400,23 @@ def confirm_parser_proposal(
         )
     except HumanDraftError as exc:
         raise ParserConfirmationError(str(exc)) from exc
+
+
+def verify_converted_parser_proposal(
+    conn: sqlite3.Connection,
+    parser_output_id: int,
+    *,
+    ai_lineage_authority=None,
+    text_posting_authorization=None,
+) -> dict[str, Any]:
+    """Legacy readback retains staging-only connection eligibility."""
+    require_staging_database(conn)
+    return _verify_converted_parser_proposal_owner(
+        conn,
+        parser_output_id,
+        ai_lineage_authority=ai_lineage_authority,
+        text_posting_authorization=text_posting_authorization,
+    )
 
 
 def convert_confirmed_parser_proposal(

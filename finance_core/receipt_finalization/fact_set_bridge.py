@@ -53,6 +53,10 @@ from finance_core.calculators.receipt_calculator_input_projection import (
     project_receipt_calculator_input,
 )
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
+)
 from finance_core.receipt_finalization.application_conditional import (
     APPLICATION_CONDITIONAL_VERSION,
     ApplicationConditionalAuthorityError,
@@ -298,7 +302,7 @@ def prepare_receipt_calculation(
     verification/write, under that same lock on fresh and replay paths. Its
     refusal rolls back this stage; it cannot replace financial authority.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     require_foreign_keys_enabled(conn)
     created_at = _now(clock)
 
@@ -1243,7 +1247,7 @@ def authorize_application_conditional_receipt_finalization(
     Trusted composition must supply supplementary source/decision revalidation
     through ``persistence_effect``; it runs under the lock after proof checks.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     require_foreign_keys_enabled(conn)
     created_at = _now(clock)
     conn.execute("BEGIN IMMEDIATE")
@@ -1629,7 +1633,7 @@ def finalize_prepared_receipt(
     group and its membership back with every other write and a subsequent
     fact-set supersession stays possible.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     prepared = authorization.prepared
     fin_input = _build_finalization_input(
         prepared,
@@ -1761,7 +1765,7 @@ def _load_persisted_receipt_finalization_authorization(
     Parameters
     ----------
     conn:
-        Open staging database connection (verified by ``require_staging_database``).
+        Guarded staging or admitted production operation connection.
     authorization_id:
         The deterministic authorization identity to recover.
 
@@ -1775,7 +1779,7 @@ def _load_persisted_receipt_finalization_authorization(
     BridgeRecoveryError
         If any durable record is missing, malformed, or contradictory.
     """
-    require_staging_database(conn)
+    require_finance_read_connection(conn)
     if not authorization_id or not authorization_id.strip():
         raise BridgeRecoveryError("authorization_id must be a non-empty string")
 

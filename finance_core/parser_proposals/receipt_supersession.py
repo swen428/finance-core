@@ -28,6 +28,9 @@ from finance_core.financial_audit import (
     append_financial_audit_event,
     derive_audit_event_public_id,
 )
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
 from finance_core.parser_proposals.amendment_lineage import (
     AmendmentPublicationAuthority,
@@ -55,7 +58,6 @@ from finance_core.parser_proposals.lifecycle import (
     validate_transition,
 )
 from finance_core.parser_proposals.repository import ParserProposalRepository
-from finance_core.staging_guard import require_staging_database
 
 # ---------------------------------------------------------------------------
 # Public errors
@@ -212,7 +214,7 @@ def supersede_receipt_total_proposal(
         correction_channel,
         correction_public_id,
     )
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
 
     _acquire_write_transaction(conn)
     try:

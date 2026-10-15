@@ -18,6 +18,9 @@ from finance_core.financial_audit import (
     append_financial_audit_event,
     derive_audit_event_public_id,
 )
+from finance_core.instance_admission import (
+    require_finance_write_connection,
+)
 from finance_core.parser_proposals.amendment_lineage import (
     AmendmentPublicationAuthority,
     refuse_legacy_amendment,
@@ -43,7 +46,6 @@ from finance_core.parser_proposals.lifecycle import (
 from finance_core.parser_proposals.repository import (
     ParserProposalRepository,
 )
-from finance_core.staging_guard import require_staging_database
 
 # ---------------------------------------------------------------------------
 # Public errors
@@ -156,7 +158,7 @@ def complete_proposal(
         completion_channel,
         completion_public_id,
     )
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
 
     public_id = completion_public_id
 

@@ -11,7 +11,7 @@ Key invariants:
 - Creates canonical transactions in the ``transactions`` table (migration 001).
 - Persists complete audit record with all authoritative IDs.
 - No runtime DDL -- migrations 020, 024, and 025 must be applied.
-- Staging databases only -- refuses ``database/finance.db``.
+- Factory-issued staging or admitted production operation connections only.
 """
 
 from __future__ import annotations
@@ -36,6 +36,10 @@ from finance_core.financial_audit import (
     AuditEventCommand,
     append_financial_audit_event,
     derive_audit_event_public_id,
+)
+from finance_core.instance_admission import (
+    require_finance_read_connection,
+    require_finance_write_connection,
 )
 from finance_core.money import (
     MoneyValidationError,
@@ -85,7 +89,6 @@ from finance_core.receipt_finalization.snapshot_authority import (
     read_snapshot_bound_authority,
 )
 from finance_core.sqlite_connection import require_foreign_keys_enabled
-from finance_core.staging_guard import require_staging_database
 
 CALCULATION_VERSION = "receipt_finalization_v2"
 ELIGIBLE_RECEIPT_GROUP_STATUSES = {"active", "calculated"}
@@ -192,7 +195,7 @@ def finalize_receipt_split(
     authority verification under the same lock; it cannot waive those checks.
     Replay invokes it after complete truth verification in the read snapshot.
     """
-    require_staging_database(conn)
+    require_finance_write_connection(conn)
     require_foreign_keys_enabled(conn)
     created_at = clock() if clock is not None else datetime.now(timezone.utc).isoformat()
 
@@ -549,7 +552,7 @@ def verify_finalized_receipt_split(
     receipt_posting_authorization=None,
 ) -> FinalizationOutput:
     """Read-only verification of a completed finalization's full durable graph."""
-    require_staging_database(conn)
+    require_finance_read_connection(conn)
     require_foreign_keys_enabled(conn)
     _require_schema(conn)
     fingerprint = build_finalization_content_fingerprint(fin_input)
