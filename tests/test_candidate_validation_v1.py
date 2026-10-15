@@ -130,6 +130,51 @@ def test_complete_exact_candidate_evidence_passes(bridge: bool) -> None:
     assert result["tested_tree"] == TREE and result["bridge_required"] is bridge
 
 
+def test_optional_bridge_accepts_actual_skipped_matrix_job_name() -> None:
+    evidence = sample(bridge=False)
+    skipped = next(job for job in evidence["jobs"]["jobs"] if job["name"] == "bridge")
+    skipped["name"] = "bridge (${{ matrix.os }})"
+    assert verify(evidence)["bridge_required"] is False
+
+
+def test_optional_bridge_preserves_existing_expanded_skipped_inventory() -> None:
+    evidence = sample(bridge=False)
+    skipped = next(job for job in evidence["jobs"]["jobs"] if job["name"] == "bridge")
+    evidence["jobs"]["jobs"].remove(skipped)
+    evidence["jobs"]["jobs"].extend(
+        {**skipped, "id": 1000 + index, "name": name}
+        for index, name in enumerate(sorted(VERIFIER.BRIDGE_JOBS))
+    )
+    evidence["jobs"]["total_count"] += 1
+    assert verify(evidence)["bridge_required"] is False
+
+
+@pytest.mark.parametrize("name", ["bridge (ubuntu-latest)", "bridge (unknown)"])
+def test_optional_bridge_rejects_partial_or_unknown_job_name(name: str) -> None:
+    evidence = sample(bridge=False)
+    skipped = next(job for job in evidence["jobs"]["jobs"] if job["name"] == "bridge")
+    skipped["name"] = name
+    with pytest.raises(ValueError, match="optional job inventory mismatch"):
+        verify(evidence)
+
+
+def test_optional_bridge_matrix_job_must_be_skipped() -> None:
+    evidence = sample(bridge=False)
+    skipped = next(job for job in evidence["jobs"]["jobs"] if job["name"] == "bridge")
+    skipped["name"] = "bridge (${{ matrix.os }})"
+    skipped["conclusion"] = "success"
+    with pytest.raises(ValueError, match="wrong or unsuccessful job evidence"):
+        verify(evidence)
+
+
+def test_required_bridge_rejects_unexpanded_matrix_job_name() -> None:
+    evidence = sample(bridge=True)
+    bridge = next(job for job in evidence["jobs"]["jobs"] if job["name"] in VERIFIER.BRIDGE_JOBS)
+    bridge["name"] = "bridge (${{ matrix.os }})"
+    with pytest.raises(ValueError, match="required job inventory mismatch"):
+        verify(evidence)
+
+
 def test_renaming_a_bridge_input_outside_its_directory_still_requires_bridge() -> None:
     evidence = sample()
     evidence["comparison"]["files"] = [

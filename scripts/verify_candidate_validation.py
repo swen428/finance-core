@@ -129,7 +129,12 @@ def verify(
         require(set(names) == CORE_JOBS | BRIDGE_JOBS, "required job inventory mismatch")
     else:
         require(
-            set(names) in (CORE_JOBS | {"bridge"}, CORE_JOBS | BRIDGE_JOBS),
+            set(names)
+            in (
+                CORE_JOBS | {"bridge"},
+                CORE_JOBS | {"bridge (${{ matrix.os }})"},
+                CORE_JOBS | BRIDGE_JOBS,
+            ),
             "optional job inventory mismatch",
         )
     for job in jobs:
