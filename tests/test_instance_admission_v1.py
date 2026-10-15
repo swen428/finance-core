@@ -58,6 +58,89 @@ def test_fence_is_permanent_and_reads_are_real_readonly(tmp_path, monkeypatch):
                 conn.execute("DELETE FROM schema_migrations")
 
 
+@pytest.mark.parametrize("successor", [False, True])
+def test_held_then_fenced_instance_reopens_real_forensics_without_write_revival(
+    tmp_path, monkeypatch, successor
+):
+    from finance_core.instance_admission import (
+        STATE_FILENAME,
+        abort_maintenance_hold,
+        enter_maintenance_hold,
+        inspect_instance_admission,
+        inspect_maintenance_hold,
+        require_finance_read_connection,
+    )
+
+    original_root = tmp_path / "original"
+    original_root.mkdir(mode=0o700)
+    config = synthetic_config(original_root, monkeypatch)
+    profile = prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved")
+    admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+    with acquire_production_owner(config) as owner:
+        with production_write_operation(owner) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO participants(public_id,display_name) VALUES ('historical','Original')"
+            )
+            conn.commit()
+        hold = enter_maintenance_hold(config, operation_id="held-original", approval_ref="approved")
+        for operation in (production_read_operation, production_write_operation):
+            with pytest.raises(InstanceAdmissionError):
+                with operation(owner):
+                    pytest.fail("ACTIVE maintenance hold issued an operation")
+        fence_production_instance(config, operation_id="fence-original", approval_ref="approved")
+    next_config = None
+    if successor:
+        next_root = tmp_path / "successor"
+        next_root.mkdir(mode=0o700)
+        next_config = synthetic_config(
+            next_root, monkeypatch, control_root=config.control_root, instance_id="fresh-successor"
+        )
+        prepare_production_profile(
+            next_config, operation_id="prepare-successor", approval_ref="approved"
+        ).close()
+        admit_production_instance(
+            next_config, operation_id="admit-successor", approval_ref="approved"
+        )
+        monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(profile.runtime))
+    expected_hold = hold["maintenance"]
+    assert inspect_instance_admission(config)["state"] == "FENCED"
+    assert inspect_maintenance_hold(config) == expected_hold
+    history = (config.control_root / STATE_FILENAME).read_bytes()
+    # Close/reacquire the actual process owner before historical SQL; successor
+    # admission must not transfer the original instance's write capability.
+    with acquire_production_owner(config) as reopened:
+        with production_read_operation(reopened) as conn:
+            require_finance_read_connection(conn)
+            cursor = conn.execute("SELECT public_id,display_name FROM participants")
+            assert tuple(cursor.fetchone()) == ("historical", "Original")
+            cursor.close()
+            assert conn.execute("SELECT COUNT(*) FROM financial_audit_events").fetchone()[0] == 0
+            with pytest.raises(InstanceAdmissionError, match="ACTIVE writable"):
+                require_finance_write_connection(conn)
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute(
+                    "INSERT INTO participants(public_id,display_name) VALUES ('revived','Refused')"
+                )
+            assert conn.total_changes == 0 and not conn.in_transaction
+        with pytest.raises(InstanceAdmissionError):
+            with production_write_operation(reopened):
+                pytest.fail("FENCED retained-hold instance revived write authority")
+        with pytest.raises(InstanceAdmissionError, match="cannot safely return"):
+            abort_maintenance_hold(
+                config,
+                operation_id="forbidden-abort",
+                approval_ref="approved",
+                evidence_ref="synthetic-zero-effects",
+            )
+    assert inspect_maintenance_hold(config) == expected_hold
+    assert (config.control_root / STATE_FILENAME).read_bytes() == history
+    if next_config is not None:
+        next_config.close()
+    profile.close()
+    config.close()
+
+
 def test_exact_journal_resume_after_publication_failure(tmp_path, monkeypatch):
     from finance_core.instance_admission import (
         PENDING_FILENAME,

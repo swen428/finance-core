@@ -240,7 +240,9 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
     from finance_core.instance_admission import (
         acquire_production_owner,
         admit_production_instance,
+        enter_maintenance_hold,
         fence_production_instance,
+        inspect_maintenance_hold,
         prepare_production_profile,
         production_read_operation,
         production_write_operation,
@@ -476,9 +478,13 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                         "ORDER BY snapshot_public_id"
                     )
                 )
+            retained_hold = enter_maintenance_hold(
+                config, operation_id="hold-business", approval_ref="approved"
+            )["maintenance"]
             fence_production_instance(
                 config, operation_id="fence-business", approval_ref="approved"
             )
+            assert inspect_maintenance_hold(config) == retained_hold
             with production_read_operation(owner) as conn:
                 reader = PostingService(
                     connection=conn,
@@ -514,6 +520,7 @@ def run_installed_business_probe(root: Path) -> dict[str, object]:
                 assert economic_events == 2
                 readonly_verified = conn.total_changes == 0 and not conn.in_transaction
                 assert readonly_verified
+            assert inspect_maintenance_hold(config) == retained_hold
         return {
             "text_posted": posted.state == "finalized",
             "receipt_posted": receipt_posted.state == "finalized",

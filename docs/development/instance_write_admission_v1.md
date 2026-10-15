@@ -84,12 +84,15 @@ the instance can be used again.
 Inspection and transition results expose the record fields `binding`,
 `db_identity`, `ledger_sha256`, `state`, `admission`, and `maintenance`. The
 state progresses from `PREPARED` to `ACTIVE`, or permanently to `FENCED`. A
-separate maintenance hold blocks production operations while maintenance is
-underway. The hold records the current admission and authority versions plus a
-protected baseline of the complete logical database contents, including
-declared application tables and SQLite sequence state, together with its
-validated schema and sealed migration ledger. Fixed profile role identities,
-ownership, permissions and manifest bytes are also protected. WAL placement and
+maintenance hold blocks production read and write operations while the
+instance remains `ACTIVE`. A legitimately fenced instance may still support a
+genuine read-only forensic session while the hold remains recorded; that read
+does not release the hold or restore write access. The hold records the current
+admission and authority versions plus a protected baseline of the complete
+logical database contents (including declared application tables and SQLite
+sequence state), its validated schema, and the sealed migration ledger. Fixed
+profile role identities, ownership, permissions and manifest bytes are also
+protected. WAL placement and
 checkpoint mechanics do not change the logical baseline. Auxiliary work,
 backup and restore payloads and the service's ACK state require their own
 consumer proofs. The Core compares its declared baseline again before a safe
@@ -153,13 +156,17 @@ closed while its operation is opening, active or cleaning up. A forked child
 cannot close an inherited owner to release the parent's lease.
 
 Production writes require a connection issued by an active production write
-operation. Production reads use a real SQLite read-only connection. A legitimate
-fenced instance may be read for forensics, but a fenced or maintenance-held
-instance cannot be written. The admission checks bind issued connections to
-the current process, owner, profile witness, and authority version. Forked,
-closed, stale, replaced, or caller-created connections are refused before
-financial work. These checks do not sandbox hostile code already trusted in
-the process and do not replace SQLite's own transaction rules.
+operation. Production reads use a real SQLite read-only connection. A
+legitimate `FENCED` instance may be read for forensics through that genuine
+read-only path, including while its maintenance hold remains recorded. An
+`ACTIVE` instance with a maintenance hold refuses both production reads and
+writes; a `FENCED` instance always refuses writes. Forensic reading leaves the
+state `FENCED` and does not release the hold or restore write access. The
+admission checks bind issued connections to the current process, owner, profile
+witness, and authority version. Forked, closed, stale, replaced, or
+caller-created connections are refused before financial work. These checks do
+not sandbox hostile code already trusted in the process or replace SQLite's
+own transaction rules.
 
 ## Production SQL authorization
 

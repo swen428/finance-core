@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from finance_core.profile_gate import initialize_profile_gate, writer_gate
+from finance_core.profile_gate import GateLease, initialize_profile_gate, writer_gate
 from finance_core.profile_layout import ProfileLayout, product_root, profile_root
 from finance_core.profile_paths import (
     _DIRECTORIES,
@@ -1178,12 +1178,13 @@ def _verify_record_database(
     from finance_core.profile_paths import _MANAGED_SQLITE_LIFETIME_LOCK
 
     profile = _profile(config, expected=record["db_identity"])
-    gate = writer_gate(profile)
+    gate: GateLease | None = None
     conn = None
     uncertain = False
     lifetime = False
     sqlite_began = False
     try:
+        gate = writer_gate(profile)
         _MANAGED_SQLITE_LIFETIME_LOCK.__enter__()
         lifetime = True
         _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
@@ -1227,12 +1228,17 @@ def _verify_record_database(
                 _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
                 raise ProductionBootstrapCloseUncertain(conn) from exc
         if not uncertain:
-            if sqlite_began:
-                _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
-            if lifetime:
-                _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
-            gate.close()
-            profile.close()
+            try:
+                if sqlite_began:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                if lifetime:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
+            finally:
+                try:
+                    if gate is not None:
+                        gate.close()
+                finally:
+                    profile.close()
 
 
 def inspect_instance_admission(config: TrustedInstanceConfig) -> dict[str, Any]:

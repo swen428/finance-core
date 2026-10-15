@@ -293,7 +293,10 @@ class _Witness:
         # installed migration bytes. No proof survives this admission call.
         state = _state(self.owner.config)
         record = _record(self.owner.config, state)
-        if state["version"] != self.authority_version or record["maintenance"] is not None:
+        if state["version"] != self.authority_version or (
+            record["maintenance"] is not None
+            and not (self.read_only and record["state"] == "FENCED")
+        ):
             raise InstanceAdmissionError("Production authority version/maintenance changed")
         if write and (
             self.read_only
@@ -697,7 +700,7 @@ def _operation(
         state = _state(owner.config)
         record = _record(owner.config, state)
         if (
-            record["maintenance"] is not None
+            (record["maintenance"] is not None and not (read_only and record["state"] == "FENCED"))
             or record["state"] not in {"ACTIVE", "FENCED"}
             or (
                 not read_only

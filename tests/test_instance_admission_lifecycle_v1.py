@@ -1419,6 +1419,70 @@ def test_maintenance_hold_denies_operations_until_bound_safe_abort(
             assert conn.execute("SELECT 1").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("pending_resume", [False, True])
+def test_authority_gate_acquisition_refusal_closes_real_pins_and_preserves_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pending_resume: bool
+) -> None:
+    from finance_core.instance_admission import authority
+
+    config = synthetic_config(tmp_path, monkeypatch)
+    prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved").close()
+    if pending_resume:
+        with monkeypatch.context() as publication:
+
+            def fail_replace(*_args, **_kwargs):
+                raise OSError("synthetic publication refusal")
+
+            publication.setattr(authority.os, "replace", fail_replace)
+            with pytest.raises(OSError, match="publication refusal"):
+                admit_production_instance(
+                    config, operation_id="admit-pending", approval_ref="approved"
+                )
+        assert (config.control_root / PENDING_FILENAME).is_file()
+    evidence = {path.name: path.read_bytes() for path in config.control_root.iterdir()}
+    original_profile = authority._profile
+    opened = []
+
+    def observe_profile(*args, **kwargs):
+        profile = original_profile(*args, **kwargs)
+        opened.append((profile, tuple(profile._pins.values())))
+        return profile
+
+    def refuse_gate(profile):
+        # These are directory/manifest pins, never extra SQLite main handles.
+        assert profile is opened[-1][0]
+        assert all(os.fstat(fd) for fd in opened[-1][1])
+        raise InstanceAdmissionBusy("synthetic gate acquisition refusal")
+
+    monkeypatch.setattr(authority, "_profile", observe_profile)
+    monkeypatch.setattr(authority, "writer_gate", refuse_gate)
+    try:
+        for _attempt in range(2):
+            with pytest.raises(InstanceAdmissionBusy, match="gate acquisition refusal"):
+                if pending_resume:
+                    resume_authority_transition(
+                        config, operation_id="admit-pending", approval_ref="approved"
+                    )
+                else:
+                    admit_production_instance(
+                        config, operation_id="admit-1", approval_ref="approved"
+                    )
+            profile, pins = opened[-1]
+            assert not profile._pins, "gate refusal leaked the real profile's pinned descriptors"
+            for fd in pins:
+                with pytest.raises(OSError):
+                    os.fstat(fd)
+            assert {
+                path.name: path.read_bytes() for path in config.control_root.iterdir()
+            } == evidence
+    finally:
+        # Preserve red-run diagnostics without letting a known leaked fixture
+        # contaminate later tests in this worker process.
+        for profile, _pins in opened:
+            profile.close()
+        config.close()
+
+
 @pytest.mark.skipif("fork" not in mp.get_all_start_methods(), reason="requires POSIX fork")
 def test_forked_or_caller_created_connection_is_rejected_before_sql_effects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
