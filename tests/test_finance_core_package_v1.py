@@ -14,6 +14,7 @@ import tomllib
 import zipfile
 from decimal import Decimal
 from pathlib import Path, PurePosixPath
+from time import monotonic
 
 import pytest
 
@@ -29,6 +30,8 @@ from finance_core.resources import (
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+INSTALLED_INSTANCE_TIMEOUT_SECONDS = 600
+INSTALLED_INSTANCE_STREAM_LIMIT = 64 * 1024
 PUBLIC_MONEY_EXPORTS = {
     "API_CONTRACT_VERSION",
     "SUPPORTED_CURRENCIES",
@@ -570,7 +573,7 @@ def _probe_installed_instance_flow(
         shutil.copyfile(REPOSITORY_ROOT / "tests" / name, helper_root / "tests" / name)
     probe_path = helper_root / "installed_instance_admission_probe.py"
     shutil.copyfile(REPOSITORY_ROOT / "tests" / probe_path.name, probe_path)
-    completed = subprocess.run(
+    return _run_installed_instance_child(
         [
             str(runtime_python),
             "-I",
@@ -582,17 +585,239 @@ def _probe_installed_instance_flow(
             str(runtime_root),
             str(REPOSITORY_ROOT),
         ],
-        check=True,
-        cwd=outside_dir,
-        env={"PATH": os.environ.get("PATH", "")},
-        capture_output=True,
-        text=True,
-        # Full per-statement admission performs filesystem and authority checks
-        # throughout the real business graph; keep the complete installed proof
-        # bounded without making its runtime budget a financial acceptance rule.
-        timeout=360,
+        install_dir,
+        outside_dir,
     )
-    return json.loads(completed.stdout)
+
+
+def _bounded_instance_output(output: bytes | None) -> str:
+    raw = output or b""
+    payload = raw.decode("utf-8", errors="replace").encode("utf-8")
+    if len(payload) <= INSTALLED_INSTANCE_STREAM_LIMIT:
+        return payload.decode("utf-8")
+    marker = f"\n...[truncated; total {len(raw)} bytes]...\n"
+    remaining = INSTALLED_INSTANCE_STREAM_LIMIT - len(marker.encode())
+    head = payload[: remaining // 2].decode("utf-8", errors="ignore")
+    tail = payload[-(remaining - remaining // 2) :].decode("utf-8", errors="ignore")
+    return head + marker + tail
+
+
+def _run_installed_instance_child(
+    command: list[str],
+    install_dir: Path,
+    outside_dir: Path,
+    *,
+    timeout_seconds: float = INSTALLED_INSTANCE_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    # Per-statement admission retains the complete real business graph. This
+    # finite resource cap does not replace any financial or isolation assertion.
+    started = monotonic()
+    failure = None
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            cwd=outside_dir,
+            env={"PATH": os.environ.get("PATH", "")},
+            capture_output=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        stdout, stderr = error.stdout, error.stderr
+        failure = f"timeout after {timeout_seconds:g}s"
+    else:
+        stdout, stderr = completed.stdout, completed.stderr
+        if completed.returncode:
+            failure = f"nonzero exit {completed.returncode}"
+        else:
+            try:
+                payload = json.loads(stdout)
+            except (ValueError, UnicodeDecodeError):
+                failure = "invalid JSON output"
+    elapsed = monotonic() - started
+    identity = f"installed-instance artifact={install_dir.name} elapsed={elapsed:.3f}s"
+    if failure is not None:
+        # Suppress exception chaining: subprocess exceptions retain unbounded
+        # captured streams, which must not reappear in the rendered traceback.
+        raise AssertionError(
+            f"{identity}: {failure}\n"
+            f"stdout:\n{_bounded_instance_output(stdout)}\n"
+            f"stderr:\n{_bounded_instance_output(stderr)}"
+        ) from None
+    print(f"{identity}: success\n{_bounded_instance_output(stderr)}", file=sys.stderr, flush=True)
+    return payload
+
+
+def test_installed_instance_child_success_preserves_json_and_diagnostics(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload = _run_installed_instance_child(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            "import json, sys; print(json.dumps(dict(ok=True))); "
+            'print("synthetic phase", file=sys.stderr, flush=True)',
+        ],
+        tmp_path / "wheel-installed",
+        tmp_path,
+    )
+    assert payload == {"ok": True}
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "artifact=wheel-installed elapsed=" in captured.err
+    assert "synthetic phase" in captured.err
+
+
+@pytest.mark.parametrize("complete_json", [False, True])
+def test_installed_instance_child_timeout_retains_partial_output(
+    tmp_path: Path, complete_json: bool
+) -> None:
+    output = '{"ok": true}' if complete_json else "partial stdout"
+    program = (
+        f"import sys, time; print({output!r}, flush=True); "
+        'print("synthetic phase", file=sys.stderr, flush=True); time.sleep(10)'
+    )
+    with pytest.raises(AssertionError, match="timeout after 1s") as failure:
+        _run_installed_instance_child(
+            [sys.executable, "-I", "-S", "-c", program],
+            tmp_path / "sdist-installed",
+            tmp_path,
+            timeout_seconds=1,
+        )
+    message = str(failure.value)
+    assert "artifact=sdist-installed elapsed=" in message
+    assert output in message
+    assert "synthetic phase" in message
+    assert failure.value.__cause__ is None
+    assert failure.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize(
+    ("program", "reason"),
+    [
+        ("import json, sys; print(json.dumps(dict(ok=True))); sys.exit(7)", "nonzero exit 7"),
+        ('print("not JSON")', "invalid JSON output"),
+        ('import sys; sys.stdout.buffer.write(b"\\xff")', "invalid JSON output"),
+    ],
+)
+def test_installed_instance_child_rejects_failed_or_invalid_result(
+    tmp_path: Path, program: str, reason: str
+) -> None:
+    with pytest.raises(AssertionError, match=reason) as failure:
+        _run_installed_instance_child(
+            [sys.executable, "-I", "-S", "-c", program],
+            tmp_path / "wheel-installed",
+            tmp_path,
+        )
+    assert "artifact=wheel-installed elapsed=" in str(failure.value)
+    assert failure.value.__cause__ is None
+    assert failure.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("unit", [b"x", b"\xff", "界".encode()])
+def test_installed_instance_output_truncation_bounds_rendered_bytes(unit: bytes) -> None:
+    rendered = _bounded_instance_output(unit * INSTALLED_INSTANCE_STREAM_LIMIT)
+    assert len(rendered.encode("utf-8")) <= INSTALLED_INSTANCE_STREAM_LIMIT
+    if unit != b"x":
+        assert "[truncated; total " in rendered
+    assert _bounded_instance_output(None) == ""
+
+
+def test_installed_instance_child_bounds_both_failure_streams(tmp_path: Path) -> None:
+    program = (
+        'import sys; print("out-head" + "x" * 70000 + "out-tail"); '
+        'print("err-head" + "y" * 70000 + "err-tail", file=sys.stderr); sys.exit(9)'
+    )
+    with pytest.raises(AssertionError, match="nonzero exit 9") as failure:
+        _run_installed_instance_child(
+            [sys.executable, "-I", "-S", "-c", program],
+            tmp_path / "wheel-installed",
+            tmp_path,
+        )
+    message = str(failure.value)
+    assert len(message.encode()) < 2 * INSTALLED_INSTANCE_STREAM_LIMIT + 200
+    assert message.count("[truncated; total ") == 2
+    assert all(marker in message for marker in ("out-head", "out-tail", "err-head", "err-tail"))
+    assert failure.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("business_fails", [False, True])
+def test_installed_instance_probe_entrypoint_diagnostics_and_exit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], business_fails: bool
+) -> None:
+    install_dir = tmp_path / "synthetic-installed"
+    core = install_dir / "finance_core"
+    core.mkdir(parents=True)
+    (core / "__init__.py").write_text("", encoding="utf-8")
+    helper_root = tmp_path / "synthetic-helpers"
+    helper_tests = helper_root / "tests"
+    helper_tests.mkdir(parents=True)
+    for name in (
+        "__init__.py",
+        "test_application_posting_recovery_v1.py",
+        "test_independent_corrections_v1.py",
+    ):
+        (helper_tests / name).write_text("", encoding="utf-8")
+    outcome = (
+        '    raise RuntimeError("synthetic business failure")\n'
+        if business_fails
+        else '    return {"synthetic": True}\n'
+    )
+    (helper_tests / "instance_admission_business_support_v1.py").write_text(
+        "import sys\n"
+        "def run_installed_business_probe(data_root):\n"
+        "    assert data_root.is_dir()\n"
+        "    for name in ('test_application_posting_recovery_v1', "
+        "'test_independent_corrections_v1'):\n"
+        "        assert sys.modules[name] is sys.modules['tests.' + name]\n" + outcome,
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-S",
+        str(REPOSITORY_ROOT / "tests/installed_instance_admission_probe.py"),
+        str(install_dir),
+        str(helper_root),
+        str(tmp_path),
+        str(tmp_path / "synthetic-runtime"),
+        str(REPOSITORY_ROOT),
+    ]
+    if business_fails:
+        with pytest.raises(AssertionError, match="nonzero exit 1") as failure:
+            _run_installed_instance_child(command, install_dir, tmp_path, timeout_seconds=5)
+        diagnostics = str(failure.value)
+        assert "RuntimeError: synthetic business failure" in diagnostics
+        assert "business-start" in diagnostics
+        assert "business-end" not in diagnostics
+        assert "json-output-start" not in diagnostics
+        assert "main-return" not in diagnostics
+    else:
+        payload = _run_installed_instance_child(command, install_dir, tmp_path, timeout_seconds=5)
+        assert payload == {
+            "business": {"synthetic": True},
+            "module_files": {"finance_core": str((core / "__init__.py").resolve())},
+            "sys_path_has_checkout": False,
+        }
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        stages = [line.split()[1] for line in captured.err.splitlines()[1:] if line]
+        assert stages == [
+            "imports-start",
+            "imports-end",
+            "isolation-start",
+            "isolation-end",
+            "business-start",
+            "business-end",
+            "final-modules-start",
+            "final-modules-end",
+            "json-output-start",
+            "json-output-end",
+            "main-return",
+        ]
+        assert "synthetic-runtime" not in captured.err
 
 
 def _probe_installed_runtime_boundary(
