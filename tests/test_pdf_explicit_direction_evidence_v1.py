@@ -7,7 +7,7 @@ import json
 import sqlite3
 from dataclasses import replace
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
@@ -315,6 +315,8 @@ def test_ambiguous_dollar_prefix_requires_authoritative_currency_context() -> No
         " 12.34",
         "12.34 ",
         "12.345",
+        "12.340",
+        "12.00",
         "--12.34",
         "+-12.34",
         "-0",
@@ -335,6 +337,38 @@ def test_normalized_amount_text_rejects_noncanonical_values(value: str) -> None:
 def test_normalized_amount_text_accepts_canonical_values(value: str) -> None:
     amount = Decimal(value)
     assert validate_canonical_normalized_amount_text(value, relational_amount=amount) == amount
+
+
+@pytest.mark.parametrize(
+    ("precision", "value"),
+    [
+        (6, "12345.678"),
+        (28, "123456789012345678901234567890.123"),
+    ],
+)
+def test_normalized_amount_text_rejects_subcent_values_at_any_precision(
+    precision: int, value: str
+) -> None:
+    with localcontext() as context:
+        context.prec = precision
+        with pytest.raises(ValueError, match="canonical normalized amount"):
+            validate_canonical_normalized_amount_text(value)
+
+
+@pytest.mark.parametrize(
+    ("precision", "value"),
+    [
+        (6, "12345.67"),
+        (28, "123456789012345678901234567890.12"),
+    ],
+)
+def test_normalized_amount_text_accepts_two_places_at_any_precision(
+    precision: int, value: str
+) -> None:
+    with localcontext() as context:
+        context.prec = precision
+        amount = Decimal(value)
+        assert validate_canonical_normalized_amount_text(value) == amount
 
 
 def test_parser_does_not_select_year_account_or_reference_as_amount() -> None:

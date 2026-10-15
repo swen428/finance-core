@@ -13,7 +13,18 @@ Covers:
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import (
+    ROUND_DOWN,
+    ROUND_HALF_EVEN,
+    ROUND_UP,
+    Clamped,
+    Decimal,
+    Inexact,
+    Overflow,
+    Rounded,
+    Underflow,
+    localcontext,
+)
 
 import pytest
 
@@ -500,6 +511,88 @@ class TestCanonicalDecimalStr:
         """Large values must not produce scientific notation."""
         result = canonical_decimal_str(Decimal("12345678901234.56"))
         assert "e" not in result.lower()
+
+    @pytest.mark.parametrize("precision", [6, 28, 50])
+    @pytest.mark.parametrize("rounding", [ROUND_DOWN, ROUND_HALF_EVEN, ROUND_UP])
+    @pytest.mark.parametrize("trap", [False, True])
+    @pytest.mark.parametrize("seed_flags", [False, True])
+    def test_finite_serialization_ignores_context_and_preserves_flags(
+        self, precision, rounding, trap, seed_flags
+    ):
+        cases = (
+            (Decimal("12345.67"), "12345.67"),
+            (Decimal("12345.6700"), "12345.67"),
+            (Decimal("-0.000"), "0"),
+            (Decimal("-100.0100"), "-100.01"),
+            (Decimal("1E+50"), "1" + "0" * 50),
+            (Decimal("1E-50"), "0." + "0" * 49 + "1"),
+            (
+                Decimal("0.1000000000000000000000000000000000000001"),
+                "0.1000000000000000000000000000000000000001",
+            ),
+        )
+        with localcontext() as ctx:
+            ctx.prec = precision
+            ctx.rounding = rounding
+            ctx.traps[Inexact] = trap
+            ctx.traps[Rounded] = trap
+            ctx.clear_flags()
+            if seed_flags:
+                ctx.flags[Inexact] = True
+                ctx.flags[Rounded] = True
+            before = ctx.flags.copy()
+            for value, expected in cases:
+                assert canonical_decimal_str(value) == expected
+                assert dict(ctx.flags) == before
+
+    def test_extreme_finite_exponents_ignore_tight_context_exponent_limits(self):
+        with localcontext() as context:
+            context.prec = 6
+            context.Emax = 6
+            context.Emin = -6
+            context.clamp = 1
+            for signal in (Clamped, Inexact, Overflow, Rounded, Underflow):
+                context.traps[signal] = True
+            context.clear_flags()
+            before = dict(context.flags)
+            assert canonical_decimal_str(Decimal("1E+50")) == "1" + "0" * 50
+            assert canonical_decimal_str(Decimal("1E-50")) == "0." + "0" * 49 + "1"
+            assert dict(context.flags) == before
+
+    def test_long_coefficient_with_trailing_zeros_remains_exact(self):
+        spelling = "123" + "0" * 10_000 + ".4500"
+        with localcontext() as context:
+            context.prec = 6
+            context.traps[Inexact] = True
+            context.traps[Rounded] = True
+            assert canonical_decimal_str(Decimal(spelling)) == spelling[:-2]
+
+    def test_plain_output_length_boundary_counts_sign_and_decimal_point(self):
+        limit = 1_048_576
+        assert len(canonical_decimal_str(Decimal("1E+1048575"))) == limit
+        assert len(canonical_decimal_str(Decimal("-1E+1048574"))) == limit
+        assert len(canonical_decimal_str(Decimal("1E-1048574"))) == limit
+
+    @pytest.mark.parametrize(
+        "value",
+        [Decimal("1E+1048576"), Decimal("-1E+1048575"), Decimal("1E-1048575")],
+    )
+    def test_overlong_plain_output_is_refused_before_rendering_without_context_mutation(
+        self, value
+    ):
+        with localcontext() as context:
+            context.prec = 6
+            context.traps[Inexact] = True
+            context.traps[Rounded] = True
+            context.flags[Inexact] = True
+            before = dict(context.flags)
+            with pytest.raises(MoneyValidationError, match="maximum plain-decimal length"):
+                canonical_decimal_str(value)
+            assert dict(context.flags) == before
+
+    def test_zero_with_extreme_exponent_never_expands(self):
+        assert canonical_decimal_str(Decimal("0E+1000000000")) == "0"
+        assert canonical_decimal_str(Decimal("-0E-1000000000")) == "0"
 
     # -- rejects -----------------------------------------------------------
 

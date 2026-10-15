@@ -357,11 +357,14 @@ def require_same_currency(
 # ---------------------------------------------------------------------------
 
 
+_MAX_CANONICAL_DECIMAL_CHARS = 1_048_576
+
+
 def canonical_decimal_str(amount: Decimal) -> str:
     """Serialize a Decimal as a normalised canonical string.
 
-    Equivalent finite Decimal values always produce the same string
-    regardless of how they were constructed::
+    Equivalent finite Decimal values whose plain text fits the representation
+    bound always produce the same string regardless of construction::
 
         canonical_decimal_str(Decimal("12.300")) -> "12.3"
         canonical_decimal_str(Decimal("12.000")) -> "12"
@@ -373,7 +376,8 @@ def canonical_decimal_str(amount: Decimal) -> str:
     hashing and content-addressable identifiers.
 
     Scientific notation is never emitted; all output uses plain decimal
-    notation.
+    notation. Text exceeding 1,048,576 characters raises MoneyValidationError
+    before expansion, independent of the active Decimal context.
 
     For monetary snapshots that must preserve currency-scale semantics
     (e.g. two-decimal SGD amounts), use ``canonical_money_str()``
@@ -387,20 +391,36 @@ def canonical_decimal_str(amount: Decimal) -> str:
         raise MoneyValidationError(
             f"canonical_decimal_str requires a finite Decimal, got {amount!r}"
         )
-    # Strip trailing zeros and normalise.
-    normalized = amount.normalize()
-    # Canonicalise negative zero to plain zero.
-    if normalized == Decimal("-0"):
+    # Decimal.normalize() rounds to the ambient context before stripping zeros.
+    # Work from the exact coefficient and exponent so serialization is lossless
+    # and does not set Decimal context flags or trigger its traps.
+    sign_tuple, digits, exponent = amount.as_tuple()
+    if not any(digits):
         return "0"
+    exp: int = int(exponent) if isinstance(exponent, int) else 0
+    trailing_zeros = 0
+    for digit in reversed(digits):
+        if digit != 0:
+            break
+        trailing_zeros += 1
+    if trailing_zeros:
+        digits = digits[:-trailing_zeros]
+        exp += trailing_zeros
+
+    sign: int = 1 if sign_tuple else 0  # 1 = negative, 0 = positive/zero
+    if exp >= 0:
+        output_length = sign + len(digits) + exp
+    elif -exp >= len(digits):
+        output_length = sign + 2 - exp  # "0." + leading zeros + digits
+    else:
+        output_length = sign + len(digits) + 1  # decimal point within digits
+    if output_length > _MAX_CANONICAL_DECIMAL_CHARS:
+        raise MoneyValidationError("canonical_decimal_str exceeds maximum plain-decimal length")
 
     # Build a plain-decimal string from the sign/digits/exponent tuple.
-    # This avoids scientific notation that Decimal.normalize() can produce
-    # for values like Decimal("100.0") → "1E+2".
-    sign_tuple, digits, exponent = normalized.as_tuple()
-    sign: int = 1 if sign_tuple else 0  # 1 = negative, 0 = positive/zero
+    # This avoids scientific notation for values like Decimal("100.0").
     body = "".join(str(d) for d in digits)
 
-    exp: int = int(exponent) if isinstance(exponent, int) else 0
     if exp > 0:
         body += "0" * exp
     elif exp < 0:
