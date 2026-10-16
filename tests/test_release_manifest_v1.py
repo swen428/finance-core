@@ -272,6 +272,10 @@ def _write_valid_release_fixture(
         project.read_text(),
         flags=re.DOTALL,
     )
+    # Keep this synthetic release fixture on its fixed 0.1.6 identity.
+    project_source = re.sub(
+        r'(?m)^version = "[^"]+"$', 'version = "0.1.6"', project_source, count=1
+    )
     if media:
         extra = "\n[project.optional-dependencies]\n" + json.dumps(extra_name)
         extra += " = " + json.dumps(list(media_dependencies)) + "\n"
@@ -863,12 +867,16 @@ def test_release_manifest_rejects_unexpected_artifact_directory_content(
 
 
 def test_release_manifest_rejects_uninspected_package_payloads(tmp_path: Path) -> None:
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     _write_fake_packages(artifacts)
 
     completed = subprocess.run(
-        _manifest_command(artifacts),
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
         capture_output=True,
         text=True,
     )
