@@ -74,6 +74,127 @@ def test_neutral_owner_preserves_legacy_exception_identity():
     assert owner.ProposalConversionError is legacy.ProposalConversionError
 
 
+@pytest.mark.parametrize("field", ["amount", "description", "public_id"])
+def test_canonical_text_drift_preserves_direct_and_application_error_boundary(
+    migrated_temp_db_connection, field
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.parser_proposals import decision_owner
+
+    conn = migrated_temp_db_connection
+    service, review, proposal, _intake, decision_id, _display = _prepare_text_subject(
+        conn, suffix="canonical-error-" + field
+    )
+    posted = service.submit_post(review.review_id, decision_id)
+    triggers = ["trg_correction_transactions_no_update"]
+    if field == "description":
+        triggers.append("application_amendment_transaction_metadata_freeze")
+    if field == "public_id":
+        triggers.append("application_posting_attempts_guard_update")
+    definitions = [
+        conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+        for name in triggers
+    ]
+    for name in triggers:
+        conn.execute("DROP TRIGGER " + name)
+    if field == "amount":
+        conn.execute("UPDATE transactions SET amount=amount+1")
+    elif field == "description":
+        conn.execute("UPDATE transactions SET description='unapproved description'")
+    else:
+        # Keep referential integrity while changing the canonical destination's
+        # public identity. The conversion registry still points to its real id.
+        conn.execute("PRAGMA defer_foreign_keys=ON")
+        changed_id = posted.transaction_public_id + "-changed"
+        conn.execute("UPDATE transactions SET public_id=?", (changed_id,))
+        conn.execute(
+            "UPDATE application_posting_attempts SET transaction_public_id=?", (changed_id,)
+        )
+    for definition in definitions:
+        conn.execute(definition)
+    conn.commit()
+    assert conn.execute("PRAGMA foreign_key_check").fetchone() is None
+    tables = (
+        "application_posting_decisions",
+        "application_posting_attempts",
+        "application_posting_events",
+        "parser_proposal_conversion_audit",
+        "financial_audit_events",
+        "transactions",
+    )
+    counts = [conn.execute("SELECT count(*) FROM " + table).fetchone()[0] for table in tables]
+    before = conn.total_changes
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    try:
+        for operation in (
+            lambda: decision_owner.verify_converted_parser_proposal(
+                conn, proposal["id"], **service._text_kwargs(posted.attempt_id)
+            ),
+            lambda: service.get_status(posted.attempt_id),
+        ):
+            with pytest.raises(decision_owner.ProposalConversionError) as error:
+                operation()
+            assert type(error.value) is decision_owner.ProposalConversionError
+            assert conn.total_changes == before and conn.in_transaction
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+    with pytest.raises(decision_owner.ProposalConversionError) as error:
+        service.resume_post(posted.attempt_id)
+    assert type(error.value) is decision_owner.ProposalConversionError
+    assert conn.total_changes == before
+    assert [
+        conn.execute("SELECT count(*) FROM " + table).fetchone()[0] for table in tables
+    ] == counts
+
+
+@pytest.mark.parametrize("error_type", ["conversion", "type", "key"])
+def test_application_preserves_unmarked_conversion_reader_errors(
+    migrated_temp_db_connection, monkeypatch, error_type
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.parser_proposals import decision_owner
+
+    conn = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display = _prepare_text_subject(conn)
+    posted = service.submit_post(review.review_id, decision_id)
+    error = {
+        "conversion": decision_owner.ProposalConversionError("unmarked conversion refusal"),
+        "type": TypeError("unexpected reader type"),
+        "key": KeyError("unexpected reader key"),
+    }[error_type]
+
+    def unavailable_reader(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(decision_owner, "verify_converted_parser_proposal", unavailable_reader)
+    before = conn.total_changes
+    counts = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT (SELECT count(*) FROM application_posting_events),"
+            "(SELECT count(*) FROM parser_proposal_conversion_audit),"
+            "(SELECT count(*) FROM financial_audit_events),(SELECT count(*) FROM transactions)"
+        )
+    ]
+    for operation in (service.get_status, service.resume_post):
+        with pytest.raises(type(error)) as caught:
+            operation(posted.attempt_id)
+        assert caught.value is error
+        assert conn.total_changes == before
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT (SELECT count(*) FROM application_posting_events),"
+            "(SELECT count(*) FROM parser_proposal_conversion_audit),"
+            "(SELECT count(*) FROM financial_audit_events),(SELECT count(*) FROM transactions)"
+        )
+    ] == counts
+
+
 def test_neutral_confirmation_and_conversion_use_one_verified_human_decision(
     migrated_temp_db_connection,
 ):

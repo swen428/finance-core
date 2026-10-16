@@ -1443,9 +1443,17 @@ class PostingService:
                     (proposal_row[0],),
                 ).fetchone()
                 if converted is not None:
-                    result = decision_owner.verify_converted_parser_proposal(
-                        self._conn, proposal_row[0], **self._text_kwargs(attempt_id)
-                    )
+                    try:
+                        result = decision_owner.verify_converted_parser_proposal(
+                            self._conn, proposal_row[0], **self._text_kwargs(attempt_id)
+                        )
+                    except decision_owner.ProposalConversionError as exc:
+                        if (
+                            getattr(exc, "_parser_audit_read_failure", None)
+                            is not decision_owner._PARSER_AUDIT_READ_FAILURE
+                        ):
+                            raise
+                        raise PostingError("Independent parser audit material changed") from exc
                     transaction = result["transaction_public_id"]
                     self._verify_parser_audit(
                         material,

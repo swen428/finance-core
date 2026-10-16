@@ -116,6 +116,9 @@ class ProposalConversionError(ParserConfirmationError):
     """Base error for deterministic proposal-to-transaction conversion."""
 
 
+_PARSER_AUDIT_READ_FAILURE = object()
+
+
 def _require_legacy_conversion_target(conn: sqlite3.Connection, parser_output_id: int) -> None:
     """Keep compatibility callers on their original authority without platform imports."""
     require_staging_database(conn)
@@ -634,9 +637,15 @@ def _require_existing_conversion_truth(
         raise ProposalConversionError(
             "Canonical parser transaction drifted from its confirmed proposal"
         )
-    verify_parser_proposal_audit(
-        conn, int(proposal["id"]), transaction_public_id=conversion["transaction_public_id"]
-    )
+    try:
+        verify_parser_proposal_audit(
+            conn, int(proposal["id"]), transaction_public_id=conversion["transaction_public_id"]
+        )
+    except ProposalConversionError as exc:
+        # Preserve the direct owner's exception while identifying this boundary
+        # for Application callers; canonical failures above remain unmarked.
+        setattr(exc, "_parser_audit_read_failure", _PARSER_AUDIT_READ_FAILURE)
+        raise
 
 
 def _read_accepted_posting_review(
