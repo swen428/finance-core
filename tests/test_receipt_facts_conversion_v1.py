@@ -3662,3 +3662,86 @@ def test_raising_clock_rolls_back_completely(
 
     assert not conn.in_transaction
     assert table_counts(conn) == before
+
+
+@pytest.mark.parametrize("history_stage", ["conversion", "fact_set", "finalized"])
+def test_readonly_conversion_review_accepts_completed_receipt_history(
+    tmp_path, monkeypatch, history_stage
+):
+    from test_application_posting_recovery_v1 import _prepare_receipt_subject
+
+    from finance_core.parser_proposals import receipt_facts_conversion as owner
+
+    values = _prepare_receipt_subject(tmp_path, "audit-review-history")
+    conn, _workspace, _manifest, service, review, _proposal, _intake, decision, *_rest = values
+    try:
+        from finance_core.application import posting as posting_owner
+
+        def stop(stage):
+            if stage == {
+                "conversion": "after_conversion_commit",
+                "fact_set": "after_fact_set_commit",
+            }.get(history_stage):
+                raise RuntimeError("stop after committed owner effect")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(posting_owner, "_failure_injection_hook", stop)
+            if history_stage == "finalized":
+                assert service.submit_post(review.review_id, decision).state == "finalized"
+            else:
+                with pytest.raises(RuntimeError, match="committed owner effect"):
+                    service.submit_post(review.review_id, decision)
+        row = conn.execute(
+            "SELECT command_public_id,receipt_id FROM receipt_proposal_conversions"
+        ).fetchone()
+        receipt = conn.execute("SELECT public_id FROM receipts WHERE id=?", (row[1],)).fetchone()[0]
+        chain = verify_financial_audit_chain(
+            conn, aggregate_type="receipt", aggregate_public_id=receipt
+        )
+        assert chain.valid and chain.event_count == (1 if history_stage == "conversion" else 2)
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        before = conn.total_changes
+        owner.verify_receipt_proposal_conversion_for_review(conn, row[0])
+        if history_stage != "conversion":
+            with pytest.raises(owner.ConversionPersistenceError):
+                owner._verify_replay_integrity(conn, owner._get_registry_row(conn, row[0]))
+        assert conn.in_transaction and conn.total_changes == before
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+    finally:
+        conn.close()
+
+
+def test_readonly_conversion_review_rejects_wrong_persisted_state(
+    migrated_temp_db_connection, tmp_path, monkeypatch
+):
+    from dataclasses import replace
+
+    from finance_core.parser_proposals import receipt_facts_conversion as owner
+
+    conn = migrated_temp_db_connection
+    seed_people(conn)
+    _pid, proposal, expected = seed_confirmed_receipt_proposal(conn, tmp_path, "audit-review-state")
+    cmd = command("audit_review_state", proposal, expected)
+    append = owner.append_financial_audit_event
+
+    def faulty_append(connection, audit_command):
+        return append(connection, replace(audit_command, new_state={"wrong": True}))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "append_financial_audit_event", faulty_append)
+        converted = convert(conn, cmd)
+    assert verify_financial_audit_chain(
+        conn, aggregate_type="receipt", aggregate_public_id=converted.receipt_public_id
+    ).valid
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        with pytest.raises(owner.ConversionPersistenceError):
+            owner.verify_receipt_proposal_conversion_for_review(conn, cmd.command_public_id)
+        assert conn.in_transaction and conn.total_changes == before
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")

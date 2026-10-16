@@ -387,6 +387,24 @@ def _verify_owner_history(
             )
         ):
             raise AmendmentLineageError("Independent text child lifecycle evidence changed")
+    from finance_core.financial_audit.chain import _normalize_timestamp
+
+    if row["publication_kind"] == "completion":
+        from finance_core.parser_proposals.completion import _parser_source_references
+
+        references = tuple(sorted(_parser_source_references(base)))
+        published = conn.execute(
+            "SELECT created_at FROM parser_proposal_completions WHERE completion_public_id=?",
+            (publication_id,),
+        ).fetchone()
+        expected_time = _normalize_timestamp(published[0])
+    else:
+        references = tuple(
+            sorted((f"parser-output:{base['public_id']}", f"source:{base['source_public_id']}"))
+        )
+        if parent_events[0]["created_at"] != child_events[0]["created_at"]:
+            raise AmendmentLineageError("Amendment lifecycle timestamps changed")
+        expected_time = _normalize_timestamp(parent_events[0]["created_at"])
     audit_id = derive_audit_event_public_id(
         aggregate_type="parser_proposal",
         aggregate_public_id=base["public_id"],
@@ -400,6 +418,14 @@ def _verify_owner_history(
     if (
         audit is None
         or not chain.valid
+        or audit.aggregate_type != "parser_proposal"
+        or audit.aggregate_public_id != base["public_id"]
+        or audit.event_type != event_type
+        or audit.source_evidence_references != references
+        or audit.correlation_public_id != base["public_id"]
+        or audit.calculation_snapshot_public_id is not None
+        or audit.calculation_snapshot_hash is not None
+        or audit.created_at != expected_time
         or audit.actor_type != "human"
         or audit.actor_public_id != actor
         or audit.authorization_public_id != publication_id

@@ -47,6 +47,7 @@ from finance_core.financial_audit import (
     verify_financial_audit_chain,
 )
 from finance_core.instance_admission import (
+    require_finance_read_connection,
     require_finance_write_connection,
 )
 from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
@@ -856,7 +857,9 @@ receipt as historical drift; the two consumers must never diverge.
 """
 
 
-def _verify_replay_integrity(conn: sqlite3.Connection, existing: dict[str, Any]) -> None:
+def _verify_replay_integrity(
+    conn: sqlite3.Connection, existing: dict[str, Any], *, require_chain_head: bool = True
+) -> None:
     """Round 3/4 replay hardening: never trust the registry row alone.
 
     Before an exact replay returns, the current ``receipts`` row, the
@@ -1019,7 +1022,12 @@ def _verify_replay_integrity(conn: sqlite3.Connection, existing: dict[str, Any])
     ).fetchone()
     if attachment_row is None or receipt["attachment_path"] != attachment_row[0]:
         raise ConversionPersistenceError(_REPLAY_DRIFT_MESSAGE)
-    _verify_replay_audit_binding(conn, existing, receipt_public_id=str(receipt["public_id"]))
+    _verify_replay_audit_binding(
+        conn,
+        existing,
+        receipt_public_id=str(receipt["public_id"]),
+        require_chain_head=require_chain_head,
+    )
 
 
 def _verify_replay_audit_binding(
@@ -1027,6 +1035,7 @@ def _verify_replay_audit_binding(
     existing: dict[str, Any],
     *,
     receipt_public_id: str,
+    require_chain_head: bool = True,
 ) -> None:
     """R4-F5: verify the full audit semantic binding on replay.
 
@@ -1135,7 +1144,8 @@ def _verify_replay_audit_binding(
     if (
         fetched.sequence_number != 1
         or fetched.previous_event_hash != ZERO_AUDIT_HASH
-        or chain_check.event_count != 1
+        or require_chain_head
+        and chain_check.event_count != 1
     ):
         raise ConversionPersistenceError(_REPLAY_AUDIT_DRIFT_MESSAGE)
 
@@ -3679,4 +3689,29 @@ __all__ = [
     "decimal_from_numeric_mirror",
     "derive_receipt_public_id",
     "resolve_receipt_conversion_payload_fields",
+    "verify_receipt_proposal_conversion_for_review",
 ]
+
+
+def verify_receipt_proposal_conversion_for_review(
+    conn: sqlite3.Connection, command_public_id: str
+) -> None:
+    """SELECT-only verification of a conversion beneath later receipt history.
+
+    Later audit events are checked for chain integrity, not certified as owner
+    facts by this reader. The write replay's original head-only rule is unchanged.
+    """
+    require_finance_read_connection(conn)
+    if not isinstance(command_public_id, str) or not command_public_id.strip():
+        raise ConversionPersistenceError("Conversion command identity is invalid")
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN DEFERRED")
+    try:
+        existing = _get_registry_row(conn, command_public_id)
+        if existing is None:
+            raise ConversionPersistenceError("Conversion registry owner is absent")
+        _verify_replay_integrity(conn, existing, require_chain_head=False)
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            conn.rollback()

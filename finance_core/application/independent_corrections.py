@@ -373,7 +373,7 @@ class IndependentCorrectionService:
             source_evidence_references=source.evidence_refs,
         )
 
-    def _verify_audit(self, command: AuditEventCommand) -> None:
+    def _verify_audit(self, command: AuditEventCommand, *, previous_state: object) -> None:
         event = FinancialAuditRepository(self._conn).fetch(command.event_public_id)
         if event is None or any(
             (
@@ -382,6 +382,7 @@ class IndependentCorrectionService:
                 event.event_type != command.event_type,
                 event.event_payload_json != canonical_json_text(command.event_payload),
                 event.new_state_json != canonical_json_text(command.new_state),
+                event.previous_state_json != canonical_json_text(previous_state),
                 event.actor_type != command.actor_type,
                 event.actor_public_id != command.actor_public_id,
                 event.correlation_public_id != command.correlation_public_id,
@@ -454,6 +455,7 @@ class IndependentCorrectionService:
         facts: set[str] = set()
         snapshots: set[str] = set()
         decisions: set[str] = set()
+        previous_audit_state = None
         for v in versions:
             if anchor is None:
                 raise IndependentCorrectionIntegrityError(
@@ -524,7 +526,8 @@ class IndependentCorrectionService:
             if _object(v["result_json"]) != result or digest != v["result_hash"]:
                 raise IndependentCorrectionIntegrityError("Committed correction result changed")
             command = self._audit_command(source, p, result, digest)
-            self._verify_audit(command)
+            self._verify_audit(command, previous_state=previous_audit_state)
+            previous_audit_state = command.new_state
             events.add(command.event_public_id)
             decisions.add(v["correction_id"])
             if material is not None:
