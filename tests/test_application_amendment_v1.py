@@ -1058,3 +1058,113 @@ def test_receipt_chain_preserves_ocr_source_snapshot_and_final_metadata(
 
 def _digest_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+@pytest.mark.parametrize("kind", ["completion", "text_supersession"])
+@pytest.mark.parametrize("fault", ["references", "correlation", "time", "snapshot"])
+def test_readonly_amendment_rejects_chain_valid_audit_metadata(
+    migrated_temp_db_connection, monkeypatch, kind, fault
+):
+    from finance_core.financial_audit import verify_financial_audit_chain
+    from finance_core.parser_proposals import completion, text_supersession
+    from finance_core.parser_proposals.amendment_lineage import (
+        AmendmentLineageError,
+        verify_amendment_record,
+    )
+
+    connection = migrated_temp_db_connection
+    _posting, _review, proposal, *_rest = _prepare_text_subject(connection, "audit-metadata")
+    service = _amendment_service(connection)
+    review = service.prepare(proposal["public_id"])
+    fields = {"merchant": "Another Cafe"} if kind == "completion" else {"amount": "13.50"}
+    _new_evidence(connection, review, fields)
+    module = completion if kind == "completion" else text_supersession
+    append = module.append_financial_audit_event
+
+    def faulty_append(conn, command):
+        changes = {
+            "references": {
+                "source_evidence_references": (*command.source_evidence_references, "source:extra")
+            },
+            "correlation": {"correlation_public_id": "wrong-parent"},
+            "time": {"created_at": "2020-01-01T00:00:00Z"},
+            "snapshot": {
+                "calculation_snapshot_public_id": "unexpected-snapshot",
+                "calculation_snapshot_hash": "f" * 64,
+            },
+        }[fault]
+        return append(conn, dataclasses.replace(command, **changes))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module, "append_financial_audit_event", faulty_append)
+        try:
+            service.amend(review.review_id, "amendment-evidence-one", "audit-amendment")
+        except AmendmentError:
+            pass
+    row = connection.execute("SELECT * FROM application_amendment_records").fetchone()
+    if row is None:
+        # New publication validation rolls the injected write back. Exercise
+        # historical read refusal separately, restoring all immutable guards.
+        service.amend(review.review_id, "amendment-evidence-one", "audit-amendment")
+        row = connection.execute("SELECT * FROM application_amendment_records").fetchone()
+        from test_independent_corrections_v1 import _run_temporary_schema_corruption
+
+        from finance_core.financial_audit import FinancialAuditRepository
+        from finance_core.financial_audit.chain import _event_hash
+
+        event_id = connection.execute(
+            "SELECT event_public_id FROM financial_audit_events WHERE aggregate_public_id=?",
+            (proposal["public_id"],),
+        ).fetchone()[0]
+        event = FinancialAuditRepository(connection).fetch(event_id)
+        changes = {
+            "references": {
+                "source_evidence_references": tuple(
+                    sorted((*event.source_evidence_references, "source:extra"))
+                )
+            },
+            "correlation": {"correlation_public_id": "wrong-parent"},
+            "time": {"created_at": "2020-01-01T00:00:00.000000Z"},
+            "snapshot": {
+                "calculation_snapshot_public_id": "unexpected-snapshot",
+                "calculation_snapshot_hash": "f" * 64,
+            },
+        }[fault]
+        changed = dataclasses.replace(event, **changes)
+        digest = _event_hash(
+            changed,
+            previous_state_hash=changed.previous_state_hash,
+            new_state_hash=changed.new_state_hash,
+        )
+        _run_temporary_schema_corruption(
+            connection,
+            trigger_names=("trg_financial_audit_events_no_update",),
+            mutation_sql=(
+                "UPDATE financial_audit_events SET source_evidence_refs_json=?,"
+                "correlation_public_id=?,created_at=?,calculation_snapshot_public_id=?,"
+                "calculation_snapshot_hash=?,event_hash=? WHERE event_public_id=?"
+            ),
+            parameters=(
+                json.dumps(list(changed.source_evidence_references)),
+                changed.correlation_public_id,
+                changed.created_at,
+                changed.calculation_snapshot_public_id,
+                changed.calculation_snapshot_hash,
+                digest,
+                event_id,
+            ),
+        )
+    assert row is not None and row["publication_kind"] == kind
+    assert verify_financial_audit_chain(
+        connection, aggregate_type="parser_proposal", aggregate_public_id=proposal["public_id"]
+    ).valid
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("BEGIN")
+    before = connection.total_changes
+    try:
+        with pytest.raises(AmendmentLineageError):
+            verify_amendment_record(connection, row)
+        assert connection.total_changes == before and connection.in_transaction
+    finally:
+        connection.rollback()
+        connection.execute("PRAGMA query_only=OFF")

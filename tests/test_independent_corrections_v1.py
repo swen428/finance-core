@@ -1564,3 +1564,76 @@ def test_missing_or_bad_signed_correction_authority_evidence_is_atomic(
         assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         reopened.close()
+
+
+def test_readonly_correction_rejects_nonnull_genesis_previous_state(
+    migrated_temp_db_connection, monkeypatch
+):
+    from finance_core.application import independent_corrections as owner
+
+    connection = migrated_temp_db_connection
+    posting, posted, authority = _posted_text(connection, "audit-genesis")
+    service = _correction_service(posting, authority=authority)
+    plan = service.prepare_correction(posted.transaction_public_id, {"amount": "13.50"}, "fix")
+    decision_id = _persist_correction_approval(
+        connection, plan, decision_id="audit-genesis-decision"
+    )
+    append = owner.append_financial_audit_event
+
+    def faulty_append(conn, command):
+        return append(conn, replace(command, previous_state={"unexpected": "genesis"}))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(owner, "append_financial_audit_event", faulty_append)
+        try:
+            service.submit(plan.plan_id, decision_id)
+        except IndependentCorrectionIntegrityError:
+            pass
+    if (
+        connection.execute("SELECT count(*) FROM application_correction_versions").fetchone()[0]
+        == 0
+    ):
+        # Fresh owners now reject this fault before commit. Reproduce an older
+        # durable malformed event in a disposable DB to exercise the read boundary.
+        service.submit(plan.plan_id, decision_id)
+        from finance_core.calculation.authoritative_snapshot import canonical_json_text
+        from finance_core.financial_audit import FinancialAuditRepository, financial_state_hash
+        from finance_core.financial_audit.chain import _event_hash
+
+        event_id = connection.execute(
+            "SELECT event_public_id FROM financial_audit_events "
+            "WHERE event_type='independent_transaction_correction_applied'"
+        ).fetchone()[0]
+        event = FinancialAuditRepository(connection).fetch(event_id)
+        changed = replace(
+            event,
+            previous_state_json=canonical_json_text({"unexpected": "genesis"}),
+            previous_state_hash=financial_state_hash({"unexpected": "genesis"}),
+        )
+        digest = _event_hash(
+            changed,
+            previous_state_hash=changed.previous_state_hash,
+            new_state_hash=changed.new_state_hash,
+        )
+        _run_temporary_schema_corruption(
+            connection,
+            trigger_names=("trg_financial_audit_events_no_update",),
+            mutation_sql=(
+                "UPDATE financial_audit_events SET previous_state_json=?,"
+                "previous_state_hash=?,event_hash=? WHERE event_public_id=?"
+            ),
+            parameters=(changed.previous_state_json, changed.previous_state_hash, digest, event_id),
+        )
+    assert verify_financial_audit_chain(
+        connection, aggregate_type="transaction", aggregate_public_id=posted.transaction_public_id
+    ).valid
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("BEGIN")
+    before = connection.total_changes
+    try:
+        with pytest.raises(IndependentCorrectionIntegrityError):
+            service.read_effective(posted.transaction_public_id)
+        assert connection.in_transaction and connection.total_changes == before
+    finally:
+        connection.rollback()
+        connection.execute("PRAGMA query_only=OFF")

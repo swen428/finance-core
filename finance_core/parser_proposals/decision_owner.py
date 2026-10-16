@@ -16,8 +16,10 @@ from finance_core.calculation.authoritative_snapshot import (
 )
 from finance_core.financial_audit import (
     AuditEventCommand,
+    FinancialAuditRepository,
     append_financial_audit_event,
     derive_audit_event_public_id,
+    verify_financial_audit_chain,
 )
 from finance_core.instance_admission import (
     require_finance_read_connection,
@@ -112,6 +114,9 @@ class UnsupportedProposalTypeError(ParserConfirmationError):
 
 class ProposalConversionError(ParserConfirmationError):
     """Base error for deterministic proposal-to-transaction conversion."""
+
+
+_PARSER_AUDIT_READ_FAILURE = object()
 
 
 def _require_legacy_conversion_target(conn: sqlite3.Connection, parser_output_id: int) -> None:
@@ -632,6 +637,15 @@ def _require_existing_conversion_truth(
         raise ProposalConversionError(
             "Canonical parser transaction drifted from its confirmed proposal"
         )
+    try:
+        verify_parser_proposal_audit(
+            conn, int(proposal["id"]), transaction_public_id=conversion["transaction_public_id"]
+        )
+    except ProposalConversionError as exc:
+        # Preserve the direct owner's exception while identifying this boundary
+        # for Application callers; canonical failures above remain unmarked.
+        setattr(exc, "_parser_audit_read_failure", _PARSER_AUDIT_READ_FAILURE)
+        raise
 
 
 def _read_accepted_posting_review(
@@ -922,8 +936,7 @@ def _epoch_from_iso(value: str) -> int:
     return int(parsed.timestamp())
 
 
-def _append_parser_decision_audit(
-    conn: sqlite3.Connection,
+def _parser_decision_audit_command(
     *,
     proposal: dict[str, Any],
     from_status: str,
@@ -934,7 +947,7 @@ def _append_parser_decision_audit(
     content_hash: str,
     actor_id: str,
     decided_at: str,
-) -> None:
+) -> AuditEventCommand:
     event_type = f"parser_proposal_{decision}"
     aggregate_id = str(proposal["public_id"])
     event_id = derive_audit_event_public_id(
@@ -943,50 +956,51 @@ def _append_parser_decision_audit(
         event_type=event_type,
         causation_public_id=confirmation_public_id,
     )
-    append_financial_audit_event(
-        conn,
-        AuditEventCommand(
-            event_public_id=event_id,
-            aggregate_type="parser_proposal",
-            aggregate_public_id=aggregate_id,
-            event_type=event_type,
-            event_payload={
-                "decision": decision,
-                "reason": reason,
-                "proposal_content_hash": content_hash,
-                "confirmation_channel": "persisted_authorization",
-            },
-            previous_state={
-                "parse_status": from_status,
-                "raw_intake_status": raw_intake_status_for_proposal_status(from_status),
-                "proposal_content_hash": content_hash,
-                "conversion_status": "not_converted",
-            },
-            new_state={
-                "parse_status": to_status,
-                "raw_intake_status": raw_intake_status_for_proposal_status(to_status),
-                "proposal_content_hash": content_hash,
-                "conversion_status": "not_converted",
-            },
-            actor_type="human",
-            actor_public_id=actor_id,
-            authorization_public_id=confirmation_public_id,
-            source_evidence_references=_parser_source_references(proposal),
-            correlation_public_id=aggregate_id,
-            causation_public_id=confirmation_public_id,
-            created_at=decided_at,
-        ),
+    return AuditEventCommand(
+        event_public_id=event_id,
+        aggregate_type="parser_proposal",
+        aggregate_public_id=aggregate_id,
+        event_type=event_type,
+        event_payload={
+            "decision": decision,
+            "reason": reason,
+            "proposal_content_hash": content_hash,
+            "confirmation_channel": "persisted_authorization",
+        },
+        previous_state={
+            "parse_status": from_status,
+            "raw_intake_status": raw_intake_status_for_proposal_status(from_status),
+            "proposal_content_hash": content_hash,
+            "conversion_status": "not_converted",
+        },
+        new_state={
+            "parse_status": to_status,
+            "raw_intake_status": raw_intake_status_for_proposal_status(to_status),
+            "proposal_content_hash": content_hash,
+            "conversion_status": "not_converted",
+        },
+        actor_type="human",
+        actor_public_id=actor_id,
+        authorization_public_id=confirmation_public_id,
+        source_evidence_references=_parser_source_references(proposal),
+        correlation_public_id=aggregate_id,
+        causation_public_id=confirmation_public_id,
+        created_at=decided_at,
     )
 
 
-def _append_parser_conversion_audit(
-    conn: sqlite3.Connection,
+def _append_parser_decision_audit(conn: sqlite3.Connection, **kwargs: Any) -> None:
+    append_financial_audit_event(conn, _parser_decision_audit_command(**kwargs))
+
+
+def _parser_conversion_audit_command(
     *,
     proposal: dict[str, Any],
     authorization: dict[str, Any],
     content_hash: str,
     transaction_public_id: str,
-) -> None:
+    created_at: str,
+) -> AuditEventCommand:
     event_type = "parser_proposal_converted"
     aggregate_id = str(proposal["public_id"])
     event_id = derive_audit_event_public_id(
@@ -1000,30 +1014,36 @@ def _append_parser_conversion_audit(
         "raw_intake_status": raw_intake_status_for_proposal_status(CONFIRMED),
         "proposal_content_hash": content_hash,
     }
+    return AuditEventCommand(
+        event_public_id=event_id,
+        aggregate_type="parser_proposal",
+        aggregate_public_id=aggregate_id,
+        event_type=event_type,
+        event_payload={
+            "transaction_public_id": transaction_public_id,
+            "proposal_content_hash": content_hash,
+        },
+        previous_state={**stable_state, "conversion_status": "not_converted"},
+        new_state={
+            **stable_state,
+            "conversion_status": "converted",
+            "transaction_public_id": transaction_public_id,
+        },
+        actor_type="human",
+        actor_public_id=str(authorization["authenticated_actor_id"]),
+        authorization_public_id=str(authorization["confirmation_public_id"]),
+        source_evidence_references=_parser_source_references(proposal),
+        correlation_public_id=aggregate_id,
+        causation_public_id=transaction_public_id,
+        created_at=created_at,
+    )
+
+
+def _append_parser_conversion_audit(conn: sqlite3.Connection, **kwargs: Any) -> None:
     append_financial_audit_event(
         conn,
-        AuditEventCommand(
-            event_public_id=event_id,
-            aggregate_type="parser_proposal",
-            aggregate_public_id=aggregate_id,
-            event_type=event_type,
-            event_payload={
-                "transaction_public_id": transaction_public_id,
-                "proposal_content_hash": content_hash,
-            },
-            previous_state={**stable_state, "conversion_status": "not_converted"},
-            new_state={
-                **stable_state,
-                "conversion_status": "converted",
-                "transaction_public_id": transaction_public_id,
-            },
-            actor_type="human",
-            actor_public_id=str(authorization["authenticated_actor_id"]),
-            authorization_public_id=str(authorization["confirmation_public_id"]),
-            source_evidence_references=_parser_source_references(proposal),
-            correlation_public_id=aggregate_id,
-            causation_public_id=transaction_public_id,
-            created_at=datetime.now(timezone.utc).isoformat(),
+        _parser_conversion_audit_command(
+            **kwargs, created_at=datetime.now(timezone.utc).isoformat()
         ),
     )
 
@@ -1217,3 +1237,139 @@ def _converted_transaction_public_id(
     )
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
     return f"{CONVERTED_TRANSACTION_PUBLIC_ID_PREFIX}_po{proposal['id']}_pc{digest[:16]}"
+
+
+def _verify_parser_audit_command(conn, command, *, verify_time):
+    from finance_core.financial_audit.chain import _canonical_references, _normalize_timestamp
+
+    event = FinancialAuditRepository(conn).fetch(command.event_public_id)
+    chain = verify_financial_audit_chain(
+        conn, aggregate_type=command.aggregate_type, aggregate_public_id=command.aggregate_public_id
+    )
+    identities = conn.execute(
+        "SELECT event_public_id FROM financial_audit_events WHERE aggregate_type=? "
+        "AND aggregate_public_id=? AND event_type=?",
+        (command.aggregate_type, command.aggregate_public_id, command.event_type),
+    ).fetchall()
+    if event is None or not chain.valid or [r[0] for r in identities] != [command.event_public_id]:
+        raise ProposalConversionError("Parser audit event identity changed")
+    for name in (
+        "audit_schema_version",
+        "aggregate_type",
+        "aggregate_public_id",
+        "event_type",
+        "actor_type",
+        "actor_public_id",
+        "authorization_public_id",
+        "correlation_public_id",
+        "causation_public_id",
+        "calculation_snapshot_public_id",
+        "calculation_snapshot_hash",
+    ):
+        if getattr(event, name) != getattr(command, name):
+            raise ProposalConversionError("Parser audit metadata changed")
+    if (
+        event.event_payload_json != canonical_json_text(command.event_payload)
+        or event.previous_state_json != canonical_json_text(command.previous_state)
+        or event.new_state_json != canonical_json_text(command.new_state)
+        or event.source_evidence_references
+        != _canonical_references(command.source_evidence_references)
+        or verify_time
+        and event.created_at != _normalize_timestamp(command.created_at)
+    ):
+        raise ProposalConversionError("Parser audit semantic material changed")
+
+
+def verify_parser_proposal_audit(
+    conn: sqlite3.Connection, parser_output_id: int, *, transaction_public_id: str | None = None
+) -> None:
+    """Verify persisted parser decision/conversion audit semantics using SELECTs only.
+
+    Lifecycle evidence supplies the confirmation's actual prior status and reason.
+    Conversion timestamps have no independent equal-value durable anchor; their
+    canonical integrity remains checked by the audit repository and chain.
+    """
+    require_finance_read_connection(conn)
+    owns_snapshot = not conn.in_transaction
+    if owns_snapshot:
+        conn.execute("BEGIN DEFERRED")
+    try:
+        proposal = _require_proposal(ParserProposalRepository(conn), parser_output_id)
+        authorization = ParserAuthorizationRepository(conn).get_for_proposal(parser_output_id)
+        content_hash = compute_effective_proposal_content_hash(conn, proposal)
+        if authorization is None or (
+            authorization["proposal_content_hash"] != content_hash
+            or authorization["confirmation_state"] not in ("confirmed", "rejected")
+            or authorization["revoked_at"] is not None
+        ):
+            raise ProposalConversionError("Parser audit authorization changed")
+        confirmation = authorization["confirmation_public_id"]
+        lifecycle = []
+        for row in conn.execute(
+            "SELECT * FROM parser_proposal_events WHERE parser_output_id=? "
+            "AND event_type IN ('confirmed','rejected')",
+            (parser_output_id,),
+        ):
+            material = json.loads(row["event_payload"])
+            if not isinstance(material, dict):
+                raise ProposalConversionError("Parser confirmation lifecycle payload changed")
+            if material.get("authoritative_confirmation_id") == confirmation:
+                lifecycle.append((row, material))
+        if len(lifecycle) != 1:
+            raise ProposalConversionError("Parser confirmation lifecycle is not unique")
+        row, material = lifecycle[0]
+        decision = authorization["confirmation_state"]
+        if (
+            row["to_status"] != decision
+            or row["event_type"] != decision
+            or row["actor_type"] != "user"
+            or row["actor_identifier"] != authorization["authenticated_actor_id"]
+            or material
+            != {
+                "authoritative_confirmation_id": confirmation,
+                "proposal_content_hash": content_hash,
+                "authenticated_actor_id": authorization["authenticated_actor_id"],
+                "decision": decision,
+                "final_transaction_created": False,
+                "raw_input_preserved": True,
+                "parser_payload_preserved": True,
+            }
+        ):
+            raise ProposalConversionError("Parser confirmation lifecycle changed")
+        validate_transition(row["from_status"], decision)
+        command = _parser_decision_audit_command(
+            proposal=proposal,
+            from_status=row["from_status"],
+            to_status=decision,
+            decision=decision,
+            reason=row["event_reason"],
+            confirmation_public_id=confirmation,
+            content_hash=content_hash,
+            actor_id=authorization["authenticated_actor_id"],
+            decided_at=authorization["decided_at"],
+        )
+        _verify_parser_audit_command(conn, command, verify_time=True)
+        if transaction_public_id is not None:
+            conversion = ParserConversionRepository(conn).get_for_proposal(parser_output_id)
+            if conversion is None or (
+                conversion["transaction_public_id"] != transaction_public_id
+                or conversion["confirmation_public_id"] != confirmation
+                or conversion["proposal_content_hash"] != content_hash
+                or conversion["authenticated_actor_id"] != authorization["authenticated_actor_id"]
+                or decision != "confirmed"
+            ):
+                raise ProposalConversionError("Parser conversion audit owner changed")
+            _verify_parser_audit_command(
+                conn,
+                _parser_conversion_audit_command(
+                    proposal=proposal,
+                    authorization=authorization,
+                    content_hash=content_hash,
+                    transaction_public_id=transaction_public_id,
+                    created_at="",
+                ),
+                verify_time=False,
+            )
+    finally:
+        if owns_snapshot and conn.in_transaction:
+            conn.rollback()

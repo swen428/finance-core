@@ -63,11 +63,6 @@ from finance_core.calculation.authoritative_snapshot import (
     canonical_json_value,
 )
 from finance_core.calculators.receipt_split_calculator import calculate_receipt_split
-from finance_core.financial_audit import (
-    FinancialAuditRepository,
-    derive_audit_event_public_id,
-    verify_financial_audit_chain,
-)
 from finance_core.intake.receipt_ocr_proposal import get_receipt_ocr_extraction_status_for_proposal
 from finance_core.parser_proposals import decision_owner
 from finance_core.parser_proposals.amendment_lineage import (
@@ -1053,43 +1048,21 @@ class PostingService:
         return row, material, decision
 
     def _verify_parser_audit(self, material, decision, confirmation_id, event_type, causation):
-        proposal_id = material["proposal_public_id"]
-        chain = verify_financial_audit_chain(
-            self._conn,
-            aggregate_type="parser_proposal",
-            aggregate_public_id=proposal_id,
-        )
-        event_id = derive_audit_event_public_id(
-            aggregate_type="parser_proposal",
-            aggregate_public_id=proposal_id,
-            event_type=event_type,
-            causation_public_id=causation,
-        )
-        event = FinancialAuditRepository(self._conn).fetch(event_id)
-        if (
-            event is None
-            or not chain.valid
-            or (
-                event.actor_type != "human"
-                or event.actor_public_id != decision.human_principal_id
-                or event.authorization_public_id != confirmation_id
-                or event.correlation_public_id != proposal_id
-                or event.causation_public_id != causation
-                or f"parser-output:{proposal_id}" not in event.source_evidence_references
-                or f"source:{material['source']['intake_public_id']}"
-                not in event.source_evidence_references
+        proposal = self._conn.execute(
+            "SELECT id FROM parser_outputs WHERE public_id=?", (material["proposal_public_id"],)
+        ).fetchone()
+        if proposal is None:
+            raise PostingError("Independent parser audit proposal is missing")
+        try:
+            decision_owner.verify_parser_proposal_audit(
+                self._conn,
+                proposal[0],
+                transaction_public_id=causation
+                if event_type == "parser_proposal_converted"
+                else None,
             )
-        ):
-            raise PostingError("Independent parser audit chain changed")
-        payload = canonical_json_value(event.event_payload_json, label="parser audit payload")
-        if not isinstance(payload, dict) or (
-            payload.get("proposal_content_hash") != material["effective_content_hash"]
-            or (
-                event_type == "parser_proposal_converted"
-                and payload.get("transaction_public_id") != causation
-            )
-        ):
-            raise PostingError("Independent parser audit material changed")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise PostingError("Independent parser audit material changed") from exc
 
     def _evidence(self, conn, attempt_id, kind, public_id, digest, material):
         expected = (public_id, digest, canonical_json_text(material))
@@ -1470,9 +1443,17 @@ class PostingService:
                     (proposal_row[0],),
                 ).fetchone()
                 if converted is not None:
-                    result = decision_owner.verify_converted_parser_proposal(
-                        self._conn, proposal_row[0], **self._text_kwargs(attempt_id)
-                    )
+                    try:
+                        result = decision_owner.verify_converted_parser_proposal(
+                            self._conn, proposal_row[0], **self._text_kwargs(attempt_id)
+                        )
+                    except decision_owner.ProposalConversionError as exc:
+                        if (
+                            getattr(exc, "_parser_audit_read_failure", None)
+                            is not decision_owner._PARSER_AUDIT_READ_FAILURE
+                        ):
+                            raise
+                        raise PostingError("Independent parser audit material changed") from exc
                     transaction = result["transaction_public_id"]
                     self._verify_parser_audit(
                         material,

@@ -73,6 +73,14 @@ links to the immediately preceding correction snapshot; the original receipt
 and snapshot remain verified throughout.
 Text corrections do not create receipt snapshots.
 
+The correction audit owner verifies the initial event's `previous_state` as
+canonical JSON `null`. For each later event, the expected previous state is the
+`new_state` of the immediately preceding independently verified correction;
+the existing chain and exact event-set checks still apply. The expected state
+comes from the verified correction history, never from the event currently
+being checked. This is a correction-specific rule: the generic financial audit
+chain keeps its existing event-family-specific genesis semantics.
+
 ## Storage and validation boundary
 
 Migration `060_independent_corrections.sql` adds the correction targets,

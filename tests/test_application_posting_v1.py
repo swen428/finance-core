@@ -74,6 +74,127 @@ def test_neutral_owner_preserves_legacy_exception_identity():
     assert owner.ProposalConversionError is legacy.ProposalConversionError
 
 
+@pytest.mark.parametrize("field", ["amount", "description", "public_id"])
+def test_canonical_text_drift_preserves_direct_and_application_error_boundary(
+    migrated_temp_db_connection, field
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.parser_proposals import decision_owner
+
+    conn = migrated_temp_db_connection
+    service, review, proposal, _intake, decision_id, _display = _prepare_text_subject(
+        conn, suffix="canonical-error-" + field
+    )
+    posted = service.submit_post(review.review_id, decision_id)
+    triggers = ["trg_correction_transactions_no_update"]
+    if field == "description":
+        triggers.append("application_amendment_transaction_metadata_freeze")
+    if field == "public_id":
+        triggers.append("application_posting_attempts_guard_update")
+    definitions = [
+        conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
+        for name in triggers
+    ]
+    for name in triggers:
+        conn.execute("DROP TRIGGER " + name)
+    if field == "amount":
+        conn.execute("UPDATE transactions SET amount=amount+1")
+    elif field == "description":
+        conn.execute("UPDATE transactions SET description='unapproved description'")
+    else:
+        # Keep referential integrity while changing the canonical destination's
+        # public identity. The conversion registry still points to its real id.
+        conn.execute("PRAGMA defer_foreign_keys=ON")
+        changed_id = posted.transaction_public_id + "-changed"
+        conn.execute("UPDATE transactions SET public_id=?", (changed_id,))
+        conn.execute(
+            "UPDATE application_posting_attempts SET transaction_public_id=?", (changed_id,)
+        )
+    for definition in definitions:
+        conn.execute(definition)
+    conn.commit()
+    assert conn.execute("PRAGMA foreign_key_check").fetchone() is None
+    tables = (
+        "application_posting_decisions",
+        "application_posting_attempts",
+        "application_posting_events",
+        "parser_proposal_conversion_audit",
+        "financial_audit_events",
+        "transactions",
+    )
+    counts = [conn.execute("SELECT count(*) FROM " + table).fetchone()[0] for table in tables]
+    before = conn.total_changes
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    try:
+        for operation in (
+            lambda: decision_owner.verify_converted_parser_proposal(
+                conn, proposal["id"], **service._text_kwargs(posted.attempt_id)
+            ),
+            lambda: service.get_status(posted.attempt_id),
+        ):
+            with pytest.raises(decision_owner.ProposalConversionError) as error:
+                operation()
+            assert type(error.value) is decision_owner.ProposalConversionError
+            assert conn.total_changes == before and conn.in_transaction
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+    with pytest.raises(decision_owner.ProposalConversionError) as error:
+        service.resume_post(posted.attempt_id)
+    assert type(error.value) is decision_owner.ProposalConversionError
+    assert conn.total_changes == before
+    assert [
+        conn.execute("SELECT count(*) FROM " + table).fetchone()[0] for table in tables
+    ] == counts
+
+
+@pytest.mark.parametrize("error_type", ["conversion", "type", "key"])
+def test_application_preserves_unmarked_conversion_reader_errors(
+    migrated_temp_db_connection, monkeypatch, error_type
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.parser_proposals import decision_owner
+
+    conn = migrated_temp_db_connection
+    service, review, _proposal, _intake, decision_id, _display = _prepare_text_subject(conn)
+    posted = service.submit_post(review.review_id, decision_id)
+    error = {
+        "conversion": decision_owner.ProposalConversionError("unmarked conversion refusal"),
+        "type": TypeError("unexpected reader type"),
+        "key": KeyError("unexpected reader key"),
+    }[error_type]
+
+    def unavailable_reader(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(decision_owner, "verify_converted_parser_proposal", unavailable_reader)
+    before = conn.total_changes
+    counts = [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT (SELECT count(*) FROM application_posting_events),"
+            "(SELECT count(*) FROM parser_proposal_conversion_audit),"
+            "(SELECT count(*) FROM financial_audit_events),(SELECT count(*) FROM transactions)"
+        )
+    ]
+    for operation in (service.get_status, service.resume_post):
+        with pytest.raises(type(error)) as caught:
+            operation(posted.attempt_id)
+        assert caught.value is error
+        assert conn.total_changes == before
+    assert [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT (SELECT count(*) FROM application_posting_events),"
+            "(SELECT count(*) FROM parser_proposal_conversion_audit),"
+            "(SELECT count(*) FROM financial_audit_events),(SELECT count(*) FROM transactions)"
+        )
+    ] == counts
+
+
 def test_neutral_confirmation_and_conversion_use_one_verified_human_decision(
     migrated_temp_db_connection,
 ):
@@ -189,3 +310,230 @@ def test_legacy_nfd_confirmation_conversion_and_replay_preserve_exact_text(
         service.verify_converted_parser_proposal(conn, proposal["id"])["transaction_public_id"]
         == converted["transaction_public_id"]
     )
+
+
+@pytest.mark.parametrize(
+    "event_type,fault",
+    [
+        (event_type, fault)
+        for event_type in ("parser_proposal_confirmed", "parser_proposal_converted")
+        for fault in (
+            "previous",
+            "new",
+            "payload",
+            "actor",
+            "references",
+            "snapshot",
+            "correlation",
+            "identity",
+            "extra_event",
+        )
+        if (event_type, fault) != ("parser_proposal_converted", "previous")
+    ],
+)
+def test_readonly_posting_rejects_chain_valid_audit_semantics(
+    migrated_temp_db_connection, monkeypatch, event_type, fault
+):
+    import dataclasses
+
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.application.posting import PostingError
+    from finance_core.financial_audit import verify_financial_audit_chain
+    from finance_core.parser_proposals import decision_owner
+
+    conn = migrated_temp_db_connection
+    service, review, proposal, _intake, decision_id, _display = _prepare_text_subject(conn)
+    append = decision_owner.append_financial_audit_event
+    observed = []
+
+    def faulty_append(connection, command):
+        if command.event_type == event_type:
+            observed.append(command)
+            changes = {
+                "previous": {"previous_state": {"wrong": True}},
+                "new": {"new_state": {"wrong": True}},
+                "payload": {"event_payload": {**command.event_payload, "extra": True}},
+                "actor": {"actor_public_id": "wrong-human"},
+                "references": {
+                    "source_evidence_references": (
+                        *command.source_evidence_references,
+                        "source:extra",
+                    )
+                },
+                "snapshot": {
+                    "calculation_snapshot_public_id": "unexpected-snapshot",
+                    "calculation_snapshot_hash": "f" * 64,
+                },
+                "correlation": {"correlation_public_id": "wrong-proposal"},
+                "identity": {"event_public_id": command.event_public_id + "-foreign"},
+                "extra_event": {},
+            }[fault]
+            # Preserve state continuity when changing a non-genesis previous state:
+            # choose that fault only on the confirmation genesis below.
+            command = dataclasses.replace(command, **changes)
+        result = append(connection, command)
+        if command.event_type == event_type and fault == "extra_event":
+            append(
+                connection,
+                dataclasses.replace(
+                    command,
+                    event_public_id=command.event_public_id + "-extra",
+                    causation_public_id=command.causation_public_id + "-extra",
+                    previous_state=command.new_state,
+                ),
+            )
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(decision_owner, "append_financial_audit_event", faulty_append)
+        try:
+            service.submit_post(review.review_id, decision_id)
+        except (PostingError, decision_owner.ProposalConversionError):
+            pass
+    assert len(observed) == 1
+    assert verify_financial_audit_chain(
+        conn, aggregate_type="parser_proposal", aggregate_public_id=proposal["public_id"]
+    ).valid
+    attempt = conn.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        with pytest.raises((PostingError, decision_owner.ProposalConversionError)):
+            service.get_status(attempt)
+        assert conn.total_changes == before and conn.in_transaction
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+
+
+@pytest.mark.parametrize("amended", [False, True])
+@pytest.mark.parametrize("boundary", ["after_acceptance_commit", "after_text_conversion_commit"])
+def test_readonly_posting_preserves_actual_confirmation_prestate_and_commit_gap(
+    migrated_temp_db_connection, monkeypatch, amended, boundary
+):
+    from test_application_posting_recovery_v1 import _prepare_text_subject
+
+    from finance_core.application import posting as posting_owner
+    from finance_core.application.independent_correction_source import verify_original
+    from finance_core.parser_proposals.decision_owner import verify_parser_proposal_audit
+
+    conn = migrated_temp_db_connection
+    service, review, proposal, _intake, decision, _display = _prepare_text_subject(
+        conn, "audit-positive"
+    )
+    if amended:
+        from test_application_amendment_v1 import (
+            _amendment_service,
+            _apply,
+            _prepare_edited_posting,
+        )
+
+        amendment = _amendment_service(conn)
+        edit = _apply(
+            conn, amendment, amendment.prepare(proposal["public_id"]), {"merchant": "Changed Cafe"}
+        )
+        review = _prepare_edited_posting(service, edit, conn, "audit-positive-decision")
+        decision = "audit-positive-decision"
+
+    def stop(stage):
+        if stage == boundary:
+            raise RuntimeError("stop after commit before coordination")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(posting_owner, "_failure_injection_hook", stop)
+        with pytest.raises(RuntimeError, match="after commit"):
+            service.submit_post(review.review_id, decision)
+    attempt = conn.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        status = service.get_status(attempt)
+        verify_parser_proposal_audit(conn, proposal["id"])
+        if boundary == "after_text_conversion_commit":
+            assert status.state == "finalized"
+            assert (
+                verify_original(service, status.transaction_public_id).target_id
+                == status.transaction_public_id
+            )
+        else:
+            assert status.state == "accepted"
+            assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 0
+        assert conn.in_transaction and conn.total_changes == before
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+
+
+def test_legacy_nfd_source_identity_preserves_conversion_replay_and_read(
+    migrated_temp_db_connection,
+):
+    from finance_core.financial_audit import verify_financial_audit_chain
+    from finance_core.intake.raw_text_repository import (
+        create_raw_intake_record,
+        save_parser_proposal,
+    )
+    from finance_core.parser_proposals import service
+    from finance_core.parsers.text_expense_parser import parse_text_expense
+
+    conn = migrated_temp_db_connection
+    source_id = "legacy-Cafe\u0301"
+    text = "Lunch SGD 12.50 Cafe\u0301"
+    raw = create_raw_intake_record(
+        conn,
+        text,
+        source_type="manual_entry",
+        source_channel="manual",
+        public_id=source_id,
+        source_metadata={"note": "Cafe\u0301"},
+    )
+    parsed = parse_text_expense(text, raw_input_reference=source_id, source_type="manual_entry")
+    parsed.update(
+        transaction_date="2026-01-01",
+        merchant="Cafe\u0301",
+        description="Cre\u0300me",
+        category="Di\u0301ning",
+    )
+    proposal = save_parser_proposal(conn, raw["id"], parsed)
+    conn.commit()
+    service.confirm_parser_proposal(conn, proposal["id"], authenticated_actor_id="legacy-human")
+    first = service.convert_confirmed_parser_proposal(conn, proposal["id"])
+    retained = tuple(
+        conn.execute("SELECT * FROM raw_intake_records WHERE id=?", (raw["id"],)).fetchone()
+    )
+    assert verify_financial_audit_chain(
+        conn, aggregate_type="parser_proposal", aggregate_public_id=proposal["public_id"]
+    ).valid
+    assert service.convert_confirmed_parser_proposal(conn, proposal["id"])["idempotent"] is True
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        checked = service.verify_converted_parser_proposal(conn, proposal["id"])
+        assert checked["transaction_public_id"] == first["transaction_public_id"]
+        assert conn.total_changes == before and conn.in_transaction
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+        assert (
+            tuple(
+                conn.execute("SELECT * FROM raw_intake_records WHERE id=?", (raw["id"],)).fetchone()
+            )
+            == retained
+        )
+        assert tuple(
+            conn.execute("SELECT merchant,category,raw_input FROM transactions").fetchone()
+        ) == ("Cafe\u0301", "Di\u0301ning", text)
+        assert (
+            service.resolve_simple_expense_conversion_fields(conn, proposal)["description"]
+            == "Cre\u0300me"
+        )
+        assert (
+            conn.execute(
+                "SELECT public_id FROM raw_intake_records WHERE id=?", (raw["id"],)
+            ).fetchone()[0]
+            == source_id
+        )
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")

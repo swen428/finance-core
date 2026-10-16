@@ -249,6 +249,7 @@ def _seed_authorization_for_input(
     confirmation_id: str = "conf_test_finalization_v1",
     actor_type: str = "cli",
     actor_id: str | None = "person_owner",
+    source_evidence_refs: tuple[str, ...] = (),
 ) -> str:
     """Seed authorization with a real content fingerprint from the input.
 
@@ -303,6 +304,7 @@ def _seed_authorization_for_input(
         settlement_obligations_json=obls_json,
         actor_type=actor_type,
         actor_id=actor_id,
+        source_evidence_refs=source_evidence_refs,
     )
 
 
@@ -381,6 +383,7 @@ def _build_finalization_input(
     actor_type: str = "cli",
     actor_id: str | None = "person_owner",
     source_evidence_refs: tuple[str, ...] = (),
+    receipt_group_materialization=None,
 ) -> FinalizationInput:
     if calc_result is None:
         calc_result = _tc001_calc_result()
@@ -409,6 +412,7 @@ def _build_finalization_input(
             actor_type=actor_type,
             actor_id=actor_id,
             source_evidence_refs=source_evidence_refs,
+            receipt_group_materialization=receipt_group_materialization,
         )
 
     provisional = make_input(calc_snapshot_hash or "")
@@ -4091,3 +4095,144 @@ def test_concurrent_receipt_finalization_replays_one_canonical_result(
         assert restarted.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         restarted.close()
+
+
+@pytest.mark.parametrize(
+    "event_type,fault",
+    [
+        ("settlement_obligations_created", "previous"),
+        ("settlement_obligations_created", "middle"),
+        ("receipt_finalized", "new"),
+        *[
+            (event, field)
+            for event in ("settlement_obligations_created", "receipt_finalized")
+            for field in (
+                "payload",
+                "actor",
+                "references",
+                "time",
+                "snapshot",
+                "identity",
+                "extra_event",
+            )
+        ],
+    ],
+)
+def test_readonly_finalization_rejects_chain_valid_audit_semantics(
+    tmp_path, monkeypatch, event_type, fault
+):
+    from dataclasses import replace
+
+    from test_application_posting_recovery_v1 import _prepare_receipt_subject
+
+    from finance_core.application.posting import PostingError
+    from finance_core.receipt_finalization import finalizer
+
+    values = _prepare_receipt_subject(tmp_path, "audit-finalization")
+    conn, _workspace, _manifest, service, review, _proposal, _intake, decision, *_rest = values
+    append = finalizer.append_financial_audit_event
+    observed = []
+
+    def faulty_append(connection, command):
+        if command.event_type == event_type:
+            observed.append(command)
+            changes = {
+                "previous": {"previous_state": {"wrong": True}},
+                "middle": {"new_state": {"wrong": True}},
+                "new": {"new_state": {"wrong": True}},
+                "payload": {"event_payload": {**command.event_payload, "extra": True}},
+                "actor": {"actor_public_id": "wrong-human"},
+                "references": {
+                    "source_evidence_references": (
+                        *command.source_evidence_references,
+                        "source:extra",
+                    )
+                },
+                "time": {"created_at": "2020-01-01T00:00:00Z"},
+                "snapshot": {"calculation_snapshot_public_id": "wrong-snapshot"},
+                "identity": {"event_public_id": command.event_public_id + "-foreign"},
+                "extra_event": {},
+            }[fault]
+            command = replace(command, **changes)
+        elif fault == "middle" and command.event_type == "receipt_finalized":
+            command = replace(command, previous_state={"wrong": True})
+        result = append(connection, command)
+        if command.event_type == event_type and fault == "extra_event":
+            append(
+                connection,
+                replace(
+                    command,
+                    event_public_id=command.event_public_id + "-extra",
+                    causation_public_id=command.causation_public_id + "-extra",
+                    previous_state=command.new_state,
+                ),
+            )
+        return result
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(finalizer, "append_financial_audit_event", faulty_append)
+            try:
+                service.submit_post(review.review_id, decision)
+            except (PostingError, FinalizationIdempotencyError):
+                pass
+        assert len(observed) == 1
+        final = conn.execute(
+            "SELECT receipt_group_public_id FROM receipt_finalization_audit"
+        ).fetchone()
+        assert final is not None
+        assert verify_financial_audit_chain(
+            conn, aggregate_type="receipt_group", aggregate_public_id=final[0]
+        ).valid
+        attempt = conn.execute("SELECT attempt_id FROM application_posting_attempts").fetchone()[0]
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("BEGIN")
+        before = conn.total_changes
+        with pytest.raises((PostingError, FinalizationIdempotencyError)):
+            service.get_status(attempt)
+        assert conn.in_transaction and conn.total_changes == before
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")
+    finally:
+        conn.close()
+
+
+def test_materialized_finalization_accepts_nfd_evidence_references(fin_db):
+    from finance_core.receipt_finalization.finalizer import verify_finalized_receipt_split
+    from finance_core.receipt_finalization.models import ReceiptGroupMaterialization
+
+    refs = ("attachment:Cafe\u0301.jpg",)
+    fin_db.execute(
+        "UPDATE receipt_groups SET source='synthetic' WHERE public_id=?", (TEST_GROUP_PUBLIC_ID,)
+    )
+    fin_input = _build_finalization_input(
+        source_evidence_refs=refs,
+        receipt_group_materialization=ReceiptGroupMaterialization(
+            receipt_public_id="r_test_finalization",
+            receipt_group_receipt_public_id="rgr_test_fin",
+            group_type="shared_expense",
+            status="calculated",
+            source="synthetic",
+        ),
+    )
+    _seed_authorization_for_input(fin_db, fin_input, source_evidence_refs=refs)
+    fin_db.commit()
+    first = finalize_receipt_split(fin_db, fin_input)
+    assert verify_financial_audit_chain(
+        fin_db, aggregate_type="receipt_group", aggregate_public_id=TEST_GROUP_PUBLIC_ID
+    ).valid
+    fin_db.execute("PRAGMA query_only=ON")
+    fin_db.execute("BEGIN")
+    before = fin_db.total_changes
+    try:
+        checked = verify_finalized_receipt_split(fin_db, fin_input)
+        assert checked.finalization_public_id == first.finalization_public_id
+        assert fin_db.total_changes == before and fin_db.in_transaction
+        assert json.loads(
+            fin_db.execute(
+                "SELECT source_evidence_refs_json FROM receipt_finalization_authorizations"
+            ).fetchone()[0]
+        ) == list(refs)
+    finally:
+        fin_db.rollback()
+        fin_db.execute("PRAGMA query_only=OFF")

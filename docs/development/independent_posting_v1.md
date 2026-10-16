@@ -195,6 +195,64 @@ versions or orphan correction evidence refuses instead of returning version
 zero as current. Original-only verification is an internal seam for the
 correction owner and is not a public current-read bypass.
 
+### Read-only audit-owner verification
+
+Historical audit verification is a SELECT-only check of durable business
+evidence. It reconstructs the expected event from its owning proposal,
+authorization, lifecycle, conversion or accepted-decision records; an event
+cannot prove its own state, actor, reason or references. The reader verifies
+the complete expected payload, previous/new state, actor and authorization,
+exact source references, aggregate and causal/correlation identities, and the
+expected event identity, while retaining the existing hash/chain checks.
+Caller-owned SQLite snapshots remain caller-owned. A successful check reports
+verified history only; it grants no write, repair, conversion or decision
+authority.
+
+`decision_owner.verify_parser_proposal_audit(conn, parser_output_id, *,
+transaction_public_id=None) -> None` owns the confirmation and text-conversion
+audit checks. With `transaction_public_id=None`, it verifies the confirmation
+event. Supplying the exact transaction also verifies its committed conversion
+event. A confirmation-only state does not require a conversion; if conversion
+has committed while a coordination marker lags, the conversion event is still
+verified. The existing `PostingService.get_status`, `verify_original` and
+`verify_converted_parser_proposal` signatures and results do not change; their
+owning read paths use the stronger owner check.
+
+`receipt_facts_conversion.verify_receipt_proposal_conversion_for_review(conn,
+command_public_id) -> None` verifies the specified receipt conversion as a
+historical event, including its exact registered membership and audit data.
+It may verify an earlier conversion when later valid events exist in the same
+aggregate; this does not certify those later events. The normal write/replay
+path remains current-head-only and retains its one-event requirement. The
+historical read preserves a caller-owned snapshot; when it opens its own read
+snapshot, it rolls that snapshot back rather than committing caller work.
+
+Receipt finalization continues to require the exact
+`settlement_obligations_created` and `receipt_finalized` audit events. For an
+independent receipt with a verified materialization anchor, the expected prior
+group status comes from the authorization-fingerprint-bound
+`fin_input.receipt_group_materialization.status`; the finalization timestamp
+comes from the same commit's persisted `receipt_finalization_audit.created_at`.
+The reader checks both complete event payloads, state transitions, actor,
+authorization, snapshot and references. It does not infer prior state from the
+current settled group or from the audit event being checked. The legacy
+group-only path without a materialization anchor remains compatible, but does
+not gain a new proof of its complete prior state.
+
+Completion and text-amendment audit reads retain the existing state, actor and
+payload checks and also verify the writer's aggregate/type, exact source
+references, correlation identity and null snapshot metadata. A text
+supersession's persisted parent/child lifecycle records provide its shared
+creation-time anchor; completion timestamps are independently checked only
+where their persisted completion/lifecycle contract supplies an anchor. A
+timestamp without such an independent anchor is not described as independently
+verified. Text conversion likewise retains its canonical/integrity contract
+where no separate timestamp source exists.
+
+These checks do not change public method signatures, monetary rules,
+authorization, write-transaction ownership, the generic audit-chain protocol,
+or the schema. They strengthen only the owning historical readers.
+
 Actual capture/ACK, card send, natural-language parsing and reply-send UNKNOWN
 belong to a transport adapter. This boundary supplies a stable verified
 financial result for that owner; it does not claim to have delivered a reply.

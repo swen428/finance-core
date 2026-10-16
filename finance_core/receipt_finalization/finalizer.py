@@ -34,8 +34,10 @@ from finance_core.calculation.receipt_output_serialization import (
 from finance_core.calculation.run_persistence import CalculationRunRepository
 from finance_core.financial_audit import (
     AuditEventCommand,
+    FinancialAuditRepository,
     append_financial_audit_event,
     derive_audit_event_public_id,
+    verify_financial_audit_chain,
 )
 from finance_core.instance_admission import (
     require_finance_read_connection,
@@ -1191,8 +1193,7 @@ def _require_schema(conn: sqlite3.Connection) -> None:
         )
 
 
-def _append_receipt_finalization_audits(
-    conn: sqlite3.Connection,
+def _receipt_finalization_audit_commands(
     *,
     fin_input: FinalizationInput,
     previous_group_status: str,
@@ -1200,7 +1201,7 @@ def _append_receipt_finalization_audits(
     transaction_public_id: str,
     settlement_public_ids: list[str],
     created_at: str,
-) -> None:
+) -> tuple[AuditEventCommand, AuditEventCommand]:
     actor_public_id = fin_input.actor_id or f"receipt-finalization:{fin_input.actor_type}"
     base = {
         "transaction_public_id": transaction_public_id,
@@ -1228,9 +1229,9 @@ def _append_receipt_finalization_audits(
         "causation_public_id": finalization_public_id,
         "created_at": created_at,
     }
+    commands = []
     obligations_type = "settlement_obligations_created"
-    append_financial_audit_event(
-        conn,
+    commands.append(
         AuditEventCommand(
             event_public_id=derive_audit_event_public_id(
                 aggregate_type="receipt_group",
@@ -1249,8 +1250,7 @@ def _append_receipt_finalization_audits(
         ),
     )
     finalization_type = "receipt_finalized"
-    append_financial_audit_event(
-        conn,
+    commands.append(
         AuditEventCommand(
             event_public_id=derive_audit_event_public_id(
                 aggregate_type="receipt_group",
@@ -1269,6 +1269,13 @@ def _append_receipt_finalization_audits(
             **common,
         ),
     )
+
+    return commands[0], commands[1]
+
+
+def _append_receipt_finalization_audits(conn: sqlite3.Connection, **kwargs: Any) -> None:
+    for command in _receipt_finalization_audit_commands(**kwargs):
+        append_financial_audit_event(conn, command)
 
 
 # ===================================================================
@@ -1969,7 +1976,7 @@ def _require_complete_replay_truth(
         "confirmation_id, receipt_group_public_id, calculation_run_public_id, "
         "calculation_snapshot_id, transaction_public_id, settlement_public_ids_json, "
         "currency, total_paid, total_to_collect, payer_participant_public_id, "
-        "actor_type, actor_id, status "
+        "actor_type, actor_id, status, created_at "
         "FROM receipt_finalization_audit WHERE finalization_id = ?",
         (audit_id,),
     ).fetchone()
@@ -2107,7 +2114,7 @@ def _require_complete_replay_truth(
     if receipt_identity is not None:
         _require_live_receipt_identity(conn, receipt_identity)
     # Financial audit-chain events appended by the original finalization.
-    _require_replay_financial_audit_events(conn, audit_id, fin_input)
+    _require_replay_financial_audit_events(conn, audit_id, fin_input, audit=audit)
 
 
 def _require_replay_receipt_group_truth(
@@ -2286,6 +2293,8 @@ def _require_replay_financial_audit_events(
     conn: sqlite3.Connection,
     audit_id: str,
     fin_input: FinalizationInput,
+    *,
+    audit: dict[str, Any],
 ) -> None:
     """Verify the append-only audit-chain events of the original finalization.
 
@@ -2326,6 +2335,64 @@ def _require_replay_financial_audit_events(
             "finalization event identities of the recorded finalization",
             reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
         )
+
+    # Group-only legacy inputs have no durable prior-status materialization
+    # anchor. Preserve their existing identity checks without inventing one.
+    materialization = fin_input.receipt_group_materialization
+    if materialization is None:
+        return
+    from finance_core.calculation.authoritative_snapshot import canonical_json_text
+    from finance_core.financial_audit.chain import _canonical_references, _normalize_timestamp
+
+    commands = _receipt_finalization_audit_commands(
+        fin_input=fin_input,
+        previous_group_status=materialization.status,
+        finalization_public_id=audit_id,
+        transaction_public_id=str(audit["transaction_public_id"]),
+        settlement_public_ids=json.loads(audit["settlement_public_ids_json"]),
+        created_at=str(audit["created_at"]),
+    )
+    chain = verify_financial_audit_chain(
+        conn, aggregate_type="receipt_group", aggregate_public_id=fin_input.receipt_group_public_id
+    )
+    if not chain.valid:
+        raise FinalizationIdempotencyError(
+            "Replay finalization audit chain changed",
+            reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
+        )
+    for command in commands:
+        event = FinancialAuditRepository(conn).fetch(command.event_public_id)
+        if (
+            event is None
+            or any(
+                getattr(event, name) != getattr(command, name)
+                for name in (
+                    "audit_schema_version",
+                    "aggregate_type",
+                    "aggregate_public_id",
+                    "event_type",
+                    "actor_type",
+                    "actor_public_id",
+                    "authorization_public_id",
+                    "calculation_snapshot_public_id",
+                    "calculation_snapshot_hash",
+                    "correlation_public_id",
+                    "causation_public_id",
+                )
+            )
+            or (
+                event.event_payload_json != canonical_json_text(command.event_payload)
+                or event.previous_state_json != canonical_json_text(command.previous_state)
+                or event.new_state_json != canonical_json_text(command.new_state)
+                or event.source_evidence_references
+                != _canonical_references(command.source_evidence_references)
+                or event.created_at != _normalize_timestamp(command.created_at)
+            )
+        ):
+            raise FinalizationIdempotencyError(
+                "Replay finalization audit semantic binding changed",
+                reason=FinalizationBlockReason.REPLAY_TRUTH_MISMATCH.value,
+            )
 
 
 def _require_replay_canonical_transaction(
