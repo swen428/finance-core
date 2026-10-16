@@ -2342,7 +2342,7 @@ def _require_replay_financial_audit_events(
     if materialization is None:
         return
     from finance_core.calculation.authoritative_snapshot import canonical_json_text
-    from finance_core.financial_audit.chain import _normalize_timestamp
+    from finance_core.financial_audit.chain import _canonical_references, _normalize_timestamp
 
     commands = _receipt_finalization_audit_commands(
         fin_input=fin_input,
@@ -2385,7 +2385,7 @@ def _require_replay_financial_audit_events(
                 or event.previous_state_json != canonical_json_text(command.previous_state)
                 or event.new_state_json != canonical_json_text(command.new_state)
                 or event.source_evidence_references
-                != tuple(sorted(command.source_evidence_references))
+                != _canonical_references(command.source_evidence_references)
                 or event.created_at != _normalize_timestamp(command.created_at)
             )
         ):

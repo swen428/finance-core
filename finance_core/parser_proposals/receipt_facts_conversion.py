@@ -46,6 +46,7 @@ from finance_core.financial_audit import (
     derive_audit_event_public_id,
     verify_financial_audit_chain,
 )
+from finance_core.financial_audit.chain import _canonical_references
 from finance_core.instance_admission import (
     require_finance_read_connection,
     require_finance_write_connection,
@@ -1131,7 +1132,7 @@ def _verify_replay_audit_binding(
         or fetched.created_at != str(existing["created_at"])
         or fetched.calculation_snapshot_public_id is not None
         or fetched.calculation_snapshot_hash is not None
-        or fetched.source_evidence_references != tuple(sorted(references))
+        or fetched.source_evidence_references != _canonical_references(references)
         or fetched.event_payload_json != expected_payload
         or fetched.previous_state_json != expected_previous_state
         or fetched.new_state_json != expected_new_state

@@ -344,3 +344,75 @@ def test_readonly_posting_preserves_actual_confirmation_prestate_and_commit_gap(
     finally:
         conn.rollback()
         conn.execute("PRAGMA query_only=OFF")
+
+
+def test_legacy_nfd_source_identity_preserves_conversion_replay_and_read(
+    migrated_temp_db_connection,
+):
+    from finance_core.financial_audit import verify_financial_audit_chain
+    from finance_core.intake.raw_text_repository import (
+        create_raw_intake_record,
+        save_parser_proposal,
+    )
+    from finance_core.parser_proposals import service
+    from finance_core.parsers.text_expense_parser import parse_text_expense
+
+    conn = migrated_temp_db_connection
+    source_id = "legacy-Cafe\u0301"
+    text = "Lunch SGD 12.50 Cafe\u0301"
+    raw = create_raw_intake_record(
+        conn,
+        text,
+        source_type="manual_entry",
+        source_channel="manual",
+        public_id=source_id,
+        source_metadata={"note": "Cafe\u0301"},
+    )
+    parsed = parse_text_expense(text, raw_input_reference=source_id, source_type="manual_entry")
+    parsed.update(
+        transaction_date="2026-01-01",
+        merchant="Cafe\u0301",
+        description="Cre\u0300me",
+        category="Di\u0301ning",
+    )
+    proposal = save_parser_proposal(conn, raw["id"], parsed)
+    conn.commit()
+    service.confirm_parser_proposal(conn, proposal["id"], authenticated_actor_id="legacy-human")
+    first = service.convert_confirmed_parser_proposal(conn, proposal["id"])
+    retained = tuple(
+        conn.execute("SELECT * FROM raw_intake_records WHERE id=?", (raw["id"],)).fetchone()
+    )
+    assert verify_financial_audit_chain(
+        conn, aggregate_type="parser_proposal", aggregate_public_id=proposal["public_id"]
+    ).valid
+    assert service.convert_confirmed_parser_proposal(conn, proposal["id"])["idempotent"] is True
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        checked = service.verify_converted_parser_proposal(conn, proposal["id"])
+        assert checked["transaction_public_id"] == first["transaction_public_id"]
+        assert conn.total_changes == before and conn.in_transaction
+        assert conn.execute("SELECT count(*) FROM transactions").fetchone()[0] == 1
+        assert (
+            tuple(
+                conn.execute("SELECT * FROM raw_intake_records WHERE id=?", (raw["id"],)).fetchone()
+            )
+            == retained
+        )
+        assert tuple(
+            conn.execute("SELECT merchant,category,raw_input FROM transactions").fetchone()
+        ) == ("Cafe\u0301", "Di\u0301ning", text)
+        assert (
+            service.resolve_simple_expense_conversion_fields(conn, proposal)["description"]
+            == "Cre\u0300me"
+        )
+        assert (
+            conn.execute(
+                "SELECT public_id FROM raw_intake_records WHERE id=?", (raw["id"],)
+            ).fetchone()[0]
+            == source_id
+        )
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")

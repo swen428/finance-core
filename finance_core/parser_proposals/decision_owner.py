@@ -1231,7 +1231,7 @@ def _converted_transaction_public_id(
 
 
 def _verify_parser_audit_command(conn, command, *, verify_time):
-    from finance_core.financial_audit.chain import _normalize_timestamp
+    from finance_core.financial_audit.chain import _canonical_references, _normalize_timestamp
 
     event = FinancialAuditRepository(conn).fetch(command.event_public_id)
     chain = verify_financial_audit_chain(
@@ -1263,7 +1263,8 @@ def _verify_parser_audit_command(conn, command, *, verify_time):
         event.event_payload_json != canonical_json_text(command.event_payload)
         or event.previous_state_json != canonical_json_text(command.previous_state)
         or event.new_state_json != canonical_json_text(command.new_state)
-        or event.source_evidence_references != tuple(sorted(command.source_evidence_references))
+        or event.source_evidence_references
+        != _canonical_references(command.source_evidence_references)
         or verify_time
         and event.created_at != _normalize_timestamp(command.created_at)
     ):

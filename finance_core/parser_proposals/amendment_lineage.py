@@ -387,20 +387,20 @@ def _verify_owner_history(
             )
         ):
             raise AmendmentLineageError("Independent text child lifecycle evidence changed")
-    from finance_core.financial_audit.chain import _normalize_timestamp
+    from finance_core.financial_audit.chain import _canonical_references, _normalize_timestamp
 
     if row["publication_kind"] == "completion":
         from finance_core.parser_proposals.completion import _parser_source_references
 
-        references = tuple(sorted(_parser_source_references(base)))
+        references = _canonical_references(_parser_source_references(base))
         published = conn.execute(
             "SELECT created_at FROM parser_proposal_completions WHERE completion_public_id=?",
             (publication_id,),
         ).fetchone()
         expected_time = _normalize_timestamp(published[0])
     else:
-        references = tuple(
-            sorted((f"parser-output:{base['public_id']}", f"source:{base['source_public_id']}"))
+        references = _canonical_references(
+            (f"parser-output:{base['public_id']}", f"source:{base['source_public_id']}")
         )
         if parent_events[0]["created_at"] != child_events[0]["created_at"]:
             raise AmendmentLineageError("Amendment lifecycle timestamps changed")

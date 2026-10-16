@@ -3745,3 +3745,52 @@ def test_readonly_conversion_review_rejects_wrong_persisted_state(
     finally:
         conn.rollback()
         conn.execute("PRAGMA query_only=OFF")
+
+
+def test_receipt_conversion_review_accepts_legal_nfd_source(
+    migrated_temp_db_connection, tmp_path, monkeypatch
+):
+    from finance_core.parser_proposals.receipt_facts_conversion import (
+        verify_receipt_proposal_conversion_for_review,
+    )
+
+    conn = migrated_temp_db_connection
+    seed_people(conn)
+    from finance_core.intake.raw_text_repository import create_raw_intake_record
+    from tests import test_receipt_ocr_proposal_ingestion_v1 as fixtures
+
+    def create_source(connection, _suffix):
+        raw = create_raw_intake_record(
+            connection,
+            "receipt image",
+            source_type="telegram_image",
+            source_channel="telegram",
+            public_id="raw-Cafe\u0301",
+        )
+        connection.commit()
+        return raw["id"]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fixtures, "_insert_raw_intake", create_source)
+        _pid, proposal, expected = seed_confirmed_receipt_proposal(
+            conn, tmp_path, "nfd_source_only"
+        )
+    cmd = command("nfd_review", proposal, expected)
+    assert (
+        conn.execute("SELECT public_id FROM raw_intake_records").fetchone()[0] == "raw-Cafe\u0301"
+    )
+    first = convert(conn, cmd)
+    source_before = tuple(conn.execute("SELECT * FROM raw_intake_records").fetchone())
+    assert verify_financial_audit_chain(
+        conn, aggregate_type="receipt", aggregate_public_id=first.receipt_public_id
+    ).valid
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("BEGIN")
+    before = conn.total_changes
+    try:
+        verify_receipt_proposal_conversion_for_review(conn, cmd.command_public_id)
+        assert conn.total_changes == before and conn.in_transaction
+        assert tuple(conn.execute("SELECT * FROM raw_intake_records").fetchone()) == source_before
+    finally:
+        conn.rollback()
+        conn.execute("PRAGMA query_only=OFF")

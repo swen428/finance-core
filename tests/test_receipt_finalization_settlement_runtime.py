@@ -249,6 +249,7 @@ def _seed_authorization_for_input(
     confirmation_id: str = "conf_test_finalization_v1",
     actor_type: str = "cli",
     actor_id: str | None = "person_owner",
+    source_evidence_refs: tuple[str, ...] = (),
 ) -> str:
     """Seed authorization with a real content fingerprint from the input.
 
@@ -303,6 +304,7 @@ def _seed_authorization_for_input(
         settlement_obligations_json=obls_json,
         actor_type=actor_type,
         actor_id=actor_id,
+        source_evidence_refs=source_evidence_refs,
     )
 
 
@@ -381,6 +383,7 @@ def _build_finalization_input(
     actor_type: str = "cli",
     actor_id: str | None = "person_owner",
     source_evidence_refs: tuple[str, ...] = (),
+    receipt_group_materialization=None,
 ) -> FinalizationInput:
     if calc_result is None:
         calc_result = _tc001_calc_result()
@@ -409,6 +412,7 @@ def _build_finalization_input(
             actor_type=actor_type,
             actor_id=actor_id,
             source_evidence_refs=source_evidence_refs,
+            receipt_group_materialization=receipt_group_materialization,
         )
 
     provisional = make_input(calc_snapshot_hash or "")
@@ -4191,3 +4195,44 @@ def test_readonly_finalization_rejects_chain_valid_audit_semantics(
         conn.execute("PRAGMA query_only=OFF")
     finally:
         conn.close()
+
+
+def test_materialized_finalization_accepts_nfd_evidence_references(fin_db):
+    from finance_core.receipt_finalization.finalizer import verify_finalized_receipt_split
+    from finance_core.receipt_finalization.models import ReceiptGroupMaterialization
+
+    refs = ("attachment:Cafe\u0301.jpg",)
+    fin_db.execute(
+        "UPDATE receipt_groups SET source='synthetic' WHERE public_id=?", (TEST_GROUP_PUBLIC_ID,)
+    )
+    fin_input = _build_finalization_input(
+        source_evidence_refs=refs,
+        receipt_group_materialization=ReceiptGroupMaterialization(
+            receipt_public_id="r_test_finalization",
+            receipt_group_receipt_public_id="rgr_test_fin",
+            group_type="shared_expense",
+            status="calculated",
+            source="synthetic",
+        ),
+    )
+    _seed_authorization_for_input(fin_db, fin_input, source_evidence_refs=refs)
+    fin_db.commit()
+    first = finalize_receipt_split(fin_db, fin_input)
+    assert verify_financial_audit_chain(
+        fin_db, aggregate_type="receipt_group", aggregate_public_id=TEST_GROUP_PUBLIC_ID
+    ).valid
+    fin_db.execute("PRAGMA query_only=ON")
+    fin_db.execute("BEGIN")
+    before = fin_db.total_changes
+    try:
+        checked = verify_finalized_receipt_split(fin_db, fin_input)
+        assert checked.finalization_public_id == first.finalization_public_id
+        assert fin_db.total_changes == before and fin_db.in_transaction
+        assert json.loads(
+            fin_db.execute(
+                "SELECT source_evidence_refs_json FROM receipt_finalization_authorizations"
+            ).fetchone()[0]
+        ) == list(refs)
+    finally:
+        fin_db.rollback()
+        fin_db.execute("PRAGMA query_only=OFF")
