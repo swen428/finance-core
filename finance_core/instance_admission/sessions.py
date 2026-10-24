@@ -806,3 +806,32 @@ def production_write_operation(owner: ProductionOwner, *, timeout_seconds: float
 def production_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
     """Open true mode=ro, including legitimate FENCED forensic admission."""
     return _operation(owner, read_only=True, timeout_seconds=timeout_seconds)
+
+
+@contextmanager
+def _lifecycle_operation(owner: ProductionOwner, *, read_only: bool, timeout_seconds: float):
+    """Opt-in v2 immutable artifact proof, valid for exactly one owned operation.
+
+    Dynamic authority, database/file identities, leases, write state, transaction
+    and close checks remain in every existing guarded SQL admission. Only the
+    installed migration bytes proved at this operation entry are reused.
+    """
+    from .authority import _IMMUTABLE_OPERATION
+
+    if _IMMUTABLE_OPERATION.get() is not None:
+        raise InstanceAdmissionError("Nested immutable operation scopes are forbidden")
+    owner.assert_valid()
+    token = _IMMUTABLE_OPERATION.set(owner.config)
+    try:
+        with _operation(owner, read_only=read_only, timeout_seconds=timeout_seconds) as conn:
+            yield conn
+    finally:
+        _IMMUTABLE_OPERATION.reset(token)
+
+
+def lifecycle_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
+    return _lifecycle_operation(owner, read_only=False, timeout_seconds=timeout_seconds)
+
+
+def lifecycle_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
+    return _lifecycle_operation(owner, read_only=True, timeout_seconds=timeout_seconds)

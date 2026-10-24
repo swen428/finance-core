@@ -13,6 +13,7 @@ import struct
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ CONTROL_LOCK_FILENAME = ".authority.v1.lock"
 OWNER_LOCK_FILENAME = ".owner.v1.lock"
 MAX_DOCUMENT_BYTES = 65536
 _TOKEN = object()
+_IMMUTABLE_OPERATION: ContextVar[object | None] = ContextVar("immutable_operation", default=None)
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}\Z")
 
 
@@ -182,7 +184,10 @@ class TrustedInstanceConfig:
                 raise InstanceAdmissionError("Control root identity changed")
         finally:
             os.close(fd)
-        if self._binding["migration_identity"] != _migration_contract_digest():
+        if (
+            _IMMUTABLE_OPERATION.get() is not self
+            and self._binding["migration_identity"] != _migration_contract_digest()
+        ):
             raise InstanceAdmissionError("Installed migration identity changed")
 
     def close(self) -> None:
@@ -468,7 +473,7 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
         if action != "maintenance" and entry["hold_baseline"] is not None:
             raise InstanceAdmissionError("Authority history has unrelated hold baseline")
         target = replay["instances"].get(key)
-        if action == "prepare":
+        if action in {"prepare", "restore_prepare"}:
             if (
                 target is not None
                 or any(
@@ -485,15 +490,15 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
                 "binding": final["binding"],
                 "db_identity": final["db_identity"],
                 "ledger_sha256": final["ledger_sha256"],
-                "state": "PREPARED",
+                "state": "RESTORE_HELD" if action == "restore_prepare" else "PREPARED",
                 "admission": None,
                 "maintenance": None,
             }
         elif target is None:
             raise InstanceAdmissionError("Authority history operation precedes prepare")
-        elif action == "admit":
+        elif action in {"admit", "restore_admit"}:
             if (
-                target["state"] != "PREPARED"
+                target["state"] != ("RESTORE_HELD" if action == "restore_admit" else "PREPARED")
                 or target["maintenance"] is not None
                 or (
                     replay["current"] is not None
@@ -911,7 +916,12 @@ def _profile(config: TrustedInstanceConfig, *, expected: list[int] | None) -> Pr
 
 
 def prepare_production_profile(
-    config: TrustedInstanceConfig, *, operation_id: str, approval_ref: str
+    config: TrustedInstanceConfig,
+    *,
+    operation_id: str,
+    approval_ref: str,
+    _restore_database: Path | None = None,
+    _restore_sha256: str | None = None,
 ) -> ProductionProfile:
     from finance_core.reconciliation.migrations import (
         TEMP_DB_MIGRATION_PATHS,
@@ -1009,6 +1019,29 @@ def prepare_production_profile(
                     initialize_application_schema(
                         conn, config._binding["migration_identity"], config.application_schema
                     )
+                    if _restore_database is not None:
+                        restore_fd = _open_checked(_restore_database, directory=False)
+                        try:
+                            restore_bytes = os.pread(restore_fd, os.fstat(restore_fd).st_size, 0)
+                            if hashlib.sha256(restore_bytes).hexdigest() != _restore_sha256:
+                                raise InstanceAdmissionError("Restored snapshot bytes changed")
+                            source = sqlite3.connect(":memory:")
+                            source.deserialize(restore_bytes)
+                            try:
+                                source.backup(conn)
+                                sealed_ledger = ledger_sha256(conn)
+                            finally:
+                                source.close()
+                            if (
+                                hashlib.sha256(_restore_database.read_bytes()).hexdigest()
+                                != _restore_sha256
+                            ):
+                                raise InstanceAdmissionError(
+                                    "Restored snapshot replaced during copy"
+                                )
+                        finally:
+                            os.close(restore_fd)
+
                     validate_application_database(
                         conn,
                         config._binding["migration_identity"],
@@ -1054,7 +1087,7 @@ def prepare_production_profile(
                     "binding": config._binding,
                     "db_identity": identity,
                     "ledger_sha256": sealed_ledger,
-                    "state": "PREPARED",
+                    "state": "RESTORE_HELD" if _restore_database is not None else "PREPARED",
                     "admission": None,
                     "maintenance": None,
                 }
@@ -1062,7 +1095,7 @@ def prepare_production_profile(
                     config,
                     state,
                     after,
-                    action="prepare",
+                    action="restore_prepare" if _restore_database is not None else "prepare",
                     operation_id=operation_id,
                     approval_ref=approval_ref,
                 )
@@ -1253,6 +1286,7 @@ def _change(
     operation_id: str,
     approval_ref: str,
     evidence_ref: str | None = None,
+    _restore_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with _control(config) as control:
         state = _state(config)
@@ -1287,14 +1321,19 @@ def _change(
             after = _decode(_canonical(state))
             target = _record(config, after)
             context: object = None
-            if action == "admit":
-                if target["state"] != "PREPARED" or target["maintenance"] is not None:
+            if action in {"admit", "restore_admit"}:
+                if (
+                    target["state"] != ("RESTORE_HELD" if action == "restore_admit" else "PREPARED")
+                    or target["maintenance"] is not None
+                ):
                     raise InstanceAdmissionError("Only fresh PREPARED instance can be admitted")
                 prior = after["current"]
                 if prior is not None and after["instances"][prior]["state"] != "FENCED":
                     raise InstanceAdmissionError("Current instance is still active")
                 target["state"], target["admission"] = "ACTIVE", operation_id
                 after["current"] = config.binding_sha256
+                if action == "restore_admit":
+                    context = _restore_context
             elif action == "fence":
                 if target["state"] != "ACTIVE":
                     raise InstanceAdmissionError("Only ACTIVE instance can be permanently fenced")
