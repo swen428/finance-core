@@ -425,7 +425,7 @@ def _assert_bounds(normalization: dict[str, Any]) -> None:
     }
     parameters = normalization["parameters"]
     assert parameters == {
-        "Pillow": "12.3.0",
+        "Pillow": "13.0.0",
         "pillow-heif": "1.8.0",
         "hevc_decoder": "libde265",
         "decode_threads": 1,
@@ -617,7 +617,7 @@ def _execute_operation(
     assert metadata["convert_hdr_to_8bit"] is True
     assert metadata["alpha_policy"] == "white_matte"
     assert normalization["decoder"]["packages"] == {
-        "Pillow": "12.3.0",
+        "Pillow": "13.0.0",
         "pillow-heif": "1.8.0",
     }
     assert verified.manifest["decoder_process_usage"] == usage

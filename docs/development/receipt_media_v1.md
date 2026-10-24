@@ -6,11 +6,26 @@ static image to PNG, invokes the explicit local OCR engine on that exact PNG,
 and publishes an immutable, replayable reference. It performs no database,
 proposal, confirmation, final-fact, provider, Telegram or runtime operations.
 
-Install the optional `finance-core[media]` extra: `Pillow==12.3.0` and
+Install the optional `finance-core[media]` extra: `Pillow==13.0.0` and
 `pillow-heif==1.8.0`. Base Core imports and existing consumers retain their
 existing dependency contract. The native worker requires Linux and a
 single-threaded caller. Actual Ubuntu 24.04 qualification is separate from
 unit tests with synthetic decoder or OCR fault adapters.
+
+## Execution and historical read compatibility
+
+New decoding admits only the exact Pillow13.0.0/pillow-heif1.8.0 installation.
+`read_verified()` also admits the complete former Pillow12.3.0 normalization
+parameter profile, with exact JSON value types and unchanged bounds. It still
+checks every original, declaration, PNG, OCR and terminal member, their hashes,
+links, permissions and operation custody. Historical read does not invoke a
+decoder or OCR, change bytes, relabel identity or migrate a fingerprint.
+
+Reusing an old operation ID with a new decoder/code installation conflicts,
+including an old failed or UNKNOWN operation. It cannot retry decoding under
+the former version. A new operation needs a distinct ID and records its own
+new intent and normalization fingerprints even when pixels are identical.
+No public request can select an older decoder or alter the admitted profile.
 
 ## Trusted composition and captured input
 

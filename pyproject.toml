@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==84.0.0"]
+requires = ["setuptools==84.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,13 +11,13 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.12"
 dependencies = [
-    "pypdf==6.16.1",
+    "pypdf==6.21.2",
     "typing-extensions==4.16.0",
 ]
 
 [project.optional-dependencies]
 media = [
-    "Pillow==12.3.0",
+    "Pillow==13.0.0",
     "pillow-heif==1.8.0",
 ]
 

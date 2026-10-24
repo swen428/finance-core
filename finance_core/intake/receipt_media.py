@@ -42,7 +42,7 @@ _OPERATION = re.compile(r"media_[A-Za-z0-9_-]{1,120}\Z")
 _CODE = re.compile(r"[a-z0-9_]{1,64}\Z")
 _failure_injection_hook: Callable[[str], None] | None = None
 _DECODER_PARAMETERS = {
-    "Pillow": "12.3.0",
+    "Pillow": "13.0.0",
     "pillow-heif": "1.8.0",
     "hevc_decoder": "libde265",
     "decode_threads": 1,
@@ -56,6 +56,8 @@ _DECODER_PARAMETERS = {
     "resize": False,
     "orientation_policy": "container_once_exif_metadata_only_refused",
 }
+# Historical verification only: never selected by process() or the worker.
+_HISTORICAL_DECODER_PARAMETERS = {**_DECODER_PARAMETERS, "Pillow": "12.3.0"}
 _BOUNDS = {
     "source_bytes": SOURCE_BYTES,
     "pixels": PIXELS,
@@ -454,7 +456,8 @@ class ReceiptMediaProcessor:
             )
         self._decoder = observed["decoder"]
         if (
-            self._decoder.get("python_prefix") != sys.prefix
+            self._decoder.get("packages") != {"Pillow": "13.0.0", "pillow-heif": "1.8.0"}
+            or self._decoder.get("python_prefix") != sys.prefix
             or self._decoder.get("python_base_prefix") != sys.base_prefix
         ):
             raise ReceiptMediaError("Decoder Python environment differs from the trusted caller")
@@ -1141,8 +1144,18 @@ class ReceiptMediaProcessor:
         original: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if (
-            intent.get("decoder_parameters") != _DECODER_PARAMETERS
-            or intent.get("bounds") != _BOUNDS
+            _canonical(intent.get("decoder_parameters"))
+            not in (
+                _canonical(_DECODER_PARAMETERS),
+                _canonical(_HISTORICAL_DECODER_PARAMETERS),
+            )
+            or _canonical(intent.get("bounds")) != _canonical(_BOUNDS)
+            or not isinstance(intent.get("decoder"), dict)
+            or intent["decoder"].get("packages")
+            != {
+                "Pillow": intent["decoder_parameters"]["Pillow"],
+                "pillow-heif": "1.8.0",
+            }
         ):
             raise MediaIntegrityError("Media reference uses an unknown normalization policy")
         declaration_raw, declaration_member = _read_member(directory, "declaration.json", 4096)
@@ -1167,8 +1180,9 @@ class ReceiptMediaProcessor:
             raise MediaIntegrityError("Original or exact normalized PNG binding differs")
         if (
             normalization.get("decoder") != intent["decoder"]
-            or normalization.get("parameters") != intent["decoder_parameters"]
-            or normalization.get("bounds") != intent["bounds"]
+            or _canonical(normalization.get("parameters"))
+            != _canonical(intent["decoder_parameters"])
+            or _canonical(normalization.get("bounds")) != _canonical(intent["bounds"])
             or normalization.get("code") != intent["code"]
         ):
             raise MediaIntegrityError("Normalization identity differs from admitted operation")

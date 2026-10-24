@@ -71,8 +71,8 @@ PYTHON_METADATA_SINGLE_FIELDS = {
 PYTHON_METADATA_MULTI_FIELDS = {"Requires-Dist", "License-File", "Dynamic"}
 # This reviewed allowlist is independent of candidate package metadata. Keep
 # wheel and sdist checks bound to the same explicitly approved dependencies.
-APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.16.1", "typing-extensions==4.16.0")
-APPROVED_MEDIA_DEPENDENCIES = ("Pillow==12.3.0", "pillow-heif==1.8.0")
+APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.21.2", "typing-extensions==4.16.0")
+APPROVED_MEDIA_DEPENDENCIES = ("Pillow==13.0.0", "pillow-heif==1.8.0")
 
 
 def _sha256(path: Path) -> str:
@@ -241,7 +241,7 @@ def _project_metadata(source_files: dict[str, bytes], version: str) -> dict[str,
         or project.get("license-files") != expected["License-File"]
         or project.get("readme") != "README.md"
         or not isinstance(project.get("description"), str)
-        or build_system.get("requires") != ["setuptools==84.0.0"]
+        or build_system.get("requires") != ["setuptools==84.1.0"]
         or build_system.get("build-backend") != "setuptools.build_meta"
     ):
         raise ValueError("pyproject.toml release metadata is not the approved contract")
@@ -352,7 +352,7 @@ def _inspect_wheel(
     if (
         set(wheel_metadata.keys()) != {"Wheel-Version", "Generator", "Root-Is-Purelib", "Tag"}
         or wheel_metadata.get("Wheel-Version") != "1.0"
-        or wheel_metadata.get("Generator") != "setuptools (84.0.0)"
+        or wheel_metadata.get("Generator") != "setuptools (84.1.0)"
         or wheel_metadata.get("Root-Is-Purelib") != "true"
         or wheel_metadata.get_all("Tag", []) != ["py3-none-any"]
     ):

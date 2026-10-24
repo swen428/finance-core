@@ -7,13 +7,13 @@ Finance Bridge declares its Node dependencies in
 
 Direct runtime dependencies and their declared licenses:
 
-- `pypdf` 6.16.1 — BSD-3-Clause.
+- `pypdf` 6.21.2 — BSD-3-Clause.
 - `typing-extensions` 4.16.0 — PSF-2.0.
 - `fs-ext` 2.1.1 — MIT.
 - `typebox` 1.3.3 — MIT.
 - `openclaw` 2026.7.1-2 is an optional peer dependency — MIT.
 
-The optional Python `media` extra adds `Pillow` 12.3.0 (MIT-CMU) and
+The optional Python `media` extra adds `Pillow` 13.0.0 (MIT-CMU) and
 `pillow-heif` 1.8.0 (BSD-3-Clause). Their binary wheels include native
 libraries under their own licenses; retain each installed wheel's license
 files, including `pillow-heif`'s `LICENSES_bundled.txt`. This repository
