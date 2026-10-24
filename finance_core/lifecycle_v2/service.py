@@ -327,6 +327,8 @@ class LedgerService:
             prior_proposal[0] if prior_proposal else None,
             prior_review[0] if prior_review else None,
             correction_reason,
+            fact["fact_sha256"] if record_id is not None else None,
+            fact["economic_event_id"] if record_id is not None else None,
         )
 
     def _propose(
@@ -541,6 +543,33 @@ class LedgerService:
     def confirm(self, review_id, action_evidence_id, operation_id):
         with lifecycle_write_operation(self.owner) as conn:
             conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT * FROM l2_decisions WHERE operation_id=?", (operation_id,)
+            ).fetchone()
+            if existing:
+                if (
+                    existing["action_evidence_id"] != action_evidence_id
+                    or existing["review_id"] != review_id
+                ):
+                    raise LifecycleError("Commit replay mismatch")
+                original_review = _row(conn, "l2_reviews", "review_id", review_id)
+                if json.loads(original_review["material_json"])["binding"] != asdict(self.binding):
+                    raise LifecycleError("Committed replay belongs to another runtime binding")
+                fact = conn.execute(
+                    "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
+                    (existing["record_id"], existing["version"]),
+                ).fetchone()
+                if fact is None:
+                    raise LifecycleError("Committed replay fact is absent")
+                from .reader import verify_record
+
+                verify_record(self, conn, existing["record_id"])
+                # verify_record authenticates the exact original provider, display,
+                # action, decision and commit. This observes an existing result;
+                # current expiry/latest-card gates apply only to fresh decisions.
+                return CommitReceipt(
+                    fact["record_id"], fact["version"], fact["fact_sha256"], fact["commit_seq"]
+                )
             row = _row(conn, "l2_reviews", "review_id", review_id)
             from .reader import verify_review
 
@@ -576,22 +605,6 @@ class LedgerService:
                 or action.action != "confirm"
             ):
                 raise LifecycleError("Confirmation action mismatch")
-            existing = conn.execute(
-                "SELECT * FROM l2_decisions WHERE operation_id=?", (operation_id,)
-            ).fetchone()
-            if existing:
-                if (
-                    existing["action_evidence_id"] != action_evidence_id
-                    or existing["review_id"] != review_id
-                ):
-                    raise LifecycleError("Commit replay mismatch")
-                fact = conn.execute(
-                    "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
-                    (existing["record_id"], existing["version"]),
-                ).fetchone()
-                return CommitReceipt(
-                    fact["record_id"], fact["version"], fact["fact_sha256"], fact["commit_seq"]
-                )
             record_id = row["record_id"] or _id("record")
             predecessor = conn.execute(
                 "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
@@ -710,7 +723,13 @@ class LedgerService:
         with lifecycle_read_operation(self.owner) as conn:
             conn.execute("BEGIN")
             audit_connection(conn)
-            if conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone():
+            if (
+                conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
+                or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
+                or conn.execute(
+                    "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
+                ).fetchone()
+            ):
                 from .legacy import verify_import_archives
 
                 verify_import_archives(conn, self.legacy_verifier)

@@ -51,3 +51,33 @@ application schema inventories, migration resource manifest, snapshot manifests,
 restore/admission state replay, and focused synthetic tests. Historical public
 posting APIs and migrations remain available. Installed combination validation,
 independent reviews, hosted validation, release and activation are separate gates.
+
+Head B validation strengthens recovery and retained-history checks. Exact committed
+operation retries are resolved before current-card expiry and latest-proposal
+checks. They authenticate the original action/review/operation and verify the
+original fact/decision plus that record's retained commit inventory; they return
+the original receipt even after a later correction. A different runtime binding,
+actor, action, review or operation cannot borrow that result.
+
+Complete audits enforce both directions between retained capture/proposal/review/
+delivery/confirmation events and their owned rows. Every native confirmation maps
+to exactly one fact version and decision; every decision/fact maps back to its
+exact event, operation, review, action, hash and sequence. Historical import
+completeness additionally uses the independently authenticated retained archive
+union. Ordinary reads inspect only the selected record's indexed history; the
+complete inventory runs on startup, daily audit, snapshots and restore checks.
+These checks detect missing owned rows against retained evidence. They cannot
+detect rollback of **all** relevant state to a previously valid complete prefix
+without an independent retained checkpoint. No external commit anchor is added
+or claimed by this candidate.
+
+Both live-original promotion and signed isolation receipt issuance use the same
+proof: actual FENCED state, released original lifetime owner, exact current
+record/version/hash and audit-sequence cut, and admitted installation/schema
+identities. A stale cut remains RESTORE_HELD. To inspect the fixed original
+profile while the caller's environment names the new held profile, this proof
+holds the existing process-wide managed SQLite lock, temporarily selects only
+the trusted original runtime path, closes its read owner, and restores the
+caller's environment in `finally`. Tests cover contention, stale rejection and
+exact-cut promotion, including restoration of the new runtime environment on
+both success and failure.

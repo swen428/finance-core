@@ -62,6 +62,8 @@ class ExpectedInvocation:
     current_proposal_id: str | None = None
     current_review_id: str | None = None
     correction_reason: str | None = None
+    current_fact_sha256: str | None = None
+    current_economic_event_id: str | None = None
 
 
 @dataclass(frozen=True)

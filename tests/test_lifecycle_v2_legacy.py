@@ -551,3 +551,346 @@ def test_receipt_import_retains_original_without_access_to_old_file(tmp_path, mo
             owner.close()
         if cfg is not None:
             cfg.close()
+
+
+@pytest.fixture(scope="module")
+def authenticated_import_inventory(tmp_path_factory):
+    """One genuine owner-built import cut, reused only through detached copies."""
+    import hashlib
+
+    from conftest import connect_temp_db
+    from instance_admission_support_v1 import synthetic_config
+    from test_lifecycle_v2 import Port, response
+
+    from finance_core.instance_admission import (
+        acquire_production_owner,
+        admit_production_instance,
+        prepare_production_profile,
+    )
+    from finance_core.lifecycle_v2 import LedgerService, RuntimeBinding, VerifiedSource
+    from finance_core.reconciliation import migrations
+
+    root = tmp_path_factory.mktemp("legacy-authenticated-inventory")
+    patch = pytest.MonkeyPatch()
+    old = connect_temp_db(root / "old.sqlite")
+    owner = cfg = None
+    try:
+        migrations.apply_migration_paths(old, LEGACY_MIGRATION_PATHS)
+        adapter, _, _, _, _ = _subject(old, ai_origin=True)
+        export = adapter.verify_export()
+        patch.setattr(migrations, "TEMP_DB_MIGRATION_PATHS", NEW_MIGRATION_PATHS)
+        target = root / "target"
+        target.mkdir(mode=0o700)
+        cfg = synthetic_config(target, patch)
+        prepare_production_profile(cfg, operation_id="prepare", approval_ref="approved").close()
+        admit_production_instance(cfg, operation_id="admit", approval_ref="approved")
+        owner = acquire_production_owner(cfg)
+        service = LedgerService(
+            owner,
+            Port(),
+            RuntimeBinding(cfg.instance_id, "inventory-generation", "wen", "chat"),
+            legacy_verifier=_export_verifier(),
+        )
+        receipt = service.import_verified(export)[0]
+        adapter._corrections.prepare_correction(
+            json.loads(export.manifest_json)["records"][0]["legacy_record_id"],
+            {"category": "additional-unexecuted-plan"},
+            "Retain another plan",
+        )
+        assert service.import_verified(adapter.verify_export())[0] == receipt
+        assert service.reader().full_audit()["fact_version_count"] == 2
+        before_native = root / "authenticated-before-native.sqlite"
+        service.seal_snapshot(before_native)
+        reply = "change amount to SGD 19.25 reason: Correct imported expense"
+        service.port.sources["inventory-fresh-reply"] = VerifiedSource(
+            "inventory-fresh-reply",
+            "wen",
+            "chat",
+            "inventory-fresh-message",
+            reply,
+            hashlib.sha256(reply.encode()).hexdigest(),
+            source_timestamp=1792800000,
+        )
+        service.port.raw = response(reply, "reply", {"amount": "19.25", "currency": "SGD"})
+        review = service.prepare_correction(
+            receipt.record_id,
+            2,
+            "inventory-observation",
+            "inventory-correction",
+            reply_evidence_id="inventory-fresh-reply",
+            reason="Correct imported expense",
+        )
+        service.record_delivery(review.review_id, "inventory-delivery")
+        service.confirm(review.review_id, "inventory-action", "inventory-confirm")
+        assert service.reader().full_audit()["fact_version_count"] == 3
+        # Completeness scans belong to full audit/snapshot/held restore, not a
+        # bounded point read of an unchanged imported record.
+        from finance_core.lifecycle_v2 import legacy
+
+        with patch.context() as point_patch:
+
+            def forbid_archive_scan(*_args):
+                raise AssertionError("Point reader attempted the entire legacy archive")
+
+            point_patch.setattr(legacy, "verify_import_archives", forbid_archive_scan)
+            assert service.reader().get(receipt.record_id)["values"]["amount"] == "19.25"
+        after_native = root / "authenticated-after-native.sqlite"
+        service.seal_snapshot(after_native)
+        yield before_native, after_native, receipt.record_id
+    finally:
+        old.close()
+        if owner is not None:
+            owner.close()
+        if cfg is not None:
+            cfg.close()
+        patch.undo()
+
+
+def _unchecked_snapshot_mutation(conn, operation):
+    """Adversarial detached copy only; original owner and evidence stay intact."""
+    conn.execute("PRAGMA foreign_keys=OFF")
+    triggers = conn.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger'").fetchall()
+    for name, _sql in triggers:
+        conn.execute('DROP TRIGGER "' + name.replace('"', '""') + '"')
+    operation()
+    for _name, sql in triggers:
+        conn.execute(sql)
+    conn.commit()
+
+
+def _rehash_remaining_events(conn):
+    """Make surviving ordinary events fully self-consistent, without HMAC roots."""
+    from finance_core.lifecycle_v2.contracts import canonical, digest
+
+    events = conn.execute("SELECT * FROM l2_events ORDER BY seq").fetchall()
+    conn.execute("DELETE FROM l2_events")
+    conn.execute("UPDATE l2_facts SET commit_seq=-commit_seq")
+    previous = None
+    for sequence, event in enumerate(events, 1):
+        payload = json.loads(event["payload_json"])
+        sha = digest(
+            [sequence, event["operation_id"], event["kind"], event["entity_id"], payload, previous]
+        )
+        conn.execute(
+            "UPDATE l2_facts SET commit_seq=? WHERE commit_seq=?", (sequence, -event["seq"])
+        )
+        conn.execute(
+            "INSERT INTO l2_events VALUES(?,?,?,?,?,?,?)",
+            (
+                sequence,
+                event["operation_id"],
+                event["kind"],
+                event["entity_id"],
+                canonical(payload),
+                previous,
+                sha,
+            ),
+        )
+        previous = sha
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "whole_record",
+        "latest_version",
+        "initial_version_relabelled",
+        "record_capsule",
+        "import_row",
+        "import_event",
+        "archive_event",
+        "archive_event_entity",
+        "archive_event_export_hash",
+        "duplicate_archive_event",
+        "forged_fact_hashes",
+        "no_import_rows_but_event",
+        "no_import_rows_but_capsule",
+    ],
+)
+def test_signed_import_inventory_rejects_missing_or_forged_rows(
+    authenticated_import_inventory, tmp_path, damage
+):
+    import shutil
+    import sqlite3
+
+    from finance_core.lifecycle_v2.contracts import canonical, digest
+    from finance_core.lifecycle_v2.legacy import verify_import_archives
+    from finance_core.lifecycle_v2.reader import audit_connection
+    from finance_core.lifecycle_v2.service import _fact_material
+
+    original, _, record_id = authenticated_import_inventory
+    path = tmp_path / (damage + ".sqlite")
+    shutil.copyfile(original, path)
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+
+        def corrupt():
+            if damage == "whole_record":
+                conn.execute("DELETE FROM l2_facts WHERE record_id=?", (record_id,))
+                conn.execute(
+                    "DELETE FROM l2_events WHERE kind='import' AND entity_id=?", (record_id,)
+                )
+            elif damage == "latest_version":
+                seq = conn.execute(
+                    "SELECT commit_seq FROM l2_facts WHERE record_id=? AND version=2", (record_id,)
+                ).fetchone()[0]
+                conn.execute("DELETE FROM l2_facts WHERE record_id=? AND version=2", (record_id,))
+                conn.execute("DELETE FROM l2_events WHERE seq=?", (seq,))
+            elif damage == "initial_version_relabelled":
+                first = conn.execute(
+                    "SELECT * FROM l2_facts WHERE record_id=? AND version=1", (record_id,)
+                ).fetchone()
+                second = conn.execute(
+                    "SELECT * FROM l2_facts WHERE record_id=? AND version=2", (record_id,)
+                ).fetchone()
+                conn.execute("DELETE FROM l2_facts WHERE record_id=? AND version=1", (record_id,))
+                conn.execute("DELETE FROM l2_events WHERE seq=?", (first["commit_seq"],))
+                fields = json.loads(second["values_json"])
+                sha = digest(
+                    _fact_material(
+                        record_id, 1, second["economic_event_id"], second["source_id"], fields, None
+                    )
+                )
+                conn.execute(
+                    "UPDATE l2_facts SET version=1,predecessor_sha256=NULL,fact_sha256=? "
+                    "WHERE record_id=?",
+                    (sha, record_id),
+                )
+                event = conn.execute(
+                    "SELECT * FROM l2_events WHERE seq=?", (second["commit_seq"],)
+                ).fetchone()
+                payload = json.loads(event["payload_json"])
+                payload.update(version=1, legacy_version=0, fact_sha256=sha)
+                conn.execute(
+                    "UPDATE l2_events SET operation_id=?,payload_json=? WHERE seq=?",
+                    (
+                        event["operation_id"].rsplit(":", 1)[0] + ":1",
+                        canonical(payload),
+                        event["seq"],
+                    ),
+                )
+            elif damage == "record_capsule":
+                conn.execute(
+                    "DELETE FROM l2_archives WHERE kind='record' AND export_id="
+                    "(SELECT min(export_id) FROM l2_imports)"
+                )
+            elif damage == "import_row":
+                export_id = conn.execute("SELECT min(export_id) FROM l2_imports").fetchone()[0]
+                conn.execute("DELETE FROM l2_archives WHERE export_id=?", (export_id,))
+                conn.execute("DELETE FROM l2_imports WHERE export_id=?", (export_id,))
+            elif damage in {"import_event", "archive_event"}:
+                kind = "import" if damage == "import_event" else "legacy_archive"
+                conn.execute(
+                    "DELETE FROM l2_events WHERE seq=(SELECT min(seq) FROM l2_events WHERE kind=?)",
+                    (kind,),
+                )
+            elif damage == "archive_event_entity":
+                conn.execute(
+                    "UPDATE l2_events SET entity_id='wrong-entity' WHERE kind='legacy_archive'"
+                )
+            elif damage == "archive_event_export_hash":
+                event = conn.execute(
+                    "SELECT * FROM l2_events WHERE kind='legacy_archive' LIMIT 1"
+                ).fetchone()
+                payload = json.loads(event["payload_json"])
+                payload["export_sha256"] = "f" * 64
+                conn.execute(
+                    "UPDATE l2_events SET payload_json=? WHERE seq=?",
+                    (canonical(payload), event["seq"]),
+                )
+            elif damage == "duplicate_archive_event":
+                event = conn.execute(
+                    "SELECT * FROM l2_events WHERE kind='legacy_archive' LIMIT 1"
+                ).fetchone()
+                seq = conn.execute("SELECT max(seq)+1 FROM l2_events").fetchone()[0]
+                conn.execute(
+                    "INSERT INTO l2_events VALUES(?,?,?,?,?,?,?)",
+                    (
+                        seq,
+                        "duplicate-archive-event",
+                        event["kind"],
+                        event["entity_id"],
+                        event["payload_json"],
+                        event["previous_sha256"],
+                        "f" * 64,
+                    ),
+                )
+            elif damage == "forged_fact_hashes":
+                previous = None
+                for fact in conn.execute(
+                    "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version", (record_id,)
+                ).fetchall():
+                    fields = json.loads(fact["values_json"])
+                    fields["amount"] = "999.00"
+                    sha = digest(
+                        _fact_material(
+                            record_id,
+                            fact["version"],
+                            fact["economic_event_id"],
+                            fact["source_id"],
+                            fields,
+                            previous,
+                        )
+                    )
+                    conn.execute(
+                        "UPDATE l2_facts SET values_json=?,predecessor_sha256=?,fact_sha256=? "
+                        "WHERE record_id=? AND version=?",
+                        (canonical(fields), previous, sha, record_id, fact["version"]),
+                    )
+                    event = conn.execute(
+                        "SELECT payload_json FROM l2_events WHERE seq=?", (fact["commit_seq"],)
+                    ).fetchone()
+                    payload = json.loads(event[0])
+                    payload["fact_sha256"] = sha
+                    conn.execute(
+                        "UPDATE l2_events SET payload_json=? WHERE seq=?",
+                        (canonical(payload), fact["commit_seq"]),
+                    )
+                    previous = sha
+            else:
+                # A complete valid prefix rollback has no retained authenticated
+                # head and is outside this claim. These retain orphan evidence.
+                for table in ("l2_facts", "l2_sources", "l2_imports", "l2_events"):
+                    conn.execute("DELETE FROM " + table)
+                if damage == "no_import_rows_but_event":
+                    conn.execute("DELETE FROM l2_archives")
+                    conn.execute(
+                        "INSERT INTO l2_events VALUES(1,'orphan','legacy_archive',"
+                        "'orphan',?,NULL,?)",
+                        (canonical({"export_id": "orphan"}), "a" * 64),
+                    )
+            _rehash_remaining_events(conn)
+
+        _unchecked_snapshot_mutation(conn, corrupt)
+        if damage in {
+            "whole_record",
+            "latest_version",
+            "initial_version_relabelled",
+            "forged_fact_hashes",
+        }:
+            # Ordinary chain/material/inventory checks pass for the surviving
+            # self-consistent rows. Independent signed expectations must refuse.
+            audit_connection(conn)
+        with pytest.raises(LegacyExportError):
+            verify_import_archives(conn, _export_verifier())
+
+
+def test_authenticated_import_union_allows_dedup_and_new_native_versions(
+    authenticated_import_inventory,
+):
+    import sqlite3
+
+    from finance_core.lifecycle_v2.legacy import verify_import_archives
+    from finance_core.lifecycle_v2.reader import audit_connection
+
+    _, path, record_id = authenticated_import_inventory
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        verify_import_archives(conn, _export_verifier())
+        assert audit_connection(conn)["fact_version_count"] == 3
+        assert conn.execute("SELECT count(*) FROM l2_imports").fetchone()[0] == 2
+        latest = conn.execute(
+            "SELECT values_json FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+            (record_id,),
+        ).fetchone()
+        assert json.loads(latest[0])["amount"] == "19.25"

@@ -76,6 +76,24 @@ archive and every original byte. A fresh current correction requires a new
 authenticated reply, provider result, full card and human action under the new
 owner; it does not execute an archived old plan.
 
+Full audit, snapshot creation and held restore derive the expected imported
+fact inventory from the independently HMAC-authenticated manifests and record
+capsules. This is a consistent union across exports: an overlapping export
+does not create a second economic fact, and every authenticated original and
+correction version must still have its exact fact row. Deleting a whole record,
+its latest version, or its initial version cannot be hidden by deleting ordinary
+events and recomputing their hashes while the signed import inventory remains.
+Later native corrections with fresh reviews/decisions may extend that history.
+Archive acceptance events and import rows match in both directions, including
+exact export identity/hash, and import events match exact fact versions.
+
+This does not create an independent durable commit head. Rolling the complete
+database back to an earlier valid prefix, including removal of all later signed
+imports, capsules and facts, is outside this guarantee unless an independently
+retained head or verified backup reveals the rollback. It does not guarantee
+recovery of every unbacked-up record. Ordinary point reads continue to verify
+only their bounded record/source capsules; completeness is a full-audit gate.
+
 Impact classification:
 
 | Surface | Treatment | Evidence |
@@ -102,7 +120,7 @@ database, provider service or Telegram runtime is inspected or invoked.
   reason contract, the two affected new-owner integration cases passed in
   18.60 seconds. These also cover receipt import, deletion of the old original,
   closing the old connection, and exact original bytes retained in the new
-  independently readable SQLite snapshot. The final file contains 19 cases;
+  independently readable SQLite snapshot. At that point the file contained 19 cases;
   the preceding results are separate executions, not a claim of one 19-case run.
 - Focused Ruff and Mypy checks passed for the new adapter and its tests.
 
@@ -112,3 +130,21 @@ with retained signed source/provider/human evidence. The target uses actual
 ProductionOwner sessions. This does not newly benchmark old production-reader
 composition, inspect real history, certify unknown legacy formats, or replace
 the final candidate's independent specialist reviews and hosted validation.
+
+## Head B review repair
+
+FIN-A02's imported-record completeness finding is addressed by the signed union
+gate above. Four adversarial cuts deliberately retain self-consistent ordinary
+facts/events: removal of a whole imported record, removal of its latest version,
+removal/relabeling of its initial version, and forged values with all ordinary
+hashes recomputed. Ordinary structural audit passes these surviving rows, while
+the independently authenticated import inventory refuses them. Other regressions
+cover missing capsules/import rows/events, wrong archive event identity/hash,
+duplicate archive events and orphan evidence when no import row remains.
+
+A genuine two-export fixture retains one economic fact, both old versions and
+a fresh native third correction; full audit and snapshot accept it. A point-read
+check explicitly forbids calling the whole-archive verifier. These are detached
+synthetic corruption copies, preserving the genuine owner-built source cut.
+The 14 new focused cases passed in 16.93 seconds; combined regression results
+are recorded separately for the final candidate.

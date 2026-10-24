@@ -13,7 +13,7 @@ from finance_core.instance_admission import (
 )
 from finance_core.instance_admission.authority import _change
 
-from .contracts import LifecycleError, SnapshotCut
+from .contracts import LifecycleError, SnapshotCut, digest
 
 _ISSUED: dict[int, object] = {}
 _VERIFIED: set[int] = set()
@@ -115,9 +115,7 @@ def promote_restored_profile(
         raise LifecycleError(
             "All held source/provider/action evidence must be verified before promotion"
         )
-    old = inspect_instance_admission(old_config)
-    if old["state"] != "FENCED":
-        raise LifecycleError("Actual original writer has not been permanently fenced")
+    old = _verify_fenced_cut(old_config, restored.cut)
     if inspect_instance_admission(restored.config)["state"] != "RESTORE_HELD":
         raise LifecycleError("Restore is not held")
     result = _change(
@@ -125,6 +123,10 @@ def promote_restored_profile(
         action="restore_admit",
         operation_id=operation_id,
         approval_ref=approval_ref,
+        _restore_context={
+            "actual_old_binding_sha256": old_config.binding_sha256,
+            "fenced_state_sha256": digest(old),
+        },
     )
     _VERIFIED.discard(id(restored))
     _ISSUED.pop(id(restored), None)
@@ -162,33 +164,7 @@ class RecoveryAuthority:
 
         from .contracts import canonical
 
-        if old_config.instance_id != cut.instance_id:
-            raise LifecycleError("Isolation receipt old instance differs from snapshot")
-        state = inspect_instance_admission(old_config)
-        if state["state"] != "FENCED":
-            raise LifecycleError("Isolation receipt requires actual permanently FENCED old writer")
-        from finance_core.instance_admission import acquire_production_owner
-        from finance_core.instance_admission.sessions import lifecycle_read_operation
-
-        # Require the original owner to have actually released its lifetime lease.
-        with acquire_production_owner(old_config) as owner:
-            with lifecycle_read_operation(owner) as conn:
-                facts = tuple(
-                    tuple(r)
-                    for r in conn.execute(
-                        "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
-                        "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
-                        "ORDER BY record_id"
-                    )
-                )
-                seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
-                if (
-                    facts != cut.facts
-                    or seq != cut.commit_seq
-                    or cut.core_identity != old_config.core_identity
-                    or cut.migration_identity != old_config._binding["migration_identity"]
-                ):
-                    raise LifecycleError("Isolation receipt snapshot cut is stale or unrelated")
+        state = _verify_fenced_cut(old_config, cut)
         material = canonical(
             {
                 "schema": "old-writer-isolation-v2",
@@ -381,3 +357,49 @@ def verify_held_profile_evidence(restored: RestoredProfile, port, binding, legac
                 conn.close()
     _VERIFIED.add(id(restored))
     return result
+
+
+def _verify_fenced_cut(old_config: TrustedInstanceConfig, cut: SnapshotCut):
+    """Shared live-original proof for both generic promotion and signed isolation.
+
+    Hold the process's existing managed SQLite lock while selecting the fixed
+    original profile's environment, then restore the caller's current environment.
+    The original lifetime owner must already be released; only a new read owner
+    may inspect its permanently fenced exact cut.
+    """
+    import os
+
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.instance_admission.sessions import lifecycle_read_operation
+    from finance_core.profile_paths import _MANAGED_SQLITE_LIFETIME_LOCK
+    from finance_core.runtime_paths import RUNTIME_ROOT_ENV
+
+    from .contracts import digest
+    from .reader import audit_connection
+
+    if old_config.instance_id != cut.instance_id:
+        raise LifecycleError("Old writer identity differs from snapshot")
+    with _MANAGED_SQLITE_LIFETIME_LOCK:
+        previous = os.environ.get(RUNTIME_ROOT_ENV)
+        os.environ[RUNTIME_ROOT_ENV] = str(Path(old_config._binding["profile_root"]) / "runtime")
+        try:
+            state = inspect_instance_admission(old_config)
+            if state["state"] != "FENCED":
+                raise LifecycleError("Actual original writer has not been permanently fenced")
+            with acquire_production_owner(old_config, timeout_seconds=0) as owner:
+                with lifecycle_read_operation(owner) as conn:
+                    audit_connection(conn)
+                    _verify_cut_connection(conn, cut)
+                    if (
+                        cut.core_identity != old_config.core_identity
+                        or cut.migration_identity != old_config._binding["migration_identity"]
+                        or cut.application_schema_digest
+                        != digest(old_config._binding["application_schema"])
+                    ):
+                        raise LifecycleError("Fenced snapshot cut installation identity differs")
+            return state
+        finally:
+            if previous is None:
+                os.environ.pop(RUNTIME_ROOT_ENV, None)
+            else:
+                os.environ[RUNTIME_ROOT_ENV] = previous

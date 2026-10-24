@@ -1087,13 +1087,42 @@ def verify_imported_fact(conn, fact, verifier):
 
 
 def verify_import_archives(conn, verifier):
-    """Whole-archive audit/recovery check, outside the ordinary indexed read path."""
+    """Authenticate the complete retained import union, including absent rows.
+
+    Signed manifests are the expected inventory. Scanning only extant facts or
+    accepting a self-consistent event chain cannot prove imported completeness.
+    This whole-archive check is deliberately outside ordinary indexed reads.
+    """
     from .contracts import digest
+    from .service import _fact_material
 
     rows = conn.execute("SELECT * FROM l2_imports ORDER BY export_id").fetchall()
+    archive_events = conn.execute(
+        "SELECT * FROM l2_events WHERE kind='legacy_archive' ORDER BY seq"
+    ).fetchall()
+    import_events = conn.execute(
+        "SELECT * FROM l2_events WHERE kind='import' ORDER BY seq"
+    ).fetchall()
+    archive_ids = {row[0] for row in conn.execute("SELECT DISTINCT export_id FROM l2_archives")}
+    import_ids = {row["export_id"] for row in rows}
     if not rows:
+        unreviewed = conn.execute(
+            "SELECT 1 FROM l2_facts WHERE review_id IS NULL LIMIT 1"
+        ).fetchone()
+        if archive_events or import_events or archive_ids or unreviewed:
+            raise LegacyExportError("Legacy events or capsules have no signed import inventory")
         return
+    if not archive_ids <= import_ids:
+        raise LegacyExportError("Legacy capsules and signed import inventory differ")
+    events_by_export = {}
+    for event in archive_events:
+        if event["entity_id"] in events_by_export:
+            raise LegacyExportError("Legacy archive has more than one acceptance event")
+        events_by_export[event["entity_id"]] = event
+    if set(events_by_export) != import_ids:
+        raise LegacyExportError("Legacy archive events and signed imports differ")
     verifier = _verifier(verifier)
+    expected_versions = {}
     for row in rows:
         material = json.loads(row["material_json"])
         verifier.verify_payload(material)
@@ -1101,13 +1130,20 @@ def verify_import_archives(conn, verifier):
         verifier._verify("import", unsigned, material["import_signature"])
         if digest(material) != row["export_sha256"]:
             raise LegacyExportError("Persisted complete legacy archive changed")
-        event = conn.execute(
-            "SELECT * FROM l2_events WHERE operation_id=?", (row["export_id"],)
-        ).fetchone()
+        manifest = material["manifest"]
+        expected_export_id = "lx_" + _legacy_key(
+            manifest["legacy_namespace"], manifest["instance_id"], manifest["snapshot_sha256"]
+        )
+        event = events_by_export[row["export_id"]]
         if (
-            event is None
-            or event["kind"] != "legacy_archive"
-            or json.loads(event["payload_json"])["export_sha256"] != row["export_sha256"]
+            row["export_id"] != expected_export_id
+            or event["operation_id"] != row["export_id"]
+            or json.loads(event["payload_json"])
+            != {
+                "export_id": row["export_id"],
+                "export_sha256": row["export_sha256"],
+                "snapshot_sha256": manifest["snapshot_sha256"],
+            }
         ):
             raise LegacyExportError("Complete legacy archive lacks its exact import event")
         expected_archived = {
@@ -1127,7 +1163,57 @@ def verify_import_archives(conn, verifier):
                     raise LegacyExportError("Legacy capsule differs from its complete archive")
                 if archived["kind"] == "record":
                     record = capsule["record"]
-                    observed_records[record["legacy_record_id"]] = record
+                    legacy_id = record["legacy_record_id"]
+                    if legacy_id in observed_records:
+                        raise LegacyExportError("Legacy manifest has duplicate economic records")
+                    observed_records[legacy_id] = record
+                    key = _legacy_key(verifier.namespace, verifier.instance_id, legacy_id)
+                    record_id, economic_id = "lr_" + key, "legacy:" + key
+                    source_id = "ls_" + _legacy_key(
+                        verifier.namespace,
+                        verifier.instance_id,
+                        record["source"]["intake_public_id"],
+                    )
+                    if (
+                        archived["identity"] != record_id
+                        or capsule["source_id"] != source_id
+                        or capsule["economic_event_id"] != economic_id
+                        or capsule["target_binding"] != material["target_binding"]
+                    ):
+                        raise LegacyExportError("Legacy capsule differs from its economic identity")
+                    previous = None
+                    for version, values in enumerate(_versions(record), 1):
+                        fact_hash = digest(
+                            _fact_material(
+                                record_id, version, economic_id, source_id, values, previous
+                            )
+                        )
+                        expectation = {
+                            "record_id": record_id,
+                            "version": version,
+                            "economic_event_id": economic_id,
+                            "source_id": source_id,
+                            "values_json": _wire(values),
+                            "predecessor_sha256": previous,
+                            "fact_sha256": fact_hash,
+                            "review_id": None,
+                        }
+                        identity = (record_id, version)
+                        existing = expected_versions.get(identity)
+                        if existing is None:
+                            expected_versions[identity] = {
+                                "fact": expectation,
+                                "legacy_id": legacy_id,
+                                "key": key,
+                                "exports": {row["export_id"]},
+                            }
+                        elif existing["fact"] != expectation:
+                            raise LegacyExportError(
+                                "Signed legacy exports contradict a fact version"
+                            )
+                        else:
+                            existing["exports"].add(row["export_id"])
+                        previous = fact_hash
             else:
                 observed_archived[(archived["kind"], archived["identity"])] = json.loads(
                     archived["material_json"]
@@ -1137,3 +1223,57 @@ def verify_import_archives(conn, verifier):
         }
         if observed_archived != expected_archived or observed_records != expected_records:
             raise LegacyExportError("Legacy archive capsule inventory is incomplete or changed")
+        if len(expected_records) != len(manifest["records"]):
+            raise LegacyExportError("Signed legacy manifest has duplicate economic records")
+
+    # The independently authenticated union implies every imported version even
+    # if an attacker removed its fact and event and recomputed ordinary hashes.
+    for identity, expected in expected_versions.items():
+        fact = conn.execute(
+            "SELECT * FROM l2_facts WHERE record_id=? AND version=?", identity
+        ).fetchone()
+        if fact is None or any(fact[name] != value for name, value in expected["fact"].items()):
+            raise LegacyExportError(
+                "Signed legacy inventory is missing or contradicts a fact version"
+            )
+        verify_imported_fact(conn, fact, verifier)
+
+    observed_versions = set()
+    for event in import_events:
+        payload = json.loads(event["payload_json"])
+        if type(payload) is not dict or type(payload.get("version")) is not int:
+            raise LegacyExportError("Import event has no exact integer fact version")
+        identity = (event["entity_id"], payload["version"])
+        expected = expected_versions.get(identity)
+        if expected is None or identity in observed_versions:
+            raise LegacyExportError("Import event is outside the authenticated fact inventory")
+        fact = conn.execute("SELECT * FROM l2_facts WHERE commit_seq=?", (event["seq"],)).fetchone()
+        export_id = payload.get("export_id")
+        if (
+            fact is None
+            or (fact["record_id"], fact["version"]) != identity
+            or export_id not in expected["exports"]
+            or event["operation_id"] != "legacy-fact:" + expected["key"] + ":" + str(identity[1])
+            or payload
+            != {
+                "export_id": export_id,
+                "legacy_record_id": expected["legacy_id"],
+                "legacy_version": identity[1] - 1,
+                "version": identity[1],
+                "fact_sha256": expected["fact"]["fact_sha256"],
+            }
+        ):
+            raise LegacyExportError(
+                "Import event differs from its exact authenticated fact version"
+            )
+        observed_versions.add(identity)
+    if observed_versions != set(expected_versions):
+        raise LegacyExportError("Authenticated imported fact versions lack exact import events")
+    # New native corrections may legitimately extend an imported record. They
+    # have actual reviews/decisions; unreviewed versions remain import-owned.
+    unreviewed_versions = {
+        (row[0], row[1])
+        for row in conn.execute("SELECT record_id,version FROM l2_facts WHERE review_id IS NULL")
+    }
+    if unreviewed_versions != set(expected_versions):
+        raise LegacyExportError("Unreviewed facts differ from the authenticated import union")

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 
 import pytest
@@ -137,7 +138,8 @@ def live(tmp_path, monkeypatch):
         clock=lambda: 1792800000,
     )
     yield service, port, cfg
-    owner.close()
+    if owner._lease.fd >= 0:
+        owner.close()
     cfg.close()
 
 
@@ -249,6 +251,17 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
         "FINANCE_RUNTIME_ROOT",
         str(profile_root(new_config.locator_root, "synthetic", new_config.layout) / "runtime"),
     )
+    from finance_core.instance_admission import InstanceAdmissionBusy
+
+    with pytest.raises(InstanceAdmissionBusy):
+        promote_restored_profile(
+            restored, old_config, operation_id="owner-still-held", approval_ref="approved"
+        )
+    assert inspect_instance_admission(new_config)["state"] == "RESTORE_HELD"
+    assert __import__("os").environ["FINANCE_RUNTIME_ROOT"] == str(
+        profile_root(new_config.locator_root, "synthetic", new_config.layout) / "runtime"
+    )
+    service.owner.close()
     result = promote_restored_profile(
         restored, old_config, operation_id="new-admit", approval_ref="approved"
     )
@@ -482,3 +495,203 @@ def test_061_upgrade_preserves_complete_old_ledger_and_native_rows():
     assert conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0] == 0
     verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
     conn.close()
+
+
+def _correct(service, port, posted):
+    text = "change amount to SGD 15.00\n原因：记录有误"
+    port.sources["edit-new"] = VerifiedSource(
+        "edit-new",
+        "wen",
+        "chat",
+        "edit-new",
+        text,
+        hashlib.sha256(text.encode()).hexdigest(),
+        1792800000,
+    )
+    port.raw = response(text, "reply", {"amount": "15.00", "currency": "SGD"})
+    review = service.prepare_correction(
+        posted.record_id,
+        posted.version,
+        "obs-correct",
+        "prepare-correct",
+        reply_evidence_id="edit-new",
+        reason="记录有误",
+    )
+    service.record_delivery(review.review_id, "delivery-correct")
+    return review, service.confirm(review.review_id, "action-correct", "commit-correct")
+
+
+def test_committed_replay_survives_expiry_correction_and_owner_restart(live):
+    service, port, cfg = live
+    _, _, review = ready(service)
+    original = service.confirm(review.review_id, "action1", "confirm1")
+    _, corrected = _correct(service, port, original)
+    assert corrected.version == 2
+    service.owner.close()
+    replacement = acquire_production_owner(cfg)
+    reopened = LedgerService(replacement, port, service.binding, clock=lambda: 1792800601)
+    try:
+        assert reopened.confirm(review.review_id, "action1", "confirm1") == original
+        assert reopened.reader().get(original.record_id)["version"] == 2
+        with pytest.raises(LifecycleError, match="replay mismatch"):
+            reopened.confirm(review.review_id, "another-action", "confirm1")
+        port.bad_actor = True
+        with pytest.raises(LifecycleError, match="authenticated human"):
+            reopened.confirm(review.review_id, "action1", "confirm1")
+        port.bad_actor = False
+        with pytest.raises(LifecycleError):
+            reopened.confirm(review.review_id, "action1", "fresh-operation")
+    finally:
+        replacement.close()
+
+
+@contextmanager
+def _adversarial_database(service):
+    """Synthetic disk corruption, restoring exact schema before guarded re-open."""
+    import sqlite3
+
+    from finance_core.profile_layout import profile_root
+
+    cfg = service.owner.config
+    db = profile_root(cfg.locator_root, cfg.profile_id, cfg.layout) / "runtime/database/finance.db"
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    triggers = conn.execute(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name GLOB 'l2_*'"
+    ).fetchall()
+    try:
+        for trigger in triggers:
+            conn.execute("DROP TRIGGER " + trigger["name"])
+        yield conn
+        for trigger in triggers:
+            conn.execute(trigger["sql"])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _rehash_audit(conn):
+
+    previous = None
+    for event in conn.execute("SELECT * FROM l2_events ORDER BY seq").fetchall():
+        sha = digest(
+            [
+                event["seq"],
+                event["operation_id"],
+                event["kind"],
+                event["entity_id"],
+                json.loads(event["payload_json"]),
+                previous,
+            ]
+        )
+        conn.execute(
+            "UPDATE l2_events SET previous_sha256=?,event_sha256=? WHERE seq=?",
+            (previous, sha, event["seq"]),
+        )
+        previous = sha
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "all-facts",
+        "latest-fact",
+        "fact-and-decision",
+        "decision",
+        "event",
+        "review",
+        "delivery",
+        "proposal",
+        "source",
+    ],
+)
+def test_full_audit_rejects_missing_or_forged_owned_inventory(live, tmp_path, damage):
+
+    service, port, _ = live
+    _, _, review = ready(service)
+    original = service.confirm(review.review_id, "action1", "confirm1")
+    _, latest = _correct(service, port, original)
+    with _adversarial_database(service) as conn:
+        if damage == "all-facts":
+            conn.execute("DELETE FROM l2_facts")
+        elif damage == "latest-fact":
+            conn.execute("DELETE FROM l2_facts WHERE version=2")
+        elif damage == "fact-and-decision":
+            conn.execute("DELETE FROM l2_decisions WHERE version=2")
+            conn.execute("DELETE FROM l2_facts WHERE version=2")
+        elif damage == "decision":
+            conn.execute("UPDATE l2_decisions SET operation_id='forged-operation' WHERE version=2")
+        elif damage == "event":
+            conn.execute(
+                "UPDATE l2_events SET entity_id='forged-record' WHERE seq=?", (latest.commit_seq,)
+            )
+            _rehash_audit(conn)
+        else:
+            table = {
+                "review": "l2_reviews",
+                "delivery": "l2_deliveries",
+                "proposal": "l2_proposals",
+                "source": "l2_sources",
+            }[damage]
+            conn.execute("DELETE FROM " + table)
+    with pytest.raises(LifecycleError, match="inventory"):
+        service.reader().full_audit()
+    with pytest.raises(LifecycleError, match="inventory"):
+        service.seal_snapshot(tmp_path / "bad-snapshot.sqlite")
+
+
+@pytest.mark.parametrize("later", ["post", "correction"])
+def test_generic_promotion_rejects_actual_fenced_stale_cut(live, tmp_path, monkeypatch, later):
+    from finance_core.lifecycle_v2.recovery import (
+        prepare_restored_profile,
+        promote_restored_profile,
+        verify_held_profile_evidence,
+    )
+    from finance_core.profile_layout import profile_root
+
+    service, port, old = live
+    posted = None
+    if later == "correction":
+        _, _, review = ready(service)
+        posted = service.confirm(review.review_id, "action1", "confirm1")
+    cut = service.seal_snapshot(tmp_path / "stale.sqlite")
+    if later == "post":
+        _, _, review = ready(service)
+        service.confirm(review.review_id, "action1", "confirm1")
+    else:
+        _correct(service, port, posted)
+    fence_production_instance(old, operation_id="fence-stale", approval_ref="approved")
+    service.owner.close()
+    other = tmp_path / "restore"
+    other.mkdir(mode=0o700)
+    new = synthetic_config(other, monkeypatch, instance_id="new-stale-instance")
+    held = prepare_restored_profile(
+        new, tmp_path / "stale.sqlite", cut, operation_id="prepare-held", approval_ref="approved"
+    )
+    verify_held_profile_evidence(
+        held, port, RuntimeBinding(new.instance_id, "new-gen", "wen", "chat")
+    )
+    with pytest.raises(LifecycleError, match="exact signed cut"):
+        promote_restored_profile(held, old, operation_id="promote-stale", approval_ref="approved")
+    assert inspect_instance_admission(new)["state"] == "RESTORE_HELD"
+    assert __import__("os").environ["FINANCE_RUNTIME_ROOT"] == str(
+        profile_root(new.locator_root, new.profile_id, new.layout) / "runtime"
+    )
+    new.close()
+
+
+def test_record_inventory_uses_indexed_selected_record_queries(live):
+    from finance_core.instance_admission.sessions import lifecycle_read_operation
+
+    service, _, _ = live
+    _, _, review = ready(service)
+    posted = service.confirm(review.review_id, "action1", "confirm1")
+    with lifecycle_read_operation(service.owner) as conn:
+        plans = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM l2_events WHERE entity_id=? "
+            "AND kind IN ('confirm','import')",
+            (posted.record_id,),
+        ).fetchall()
+        detail = " ".join(row[3] for row in plans)
+        assert "SEARCH l2_events USING INDEX l2_events_entity" in detail
+        assert "SCAN l2_events" not in detail
