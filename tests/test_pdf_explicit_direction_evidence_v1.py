@@ -217,6 +217,7 @@ def test_fingerprint_binds_page_row_sign_dates_versions_and_direction() -> None:
         replace(base, posted_date=date(2026, 7, 15), posted_date_token="15/07/2026"),
         replace(base, parser_version="pdf-template-parser-v3"),
         replace(base, template_version="synthetic-bank-v3"),
+        replace(base, extraction_version="pypdf-6.16.1-text-extraction-v3"),
         replace(base, extraction_version=PDF_TEXT_EXTRACTION_VERSION),
         replace(base, amount_direction=StatementAmountDirection.CREDIT),
     )
@@ -227,6 +228,29 @@ def test_fingerprint_binds_page_row_sign_dates_versions_and_direction() -> None:
         )
         == base_hash
     )
+
+
+@pytest.mark.parametrize(
+    ("extraction_version", "expected"),
+    [
+        (
+            "pypdf-text-extraction-v2",
+            "a6cd264ef3864ea1ef896a7bf65e2234e754ee2fcaff7841b6d1356be97f9ca9",
+        ),
+        (
+            "pypdf-6.16.1-text-extraction-v3",
+            "04f5f7cec884c9840d08178ccd28ae3e5bde87e9ec91525c0aa8b15193e8325d",
+        ),
+    ],
+)
+def test_historical_extraction_identity_keeps_its_original_fingerprint(
+    extraction_version: str, expected: str
+) -> None:
+    row = _row(extraction_version=extraction_version)
+    assert build_pdf_statement_row_fingerprint(row) == expected
+    normalized = normalize_pdf_statement_row_checked(row)
+    assert normalized.row_fingerprint == expected
+    assert normalized.raw_row_payload["extraction_version"] == extraction_version
 
 
 def test_complete_evidence_contract_reaches_structured_row() -> None:
@@ -674,7 +698,8 @@ def test_parse_result_preserves_multipage_duplicate_text(monkeypatch: pytest.Mon
 
 
 @pytest.mark.parametrize(
-    "extraction_version", ["pypdf-text-extraction-v2", PDF_TEXT_EXTRACTION_VERSION]
+    "extraction_version",
+    ["pypdf-text-extraction-v2", "pypdf-6.16.1-text-extraction-v3", PDF_TEXT_EXTRACTION_VERSION],
 )
 def test_persistence_reload_and_audit_preserve_pdf_evidence(
     migrated_temp_db_connection: sqlite3.Connection,

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
+import textwrap
 import tomllib
 import zipfile
 from decimal import Decimal
@@ -432,6 +433,7 @@ def _probe_installed_package(
                 "dataclasses.fields(item)] for item in v2_types}, "
                 "'distribution_name': dist.metadata['Name'], "
                 "'distribution_version': dist.version, "
+                "'runtime_dependencies': dist.metadata.get_all('Requires-Dist'), "
                 "'money_module': finance_core.Money.__module__, "
                 "'module_file': finance_core.__file__, "
                 "'migration_count': len(migration_resource_paths()), "
@@ -514,7 +516,7 @@ def _probe_installed_correction_flow(
         dependency_site = Path(sysconfig.get_paths()["purelib"])
         for name in (
             "pypdf",
-            "pypdf-6.16.1.dist-info",
+            "pypdf-6.21.2.dist-info",
             "typing_extensions.py",
             "typing_extensions-4.16.0.dist-info",
         ):
@@ -902,6 +904,133 @@ print(json.dumps({{
     return json.loads(completed.stdout)
 
 
+def _probe_installed_pdf(
+    runtime_python: Path, install_dir: Path, outside_dir: Path, runtime_root: Path
+) -> dict[str, object]:
+    dependency_root = outside_dir / "independent-correction-fixtures" / "runtime-dependencies"
+    # Copy the exact installed optional media distributions, including native closure.
+    # This is a codec/import proof; Linux sandbox qualification stays in its required lane.
+    import importlib.metadata
+
+    dependency_site = Path(sysconfig.get_paths()["purelib"])
+    for name in ("Pillow", "pillow-heif"):
+        distribution = importlib.metadata.distribution(name)
+        for member in distribution.files or ():
+            if str(member).endswith((".pyc", ".pyo")):
+                continue
+            source_member = Path(distribution.locate_file(member)).resolve()
+            relative = source_member.relative_to(dependency_site.resolve())
+            destination = dependency_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_member, destination)
+    source = outside_dir / (install_dir.name + "-symbol.pdf")
+    script = textwrap.dedent(
+        """
+        import hashlib, json, sys
+        from dataclasses import replace
+        from importlib.metadata import version
+        from pathlib import Path
+        sys.path[:0] = [sys.argv[1], sys.argv[2]]
+        import finance_core, pypdf
+        import os, PIL, pillow_heif
+        from PIL import Image
+        from finance_core.intake import _receipt_media_worker as media_worker
+        assert media_worker.identity()['packages'] == {'Pillow': '13.0.0', 'pillow-heif': '1.8.0'}
+        original = Path(sys.argv[3] + '.png')
+        output = Path(sys.argv[3] + '-normalized.png')
+        Image.new('RGBA', (2, 1), (10, 20, 30, 0)).save(original)
+        source_fd = os.open(original, os.O_RDONLY)
+        output_fd = os.open(output, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            metadata = media_worker.normalize(source_fd, output_fd, {})
+        finally:
+            os.close(source_fd)
+            os.close(output_fd)
+        with Image.open(output) as decoded:
+            assert decoded.mode == 'RGB' and decoded.getpixel((0, 0)) == (255, 255, 255)
+        assert metadata['alpha_policy'] == 'white_matte'
+        from pypdf import PdfWriter
+        from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+        from finance_core.reconciliation.pdf_statement_template_cli import parse_pdf_with_template
+        from finance_core.reconciliation.pdf_statement_extractor import (
+            DEFAULT_PDF_RESOURCE_LIMITS, extract_text_from_pdf)
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=612, height=792)
+        fonts = DictionaryObject()
+        for name, base in (('/F1', '/Courier'), ('/F2', '/Symbol')):
+            fonts[NameObject(name)] = DictionaryObject({
+                NameObject('/Type'): NameObject('/Font'),
+                NameObject('/Subtype'): NameObject('/Type1'),
+                NameObject('/BaseFont'): NameObject(base)})
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): fonts})
+        stream = DecodedStreamObject()
+        stream.set_data(b'BT /F1 10 Tf 72 740 Td (01/07/2026 ) Tj '
+                        b'/F2 10 Tf (D) Tj /F1 10 Tf ( 12.50 D) Tj ET')
+        page[NameObject('/Contents')] = writer._add_object(stream)
+        source = Path(sys.argv[3])
+        writer.write(source)
+        result = parse_pdf_with_template(source, 'sample_bank_v1')
+        assert result.extraction_success and result.total_rows == 1
+        limited = extract_text_from_pdf(source, limits=replace(
+            DEFAULT_PDF_RESOURCE_LIMITS, max_chars_per_page=5))
+        print(json.dumps({
+            'core_module': finance_core.__file__, 'pypdf_module': pypdf.__file__,
+            'pillow_version': version('Pillow'), 'pillow_heif_version': version('pillow-heif'),
+            'media_module': media_worker.__file__, 'pillow_module': PIL.__file__,
+            'actual_small_codec_helper': True, 'linux_worker_qualification': False,
+            'pypdf_version': version('pypdf'),
+            'extraction_version': result.extraction.extraction_version,
+            'row_extraction_version': result.rows[0].extraction_version,
+            'raw_line': result.rows[0].raw_line, 'amount': str(result.rows[0].amount),
+            'source_hash_matches': result.rows[0].source_content_hash ==
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+            'limit_error': limited.error_code.value,
+            'sys_path_has_checkout': any(Path(p or '.').resolve().is_relative_to(
+                Path(sys.argv[4]).resolve()) for p in sys.path)
+        }))
+        """
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment["FINANCE_RUNTIME_ROOT"] = str(runtime_root)
+    completed = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-S",
+            "-c",
+            script,
+            str(install_dir),
+            str(dependency_root),
+            str(source),
+            str(REPOSITORY_ROOT),
+        ],
+        check=True,
+        cwd=outside_dir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=environment,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["pillow_version"] == "13.0.0"
+    assert payload["pillow_heif_version"] == "1.8.0"
+    assert payload["actual_small_codec_helper"] and not payload["linux_worker_qualification"]
+    assert Path(payload["media_module"]).resolve().is_relative_to(install_dir.resolve())
+    assert Path(payload["pillow_module"]).resolve().is_relative_to(dependency_root.resolve())
+    assert payload["pypdf_version"] == "6.21.2"
+    assert payload["extraction_version"] == "pypdf-6.21.2-text-extraction-v4"
+    assert payload["row_extraction_version"] == payload["extraction_version"]
+    assert payload["raw_line"] == "01/07/2026 \u2206 12.50 D"
+    assert payload["amount"] == "12.50" and payload["source_hash_matches"]
+    assert payload["limit_error"] == "pdf_page_text_limit_exceeded"
+    assert not payload["sys_path_has_checkout"]
+    assert Path(payload["core_module"]).resolve().is_relative_to(install_dir.resolve())
+    assert Path(payload["pypdf_module"]).resolve().is_relative_to(dependency_root.resolve())
+    print("INSTALLED_PDF_PROOF " + json.dumps(payload, sort_keys=True))
+    return payload
+
+
 def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Path) -> None:
     """A missing package/module in either artifact must fail outside the repository."""
 
@@ -943,6 +1072,9 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
     source_distributions = list(dist_dir.glob("*.tar.gz"))
     assert len(wheels) == 1
     assert len(source_distributions) == 1
+    with zipfile.ZipFile(wheels[0]) as archive:
+        wheel_identity = archive.read("finance_core-0.1.7.dist-info/WHEEL")
+        assert b"Generator: setuptools (84.1.0)\n" in wheel_identity
 
     subprocess.run(
         [
@@ -991,9 +1123,13 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
 
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
+        assert "pypdf==6.21.2" in payload["runtime_dependencies"]
+        assert 'Pillow==13.0.0; extra == "media"' in payload["runtime_dependencies"]
+        assert 'pillow-heif==1.8.0; extra == "media"' in payload["runtime_dependencies"]
         correction_flow = _probe_installed_correction_flow(
             runtime_python, install_dir, outside_dir, runtime_root
         )
+        _probe_installed_pdf(runtime_python, install_dir, outside_dir, runtime_root)
         instance_flow = _probe_installed_instance_flow(
             runtime_python, install_dir, outside_dir, runtime_root
         )

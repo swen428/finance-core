@@ -249,7 +249,8 @@ def _write_valid_release_fixture(
     *,
     media: bool = True,
     extra_name: str = "media",
-    media_dependencies: tuple[str, ...] = ("Pillow==12.3.0", "pillow-heif==1.8.0"),
+    media_dependencies: tuple[str, ...] = ("Pillow==13.0.0", "pillow-heif==1.8.0"),
+    pypdf_dependency: str = "pypdf==6.21.2",
 ) -> tuple[Path, Path, str]:
     source_root = tmp_path / "source"
     shutil.copytree(REPOSITORY_ROOT / "finance_core", source_root / "finance_core")
@@ -276,6 +277,7 @@ def _write_valid_release_fixture(
     project_source = re.sub(
         r'(?m)^version = "[^"]+"$', 'version = "0.1.6"', project_source, count=1
     )
+    project_source = project_source.replace("pypdf==6.21.2", pypdf_dependency)
     if media:
         extra = "\n[project.optional-dependencies]\n" + json.dumps(extra_name)
         extra += " = " + json.dumps(list(media_dependencies)) + "\n"
@@ -332,7 +334,7 @@ def _write_valid_release_fixture(
         "License-File: LICENSE\n"
         "License-File: NOTICE\n"
         "License-File: THIRD_PARTY_NOTICES.md\n"
-        "Requires-Dist: pypdf==6.16.1\n"
+        f"Requires-Dist: {pypdf_dependency}\n"
         "Requires-Dist: typing-extensions==4.16.0\n"
     )
     if media:
@@ -342,12 +344,12 @@ def _write_valid_release_fixture(
         )
     metadata = (metadata + "Dynamic: license-file\n\n").encode()
     metadata += (source_root / "README.md").read_bytes()
-    requires = b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"
+    requires = f"{pypdf_dependency}\ntyping-extensions==4.16.0\n".encode()
     if media:
         requires += f"\n[{extra_name}]\n".encode()
         requires += "".join(f"{item}\n" for item in media_dependencies).encode()
     wheel_metadata = (
-        b"Wheel-Version: 1.0\nGenerator: setuptools (84.0.0)\n"
+        b"Wheel-Version: 1.0\nGenerator: setuptools (84.1.0)\n"
         b"Root-Is-Purelib: true\nTag: py3-none-any\n\n"
     )
     dist_root = "finance_core-0.1.6.dist-info"
@@ -537,7 +539,12 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "unapproved_dependency",
-    ["pypdf==6.14.2", "pypdf>=6.16.1", "pypdf @ https://example.invalid/package.whl"],
+    [
+        "pypdf==6.14.2",
+        "pypdf==6.16.1",
+        "pypdf>=6.21.2",
+        "pypdf @ https://example.invalid/package.whl",
+    ],
 )
 def test_release_manifest_rejects_unapproved_runtime_dependency(
     tmp_path: Path, unapproved_dependency: str
@@ -545,7 +552,7 @@ def test_release_manifest_rejects_unapproved_runtime_dependency(
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     project = source_root / "pyproject.toml"
     project.write_text(
-        project.read_text(encoding="utf-8").replace("pypdf==6.16.1", unapproved_dependency),
+        project.read_text(encoding="utf-8").replace("pypdf==6.21.2", unapproved_dependency),
         encoding="utf-8",
     )
     completed = subprocess.run(
@@ -557,6 +564,42 @@ def test_release_manifest_rejects_unapproved_runtime_dependency(
     assert "pyproject.toml release metadata is not the approved contract" in completed.stderr
     assert not (artifacts / "component-manifest-v1.json").exists()
     assert not (artifacts / "SHA256SUMS").exists()
+
+
+@pytest.mark.parametrize("dependency", ["pypdf==6.16.1", "pypdf>=6.21.2"])
+def test_release_manifest_rejects_consistent_unapproved_runtime_dependency(
+    tmp_path: Path, dependency: str
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(
+        tmp_path, pypdf_dependency=dependency
+    )
+    error = _refused_media_fixture(artifacts, source_root, core_commit)
+    assert "pyproject.toml release metadata is not the approved contract" in error
+    assert "source root must be clean" not in error
+
+
+@pytest.mark.parametrize("location", ["wheel", "PKG-INFO", "finance_core.egg-info/PKG-INFO"])
+def test_release_manifest_rejects_stale_pypdf_in_each_artifact_metadata(
+    tmp_path: Path, location: str
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
+    sdist = artifacts / "finance_core-0.1.6.tar.gz"
+    if location == "wheel":
+        name = "finance_core-0.1.6.dist-info/METADATA"
+        with zipfile.ZipFile(wheel) as archive:
+            before = archive.read(name)
+        after = before.replace(b"pypdf==6.21.2", b"pypdf==6.16.1")
+        assert before != after
+        _rewrite_wheel(wheel, {name: after})
+    else:
+        name = "finance_core-0.1.6/" + location
+        with tarfile.open(sdist) as archive:
+            before = archive.extractfile(name).read()
+        after = before.replace(b"pypdf==6.21.2", b"pypdf==6.16.1")
+        assert before != after
+        _rewrite_sdist(sdist, {name: after})
+    assert "metadata" in _refused_media_fixture(artifacts, source_root, core_commit)
 
 
 def test_release_manifest_rejects_dirty_release_verification_tool(tmp_path: Path) -> None:
@@ -955,19 +998,20 @@ def test_release_manifest_preserves_historical_no_extra_metadata(tmp_path: Path)
         requires = archive.extractfile(
             "finance_core-0.1.6/finance_core.egg-info/requires.txt"
         ).read()
-    assert requires == b"pypdf==6.16.1\ntyping-extensions==4.16.0\n"
+    assert requires == b"pypdf==6.21.2\ntyping-extensions==4.16.0\n"
 
 
 @pytest.mark.parametrize(
     ("extra_name", "dependencies"),
     [
-        ("unknown", ("Pillow==12.3.0", "pillow-heif==1.8.0")),
+        ("unknown", ("Pillow==13.0.0", "pillow-heif==1.8.0")),
         ("media", ("Pillow==12.2.0", "pillow-heif==1.8.0")),
-        ("media", ("Pillow>=12.3.0", "pillow-heif==1.8.0")),
+        ("media", ("Pillow==12.3.0", "pillow-heif==1.8.0")),
+        ("media", ("Pillow>=13.0.0", "pillow-heif==1.8.0")),
         ("media", ("Pillow @ https://example.invalid/pillow.whl", "pillow-heif==1.8.0")),
-        ("media", ("Pillow==12.3.0", "pillow-heif>=1.8.0")),
-        ("media", ("Pillow==12.3.0",)),
-        ("media", ("Pillow==12.3.0", "pillow-heif==1.8.0", "unknown==1.0")),
+        ("media", ("Pillow==13.0.0", "pillow-heif>=1.8.0")),
+        ("media", ("Pillow==13.0.0",)),
+        ("media", ("Pillow==13.0.0", "pillow-heif==1.8.0", "unknown==1.0")),
     ],
 )
 def test_release_rejects_consistent_unapproved_optional_dependencies(
@@ -994,7 +1038,7 @@ def test_release_rejects_source_wheel_optional_profile_mismatch(
         metadata = archive.read(name)
     extra = (
         b"Provides-Extra: media\n"
-        b'Requires-Dist: Pillow==12.3.0; extra == "media"\n'
+        b'Requires-Dist: Pillow==13.0.0; extra == "media"\n'
         b'Requires-Dist: pillow-heif==1.8.0; extra == "media"\n'
     )
     if media:
@@ -1039,14 +1083,14 @@ def test_release_rejects_each_unapproved_optional_metadata_record(
             b"Provides-Extra: media\nProvides-Extra: media\n",
         ),
         "unknown-extra": (b"Provides-Extra: media\n", b"Provides-Extra: unknown\n"),
-        "missing-condition": (b'Pillow==12.3.0; extra == "media"', b"Pillow==12.3.0"),
+        "missing-condition": (b'Pillow==13.0.0; extra == "media"', b"Pillow==13.0.0"),
         "other-condition": (
-            b'Pillow==12.3.0; extra == "media"',
-            b'Pillow==12.3.0; extra == "other"',
+            b'Pillow==13.0.0; extra == "media"',
+            b'Pillow==13.0.0; extra == "other"',
         ),
         "true-condition": (
-            b'Pillow==12.3.0; extra == "media"',
-            b'Pillow==12.3.0; python_version >= "3.0"',
+            b'Pillow==13.0.0; extra == "media"',
+            b'Pillow==13.0.0; python_version >= "3.0"',
         ),
     }
     before, after = replacements[mutation]
@@ -1062,9 +1106,9 @@ def test_release_rejects_each_unapproved_optional_metadata_record(
 @pytest.mark.parametrize(
     "requires",
     [
-        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n",
-        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n\n[other]\nPillow==12.3.0\npillow-heif==1.8.0\n",
-        b"pypdf==6.16.1\ntyping-extensions==4.16.0\n\n[media]\nPillow>=12.3.0\npillow-heif==1.8.0\n",
+        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n",
+        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n\n[other]\nPillow==13.0.0\npillow-heif==1.8.0\n",
+        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n\n[media]\nPillow>=13.0.0\npillow-heif==1.8.0\n",
     ],
 )
 def test_release_rejects_sdist_optional_requires_inventory(tmp_path: Path, requires: bytes) -> None:
@@ -1072,3 +1116,45 @@ def test_release_rejects_sdist_optional_requires_inventory(tmp_path: Path, requi
     sdist = artifacts / "finance_core-0.1.6.tar.gz"
     _rewrite_sdist(sdist, {"finance_core-0.1.6/finance_core.egg-info/requires.txt": requires})
     assert "dependency metadata" in _refused_media_fixture(artifacts, source_root, core_commit)
+
+
+def test_release_manifest_rejects_previous_exact_builder(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    project = source_root / "pyproject.toml"
+    project.write_bytes(project.read_bytes().replace(b"setuptools==84.1.0", b"setuptools==84.0.0"))
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "pyproject.toml release metadata is not the approved contract" in completed.stderr
+
+
+def test_release_manifest_rejects_previous_wheel_generator(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
+    wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
+    with zipfile.ZipFile(wheel) as archive:
+        payloads = {name: archive.read(name) for name in archive.namelist()}
+    name = "finance_core-0.1.6.dist-info/WHEEL"
+    payloads[name] = payloads[name].replace(b"setuptools (84.1.0)", b"setuptools (84.0.0)")
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, payload in payloads.items():
+            archive.writestr(name, payload)
+    completed = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode != 0
+    assert "wheel compatibility metadata is unexpected" in completed.stderr

@@ -82,6 +82,19 @@ extracted PDF text, so new PDF evidence uses
 than a template's saved label. Historical evidence and fingerprints remain
 unchanged; the upgrade performs no automatic reimport or database migration.
 
+The unreleased source candidate uses setuptools 84.1.0 and optional media
+Pillow 13.0.0 with pillow-heif 1.8.0. Historical Pillow 12.3.0 evidence remains
+read-only under its complete recorded profile; new operations require 13.0.0.
+No historical evidence is migrated or re-decoded.
+
+The unreleased source candidate pins pypdf 6.21.2 and records new PDF text
+extraction as `pypdf-6.21.2-text-extraction-v4`. This dependency update does not
+change the PDF evidence/fingerprint contract or financial review rules. Retained
+`pypdf-text-extraction-v2` and `pypdf-6.16.1-text-extraction-v3` evidence keeps
+its original identity and fingerprint; nothing is automatically reimported or
+migrated. This source change does not announce a new release or activate PDF
+runtime processing.
+
 ## Data boundary
 
 Never commit real financial data or credentials. Runtime databases, receipts,

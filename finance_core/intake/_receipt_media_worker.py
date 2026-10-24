@@ -20,7 +20,7 @@ MAX_SOURCE = 20_000_000
 MAX_PIXELS = 24_000_000
 MAX_DECODED = 134_217_728
 MAX_PNG = 20_000_000
-VERSIONS = {"Pillow": "12.3.0", "pillow-heif": "1.8.0"}
+VERSIONS = {"Pillow": "13.0.0", "pillow-heif": "1.8.0"}
 
 
 class Refused(Exception):

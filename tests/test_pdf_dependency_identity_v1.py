@@ -30,7 +30,7 @@ from finance_core.reconciliation.pdf_statement_template_adapter import (
     convert_parsed_statement_row_to_adapter_row,
 )
 
-EXPECTED_IDENTITY = "pypdf-6.16.1-text-extraction-v3"
+EXPECTED_IDENTITY = "pypdf-6.21.2-text-extraction-v4"
 
 
 def _write_symbol_statement(path: Path) -> None:
@@ -55,8 +55,11 @@ def _write_symbol_statement(path: Path) -> None:
     writer.write(path)
 
 
+@pytest.mark.parametrize(
+    "stale_identity", ["pypdf-text-extraction-v2", "pypdf-6.16.1-text-extraction-v3"]
+)
 def test_symbol_mapping_records_actual_extractor_not_stale_template(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_identity: str
 ) -> None:
     source = tmp_path / "synthetic-symbol.pdf"
     _write_symbol_statement(source)
@@ -64,7 +67,7 @@ def test_symbol_mapping_records_actual_extractor_not_stale_template(
     monkeypatch.setattr(
         pdf_statement_template_cli,
         "get_template",
-        lambda _: replace(template, extraction_version="pypdf-text-extraction-v2"),
+        lambda _: replace(template, extraction_version=stale_identity),
     )
     result = pdf_statement_template_cli.parse_pdf_with_template(source, DEFAULT_TEMPLATE_ID)
     assert result.extraction_success
@@ -72,7 +75,7 @@ def test_symbol_mapping_records_actual_extractor_not_stale_template(
     assert result.rows[0].raw_line == "01/07/2026 \u2206 12.50 D"
     assert result.rows[0].amount == Decimal("12.50")
     assert result.rows[0].source_content_hash == hashlib.sha256(source.read_bytes()).hexdigest()
-    assert version("pypdf") == "6.16.1"
+    assert version("pypdf") == "6.21.2"
     assert result.extraction.extraction_version == EXPECTED_IDENTITY
     assert result.template.extraction_version == EXPECTED_IDENTITY
     assert result.rows[0].extraction_version == EXPECTED_IDENTITY
@@ -81,7 +84,7 @@ def test_symbol_mapping_records_actual_extractor_not_stale_template(
     assert normalized.raw_row_payload is not None
     assert normalized.raw_row_payload["extraction_version"] == EXPECTED_IDENTITY
     assert build_pdf_statement_row_fingerprint(row) != build_pdf_statement_row_fingerprint(
-        replace(row, extraction_version="pypdf-text-extraction-v2")
+        replace(row, extraction_version=stale_identity)
     )
 
 

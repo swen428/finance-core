@@ -61,7 +61,7 @@ def seam(tmp_path, monkeypatch):
     original.chmod(0o400)
     worker_calls = []
     identity = {
-        "packages": {"Pillow": "12.3.0", "pillow-heif": "1.8.0"},
+        "packages": {"Pillow": "13.0.0", "pillow-heif": "1.8.0"},
         "installed_files_sha256": "c" * 64,
         "python_prefix": sys.prefix,
         "python_base_prefix": sys.base_prefix,
@@ -606,7 +606,7 @@ def test_invocation_preserves_actual_venv_import_environment(seam):
         capture_output=True,
         timeout=10,
     )
-    assert json.loads(output.stdout) == [sys.prefix, sys.base_prefix, "12.3.0", "1.8.0"]
+    assert json.loads(output.stdout) == [sys.prefix, sys.base_prefix, "13.0.0", "1.8.0"]
 
 
 def test_local_xmp_only_is_not_synthesized_exif(tmp_path):
@@ -1130,3 +1130,222 @@ def test_claim_only_unknown_binds_same_intent_and_refuses_changed_request(seam, 
         fresh.process(**{**request, "original_filename": "changed.png"})
     assert claim.read_bytes() == retained
     assert engine.calls == len(worker_calls) == 0
+
+
+def _synthetic_historical_bundle(seam, monkeypatch):
+    """Synthetic identity fixture, not actual old decoder/OS qualification."""
+    processor, _, request, _, _, _, _ = seam
+    original_parameters = media._DECODER_PARAMETERS
+    original_packages = processor._decoder["packages"]
+    monkeypatch.setattr(media, "_DECODER_PARAMETERS", media._HISTORICAL_DECODER_PARAMETERS)
+    processor._decoder["packages"] = {"Pillow": "12.3.0", "pillow-heif": "1.8.0"}
+    try:
+        return processor.process(**request).reference
+    finally:
+        monkeypatch.setattr(media, "_DECODER_PARAMETERS", original_parameters)
+        processor._decoder["packages"] = original_packages
+
+
+def test_historical_decoder_profile_is_read_only_without_worker_or_ocr(seam, monkeypatch):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+    reference = _synthetic_historical_bundle(seam, monkeypatch)
+    retained = {p.name: p.read_bytes() for p in (evidence / "media_unit").iterdir()}
+    verified = processor.read_verified(reference)
+    assert verified.blocks[0].text == "TOTAL 12.50"
+    assert verified.manifest["normalization"]["parameters"]["Pillow"] == "12.3.0"
+    with pytest.raises(media.MediaOperationConflictError):
+        processor.process(**request)
+    assert engine.calls == len(worker_calls) == 1
+    assert retained == {p.name: p.read_bytes() for p in (evidence / "media_unit").iterdir()}
+    current = processor.process(**{**request, "operation_id": "media_current"})
+    assert current.reference.normalization_fingerprint != reference.normalization_fingerprint
+    assert (
+        processor.read_verified(current.reference).manifest["normalization"]["parameters"]["Pillow"]
+        == "13.0.0"
+    )
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "original.bin",
+        "normalized.png",
+        "ocr.json",
+        "intent.json",
+        "result.json",
+        "declaration.json",
+    ],
+)
+def test_historical_decoder_profile_keeps_all_member_integrity_checks(seam, monkeypatch, member):
+    processor, engine, _, _, evidence, _, worker_calls = seam
+    reference = _synthetic_historical_bundle(seam, monkeypatch)
+    path = evidence / "media_unit" / member
+    path.chmod(0o600)
+    path.write_bytes(path.read_bytes() + b"corrupt")
+    path.chmod(0o400)
+    with pytest.raises(media.MediaIntegrityError):
+        processor.read_verified(reference)
+    assert engine.calls == len(worker_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("Pillow", "12.2.0"),
+        ("decode_threads", True),
+        ("decode_threads", 1.0),
+        ("security_limits_disabled", 0),
+        ("allowed_heif_bit_depths", [8.0, 10]),
+        ("output_mode", "RGBA"),
+        ("extra", 1),
+    ],
+)
+def test_historical_profile_requires_exact_full_typed_policy(seam, monkeypatch, key, value):
+    processor, _, _, _, evidence, _, _ = seam
+    _synthetic_historical_bundle(seam, monkeypatch)
+    directory = evidence / "media_unit"
+    intent = json.loads((directory / "intent.json").read_bytes())
+    result = json.loads((directory / "result.json").read_bytes())
+    intent["decoder_parameters"][key] = value
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(media.MediaIntegrityError, match="unknown normalization policy"):
+            processor._verify_completed_normalization(fd, intent, result, result["original"])
+    finally:
+        os.close(fd)
+
+
+def test_old_decoder_installation_cannot_be_selected_for_new_execution(seam, monkeypatch):
+    _, engine, _, source, evidence, _, worker_calls = seam
+    original = media._worker_run
+
+    def old_identity(*args, **kwargs):
+        response = original(*args, **kwargs)
+        response["decoder"]["packages"] = {"Pillow": "12.3.0", "pillow-heif": "1.8.0"}
+        return response
+
+    monkeypatch.setattr(media, "_worker_run", old_identity)
+    with pytest.raises(media.ReceiptMediaError):
+        media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    assert engine.calls == len(worker_calls) == 0
+
+
+@pytest.mark.parametrize("state", ["failure", "unknown"])
+def test_old_incomplete_or_failed_operations_conflict_without_retry(seam, monkeypatch, state):
+    processor, engine, request, _, evidence, _, worker_calls = seam
+    original_parameters = media._DECODER_PARAMETERS
+    packages = processor._decoder["packages"]
+    monkeypatch.setattr(media, "_DECODER_PARAMETERS", media._HISTORICAL_DECODER_PARAMETERS)
+    processor._decoder["packages"] = {"Pillow": "12.3.0", "pillow-heif": "1.8.0"}
+    if state == "failure":
+        engine.fail = True
+        assert processor.process(**request).status == "engine_failed"
+    else:
+
+        def interrupt(stage):
+            if stage == "after_normalization":
+                raise KeyboardInterrupt("synthetic old interruption")
+
+        monkeypatch.setattr(media, "_failure_injection_hook", interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            processor.process(**request)
+        monkeypatch.setattr(media, "_failure_injection_hook", None)
+    monkeypatch.setattr(media, "_DECODER_PARAMETERS", original_parameters)
+    processor._decoder["packages"] = packages
+    retained = {p.name: p.read_bytes() for p in (evidence / "media_unit").iterdir()}
+    counts = (engine.calls, len(worker_calls))
+    with pytest.raises(media.MediaOperationConflictError):
+        processor.process(**request)
+    assert (engine.calls, len(worker_calls)) == counts
+    assert retained == {p.name: p.read_bytes() for p in (evidence / "media_unit").iterdir()}
+
+
+def test_apng_background_disposal_is_checked_before_canvas_allocation(tmp_path):
+    """Bounded child + fill tripwire; never allocate the declared large canvas."""
+    script = r"""
+import io, json, os, resource, struct, tempfile, zlib
+from PIL import Image
+from finance_core.intake import _receipt_media_worker as worker
+resource.setrlimit(resource.RLIMIT_CPU, (5, 5))
+resource.setrlimit(resource.RLIMIT_FSIZE, (1048576, 1048576))
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+def chunk(tag, payload):
+    return (struct.pack(">I", len(payload)) + tag + payload
+            + struct.pack(">I", zlib.crc32(tag+payload) & 0xffffffff))
+def apng(width, height):
+    compressor = zlib.compressobj()
+    row = b"\0" + bytes(width * 4)
+    data = b"".join(compressor.compress(row) for _ in range(height)) + compressor.flush()
+    return (b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR", struct.pack(">IIBBBBB", width,height,8,6,0,0,0))
+      +chunk(b"acTL", struct.pack(">II",2,0))
+      +chunk(b"fcTL", struct.pack(">IIIIIHHBB",0,width,height,0,0,1,10,1,0))
+      +chunk(b"IDAT", data)
+      +chunk(b"IEND",b""))
+original_fill = Image.core.fill
+fills=[]
+def refuse_fill(*args, **kwargs):
+    fills.append(repr(args[:2]))
+    raise AssertionError("canvas allocation attempted before resource check")
+Image.core.fill=refuse_fill
+Image.MAX_IMAGE_PIXELS=worker.MAX_PIXELS
+try:
+    Image.open(io.BytesIO(apng(6000,10000)), formats=["PNG"])
+except Image.DecompressionBombError:
+    assert not fills
+else:
+    raise AssertionError("oversized APNG was not rejected")
+Image.core.fill = original_fill
+with tempfile.TemporaryDirectory() as directory:
+    source = os.path.join(directory, "small.png")
+    output = os.path.join(directory, "output.png")
+    Image.new("RGBA", (2, 1), (1, 2, 3, 255)).save(
+        source, save_all=True,
+        append_images=[Image.new("RGBA", (2, 1), (3, 2, 1, 255))],
+        disposal=1, duration=100)
+    source_fd = os.open(source, os.O_RDONLY)
+    output_fd = os.open(output, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        worker.normalize(source_fd, output_fd, {})
+    except worker.Refused as exc:
+        assert (exc.status, exc.code) == ("unsupported_input", "multiple_frames")
+        assert os.fstat(output_fd).st_size == 0
+    else:
+        raise AssertionError("small APNG was admitted")
+    finally:
+        os.close(source_fd)
+        os.close(output_fd)
+print(json.dumps({"oversized_apng":"bomb_error_before_fill", "fill_calls":len(fills),
+                  "small_apng":"multiple_frames"}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    assert json.loads(completed.stdout) == {
+        "oversized_apng": "bomb_error_before_fill",
+        "fill_calls": 0,
+        "small_apng": "multiple_frames",
+    }
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("decode_threads", True), ("decode_threads", 1.0), ("security_limits_disabled", 0)],
+)
+def test_normalization_copy_cannot_alias_typed_historical_parameters(seam, monkeypatch, key, value):
+    processor, _, _, _, evidence, _, _ = seam
+    _synthetic_historical_bundle(seam, monkeypatch)
+    directory = evidence / "media_unit"
+    intent = json.loads((directory / "intent.json").read_bytes())
+    result = json.loads((directory / "result.json").read_bytes())
+    result["normalization"]["parameters"][key] = value
+    result["normalization_fingerprint"] = media._digest(result["normalization"])
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(media.MediaIntegrityError, match="Normalization identity differs"):
+            processor._verify_completed_normalization(fd, intent, result, result["original"])
+    finally:
+        os.close(fd)
