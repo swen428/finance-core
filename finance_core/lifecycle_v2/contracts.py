@@ -165,5 +165,3 @@ class SnapshotCut:
     core_identity: str = ""
     migration_identity: str = ""
     application_schema_digest: str = ""
-
-
