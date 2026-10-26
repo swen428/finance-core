@@ -750,7 +750,7 @@ def test_linux_profile_uses_fixed_linux_production_shape(
     assert admitted["state"] == "ACTIVE"
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 61
 
 
 @pytest.mark.skipif("fork" not in mp.get_all_start_methods(), reason="requires POSIX fork")
@@ -761,7 +761,7 @@ def test_process_owner_stays_exclusive_until_owner_context_closes(
     paths = (config.control_root, config.locator_root)
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 61
             with pytest.raises(InstanceAdmissionError):
                 owner.close()
             process, receiver = _start_spawn_process(_owner_attempt, paths)
@@ -932,7 +932,7 @@ def test_fence_waits_for_the_real_write_connection_to_close(
         assert process.exitcode == 0
         assert inspect_instance_admission(config)["state"] == "FENCED"
         with production_read_operation(owner) as read_conn:
-            assert read_conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            assert read_conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 61
             # The fixed hook may refuse at compilation before SQLite's native
             # read-only error; both are DatabaseError and must have no effect.
             with pytest.raises(sqlite3.DatabaseError):
@@ -1250,7 +1250,7 @@ def test_moved_symlinked_or_hardlinked_profile_database_fails_closed(
     assert database.read_bytes() == original_bytes
     with acquire_production_owner(config) as owner:
         with production_read_operation(owner) as conn:
-            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 61
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Linux POSIX ACL xattrs are host-specific")
@@ -1509,7 +1509,7 @@ def test_forked_or_caller_created_connection_is_rejected_before_sql_effects(
                 _owner_attempt, (config.control_root, config.locator_root)
             )
             assert _receive(receiver, process)[0] == "busy"
-            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 61
             assert conn.execute("SELECT COUNT(*) FROM lifecycle_fork_probe").fetchone()[0] == 0
 
         with pytest.raises(StagingDatabaseError):

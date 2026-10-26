@@ -10,6 +10,7 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
+import tempfile
 import textwrap
 import tomllib
 import zipfile
@@ -54,7 +55,8 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
+EXPECTED_LEDGER_DIGEST = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
+HISTORICAL_LEDGER_DIGEST_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
 EXPECTED_LEDGER_PREFIX_057 = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
 EXPECTED_AI_FEATURE_CONSTANTS = {
@@ -193,11 +195,11 @@ def test_bridge_distribution_inventory_rejects_missing_synthetic_060(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_rejects_extra_synthetic_061(
+def test_bridge_distribution_inventory_rejects_extra_synthetic_062(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_060_migration_payloads()
-    payloads["finance_core/resources/migrations/061_synthetic_inventory.sql"] = (
+    payloads = _bridge_migration_payloads()
+    payloads["finance_core/resources/migrations/062_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
@@ -205,16 +207,29 @@ def test_bridge_distribution_inventory_rejects_extra_synthetic_061(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_060(
+def test_bridge_distribution_inventory_accepts_reviewed_complete_061(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 60
+    assert len(payloads) == 61
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
 
 
+def test_bridge_distribution_inventory_accepts_actual_historical_060_prefix(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = {
+        name: body
+        for name, body in _bridge_migration_payloads().items()
+        if int(PurePosixPath(name).name[:3]) <= 60
+    }
+    assert len(payloads) == 60
+    assert bridge_distribution_verifier._migration_digest(payloads) == HISTORICAL_LEDGER_DIGEST_060
+
+
 @pytest.mark.parametrize(
-    "mutation", ["missing_060", "missing_middle", "extra_061", "duplicate_055"]
+    "mutation",
+    ["missing_060", "missing_middle", "extra_062", "replace_061_with_062", "duplicate_055"],
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
@@ -224,8 +239,11 @@ def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
         sequence = "060_" if mutation == "missing_060" else "028_"
         missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
         del payloads[missing]
+    elif mutation == "replace_061_with_062":
+        removed = next(name for name in payloads if PurePosixPath(name).name.startswith("061_"))
+        payloads["finance_core/resources/migrations/062_replacement.sql"] = payloads.pop(removed)
     else:
-        sequence = "061" if mutation == "extra_061" else "055"
+        sequence = "062" if mutation == "extra_062" else "055"
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -269,10 +287,11 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 61))
+    assert len(paths) == 61
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 62))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
+    assert _ledger_digest(paths[:60]) == HISTORICAL_LEDGER_DIGEST_060
     assert _ledger_digest(paths[:58]) == EXPECTED_LEDGER_PREFIX_058
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
 
@@ -280,7 +299,7 @@ def test_migration_resources_have_one_package_owned_source() -> None:
 def test_previous_migration_bytes_remain_unchanged_through_057() -> None:
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
+    assert len(paths) == 61
     assert _ledger_digest(paths[:57]) == EXPECTED_LEDGER_PREFIX_057
 
 
@@ -293,7 +312,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
+    assert len(paths) == 61
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 
@@ -462,6 +481,211 @@ def _probe_installed_package(
     return json.loads(completed.stdout)
 
 
+def _installed_runtime_dependencies(outside_dir: Path) -> Path:
+    """Provide the same pinned third-party bytes to every site-disabled package probe."""
+
+    dependency_root = outside_dir / "independent-correction-fixtures" / "runtime-dependencies"
+    dependency_root.mkdir(parents=True, exist_ok=True)
+    dependency_site = Path(sysconfig.get_paths()["purelib"])
+    for name in (
+        "pypdf",
+        "pypdf-6.21.2.dist-info",
+        "typing_extensions.py",
+        "typing_extensions-4.16.0.dist-info",
+    ):
+        source = dependency_site / name
+        target = dependency_root / name
+        if target.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, target)
+        elif source.is_file():
+            shutil.copyfile(source, target)
+        else:
+            raise AssertionError(f"required pinned runtime dependency is missing: {source}")
+    return dependency_root
+
+
+def _probe_installed_lifecycle(
+    runtime_python: Path, install_dir: Path, outside_dir: Path
+) -> dict[str, object]:
+    """Exercise the opt-in API and appended schema using only installed bytes."""
+
+    program = textwrap.dedent(
+        """
+        import hashlib
+        import json
+        import os
+        import sqlite3
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        installed = Path(sys.argv[1]).resolve()
+        checkout = Path(sys.argv[2]).resolve()
+        outside = Path(sys.argv[3]).resolve()
+        dependency_root = Path(sys.argv[4]).resolve()
+        sys.path.insert(0, str(dependency_root))
+        sys.path.insert(0, str(installed))
+        import finance_core
+        import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.instance_admission as admission
+        from finance_core.profile_layout import product_root, profile_root
+        from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
+
+        binding = lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat')
+        refused_owner = False
+        try:
+            lifecycle.LedgerService(None, None, binding)
+        except lifecycle.LifecycleError:
+            refused_owner = True
+        refused_runtime = False
+        try:
+            lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat',
+                                     environment='production')
+        except lifecycle.LifecycleError:
+            refused_runtime = True
+
+        paths = migration_resource_paths()
+        migration = paths[-1]
+        connection = sqlite3.connect(':memory:')
+        connection.executescript(migration.read_text())
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'l2_%'")}
+        connection.close()
+        with tempfile.TemporaryDirectory(prefix='installed-lifecycle-', dir=outside) as scratch:
+            scratch = Path(scratch)
+            layout = 'mac' if sys.platform == 'darwin' else 'linux'
+            support = scratch / ('Application Support' if layout == 'mac' else 'finance-codex')
+            support.mkdir(mode=0o700)
+            product = product_root(support, layout)
+            profile = profile_root(support, 'synthetic', layout)
+            if product != support:
+                product.mkdir(mode=0o700)
+            for directory in (
+                profile.parent, profile, profile / 'runtime', profile / 'runtime/database',
+                profile / 'workspace', profile / 'workspace/database', profile / 'backups',
+                profile / 'work', profile / 'restore', scratch / 'control',
+            ):
+                directory.mkdir(mode=0o700)
+            manifest = profile / 'profile.json'
+            manifest.write_text(json.dumps({
+                'profile_id': 'synthetic', 'runtime_root': str(profile / 'runtime'),
+                'workspace_root': str(profile / 'workspace'),
+            }))
+            manifest.chmod(0o600)
+            os.environ['FINANCE_RUNTIME_ROOT'] = str(profile / 'runtime')
+            cfg = admission.TrustedInstanceConfig(
+                scratch / 'control', support, 'synthetic', layout=layout,
+                instance_id='synthetic-instance',
+                config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+            )
+            owner = None
+            try:
+                admission.prepare_production_profile(
+                    cfg, operation_id='prepare', approval_ref='approved').close()
+                admission.admit_production_instance(
+                    cfg, operation_id='admit', approval_ref='approved')
+                owner = admission.acquire_production_owner(cfg)
+                raw = '2026-10-24 Cafe SGD 12.00'
+                original_sha = hashlib.sha256(raw.encode()).hexdigest()
+                class Port:
+                    bad_actor = False
+                    def source(self, conn, evidence_id):
+                        return lifecycle.VerifiedSource(
+                            evidence_id, 'other' if self.bad_actor else 'actor', 'chat',
+                            'message-1', raw, original_sha, 1792800000,
+                        )
+                port = Port()
+                service = lifecycle.LedgerService(owner, port, binding, clock=lambda: 1792800000)
+                port.bad_actor = True
+                actor_refused = False
+                try:
+                    service.capture('source1', 'capture-bad-actor')
+                except lifecycle.LifecycleError:
+                    actor_refused = True
+                port.bad_actor = False
+                source = service.capture('source1', 'capture1')
+                retry_same = service.capture('source1', 'capture1') == source
+                audit = service.reader().full_audit()
+                guarded_capture = {
+                    'actor_refused': actor_refused,
+                    'retry_same': retry_same,
+                    'source_sha256': source.source_sha256,
+                    'event_count': audit['event_count'],
+                    'fact_version_count': audit['fact_version_count'],
+                }
+            finally:
+                if owner is not None:
+                    owner.close()
+                cfg.close()
+        module_paths = [Path(lifecycle.__file__).resolve(),
+                        Path(sys.modules[lifecycle.LedgerService.__module__].__file__).resolve(),
+                        Path(admission.__file__).resolve(),
+                        migration.resolve()]
+        print(json.dumps({
+            'root_api': finance_core.API_CONTRACT_VERSION,
+            'lifecycle_exports': sorted(lifecycle.__all__),
+            'refused_owner': refused_owner,
+            'refused_runtime': refused_runtime,
+            'migration_count': len(paths),
+            'migration_digest': MIGRATION_LEDGER_DIGEST,
+            'migration_name': migration.name,
+            'migration_sha256': hashlib.sha256(migration.read_bytes()).hexdigest(),
+            'lifecycle_tables': sorted(tables),
+            'guarded_capture': guarded_capture,
+            'module_paths': [str(path) for path in module_paths],
+            'installed_only': all(path.is_relative_to(installed) for path in module_paths)
+                and not any(Path(path or '.').resolve().is_relative_to(checkout)
+                            for path in sys.path),
+        }, sort_keys=True))
+        """
+    )
+    with tempfile.TemporaryDirectory(prefix="installed-lifecycle-import-", dir=outside_dir) as root:
+        dependency_root = _installed_runtime_dependencies(outside_dir)
+        import_runtime = Path(root) / "runtime"
+        import_runtime.mkdir(mode=0o700)
+        (import_runtime / "database").mkdir(mode=0o700)
+        command = [
+            str(runtime_python),
+            "-I",
+            "-S",
+            "-c",
+            program,
+            str(install_dir),
+            str(REPOSITORY_ROOT),
+            str(outside_dir),
+            str(dependency_root),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                cwd=outside_dir,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "FINANCE_RUNTIME_ROOT": str(import_runtime.resolve(strict=True)),
+                },
+                capture_output=True,
+                text=True,
+                timeout=INSTALLED_INSTANCE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                f"installed lifecycle probe timeout after {INSTALLED_INSTANCE_TIMEOUT_SECONDS}s; "
+                f"stdout={_bounded_instance_output(error.stdout)!r}; "
+                f"stderr={_bounded_instance_output(error.stderr)!r}"
+            ) from None
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"installed lifecycle probe exit {completed.returncode}; "
+            f"stdout={completed.stdout[-INSTALLED_INSTANCE_STREAM_LIMIT:]!r}; "
+            f"stderr={completed.stderr[-INSTALLED_INSTANCE_STREAM_LIMIT:]!r}"
+        )
+    return json.loads(completed.stdout)
+
+
 def _probe_installed_correction_flow(
     runtime_python: Path,
     install_dir: Path,
@@ -510,23 +734,7 @@ def _probe_installed_correction_flow(
         "class MonkeyPatch: pass\n",
         encoding="utf-8",
     )
-    dependency_root = helper_root / "runtime-dependencies"
-    dependency_root.mkdir(exist_ok=True)
-    if not any(dependency_root.iterdir()):
-        dependency_site = Path(sysconfig.get_paths()["purelib"])
-        for name in (
-            "pypdf",
-            "pypdf-6.21.2.dist-info",
-            "typing_extensions.py",
-            "typing_extensions-4.16.0.dist-info",
-        ):
-            source = dependency_site / name
-            if source.is_dir():
-                shutil.copytree(source, dependency_root / name)
-            elif source.is_file():
-                shutil.copyfile(source, dependency_root / name)
-            else:
-                raise AssertionError(f"required pinned runtime dependency is missing: {source}")
+    _installed_runtime_dependencies(outside_dir)
     probe_path = helper_root / "installed_correction_probe.py"
     shutil.copyfile(REPOSITORY_ROOT / "tests" / "installed_correction_probe.py", probe_path)
     completed = subprocess.run(
@@ -1123,6 +1331,40 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
 
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
+        lifecycle = _probe_installed_lifecycle(runtime_python, install_dir, outside_dir)
+        assert lifecycle["root_api"] == "finance-core-api-v1"
+        assert {"LedgerService", "LedgerReader", "RuntimeBinding", "VerifiedSource"}.issubset(
+            lifecycle["lifecycle_exports"]
+        )
+        assert lifecycle["refused_owner"] and lifecycle["refused_runtime"]
+        assert lifecycle["migration_count"] == 61
+        assert lifecycle["migration_digest"] == EXPECTED_LEDGER_DIGEST
+        assert lifecycle["migration_name"] == "061_lifecycle_v2.sql"
+        assert lifecycle["guarded_capture"]["actor_refused"] is True
+        assert lifecycle["guarded_capture"]["retry_same"] is True
+        assert lifecycle["guarded_capture"]["event_count"] == 1
+        assert lifecycle["guarded_capture"]["fact_version_count"] == 0
+        assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
+            lifecycle["lifecycle_tables"]
+        )
+        assert lifecycle["installed_only"] is True
+        print(
+            "INSTALLED_LIFECYCLE_PROOF "
+            + json.dumps(
+                {
+                    "artifact": install_dir.name,
+                    "artifact_sha256": hashlib.sha256(
+                        (
+                            wheels[0]
+                            if install_dir == wheel_install_dir
+                            else source_distributions[0]
+                        ).read_bytes()
+                    ).hexdigest(),
+                    **lifecycle,
+                },
+                sort_keys=True,
+            )
+        )
         assert "pypdf==6.21.2" in payload["runtime_dependencies"]
         assert 'Pillow==13.0.0; extra == "media"' in payload["runtime_dependencies"]
         assert 'pillow-heif==1.8.0; extra == "media"' in payload["runtime_dependencies"]
@@ -1259,9 +1501,9 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.7"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 60
-        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 61))
-        assert payload["migration_filenames"][-1] == "060_independent_corrections.sql"
+        assert payload["migration_count"] == 61
+        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 62))
+        assert payload["migration_filenames"][-1] == "061_lifecycle_v2.sql"
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True

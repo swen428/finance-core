@@ -36,7 +36,7 @@ _WITNESSES: dict[int, "_Witness"] = {}
 # Unknown-close handles deliberately remain reachable until process exit.
 _UNCERTAIN: list["_Witness"] = []
 
-# Fixed native functions from migrations 001-060, approved Core SQL, and the
+# Fixed native functions from migrations 001-061, approved Core SQL, and the
 # admission metadata query (GLOB). This is deliberately not learned at runtime.
 _SQL_FUNCTIONS = frozenset(
     {

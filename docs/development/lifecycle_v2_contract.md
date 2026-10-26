@@ -4,6 +4,12 @@ This opt-in API is an offline-synthetic feasibility candidate. It does not admit
 production bindings, publish a release, replace historical facts or activate a
 runtime. Migration 061 appends new tables; migrations 001 through 060 are unchanged.
 
+The root `finance_core.API_CONTRACT_VERSION` remains `finance-core-api-v1` because
+its existing exports and behavior are unchanged. `finance_core.lifecycle_v2` is a
+separately named, opt-in additive API; consumers must explicitly import it and
+bind the installed package, API marker and 061 migration ledger together. This
+source change alone assigns no new immutable release or active consumer identity.
+
 `LedgerService` requires the actual `ProductionOwner`, a fixed `RuntimeBinding`,
 and a trusted `EvidencePort`. Capture authenticates retained input and original
 bytes, including the source timestamp and Asia/Singapore interpretation zone.
