@@ -506,6 +506,163 @@ def _installed_runtime_dependencies(outside_dir: Path) -> Path:
     return dependency_root
 
 
+def _installed_recovery_restart_program() -> str:
+    """Fresh installed-only consumers reconstruct synthetic retained recovery material."""
+    return textwrap.dedent(
+        """
+        import hashlib
+        import json
+        import os
+        import sqlite3
+        import sys
+        from dataclasses import replace
+        from pathlib import Path
+
+        installed, dependencies, checkout, material_path = map(Path, sys.argv[1:5])
+        mode = sys.argv[5]
+        sys.path[:0] = [str(installed), str(dependencies)]
+        import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.lifecycle_v2.recovery as recovery
+        import finance_core.instance_admission as admission
+        m = json.loads(material_path.read_text())
+        b = m['config']
+        os.environ['FINANCE_RUNTIME_ROOT'] = str(Path(b['profile_root']) / 'runtime')
+        config = admission.TrustedInstanceConfig(
+            Path(b['control_root']), Path(m['support_root']), b['profile_id'],
+            layout=b['layout'], instance_id=b['instance_id'],
+            config_identity=b['config_identity'], core_identity=b['core_identity'],
+            approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+        )
+        cut = lifecycle.SnapshotCut.from_dict(m['cut'])
+        receipt = recovery.OldWriterIsolationReceipt(**m['receipt'])
+        authority = recovery.RecoveryAuthority('installed-synthetic-recovery', b'r' * 32)
+        binding = lifecycle.RuntimeBinding(**m['binding'])
+        class Port:
+            def source(self, conn, evidence_id):
+                return lifecycle.VerifiedSource(
+                    evidence_id, 'actor', 'chat',
+                    'message-1' if evidence_id == 'source1' else evidence_id,
+                    m['raw'], m['original_sha'], 1792800000,
+                )
+            def provider(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedObservation(**m['observations'][evidence_id])
+            def delivery(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedDelivery(
+                    evidence_id, expected.review_id, expected.review_sha256, 'actor', 'chat',
+                )
+            def action(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedAction(
+                    evidence_id, expected.review_id, expected.review_sha256,
+                    expected.delivery_evidence_id, 'actor', 'chat',
+                )
+        port = Port()
+        pending = config.control_root / admission.PENDING_FILENAME
+        state_path = config.control_root / admission.STATE_FILENAME
+        def reconstruct(selected_cut=cut, selected_receipt=receipt):
+            return recovery.resume_held_restore(config, selected_cut, selected_receipt, authority)
+        def resume(held, operation_id='restore-admit', selected_receipt=receipt):
+            return recovery.resume_restore_promotion(
+                held, operation_id=operation_id, approval_ref='approved',
+                port=port, binding=binding, receipt=selected_receipt,
+                recovery_authority=authority,
+            )
+        refused = []
+        owner = None
+        try:
+            held = reconstruct()
+            assert held.new_binding == binding
+            observed_status = held.status
+            if mode == 'pending':
+                assert observed_status == 'RESTORE_ADMIT_PENDING'
+                pending_bytes = pending.read_bytes()
+                def refuse(name, action):
+                    try:
+                        action()
+                    except (lifecycle.LifecycleError, admission.InstanceAdmissionError):
+                        refused.append(name)
+                    else:
+                        raise AssertionError(name + ' unexpectedly accepted')
+                    assert pending.read_bytes() == pending_bytes
+                refuse('owner_while_pending', lambda: admission.acquire_production_owner(config))
+                refuse('generic_resume', lambda: admission.resume_authority_transition(
+                    config, operation_id='restore-admit', approval_ref='approved'))
+                refuse('wrong_operation', lambda: resume(held, operation_id='wrong-operation'))
+                wrong_cut = replace(cut, logical_database_sha256='0' * 64)
+                refuse('wrong_cut', lambda: resume(reconstruct(wrong_cut)))
+                wrong_receipt = replace(receipt, signature='0' * 64)
+                refuse('wrong_receipt', lambda: resume(
+                    reconstruct(selected_receipt=wrong_receipt), selected_receipt=wrong_receipt))
+                database = Path(b['profile_root']) / 'runtime/database/finance.db'
+                original_database = database.read_bytes()
+                with sqlite3.connect(database) as offline:
+                    offline.execute(
+                        "INSERT INTO participants(public_id,display_name) VALUES "
+                        "('installed-tamper','Installed tamper')")
+                offline.close()
+                try:
+                    refuse('changed_content', lambda: resume(reconstruct()))
+                finally:
+                    with database.open('r+b') as restored:
+                        restored.write(original_database)
+                        restored.truncate()
+                assert pending.read_bytes() == pending_bytes
+                assert resume(reconstruct())['state'] == 'ACTIVE'
+                assert not pending.exists()
+            else:
+                assert mode == 'completed' and observed_status == 'ACTIVE'
+                authority_before = state_path.read_bytes()
+                assert resume(held)['state'] == 'ACTIVE'
+                assert state_path.read_bytes() == authority_before
+                assert hashlib.sha256(authority_before).hexdigest() == m['completed_expectation'][
+                    'authority_sha256']
+            owner = admission.acquire_production_owner(config)
+            service = lifecycle.LedgerService(owner, port, binding, clock=lambda: 1792800001)
+            restored_fact = service.reader().get(m['posted']['record_id'])
+            assert restored_fact['fact_sha256'] == m['posted']['fact_sha256']
+            assert restored_fact['version'] == m['posted']['version']
+            if mode == 'pending':
+                active_source = service.capture('source-after-recovery', 'capture-after-recovery')
+                active_source_id = active_source.source_id
+            else:
+                active_source_id = m['completed_expectation']['post_promotion_source_id']
+                assert service.reader().source(active_source_id) is not None
+            audit = service.reader().full_audit()
+            assert audit['fact_version_count'] == 1 and audit['event_count'] == 6
+            state_bytes = state_path.read_bytes()
+            state = json.loads(state_bytes)
+            assert sum(entry['action'] == 'restore_admit' for entry in state['history']) == 1
+            if mode == 'completed':
+                assert audit == m['completed_expectation']['audit']
+                assert state['version'] == m['completed_expectation']['authority_version']
+            module_paths = [
+                Path(module.__file__).resolve()
+                for name, module in sys.modules.items()
+                if (name == 'finance_core' or name.startswith('finance_core.'))
+                and getattr(module, '__file__', None)
+            ]
+            installed_only = all(path.is_relative_to(installed) for path in module_paths)
+            assert installed_only and not any(
+                Path(entry or '.').resolve().is_relative_to(checkout) for entry in sys.path)
+            print(json.dumps({
+                'mode': mode, 'pid': os.getpid(), 'installed_only': installed_only,
+                'observed_status': observed_status, 'refused': refused,
+                'pending_retained_on_refusal': mode == 'pending',
+                'authority_sha256': hashlib.sha256(state_bytes).hexdigest(),
+                'authority_version': state['version'], 'audit': audit,
+                'post_promotion_source_id': active_source_id,
+                'record_id': restored_fact['record_id'],
+                'record_version': restored_fact['version'],
+                'fact_sha256': restored_fact['fact_sha256'],
+                'prepare_entry_sha256': held.restore_prepare_entry_sha256,
+            }, sort_keys=True))
+        finally:
+            if owner is not None:
+                owner.close()
+            config.close()
+        """
+    )
+
+
 def _probe_installed_lifecycle(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
@@ -517,15 +674,18 @@ def _probe_installed_lifecycle(
         import json
         import os
         import sqlite3
+        import subprocess
         import sys
         import tempfile
         from dataclasses import asdict
         from pathlib import Path
+        from unittest.mock import patch
 
         installed = Path(sys.argv[1]).resolve()
         checkout = Path(sys.argv[2]).resolve()
         outside = Path(sys.argv[3]).resolve()
         dependency_root = Path(sys.argv[4]).resolve()
+        restart_program = sys.argv[5]
         sys.path.insert(0, str(dependency_root))
         sys.path.insert(0, str(installed))
         import finance_core
@@ -732,10 +892,58 @@ def _probe_installed_lifecycle(
                 old_control.rename(scratch / 'unavailable-old-control')
                 old_root_unavailable = not support.exists() and not old_control.exists()
                 os.environ['FINANCE_RUNTIME_ROOT'] = str(new_runtime)
-                promoted = recovery.promote_with_isolation_receipt(
-                    held, isolation, authority, operation_id='restore-admit',
-                    approval_ref='approved', port=port, binding=new_binding,
+                with patch.object(recovery, '_publish', side_effect=OSError(
+                    'synthetic installed process loss before authority publication'
+                )):
+                    try:
+                        recovery.promote_with_isolation_receipt(
+                            held, isolation, authority, operation_id='restore-admit',
+                            approval_ref='approved', port=port, binding=new_binding,
+                        )
+                    except OSError as error:
+                        assert 'synthetic installed process loss' in str(error)
+                    else:
+                        raise AssertionError('Synthetic promotion interruption did not run')
+                assert (new_config.control_root / admission.PENDING_FILENAME).is_file()
+                retained = {
+                    'config': new_config._binding, 'support_root': str(new_support),
+                    'cut': asdict(cut), 'receipt': asdict(isolation),
+                    'binding': asdict(new_binding), 'raw': raw, 'original_sha': original_sha,
+                    'observations': {key: asdict(value)
+                                     for key, value in port.observations.items()},
+                    'posted': asdict(posted),
+                }
+                material_path = scratch / 'retained-recovery.json'
+                material_path.write_text(json.dumps(retained))
+                material_path.chmod(0o600)
+                new_config.close()
+                new_config = None
+                fresh_proofs = []
+                for mode in ('pending', 'completed'):
+                    child = subprocess.run(
+                        [sys.executable, '-I', '-S', '-c', restart_program,
+                         str(installed), str(dependency_root), str(checkout),
+                         str(material_path), mode],
+                        cwd=outside,
+                        env={'PATH': os.environ.get('PATH', ''),
+                             'FINANCE_RUNTIME_ROOT': str(new_runtime)},
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    assert child.returncode == 0, child.stdout[-32768:] + child.stderr[-32768:]
+                    fresh = json.loads(child.stdout)
+                    assert fresh['pid'] != os.getpid() and fresh['installed_only']
+                    fresh_proofs.append(fresh)
+                    if mode == 'pending':
+                        retained['completed_expectation'] = fresh
+                        material_path.write_text(json.dumps(retained))
+                assert fresh_proofs[0]['pid'] != fresh_proofs[1]['pid']
+                new_config = admission.TrustedInstanceConfig(
+                    new_root / 'control', new_support, 'synthetic', layout=layout,
+                    instance_id='successor-instance',
+                    config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                    approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
                 )
+                promoted = admission.inspect_instance_admission(new_config)
                 new_owner = admission.acquire_production_owner(new_config)
                 restored_service = lifecycle.LedgerService(new_owner, port, new_binding)
                 restored_fact = restored_service.reader().get(posted.record_id)
@@ -762,6 +970,7 @@ def _probe_installed_lifecycle(
                     'record_version': restored_fact['version'],
                     'record_amount': restored_fact['values']['amount'],
                     'fact_sha256_matches': restored_fact['fact_sha256'] == posted.fact_sha256,
+                    'fresh_process_retries': fresh_proofs,
                 }
             finally:
                 if new_owner is not None:
@@ -811,6 +1020,7 @@ def _probe_installed_lifecycle(
             str(REPOSITORY_ROOT),
             str(outside_dir),
             str(dependency_root),
+            _installed_recovery_restart_program(),
         ]
         try:
             completed = subprocess.run(
@@ -1517,6 +1727,34 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert recovery["record_version"] == 1
         assert recovery["record_amount"] == "12.00"
         assert recovery["fact_sha256_matches"] is True
+        pending_retry, completed_retry = recovery["fresh_process_retries"]
+        assert pending_retry["observed_status"] == "RESTORE_ADMIT_PENDING"
+        assert completed_retry["observed_status"] == "ACTIVE"
+        assert pending_retry["mode"] == "pending" and completed_retry["mode"] == "completed"
+        assert pending_retry["pid"] != completed_retry["pid"]
+        assert pending_retry["installed_only"] and completed_retry["installed_only"]
+        assert pending_retry["pending_retained_on_refusal"] is True
+        assert set(pending_retry["refused"]) == {
+            "owner_while_pending",
+            "generic_resume",
+            "wrong_operation",
+            "wrong_cut",
+            "wrong_receipt",
+            "changed_content",
+        }
+        for key in (
+            "authority_sha256",
+            "authority_version",
+            "audit",
+            "post_promotion_source_id",
+            "record_id",
+            "record_version",
+            "fact_sha256",
+            "prepare_entry_sha256",
+        ):
+            assert pending_retry[key] == completed_retry[key]
+        assert completed_retry["audit"]["event_count"] == 6
+        assert completed_retry["audit"]["fact_version_count"] == 1
         assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
             lifecycle["lifecycle_tables"]
         )

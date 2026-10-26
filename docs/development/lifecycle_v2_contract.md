@@ -120,9 +120,19 @@ original shape. This is a control-log extension, not a new SQLite migration.
 Generic authority resume cannot complete recovery designation/admission without
 their dedicated full validation. Interrupted preparation must likewise retain
 the exact v3 preparation context and recheck the target cut before publication.
-`resume_held_restore` relocates the same durable target using its signed receipt;
-it remains HELD. `resume_restore_promotion` repeats the protected content and
-evidence checks for the exact pending operation and approval. A completed retry
+`resume_held_restore(config, cut, receipt, recovery_authority)` reconstructs the
+same originally HELD target without changing authority. A receipt-free live
+caller may instead supply `old_config` by keyword; exactly one complete route is
+required. The descriptor's advisory status is `RESTORE_HELD`,
+`RESTORE_ADMIT_PENDING`, `ACTIVE`, or `FENCED`. Pending status takes precedence
+over an ACTIVE disk state while its journal remains. Reconstruction authenticates
+preparation, full target/file identity, designation and persisted route context;
+only clean HELD reconstruction runs the held content diagnostic. Pending and
+completed reconstruction grants no content or admission proof. Status may become
+stale and never controls publication.
+
+`resume_restore_promotion` repeats the protected content and evidence checks for
+the caller's exact pending operation, approval and route. A completed retry
 only observes its original entry/current state: it creates no second admission,
 does not force a later legitimately changed ACTIVE database back to the old cut,
 and cannot revive a subsequently fenced instance.

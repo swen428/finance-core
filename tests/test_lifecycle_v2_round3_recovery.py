@@ -826,3 +826,422 @@ print("RESTARTED_EXACT_TARGET_ACTIVE")
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RESTARTED_EXACT_TARGET_ACTIVE" in result.stdout
+
+
+@pytest.mark.parametrize("route", ["live", "receipt"])
+@pytest.mark.parametrize("shared_control", [False, True], ids=["separate-root", "shared-root"])
+@pytest.mark.parametrize("interruption", ["before-publish", "pending-unlink"])
+def test_pending_promotion_resume_authenticates_exact_request_and_rechecks_target(
+    original, tmp_path, monkeypatch, route, shared_control, interruption
+):
+    from finance_core.lifecycle_v2.recovery import promote_restored_profile
+
+    old, owner, service, port = original
+    service.capture("source1", "capture-before-recovery")
+    cut, path = _cut(service, tmp_path)
+    _fence(old, owner)
+    root = tmp_path / "resume-target"
+    root.mkdir(mode=0o700)
+    new = synthetic_config(
+        root,
+        monkeypatch,
+        instance_id="resume-target",
+        control_root=old.control_root if shared_control else None,
+    )
+    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    held = prepare_restored_profile(
+        new, path, cut, new_binding=binding, operation_id="prepare-resume", approval_ref="approved"
+    )
+    recovery = RecoveryAuthority("pending-resume", b"r" * 32)
+    receipt = recovery.issue_old_writer_isolation(
+        old, held, operation_id="designate-resume", approval_ref="approved"
+    )
+    common = dict(
+        operation_id="promote-resume", approval_ref="approved", port=port, binding=binding
+    )
+    route_args = (
+        dict(old_config=old)
+        if route == "live"
+        else dict(receipt=receipt, recovery_authority=recovery)
+    )
+
+    def promote():
+        if route == "live":
+            return promote_restored_profile(
+                held,
+                old,
+                designation_operation_id="designate-resume",
+                designation_approval_ref="approved",
+                **common,
+            )
+        return promote_with_isolation_receipt(held, receipt, recovery, **common)
+
+    original_unlink = authority.os.unlink
+
+    def fail_pending_delete(filename, *args, **kwargs):
+        if filename == PENDING_FILENAME:
+            raise OSError("synthetic interrupted promotion")
+        return original_unlink(filename, *args, **kwargs)
+
+    if interruption == "before-publish":
+        failure = patch.object(
+            recovery_module, "_publish", side_effect=OSError("synthetic interrupted promotion")
+        )
+    else:
+        failure = patch.object(authority.os, "unlink", side_effect=fail_pending_delete)
+    with failure, pytest.raises(OSError, match="synthetic interrupted promotion"):
+        promote()
+    pending = new.control_root / PENDING_FILENAME
+    pending_bytes = pending.read_bytes()
+    published = authority._read(new, authority.STATE_FILENAME)
+    expected = "RESTORE_HELD" if interruption == "before-publish" else "ACTIVE"
+    assert published["instances"][new.binding_sha256]["state"] == expected
+    with pytest.raises(InstanceAdmissionError, match="pending"):
+        acquire_production_owner(new)
+    with pytest.raises(InstanceAdmissionError, match="dedicated"):
+        resume_authority_transition(new, operation_id="promote-resume", approval_ref="approved")
+
+    def resume(restored=held, **changed):
+        return resume_restore_promotion(restored, **(common | changed), **route_args)
+
+    for changed in (
+        dict(operation_id="wrong-operation"),
+        dict(approval_ref="wrong-approval"),
+        dict(binding=replace(binding, generation="wrong-generation")),
+    ):
+        with pytest.raises((LifecycleError, InstanceAdmissionError)):
+            resume(**changed)
+        assert pending.read_bytes() == pending_bytes
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume(replace(held, cut=replace(cut, logical_database_sha256="0" * 64)))
+    assert pending.read_bytes() == pending_bytes
+    altered = json.loads(pending_bytes)
+    altered["context"]["target_sha256"] = "0" * 64
+    pending.write_text(canonical(altered))
+    altered_bytes = pending.read_bytes()
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume()
+    assert pending.read_bytes() == altered_bytes
+    pending.write_bytes(pending_bytes)
+
+    database = Path(new._binding["profile_root"]) / "runtime/database/finance.db"
+    database_bytes = database.read_bytes()
+    with sqlite3.connect(database) as offline:
+        offline.execute(
+            "INSERT INTO participants(public_id,display_name) VALUES ('changed','Changed')"
+        )
+    offline.close()
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume()
+    assert pending.read_bytes() == pending_bytes
+    # Restore synthetic bytes in place, preserving the original pinned inode.
+    with database.open("r+b") as restored_database:
+        restored_database.write(database_bytes)
+        restored_database.truncate()
+    saved = database.with_suffix(".original-inode")
+    database.rename(saved)
+    database.write_bytes(database_bytes)
+    database.chmod(0o600)
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume()
+    assert pending.read_bytes() == pending_bytes
+    database.unlink()
+    saved.rename(database)
+
+    assert resume()["state"] == "ACTIVE"
+    assert not pending.exists()
+    state = authority._state(new)
+    assert sum(entry["action"] == "restore_admit" for entry in state["history"]) == 1
+    assert (
+        sum(entry["action"] == "recovery_designate" for entry in authority._state(old)["history"])
+        == 1
+    )
+    assert resume()["state"] == "ACTIVE"
+    assert authority._state(new) == state
+    fence_production_instance(new, operation_id="fence-after-resume", approval_ref="approved")
+    fenced = authority._state(new)
+    assert resume()["state"] == "FENCED"
+    assert authority._state(new) == fenced
+    new.close()
+
+
+@pytest.mark.parametrize("route", ["live", "receipt"])
+@pytest.mark.parametrize("shared_control", [False, True], ids=["separate-root", "shared-root"])
+@pytest.mark.parametrize("interruption", ["before-publish", "pending-unlink", "completed"])
+def test_public_restore_reconstruction_after_process_loss(
+    original, tmp_path, monkeypatch, route, shared_control, interruption
+):
+    from finance_core.lifecycle_v2.recovery import promote_restored_profile
+
+    old, owner, service, port = original
+    cut, path = _cut(service, tmp_path)
+    _fence(old, owner)
+    root = tmp_path / "cold-target"
+    root.mkdir(mode=0o700)
+    new = synthetic_config(
+        root,
+        monkeypatch,
+        instance_id="cold-target",
+        control_root=old.control_root if shared_control else None,
+    )
+    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    held = prepare_restored_profile(
+        new, path, cut, new_binding=binding, operation_id="prepare-cold", approval_ref="approved"
+    )
+    recovery = RecoveryAuthority("cold-resume", b"r" * 32)
+    receipt = recovery.issue_old_writer_isolation(
+        old, held, operation_id="designate-cold", approval_ref="approved"
+    )
+    common = dict(operation_id="promote-cold", approval_ref="approved", port=port, binding=binding)
+
+    def promote():
+        if route == "live":
+            return promote_restored_profile(
+                held,
+                old,
+                designation_operation_id="designate-cold",
+                designation_approval_ref="approved",
+                **common,
+            )
+        return promote_with_isolation_receipt(held, receipt, recovery, **common)
+
+    unlink = authority.os.unlink
+
+    def fail_pending_delete(filename, *args, **kwargs):
+        if filename == PENDING_FILENAME:
+            raise OSError("synthetic cold interruption")
+        return unlink(filename, *args, **kwargs)
+
+    if interruption == "completed":
+        assert promote()["state"] == "ACTIVE"
+    else:
+        failure = (
+            patch.object(
+                recovery_module, "_publish", side_effect=OSError("synthetic cold interruption")
+            )
+            if interruption == "before-publish"
+            else patch.object(authority.os, "unlink", side_effect=fail_pending_delete)
+        )
+        with failure, pytest.raises(OSError, match="synthetic cold interruption"):
+            promote()
+    material = {
+        "cut": asdict(cut),
+        "receipt": asdict(receipt),
+        "route": route,
+        "old": old._binding,
+        "new": new._binding,
+        "old_locator": str(old.locator_root),
+        "new_locator": str(new.locator_root),
+        "expected_status": "ACTIVE" if interruption == "completed" else "RESTORE_ADMIT_PENDING",
+        "approvals": [
+            [entry["approval_ref"], entry["action"], entry["approval_digest"]]
+            for state in (
+                authority._read(old, authority.STATE_FILENAME),
+                authority._read(new, PENDING_FILENAME)["after"]
+                if (new.control_root / PENDING_FILENAME).exists()
+                else authority._state(new),
+            )
+            for entry in state["history"]
+        ],
+    }
+    payload = tmp_path / "cold-reconstruction.json"
+    payload.write_text(json.dumps(material))
+    payload.chmod(0o600)
+    new.close()
+    old.close()
+    if route == "receipt" and not shared_control:
+        old.control_root.rename(old.control_root.with_name("unavailable-original-control"))
+        old_database = Path(old._binding["profile_root"]) / "runtime/database/finance.db"
+        old_database.rename(old_database.with_suffix(".unavailable"))
+    script = r"""
+import json, os, sqlite3, sys
+from dataclasses import replace
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_lifecycle_v2 import Port
+from finance_core.instance_admission import (
+    TrustedInstanceConfig, InstanceAdmissionError, PENDING_FILENAME, authority,
+    acquire_production_owner, fence_production_instance,
+)
+from finance_core.lifecycle_v2 import LedgerService, LifecycleError, SnapshotCut
+from finance_core.lifecycle_v2.recovery import (
+    RecoveryAuthority, OldWriterIsolationReceipt, resume_held_restore,
+    resume_restore_promotion,
+)
+m = json.loads(Path(sys.argv[1]).read_text())
+phase = sys.argv[2] if len(sys.argv) > 2 else ""
+os.environ.pop("FINANCE_RUNTIME_ROOT", None)
+os.environ["FINANCE_RUNTIME_ROOT"] = str(Path(m["new"]["profile_root"]) / "runtime")
+def config(binding, locator):
+    return TrustedInstanceConfig(
+        Path(binding["control_root"]), Path(locator), binding["profile_id"],
+        layout=binding["layout"], instance_id=binding["instance_id"],
+        config_identity=binding["config_identity"], core_identity=binding["core_identity"],
+        approval_verifier=lambda ref, action, digest: (
+            [ref, action, digest] in m["approvals"]
+            if action in {"restore_prepare", "restore_admit", "recovery_designate"}
+            else ref == "approved"
+        ),
+    )
+new = config(m["new"], m["new_locator"])
+old = config(m["old"], m["old_locator"]) if m["route"] == "live" else None
+cut = SnapshotCut.from_dict(m["cut"])
+r = OldWriterIsolationReceipt(**m["receipt"])
+a = RecoveryAuthority("cold-resume", b"r" * 32)
+route_args = dict(old_config=old) if old is not None else dict(receipt=r, recovery_authority=a)
+state_bytes = (new.control_root / authority.STATE_FILENAME).read_bytes()
+pending = new.control_root / PENDING_FILENAME
+pending_bytes = pending.read_bytes() if pending.exists() else None
+held = resume_held_restore(new, cut, **route_args)
+expected_status = {"active": "ACTIVE", "fenced": "FENCED"}.get(phase, m["expected_status"])
+assert held.status == expected_status
+assert (new.control_root / authority.STATE_FILENAME).read_bytes() == state_bytes
+assert (pending.read_bytes() if pending.exists() else None) == pending_bytes
+for bad in (
+    {}, dict(receipt=r), dict(recovery_authority=a),
+    dict(receipt=r, recovery_authority=a, old_config=new),
+):
+    try:
+        resume_held_restore(new, cut, **bad)
+    except LifecycleError:
+        pass
+    else:
+        raise AssertionError("Incomplete or mixed reconstruction route accepted")
+def denied(call):
+    try:
+        call()
+    except (LifecycleError, InstanceAdmissionError):
+        pass
+    else:
+        raise AssertionError("Changed reconstruction metadata accepted")
+wrong_config = config(dict(m["new"], config_identity="wrong-composition"), m["new_locator"])
+denied(lambda: resume_held_restore(wrong_config, cut, **route_args))
+wrong_config.close()
+for bad_receipt, bad_authority in (
+    (replace(r, signature="0" * 64), a),
+    (r, RecoveryAuthority("wrong-namespace", b"r" * 32)),
+    (r, RecoveryAuthority("cold-resume", b"x" * 32)),
+):
+    denied(lambda: resume_held_restore(new, cut, bad_receipt, bad_authority))
+if old is not None:
+    # A valid receipt for this target cannot replace a persisted live route.
+    denied(lambda: resume_held_restore(new, cut, r, a))
+database = Path(new._binding["profile_root"]) / "runtime/database/finance.db"
+database_bytes = database.read_bytes()
+saved = database.with_suffix(".saved-inode")
+database.rename(saved)
+database.write_bytes(database_bytes)
+database.chmod(0o600)
+denied(lambda: resume_held_restore(new, cut, **route_args))
+database.unlink()
+saved.rename(database)
+# Tamper with durable preparation rather than only caller-supplied arguments.
+metadata_path = (
+    pending if pending_bytes is not None else new.control_root / authority.STATE_FILENAME
+)
+metadata_bytes = metadata_path.read_bytes()
+for damage in ("generation", "principal_id", "client_id", "prepare-entry", "old-prepare"):
+    changed = json.loads(metadata_bytes)
+    history = changed["after"]["history"] if pending_bytes is not None else changed["history"]
+    prepare = next(entry for entry in history if entry["action"] == "restore_prepare")
+    if damage == "prepare-entry":
+        prepare["entry_sha256"] = "0" * 64
+    elif damage == "old-prepare":
+        del prepare["recovery_context"]
+    else:
+        prepare["recovery_context"]["runtime_binding"][damage] = "wrong-identity"
+    metadata_path.write_text(json.dumps(changed))
+    altered = metadata_path.read_bytes()
+    denied(lambda: resume_held_restore(new, cut, **route_args))
+    assert metadata_path.read_bytes() == altered
+    metadata_path.write_bytes(metadata_bytes)
+try:
+    resume_held_restore(new, replace(cut, logical_database_sha256="0" * 64), **route_args)
+except (LifecycleError, InstanceAdmissionError):
+    pass
+else:
+    raise AssertionError("Changed reconstruction cut accepted")
+if pending_bytes is not None:
+    changed = json.loads(pending_bytes)
+    changed["context"]["target_sha256"] = "0" * 64
+    pending.write_text(json.dumps(changed))
+    altered_bytes = pending.read_bytes()
+    try:
+        resume_held_restore(new, cut, **route_args)
+    except (LifecycleError, InstanceAdmissionError):
+        pass
+    else:
+        raise AssertionError("Changed pending context accepted")
+    assert pending.read_bytes() == altered_bytes
+    pending.write_bytes(pending_bytes)
+    changed = json.loads(pending_bytes)
+    changed["action"] = "maintenance"
+    pending.write_text(json.dumps(changed))
+    denied(lambda: resume_held_restore(new, cut, **route_args))
+    pending.write_bytes(pending_bytes)
+args = dict(
+    operation_id="promote-cold", approval_ref="approved", port=Port(), binding=held.new_binding
+)
+if pending_bytes is not None:
+    for change in (
+        dict(operation_id="wrong-operation"), dict(approval_ref="wrong-approval"),
+        dict(binding=replace(held.new_binding, generation="wrong-generation")),
+    ):
+        denied(lambda: resume_restore_promotion(held, **(args | change), **route_args))
+        assert pending.read_bytes() == pending_bytes
+    with sqlite3.connect(database) as offline:
+        offline.execute(
+            "INSERT INTO participants(public_id,display_name) "
+            "VALUES ('after-reconstruction','Changed')"
+        )
+    offline.close()
+    assert resume_held_restore(new, cut, **route_args).status == "RESTORE_ADMIT_PENDING"
+    denied(lambda: resume_restore_promotion(held, **args, **route_args))
+    assert pending.read_bytes() == pending_bytes
+    with database.open("r+b") as restored_database:
+        restored_database.write(database_bytes)
+        restored_database.truncate()
+    held = replace(held, status="ACTIVE")  # Advisory status cannot skip protected checks.
+result = resume_restore_promotion(held, **args, **route_args)
+assert result["state"] == ("FENCED" if phase == "fenced" else "ACTIVE")
+assert not pending.exists()
+version = authority._state(new)["version"]
+if phase:
+    assert (new.control_root / authority.STATE_FILENAME).read_bytes() == state_bytes
+    if phase == "active":
+        fence_production_instance(new, operation_id="fence-cold", approval_ref="approved")
+    if old is not None:
+        old.close()
+    new.close()
+    print("COLD_PUBLIC_RECONSTRUCTION_PASSED")
+    sys.exit(0)
+os.environ["FINANCE_RUNTIME_ROOT"] = str(Path(new._binding["profile_root"]) / "runtime")
+owner = acquire_production_owner(new)
+port = Port()
+port.sources["later-source"] = replace(
+    port.sources["source1"], evidence_id="later-source", source_key="later-message"
+)
+service = LedgerService(owner, port, held.new_binding)
+source = service.capture("later-source", "later-capture")
+owner.close()
+# Current content legitimately differs from the old cut; completed observation
+# must authenticate metadata without imposing the historical cut on current data.
+observed = resume_held_restore(new, cut, **route_args)
+assert observed.status == "ACTIVE"
+assert resume_restore_promotion(observed, **args, **route_args)["state"] == "ACTIVE"
+assert authority._state(new)["version"] == version
+if old is not None:
+    old.close()
+new.close()
+print("COLD_PUBLIC_RECONSTRUCTION_PASSED")
+"""
+    for phase in ("", "active", "fenced"):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(payload), phase],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "COLD_PUBLIC_RECONSTRUCTION_PASSED" in result.stdout

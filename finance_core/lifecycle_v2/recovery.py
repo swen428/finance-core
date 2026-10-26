@@ -696,6 +696,7 @@ class RecoveryAuthority:
             or material["designation"]["cut_ref"] != cut_ref(restored.cut)
             or material["designation"]["target"] != target
             or material["designation"]["old_binding_sha256"] != restored.cut.source_binding_sha256
+            or material["designation"]["old_instance_id"] != restored.cut.instance_id
         ):
             raise LifecycleError("Signed isolation does not bind exact held target and cut")
         return RestoreDesignation(
@@ -813,6 +814,17 @@ def _live_designation(old_config, restored, *, operation_id, approval_ref):
     return designation, None
 
 
+def _promotion_context(restored, target, designation, receipt_sha256):
+    return {
+        "format": "restore-admit-context-v1",
+        "cut_ref": cut_ref(restored.cut),
+        "target_sha256": digest(target),
+        "designation_entry_sha256": designation.entry_sha256,
+        "designation_sha256": digest(designation.material),
+        "receipt_sha256": receipt_sha256,
+    }
+
+
 def _promote(
     restored,
     designation,
@@ -831,14 +843,7 @@ def _promote(
         or designation.material["old_binding_sha256"] != restored.cut.source_binding_sha256
     ):
         raise LifecycleError("Designation does not bind the exact target")
-    context = {
-        "format": "restore-admit-context-v1",
-        "cut_ref": cut_ref(restored.cut),
-        "target_sha256": digest(target),
-        "designation_entry_sha256": designation.entry_sha256,
-        "designation_sha256": digest(designation.material),
-        "receipt_sha256": receipt_sha256,
-    }
+    context = _promotion_context(restored, target, designation, receipt_sha256)
     config = restored.config
     owner = _Lock(config, OWNER_LOCK_FILENAME)
     try:
@@ -971,17 +976,65 @@ def promote_with_isolation_receipt(
     )
 
 
+def _uses_receipt_route(receipt, recovery_authority, old_config):
+    if old_config is not None:
+        if receipt is not None or recovery_authority is not None:
+            raise LifecycleError("Recovery requires exactly one complete route")
+        return False
+    if receipt is None or recovery_authority is None:
+        raise LifecycleError("Recovery requires exactly one complete route")
+    return True
+
+
+def _verify_recovery_entry_approval(config, state, entry):
+    predecessor = _validate_state(state, prefix_version=entry["version"] - 1)
+    expected = _approve(
+        config,
+        entry["approval_ref"],
+        entry["action"],
+        {
+            "operation_id": entry["operation_id"],
+            "before_sha256": _digest(predecessor),
+            "context": entry["recovery_context"],
+        },
+    )
+    if expected != entry["approval_digest"]:
+        raise LifecycleError("Recovery history approval differs from exact predecessor")
+
+
 def resume_held_restore(
     config: TrustedInstanceConfig,
     cut: SnapshotCut,
-    receipt: OldWriterIsolationReceipt,
-    recovery_authority: RecoveryAuthority,
+    receipt: OldWriterIsolationReceipt | None = None,
+    recovery_authority: RecoveryAuthority | None = None,
+    *,
+    old_config: TrustedInstanceConfig | None = None,
 ) -> RestoredProfile:
+    """Reconstruct one prepared target; its observed status grants no authority."""
+    receipt_route = _uses_receipt_route(receipt, recovery_authority, old_config)
+    if type(cut) is not SnapshotCut:
+        raise LifecycleError("Exact v3 snapshot cut required")
     with _control(config, shared=True):
-        state = _state(config)
-        record = _record(config, state)
-        if record["state"] != "RESTORE_HELD":
-            raise LifecycleError("Only durable held restore can be resumed")
+        pending = _read(config, PENDING_FILENAME) if _exists(config, PENDING_FILENAME) else None
+        if pending is not None:
+            if not {"operation_id", "approval_ref", "context"}.issubset(pending):
+                raise LifecycleError("Pending reconstruction locator is malformed")
+            state, _, promotion = _validate_recovery_pending(
+                config,
+                pending,
+                action="restore_admit",
+                operation_id=pending["operation_id"],
+                approval_ref=pending["approval_ref"],
+                context=pending["context"],
+            )
+            observed = _read(config, STATE_FILENAME)
+            status = "RESTORE_ADMIT_PENDING"
+        else:
+            state = observed = _state(config)
+            promotion = None
+            status = _record(config, state)["state"]
+            if status not in {"RESTORE_HELD", "ACTIVE", "FENCED"}:
+                raise LifecycleError("Only an originally held restore can be reconstructed")
         entries = [
             entry
             for entry in state["history"]
@@ -992,12 +1045,58 @@ def resume_held_restore(
         if len(entries) != 1 or entries[0]["recovery_context"]["cut_ref"] != cut_ref(cut):
             raise LifecycleError("Held preparation lacks exact v3 cut")
         prepare = entries[0]
+        _verify_recovery_entry_approval(config, state, prepare)
         new_binding = RuntimeBinding(**prepare["recovery_context"]["runtime_binding"])
-    restored = RestoredProfile(
-        config, cut, new_binding, prepare["operation_id"], prepare["entry_sha256"]
-    )
-    recovery_authority.verify_old_writer_isolation(receipt, restored)
-    verify_held_profile_evidence_content(restored)
+        if config.instance_id == cut.instance_id or new_binding.generation == cut.generation:
+            raise LifecycleError("Reconstruction requires the exact new instance and generation")
+        restored = RestoredProfile(
+            config, cut, new_binding, prepare["operation_id"], prepare["entry_sha256"], status
+        )
+        target, record = _target_from_state(restored, state, allow_completed=True)
+        if pending is None and status != "RESTORE_HELD":
+            promotion = _entry(state, record["admission"], "restore_admit")
+            if promotion["binding"] != config.binding_sha256:
+                raise LifecycleError("Completed restore admission belongs to another target")
+            _verify_recovery_entry_approval(config, state, promotion)
+
+    if receipt_route:
+        assert recovery_authority is not None and receipt is not None
+        designation = recovery_authority.verify_old_writer_isolation(receipt, restored)
+        receipt_sha256 = digest(asdict(receipt))
+    else:
+        designation = _resume_live_designation(
+            restored,
+            old_config,
+            operation_id=promotion["operation_id"] if promotion is not None else None,
+            approval_ref=promotion["approval_ref"] if promotion is not None else None,
+        )
+        receipt_sha256 = None
+    if promotion is not None and promotion.get("recovery_context") != _promotion_context(
+        restored, target, designation, receipt_sha256
+    ):
+        raise LifecycleError("Reconstructed promotion context differs from exact route")
+
+    # Separate-root designation lookup cannot lend a stale target observation.
+    # Pin the actual profile/inode here without opening or auditing SQLite.
+    with _control(config, shared=True):
+        current_pending = (
+            _read(config, PENDING_FILENAME) if _exists(config, PENDING_FILENAME) else None
+        )
+        if current_pending != pending or _read(config, STATE_FILENAME) != observed:
+            raise LifecycleError("Restore authority changed during reconstruction")
+        with _MANAGED_SQLITE_LIFETIME_LOCK:
+            previous_runtime = os.environ.get(RUNTIME_ROOT_ENV)
+            os.environ[RUNTIME_ROOT_ENV] = str(Path(config._binding["profile_root"]) / "runtime")
+            try:
+                profile = _profile(config, expected=record["db_identity"])
+                profile.close()
+            finally:
+                if previous_runtime is None:
+                    os.environ.pop(RUNTIME_ROOT_ENV, None)
+                else:
+                    os.environ[RUNTIME_ROOT_ENV] = previous_runtime
+    if status == "RESTORE_HELD":
+        verify_held_profile_evidence_content(restored)
     return restored
 
 
@@ -1007,6 +1106,70 @@ def verify_held_profile_evidence_content(restored: RestoredProfile) -> None:
     with _held_read_connection(restored) as conn:
         audit_connection(conn)
         _verify_cut_connection(conn, restored.cut)
+
+
+def _resume_live_designation(restored, old_config, *, operation_id, approval_ref):
+    """Recover an existing designation without treating pending state as ordinary."""
+    config = restored.config
+    with _control(config, shared=True):
+        pending = _read(config, PENDING_FILENAME) if _exists(config, PENDING_FILENAME) else None
+        if pending is None:
+            state = _state(config)
+        else:
+            state, _, _ = _validate_recovery_pending(
+                config,
+                pending,
+                action="restore_admit",
+                operation_id=operation_id,
+                approval_ref=approval_ref,
+                context=pending.get("context"),
+            )
+        target, _ = _target_from_state(restored, state, allow_completed=True)
+    cut = restored.cut
+    if (
+        old_config.instance_id != cut.instance_id
+        or old_config.binding_sha256 != cut.source_binding_sha256
+        or old_config.core_identity != cut.core_identity
+        or old_config._binding["migration_identity"] != cut.migration_identity
+        or digest(old_config._binding["application_schema"]) != cut.application_schema_digest
+    ):
+        raise LifecycleError("Old writer does not match complete source cut")
+    # Never hold two control roots simultaneously. Shared-root pending belongs
+    # to the target, so only its authenticated predecessor can supply history.
+    with _control(old_config, shared=True):
+        if pending is not None and old_config.control_root == config.control_root:
+            if _read(old_config, PENDING_FILENAME) != pending:
+                raise LifecycleError("Pending restore admission changed during resume")
+            state, _, _ = _validate_recovery_pending(
+                config,
+                pending,
+                action="restore_admit",
+                operation_id=operation_id,
+                approval_ref=approval_ref,
+                context=pending["context"],
+            )
+        else:
+            state = _state(old_config)
+        record = _record(old_config, state)
+        matches = [
+            entry
+            for entry in state["history"]
+            if entry["action"] == "recovery_designate"
+            and entry["binding"] == old_config.binding_sha256
+        ]
+        if len(matches) != 1 or record["state"] != "FENCED":
+            raise LifecycleError("Original fenced designation is unavailable")
+        entry = matches[0]
+        designation = _designation_from_entry(entry)
+        _verify_recovery_entry_approval(old_config, state, entry)
+        if (
+            designation.material["target"] != target
+            or designation.material["cut_ref"] != cut_ref(cut)
+            or designation.material["old_binding_sha256"] != old_config.binding_sha256
+            or designation.material["old_instance_id"] != old_config.instance_id
+        ):
+            raise LifecycleError("Original designation differs from exact recovery request")
+        return designation
 
 
 def resume_restore_promotion(
@@ -1021,27 +1184,13 @@ def resume_restore_promotion(
     receipt: OldWriterIsolationReceipt | None = None,
     recovery_authority: RecoveryAuthority | None = None,
 ):
-    if receipt is not None and recovery_authority is not None:
+    if _uses_receipt_route(receipt, recovery_authority, old_config):
+        assert receipt is not None and recovery_authority is not None
         designation = recovery_authority.verify_old_writer_isolation(receipt, restored)
         receipt_sha256 = digest(asdict(receipt))
     elif old_config is not None:
-        with _control(old_config, shared=True):
-            state = _state(old_config)
-            matches = [
-                entry
-                for entry in state["history"]
-                if entry["action"] == "recovery_designate"
-                and entry["binding"] == old_config.binding_sha256
-            ]
-            if len(matches) != 1:
-                raise LifecycleError("Original designation is unavailable")
-            old_operation = matches[0]["operation_id"]
-            old_approval = matches[0]["approval_ref"]
-        designation = designate_restore_successor(
-            old_config,
-            restored,
-            operation_id=old_operation,
-            approval_ref=old_approval,
+        designation = _resume_live_designation(
+            restored, old_config, operation_id=operation_id, approval_ref=approval_ref
         )
         receipt_sha256 = None
     else:
