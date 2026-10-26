@@ -2141,14 +2141,26 @@ def _candidate_package_archives(tmp_path, payloads, *, kind=None, mutation=None)
     sdist = tmp_path / "finance_core-0.1.7.tar.gz"
     wheel_members = {
         **core,
-        "finance_core-0.1.7.dist-info/METADATA": b"Name: finance-core\nVersion: 0.1.7\n",
+        "finance_core-0.1.7.dist-info/METADATA": producer.sdist_metadata(payloads, "0.1.7")[
+            "PKG-INFO"
+        ],
         "finance_core-0.1.7.dist-info/RECORD": b"",
         "finance_core-0.1.7.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
     }
     sdist_members = {
         **core,
         **{name: payloads[name] for name in producer.PROJECT_INPUTS},
+        **producer.sdist_metadata(payloads, "0.1.7"),
     }
+    source_paths = (
+        set(core)
+        | producer.PROJECT_INPUTS
+        | {name for name in sdist_members if name.startswith("finance_core.egg-info/")}
+        | {"finance_core.egg-info/SOURCES.txt"}
+    )
+    sdist_members["finance_core.egg-info/SOURCES.txt"] = (
+        "\n".join(sorted(source_paths)) + "\n"
+    ).encode()
     selected = wheel_members if kind == "wheel" else sdist_members
     first = "finance_core/__init__.py"
     if mutation == "missing":
@@ -2259,3 +2271,118 @@ def test_candidate_package_complete_archive_pair_passes(tmp_path):
     payloads, _ = producer.tracked_snapshot(root, identity)
     wheel, sdist = _candidate_package_archives(tmp_path, payloads)
     producer.verify_distributions(wheel, sdist, payloads, "0.1.7")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "setup.py",
+        "arbitrary.txt",
+        "bin/launcher",
+        "finance_core.egg-info/entry_points.txt",
+        "changed-config",
+        "changed-requires",
+        "changed-pkg-info",
+        "changed-top-level",
+        "changed-links",
+        "sources-extra",
+        "sources-missing",
+        "sources-duplicate",
+        "sources-traversal",
+        "executable-config",
+        "missing-metadata",
+        "unknown-directory",
+        "duplicate-directory",
+    ],
+)
+def test_candidate_package_sdist_rejects_undeclared_or_changed_metadata(tmp_path, mutation):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    members = []
+    with tarfile.open(sdist, "r:gz") as archive:
+        for member in archive:
+            members.append((member, archive.extractfile(member).read()))
+    prefix = "finance_core-0.1.7/"
+    sources = "finance_core.egg-info/SOURCES.txt"
+    target = {
+        "changed-config": "setup.cfg",
+        "executable-config": "setup.cfg",
+        "changed-requires": "finance_core.egg-info/requires.txt",
+        "changed-pkg-info": "PKG-INFO",
+        "changed-top-level": "finance_core.egg-info/top_level.txt",
+        "changed-links": "finance_core.egg-info/dependency_links.txt",
+        "missing-metadata": "finance_core.egg-info/top_level.txt",
+        **{
+            name: sources
+            for name in (
+                "sources-extra",
+                "sources-missing",
+                "sources-duplicate",
+                "sources-traversal",
+            )
+        },
+    }.get(mutation)
+    revised = []
+    for member, body in members:
+        if member.name == prefix + str(target):
+            if mutation == "missing-metadata":
+                continue
+            if mutation == "executable-config":
+                member.mode = 0o755
+            elif mutation == "sources-extra":
+                body += b"setup.py\n"
+            elif mutation == "sources-missing":
+                body = body.split(b"\n", 1)[1]
+            elif mutation == "sources-duplicate":
+                body += body.split(b"\n", 1)[0] + b"\n"
+            elif mutation == "sources-traversal":
+                body += b"../outside.py\n"
+            else:
+                body = b"undeclared generated metadata\n"
+            member.size = len(body)
+        revised.append((member, body))
+    if target is None:
+        if mutation in {"unknown-directory", "duplicate-directory"}:
+            member = tarfile.TarInfo(
+                prefix + ("unexpected" if mutation == "unknown-directory" else "finance_core")
+            )
+            member.type = tarfile.DIRTYPE
+            revised.append((member, b""))
+            if mutation == "duplicate-directory":
+                revised.append((member, b""))
+        else:
+            member = tarfile.TarInfo(prefix + mutation)
+            body = b"raise RuntimeError('undeclared root hook')\n"
+            member.size = len(body)
+            member.mode = 0o755 if mutation in {"setup.py", "bin/launcher"} else 0o644
+            revised.append((member, body))
+    altered = tmp_path / "altered-sdist.tar.gz"
+    with tarfile.open(altered, "w:gz") as archive:
+        for member, body in revised:
+            archive.addfile(member, io.BytesIO(body))
+    with pytest.raises(ValueError):
+        producer.verify_distributions(wheel, altered, payloads, "0.1.7")
+
+
+def test_candidate_package_metadata_cannot_collectively_override_source_dependencies(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    altered_wheel = tmp_path / "altered-wheel.whl"
+    with zipfile.ZipFile(wheel) as original, zipfile.ZipFile(altered_wheel, "w") as altered:
+        for member in original.infolist():
+            body = original.read(member)
+            if member.filename.endswith("/METADATA"):
+                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+            altered.writestr(member, body)
+    altered_sdist = tmp_path / "altered-sdist.tar.gz"
+    with tarfile.open(sdist, "r:gz") as original, tarfile.open(altered_sdist, "w:gz") as altered:
+        for member in original:
+            body = original.extractfile(member).read()
+            if member.name.endswith("/PKG-INFO"):
+                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+            member.size = len(body)
+            altered.addfile(member, io.BytesIO(body))
+    with pytest.raises(ValueError, match="metadata differs from source recipe"):
+        producer.verify_distributions(altered_wheel, altered_sdist, payloads, "0.1.7")

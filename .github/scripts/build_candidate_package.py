@@ -173,11 +173,58 @@ def package_payloads(payloads: dict[str, bytes]) -> dict[str, bytes]:
     return selected
 
 
+def sdist_metadata(payloads: dict[str, bytes], version: str) -> dict[str, bytes]:
+    """The exact generated metadata of the reviewed setuptools 84.1.0 recipe."""
+    project = tomllib.loads(payloads["pyproject.toml"].decode())["project"]
+    require(
+        project["name"] == "finance-core" and project["version"] == version,
+        "sdist project identity differs",
+    )
+    require(project["readme"] == "README.md", "sdist readme recipe differs")
+    headers = [
+        "Metadata-Version: 2.4",
+        "Name: finance-core",
+        f"Version: {version}",
+        f"Summary: {project['description']}",
+        f"License-Expression: {project['license']}",
+        f"Requires-Python: {project['requires-python']}",
+        "Description-Content-Type: text/markdown",
+    ]
+    headers += [f"License-File: {name}" for name in project["license-files"]]
+    headers += [f"Requires-Dist: {requirement}" for requirement in project["dependencies"]]
+    requirements = "".join(f"{requirement}\n" for requirement in project["dependencies"])
+    for extra, dependencies in project.get("optional-dependencies", {}).items():
+        headers.append(f"Provides-Extra: {extra}")
+        headers += [
+            f'Requires-Dist: {requirement}; extra == "{extra}"' for requirement in dependencies
+        ]
+        requirements += f"\n[{extra}]\n" + "".join(f"{item}\n" for item in dependencies)
+    headers.append("Dynamic: license-file")
+    metadata = ("\n".join(headers) + "\n\n").encode() + payloads["README.md"]
+    return {
+        "PKG-INFO": metadata,
+        "finance_core.egg-info/PKG-INFO": metadata,
+        "finance_core.egg-info/dependency_links.txt": b"\n",
+        "finance_core.egg-info/requires.txt": requirements.encode(),
+        "finance_core.egg-info/top_level.txt": b"finance_core\n",
+        "setup.cfg": b"[egg_info]\ntag_build = \ntag_date = 0\n\n",
+    }
+
+
 def verify_distributions(
     wheel: Path, sdist: Path, payloads: dict[str, bytes], version: str
 ) -> None:
     """Check complete Core/resource membership and byte identity in both archives."""
     expected = package_payloads(payloads)
+    generated = sdist_metadata(payloads, version)
+    sources_name = "finance_core.egg-info/SOURCES.txt"
+    allowed = set(expected) | PROJECT_INPUTS | set(generated) | {sources_name}
+    allowed_directories = {""} | {
+        str(parent)
+        for name in allowed
+        for parent in PurePosixPath(name).parents
+        if str(parent) != "."
+    }
     dist_info = f"finance_core-{version}.dist-info/"
     with zipfile.ZipFile(wheel) as archive:
         entries = archive.infolist()
@@ -214,12 +261,10 @@ def verify_distributions(
             "wheel metadata missing",
         )
         metadata = archive.read(f"{dist_info}METADATA")
-        require(
-            b"Name: finance-core\n" in metadata and f"Version: {version}\n".encode() in metadata,
-            "wheel metadata identity differs",
-        )
+        require(metadata == generated["PKG-INFO"], "wheel metadata differs from source recipe")
     prefix = f"finance_core-{version}/"
     actual_sdist: dict[str, bytes] = {}
+    seen_members: set[str] = set()
     with tarfile.open(sdist, "r:gz") as archive:
         for member in archive:
             name = safe_name(member.name.rstrip("/"))
@@ -227,13 +272,24 @@ def verify_distributions(
                 name == prefix.rstrip("/") or name.startswith(prefix),
                 "unexpected sdist root",
             )
+            require(
+                name not in seen_members and len(seen_members) < MAX_FILES,
+                "duplicate or excessive sdist member",
+            )
+            seen_members.add(name)
+            relative = "" if name == prefix.rstrip("/") else name[len(prefix) :]
             if member.isdir():
+                require(relative in allowed_directories, "undeclared sdist directory")
                 continue
             require(
                 member.isfile() and not member.issparse() and member.size <= MAX_BYTES,
                 "nonregular sdist member",
             )
-            relative = name[len(prefix) :]
+            require(relative in allowed, "undeclared sdist member")
+            require(
+                relative in expected or not member.mode & 0o111,
+                "executable sdist metadata or project input",
+            )
             require(
                 relative and relative not in actual_sdist and len(actual_sdist) < MAX_FILES,
                 "duplicate sdist member",
@@ -247,8 +303,8 @@ def verify_distributions(
                 "sdist expanded bound exceeded",
             )
     require(
-        {name for name in actual_sdist if name.startswith("finance_core/")} == set(expected),
-        "sdist package inventory differs",
+        set(actual_sdist) == allowed,
+        "sdist complete inventory differs",
     )
     require(
         all(actual_sdist[name] == body for name, body in expected.items()),
@@ -257,6 +313,24 @@ def verify_distributions(
     require(
         all(actual_sdist.get(name) == payloads[name] for name in PROJECT_INPUTS),
         "sdist recipe inputs differ",
+    )
+    require(
+        all(actual_sdist[name] == body for name, body in generated.items()),
+        "sdist generated metadata differs from source recipe",
+    )
+    try:
+        sources = actual_sdist[sources_name].decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise ValueError("sdist SOURCES inventory is not UTF-8") from error
+    source_inventory = (
+        set(expected)
+        | PROJECT_INPUTS
+        | {name for name in allowed if name.startswith("finance_core.egg-info/")}
+    )
+    require(
+        len(sources) == len(set(sources))
+        and {safe_name(name) for name in sources} == source_inventory,
+        "sdist SOURCES inventory differs",
     )
 
 
