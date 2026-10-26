@@ -1245,3 +1245,246 @@ print("COLD_PUBLIC_RECONSTRUCTION_PASSED")
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "COLD_PUBLIC_RECONSTRUCTION_PASSED" in result.stdout
+
+
+@pytest.mark.parametrize("shared_control", [False, True], ids=["separate-root", "shared-root"])
+@pytest.mark.parametrize("interruption", ["before-publish", "pending-unlink"])
+def test_each_root_resumes_interrupted_preparation_and_designation(
+    original, tmp_path, monkeypatch, shared_control, interruption
+):
+    old, owner, service, _ = original
+    cut, path = _cut(service, tmp_path)
+    _fence(old, owner)
+    root = tmp_path / "designation-target"
+    root.mkdir(mode=0o700)
+    new = synthetic_config(
+        root,
+        monkeypatch,
+        instance_id="designation-target",
+        control_root=old.control_root if shared_control else None,
+    )
+    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    original_unlink = authority.os.unlink
+
+    def fail_pending_delete(filename, *args, **kwargs):
+        if filename == PENDING_FILENAME:
+            raise OSError("synthetic interrupted recovery phase")
+        return original_unlink(filename, *args, **kwargs)
+
+    def interrupt(module):
+        if interruption == "before-publish":
+            return patch.object(
+                module, "_publish", side_effect=OSError("synthetic interrupted recovery phase")
+            )
+        return patch.object(authority.os, "unlink", side_effect=fail_pending_delete)
+
+    # Cover preparation under both root layouts and both journal cut points too;
+    # admission has the independent live/receipt/root/interruption matrix above.
+    with interrupt(authority), pytest.raises(OSError, match="synthetic interrupted recovery phase"):
+        prepare_restored_profile(
+            new,
+            path,
+            cut,
+            new_binding=binding,
+            operation_id="prepare-designation-target",
+            approval_ref="approved",
+        )
+    prepared_pending = new.control_root / PENDING_FILENAME
+    prepared_bytes = prepared_pending.read_bytes()
+    with pytest.raises(InstanceAdmissionError, match="dedicated"):
+        resume_authority_transition(
+            new, operation_id="prepare-designation-target", approval_ref="approved"
+        )
+    assert prepared_pending.read_bytes() == prepared_bytes
+    held = resume_restore_prepare(
+        new, cut, binding, operation_id="prepare-designation-target", approval_ref="approved"
+    )
+    assert not prepared_pending.exists()
+    assert (
+        resume_restore_prepare(
+            new, cut, binding, operation_id="prepare-designation-target", approval_ref="approved"
+        )
+        == held
+    )
+    other_config, _, other_target = _target(
+        tmp_path, monkeypatch, cut, path, name="other-designation-target", operation="prepare-other"
+    )
+    recovery = RecoveryAuthority("designation-interruption", b"r" * 32)
+    with (
+        interrupt(recovery_module),
+        pytest.raises(OSError, match="synthetic interrupted recovery phase"),
+    ):
+        # A signing attempt cannot return any receipt while publication is unknown.
+        recovery.issue_old_writer_isolation(
+            old, held, operation_id="designate-interrupted", approval_ref="approved"
+        )
+    pending = old.control_root / PENDING_FILENAME
+    pending_bytes = pending.read_bytes()
+    journal = json.loads(pending_bytes)
+    assert journal["action"] == "recovery_designate"
+    published = authority._read(old, authority.STATE_FILENAME)
+    assert published == (
+        authority._validate_state(journal["after"], prefix_version=journal["after"]["version"] - 1)
+        if interruption == "before-publish"
+        else journal["after"]
+    )
+    for config in (old, new):
+        with pytest.raises(InstanceAdmissionError):
+            acquire_production_owner(config)
+    with pytest.raises(InstanceAdmissionError, match="dedicated"):
+        resume_authority_transition(
+            old, operation_id="designate-interrupted", approval_ref="approved"
+        )
+
+    def resume(restored=held, operation_id="designate-interrupted", approval_ref="approved"):
+        return resume_restore_designation(
+            old, restored, operation_id=operation_id, approval_ref=approval_ref
+        )
+
+    for changed in (
+        dict(operation_id="wrong-operation"),
+        dict(approval_ref="wrong-approval"),
+        dict(restored=replace(held, cut=replace(cut, logical_database_sha256="0" * 64))),
+        dict(restored=other_target),
+    ):
+        with pytest.raises((LifecycleError, InstanceAdmissionError)):
+            resume(**changed)
+        assert pending.read_bytes() == pending_bytes
+    altered = json.loads(pending_bytes)
+    altered["context"]["designation"]["target"]["binding_sha256"] = "0" * 64
+    pending.write_text(canonical(altered))
+    altered_bytes = pending.read_bytes()
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume()
+    assert pending.read_bytes() == altered_bytes
+    pending.write_bytes(pending_bytes)
+    source = Path(old._binding["profile_root"]) / "runtime/database/finance.db"
+    source_bytes = source.read_bytes()
+    with sqlite3.connect(source) as offline:
+        offline.execute(
+            "INSERT INTO participants(public_id,display_name) VALUES ('changed-old','Changed')"
+        )
+    offline.close()
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        resume()
+    assert pending.read_bytes() == pending_bytes
+    with source.open("r+b") as restored_source:
+        restored_source.write(source_bytes)
+        restored_source.truncate()
+
+    from finance_core.instance_admission import TrustedInstanceConfig
+
+    closed_target = TrustedInstanceConfig(
+        new.control_root,
+        new.locator_root,
+        new.profile_id,
+        layout=new.layout,
+        instance_id=new.instance_id,
+        config_identity=new.config_identity,
+        core_identity=new.core_identity,
+        application_schema=new.application_schema,
+        approval_verifier=new.approval_verifier,
+    )
+    assert closed_target.binding_sha256 == new.binding_sha256
+    closed_target.close()
+    with pytest.raises(InstanceAdmissionError, match="process/fork"):
+        resume(replace(held, config=closed_target))
+    assert pending.read_bytes() == pending_bytes
+
+    # Retain only the original public preparation descriptor fields and trusted
+    # composition inputs; do not rebuild a target by decoding private history.
+    material = {
+        "old_binding": old._binding,
+        "old_locator": str(old.locator_root),
+        "new_binding": new._binding,
+        "new_locator": str(new.locator_root),
+        "cut": asdict(cut),
+        "runtime_binding": asdict(binding),
+        "prepare_operation": held.restore_prepare_operation_id,
+        "prepare_entry": held.restore_prepare_entry_sha256,
+        "approval_digest": journal["approval_digest"],
+    }
+    payload = tmp_path / "designation-restart.json"
+    payload.write_text(json.dumps(material))
+    payload.chmod(0o600)
+    child = r"""
+import json, os, sys
+from dataclasses import asdict
+from pathlib import Path
+from finance_core.instance_admission import TrustedInstanceConfig, authority, PENDING_FILENAME
+from finance_core.lifecycle_v2 import RuntimeBinding, SnapshotCut
+from finance_core.lifecycle_v2.recovery import (
+    RestoredProfile, RecoveryAuthority, resume_restore_designation,
+)
+m = json.loads(Path(sys.argv[1]).read_text())
+os.environ["FINANCE_RUNTIME_ROOT"] = str(Path(m["new_binding"]["profile_root"]) / "runtime")
+def config(binding, locator):
+    return TrustedInstanceConfig(
+        Path(binding["control_root"]), Path(locator), binding["profile_id"],
+        layout=binding["layout"], instance_id=binding["instance_id"],
+        config_identity=binding["config_identity"], core_identity=binding["core_identity"],
+        approval_verifier=lambda ref, action, digest: (
+            ref == "approved" and action == "recovery_designate" and digest == m["approval_digest"]
+        ),
+    )
+old = config(m["old_binding"], m["old_locator"])
+new = config(m["new_binding"], m["new_locator"])
+held = RestoredProfile(
+    new, SnapshotCut.from_dict(m["cut"]), RuntimeBinding(**m["runtime_binding"]),
+    m["prepare_operation"], m["prepare_entry"],
+)
+designation = resume_restore_designation(
+    old, held, operation_id="designate-interrupted", approval_ref="approved"
+)
+assert not (old.control_root / PENDING_FILENAME).exists()
+assert authority._state(old)["history"][-1]["entry_sha256"] == designation.entry_sha256
+signer = RecoveryAuthority("designation-interruption", b"r" * 32)
+receipt = signer.issue_old_writer_isolation(
+    old, held, operation_id="designate-interrupted", approval_ref="approved"
+)
+assert signer.issue_old_writer_isolation(
+    old, held, operation_id="designate-interrupted", approval_ref="approved"
+) == receipt
+print(json.dumps({"designation": asdict(designation), "receipt": asdict(receipt)}))
+new.close()
+old.close()
+"""
+    restarted = subprocess.run(
+        [sys.executable, "-c", child, str(payload)],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert restarted.returncode == 0, restarted.stdout + restarted.stderr
+    restarted_result = json.loads(restarted.stdout)
+
+    designation = resume()
+    assert not pending.exists()
+    state = authority._state(old)
+    assert sum(entry["action"] == "recovery_designate" for entry in state["history"]) == 1
+    assert designation.material["target"]["binding_sha256"] == new.binding_sha256
+    assert asdict(designation) == restarted_result["designation"]
+    assert resume() == designation
+    assert authority._state(old) == state
+    receipt = recovery.issue_old_writer_isolation(
+        old, held, operation_id="designate-interrupted", approval_ref="approved"
+    )
+    assert asdict(receipt) == restarted_result["receipt"]
+    restarted_signer = RecoveryAuthority("designation-interruption", b"r" * 32)
+    assert (
+        restarted_signer.issue_old_writer_isolation(
+            old, held, operation_id="designate-interrupted", approval_ref="approved"
+        )
+        == receipt
+    )
+    assert (
+        recovery.verify_old_writer_isolation(receipt, held).entry_sha256 == designation.entry_sha256
+    )
+    assert authority._state(old) == state
+    with pytest.raises(LifecycleError, match="already designated"):
+        designate_restore_successor(
+            old, other_target, operation_id="cannot-retarget", approval_ref="approved"
+        )
+    new.close()
+    other_config.close()

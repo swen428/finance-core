@@ -499,7 +499,25 @@ def designate_restore_successor(
     operation_id: str,
     approval_ref: str,
 ) -> RestoreDesignation:
-    target, _ = _held_description(restored, allow_completed=True)
+    target = None
+    if old_config.control_root == restored.config.control_root:
+        # A designation pending in this shared root also blocks ordinary target
+        # reads. Only this exact coordinator may use its authenticated predecessor.
+        with _control(old_config, shared=True):
+            if _exists(old_config, PENDING_FILENAME):
+                restored.config.assert_valid()
+                journal = _read(old_config, PENDING_FILENAME)
+                predecessor, _, _ = _validate_recovery_pending(
+                    old_config,
+                    journal,
+                    action="recovery_designate",
+                    operation_id=operation_id,
+                    approval_ref=approval_ref,
+                    context=journal.get("context", {}),
+                )
+                target, _ = _target_from_state(restored, predecessor)
+    if target is None:
+        target, _ = _held_description(restored, allow_completed=True)
     cut = restored.cut
     if (
         old_config.instance_id != cut.instance_id
