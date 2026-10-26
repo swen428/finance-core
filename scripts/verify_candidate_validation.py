@@ -21,9 +21,13 @@ from typing import Any
 
 WORKFLOW = ".github/workflows/validate.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
-CORE_JOBS = {"classify", "quality", "pytest-report", "validate"} | {
-    f"pytest ({index})" for index in range(4)
-}
+CORE_JOBS = {
+    "classify",
+    "quality",
+    "pytest-report",
+    "validate",
+    "candidate-package",
+} | {f"pytest ({index})" for index in range(4)}
 BRIDGE_JOBS = {"bridge (ubuntu-latest)", "bridge (macos-15)"}
 MAX_ARTIFACT_BYTES = 1024 * 1024
 
@@ -37,25 +41,41 @@ def verify(
     evidence: dict[str, Any], *, repository: str, pr_number: int, base: str, head: str
 ) -> dict[str, Any]:
     """Verify independently fetched API records and exact run artifact."""
-    require(SHA.fullmatch(base) and SHA.fullmatch(head), "expected identities must be exact SHAs")
+    require(
+        SHA.fullmatch(base) and SHA.fullmatch(head),
+        "expected identities must be exact SHAs",
+    )
     pr, run, workflow = evidence["pr"], evidence["run"], evidence["workflow"]
-    require(pr["number"] == pr_number and pr["state"] == "open", "PR is not the open candidate")
+    require(
+        pr["number"] == pr_number and pr["state"] == "open",
+        "PR is not the open candidate",
+    )
     require(pr["base"]["repo"]["full_name"] == repository, "wrong base repository")
     require(pr["base"]["ref"] == "main", "PR must target main")
-    require(pr["base"]["sha"] == base and evidence["main"]["sha"] == base, "base/main drifted")
+    require(
+        pr["base"]["sha"] == base and evidence["main"]["sha"] == base,
+        "base/main drifted",
+    )
     require(pr["head"]["sha"] == head, "candidate head drifted")
-    require(run["repository"]["full_name"] == repository, "run belongs to another repository")
+    require(
+        run["repository"]["full_name"] == repository,
+        "run belongs to another repository",
+    )
     require(run["event"] == "pull_request", "normal candidate proof requires a PR run")
     require(run["head_sha"] == head, "run head mismatch")
     require(run["run_attempt"] == 1, "normal candidate proof cannot reuse a rerun")
-    require(run["status"] == "completed" and run["conclusion"] == "success", "run did not succeed")
+    require(
+        run["status"] == "completed" and run["conclusion"] == "success",
+        "run did not succeed",
+    )
     require(workflow["path"] == WORKFLOW and workflow["state"] == "active", "wrong workflow")
     require(
-        run["path"] == WORKFLOW and run["workflow_id"] == workflow["id"], "run workflow mismatch"
+        run["path"] == WORKFLOW and run["workflow_id"] == workflow["id"],
+        "run workflow mismatch",
     )
 
     proof = evidence["proof"]
-    require(proof["schema"] == "finance-candidate-validation-v1", "unknown proof schema")
+    require(proof["schema"] == "finance-candidate-validation-v2", "unknown proof schema")
     identity = proof["identity"]
     expected = {
         "schema": "finance-candidate-identity-v1",
@@ -77,7 +97,8 @@ def verify(
     )
     require(evidence["head_commit"]["sha"] == head, "head commit record mismatch")
     require(
-        evidence["comparison"]["merge_base_commit"]["sha"] == base, "candidate excludes frozen base"
+        evidence["comparison"]["merge_base_commit"]["sha"] == base,
+        "candidate excludes frozen base",
     )
     event_commit = evidence["event_commit"]
     require(event_commit["sha"] == identity["event_sha"], "event commit record mismatch")
@@ -92,7 +113,10 @@ def verify(
     )
     reviewed_bytes = base64.b64decode(evidence["head_workflow"]["content"], validate=False)
     executed_bytes = base64.b64decode(evidence["executed_workflow"]["content"], validate=False)
-    require(reviewed_bytes == executed_bytes, "executed workflow differs from reviewed workflow")
+    require(
+        reviewed_bytes == executed_bytes,
+        "executed workflow differs from reviewed workflow",
+    )
     require(
         hashlib.sha256(reviewed_bytes).hexdigest() == identity["workflow_sha256"],
         "workflow content digest mismatch",
@@ -101,7 +125,10 @@ def verify(
     bridge_required = proof["bridge_required"]
     # Recompute scope from the complete API comparison, never trust only the artifact.
     files = evidence["comparison"]["files"]
-    require(len(files) < 300, "comparison may be truncated; cannot prove complete changed paths")
+    require(
+        len(files) < 300,
+        "comparison may be truncated; cannot prove complete changed paths",
+    )
     pattern = re.compile(
         r"^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|"
         r"plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|"
@@ -113,9 +140,19 @@ def verify(
         for item in files
         for path in (item["filename"], item.get("previous_filename", ""))
     )
-    require(bridge_required is actual_scope, "Bridge requirement disagrees with candidate paths")
+    require(
+        bridge_required is actual_scope,
+        "Bridge requirement disagrees with candidate paths",
+    )
     expected_results = {
-        name: "success" for name in ("classify", "quality", "pytest", "pytest-report")
+        name: "success"
+        for name in (
+            "classify",
+            "quality",
+            "pytest",
+            "pytest-report",
+            "candidate-package",
+        )
     }
     expected_results["bridge"] = "success" if bridge_required else "skipped"
     require(proof["results"] == expected_results, "proof lacks successful required results")
@@ -147,9 +184,40 @@ def verify(
             and job["conclusion"] == conclusion,
             f"wrong or unsuccessful job evidence: {job['name']}",
         )
+    package = proof.get("package")
+    require(
+        isinstance(package, dict)
+        and set(package) == {"artifact_id", "artifact_name", "artifact_digest", "receipt_sha256"},
+        "candidate package proof is missing or malformed",
+    )
+    require(
+        type(package["artifact_id"]) is int
+        and package["artifact_id"] > 0
+        and isinstance(package["receipt_sha256"], str)
+        and re.fullmatch(r"[0-9a-f]{64}", package["receipt_sha256"]),
+        "invalid package receipt identity",
+    )
+    package_artifact = evidence["package_artifact"]
+    require(
+        package_artifact["id"] == package["artifact_id"]
+        and package_artifact["name"]
+        == package["artifact_name"]
+        == f"candidate-package-v1-{run['id']}-1"
+        and package_artifact["digest"] == package["artifact_digest"]
+        and isinstance(package_artifact["digest"], str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", package_artifact["digest"])
+        and package_artifact["expired"] is False
+        and 0 < package_artifact["size_in_bytes"] <= 128 * 1024 * 1024
+        and package_artifact["workflow_run"]["id"] == run["id"]
+        and package_artifact["workflow_run"]["head_sha"] == head,
+        "candidate package artifact identity mismatch",
+    )
     artifact = evidence["artifact"]
     require(not artifact["expired"], "candidate proof artifact expired")
-    require(artifact["name"] == f"candidate-validation-v1-{run['id']}-1", "artifact name mismatch")
+    require(
+        artifact["name"] == f"candidate-validation-v2-{run['id']}-1",
+        "artifact name mismatch",
+    )
     require(
         artifact.get("digest") == "sha256:" + evidence["artifact_sha256"],
         "downloaded artifact digest mismatch",
@@ -160,7 +228,7 @@ def verify(
         "artifact run identity mismatch",
     )
     return {
-        "schema": "finance-verified-candidate-v1",
+        "schema": "finance-verified-candidate-v2",
         "repository": repository,
         "pr_number": pr_number,
         "base_sha": base,
@@ -173,6 +241,7 @@ def verify(
         "run_attempt": 1,
         "artifact_id": artifact["id"],
         "artifact_digest": artifact.get("digest"),
+        "package": package,
         "bridge_required": bridge_required,
         "jobs": [{key: job[key] for key in ("id", "name", "conclusion")} for job in jobs],
         "verified_at": datetime.now(UTC).isoformat(),
@@ -189,7 +258,7 @@ def unpack_proof(payload: bytes) -> dict[str, Any]:
     require(len(payload) <= MAX_ARTIFACT_BYTES, "candidate archive is too large")
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         require(
-            archive.namelist() == ["candidate-validation-v1.json"],
+            archive.namelist() == ["candidate-validation-v2.json"],
             "unexpected proof archive members",
         )
         info = archive.infolist()[0]
@@ -201,11 +270,14 @@ def collect(repository: str, pr_number: int, run_id: int) -> dict[str, Any]:
     prefix = f"repos/{repository}"
     run = api(f"{prefix}/actions/runs/{run_id}")
     artifacts = api(f"{prefix}/actions/runs/{run_id}/artifacts?per_page=100")
-    require(artifacts["total_count"] == len(artifacts["artifacts"]), "artifact inventory truncated")
+    require(
+        artifacts["total_count"] == len(artifacts["artifacts"]),
+        "artifact inventory truncated",
+    )
     found = [
         item
         for item in artifacts["artifacts"]
-        if item["name"] == f"candidate-validation-v1-{run_id}-1"
+        if item["name"] == f"candidate-validation-v2-{run_id}-1"
     ]
     require(len(found) == 1, "unique candidate proof artifact is missing")
     artifact = found[0]
@@ -217,11 +289,15 @@ def collect(repository: str, pr_number: int, run_id: int) -> dict[str, Any]:
     identity = proof["identity"]
     for key in ("base_sha", "head_sha", "event_sha", "workflow_sha"):
         require(
-            isinstance(identity[key], str) and SHA.fullmatch(identity[key]), "invalid proof SHA"
+            isinstance(identity[key], str) and SHA.fullmatch(identity[key]),
+            "invalid proof SHA",
         )
     head, base = identity["head_sha"], identity["base_sha"]
     evidence = {
         "run": run,
+        "package_artifact": api(
+            f"{prefix}/actions/artifacts/{int(proof['package']['artifact_id'])}"
+        ),
         "artifact": artifact,
         "artifact_sha256": hashlib.sha256(payload).hexdigest(),
         "proof": proof,
@@ -248,7 +324,10 @@ def main() -> None:
     parser.add_argument("--head", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
-    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository), "invalid repository")
+    require(
+        re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository),
+        "invalid repository",
+    )
     require(args.pr > 0 and args.run_id > 0, "invalid PR/run identity")
     args.output_dir.mkdir(parents=True, exist_ok=False)
     evidence = collect(args.repository, args.pr, args.run_id)
@@ -256,7 +335,11 @@ def main() -> None:
         json.dumps(evidence, indent=2) + "\n", encoding="utf-8"
     )
     verified = verify(
-        evidence, repository=args.repository, pr_number=args.pr, base=args.base, head=args.head
+        evidence,
+        repository=args.repository,
+        pr_number=args.pr,
+        base=args.base,
+        head=args.head,
     )
     (args.output_dir / "verified.json").write_text(
         json.dumps(verified, indent=2) + "\n", encoding="utf-8"

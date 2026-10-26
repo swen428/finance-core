@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -2025,3 +2026,236 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         for name, expected_payload in expected_package_payloads.items():
             assert observed_source_payloads[name] == expected_payload
         _assert_safe_text_payloads(payloads)
+
+
+def _candidate_package_producer():
+    path = REPOSITORY_ROOT / ".github/scripts/build_candidate_package.py"
+    spec = importlib.util.spec_from_file_location("candidate_package_producer_test", path)
+    assert spec and spec.loader
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+def _candidate_package_repository(tmp_path, *, complete_core=False):
+    producer = _candidate_package_producer()
+    root = tmp_path / "tracked-source"
+    root.mkdir()
+    paths = producer.PROJECT_INPUTS | {
+        "requirements-dev.txt",
+        ".github/scripts/build_candidate_package.py",
+    }
+    if complete_core:
+        tracked = subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "finance_core"], cwd=REPOSITORY_ROOT
+        )
+        paths |= {name.decode() for name in tracked.split(b"\0") if name}
+    for name in paths:
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPOSITORY_ROOT / name, target)
+        target.chmod((REPOSITORY_ROOT / name).stat().st_mode & 0o777)
+    if not complete_core:
+        for name, body in {
+            "finance_core/__init__.py": b'"""Synthetic package only."""\n',
+            "finance_core/resources/__init__.py": b"",
+            "finance_core/resources/example.json": b"{}\n",
+            "finance_core/resources/migrations/001_fixture.sql": b"-- synthetic\n",
+        }.items():
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Candidate Package Test",
+            "-c",
+            "user.email=package@example.invalid",
+            "commit",
+            "-qm",
+            "synthetic tracked fixture",
+        ],
+        cwd=root,
+        check=True,
+    )
+    identity = {
+        "head_sha": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "tested_sha": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "tested_tree": subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip(),
+    }
+    return producer, root, identity
+
+
+@pytest.mark.parametrize("change", ["dirty", "untracked", "wrong-head", "symlink", "export-ignore"])
+def test_candidate_package_snapshot_refuses_source_drift(tmp_path, change):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    if change == "dirty":
+        (root / "finance_core/__init__.py").write_bytes(b"unreviewed\n")
+    elif change == "untracked":
+        (root / "finance_core/untracked.py").write_bytes(b"untracked\n")
+    elif change == "wrong-head":
+        identity["head_sha"] = "a" * 40
+    elif change == "symlink":
+        (root / "finance_core/link.py").symlink_to("__init__.py")
+    else:
+        (root / ".gitattributes").write_text("finance_core/__init__.py export-ignore\n")
+    if change in {"symlink", "export-ignore"}:
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package@example.invalid",
+                "commit",
+                "-qm",
+                "unsafe synthetic fixture",
+            ],
+            cwd=root,
+            check=True,
+        )
+        identity["head_sha"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        identity["tested_tree"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip()
+    with pytest.raises(ValueError):
+        producer.tracked_snapshot(root, identity)
+
+
+def _candidate_package_archives(tmp_path, payloads, *, kind=None, mutation=None):
+    producer = _candidate_package_producer()
+    core = producer.package_payloads(payloads)
+    wheel = tmp_path / "finance_core-0.1.7-py3-none-any.whl"
+    sdist = tmp_path / "finance_core-0.1.7.tar.gz"
+    wheel_members = {
+        **core,
+        "finance_core-0.1.7.dist-info/METADATA": b"Name: finance-core\nVersion: 0.1.7\n",
+        "finance_core-0.1.7.dist-info/RECORD": b"",
+        "finance_core-0.1.7.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
+    }
+    sdist_members = {
+        **core,
+        **{name: payloads[name] for name in producer.PROJECT_INPUTS},
+    }
+    selected = wheel_members if kind == "wheel" else sdist_members
+    first = "finance_core/__init__.py"
+    if mutation == "missing":
+        del selected[first]
+    elif mutation == "changed":
+        selected[first] = b"changed\n"
+    elif mutation == "extra":
+        selected["finance_core/extra.py"] = b"extra\n"
+    elif mutation == "unsafe":
+        selected["../escape.py"] = b"unsafe\n"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, body in wheel_members.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (
+                0o120777
+                if kind == "wheel" and mutation == "symlink" and name == first
+                else 0o100644
+            ) << 16
+            archive.writestr(info, body)
+        if kind == "wheel" and mutation == "duplicate":
+            archive.writestr(first, core[first])
+    with tarfile.open(sdist, "w:gz") as archive:
+        for name, body in sdist_members.items():
+            member = tarfile.TarInfo("finance_core-0.1.7/" + name)
+            member.size = len(body)
+            if kind == "sdist" and mutation == "symlink" and name == first:
+                member.type = tarfile.SYMTYPE
+                member.linkname = "/outside"
+            archive.addfile(member, io.BytesIO(body))
+        if kind == "sdist" and mutation == "duplicate":
+            member = tarfile.TarInfo("finance_core-0.1.7/" + first)
+            member.size = len(core[first])
+            archive.addfile(member, io.BytesIO(core[first]))
+    return wheel, sdist
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "mutation", ["missing", "changed", "extra", "unsafe", "symlink", "duplicate"]
+)
+def test_candidate_package_archives_reject_incomplete_or_unsafe_bytes(tmp_path, kind, mutation):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads, kind=kind, mutation=mutation)
+    with pytest.raises(ValueError):
+        producer.verify_distributions(wheel, sdist, payloads, "0.1.7")
+
+
+def test_candidate_package_real_locked_build_and_outside_import(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path, complete_core=True)
+    output = tmp_path / "candidate-artifact"
+    before = subprocess.check_output(["git", "status", "--porcelain"], cwd=root)
+    record = producer.build(root, output, identity)
+    assert record["status"] == "BUILT_NOT_VALIDATED"
+    assert record["identity"] == identity
+    assert record["recipe"]["tools"] == {"build": "1.6.1", "setuptools": "84.1.0"}
+    inventory_bytes = (output / "source-inventory.json").read_bytes()
+    assert hashlib.sha256(inventory_bytes).hexdigest() == record["source_inventory_sha256"]
+    files = json.loads(inventory_bytes)["files"]
+    assert (
+        len(files)
+        == len(subprocess.check_output(["git", "ls-files", "-z"], cwd=root).split(b"\0")) - 1
+    )
+    assert set(record["artifacts"]) == {
+        "finance_core-0.1.7-py3-none-any.whl",
+        "finance_core-0.1.7.tar.gz",
+    }
+    for name, artifact in record["artifacts"].items():
+        assert hashlib.sha256((output / name).read_bytes()).hexdigest() == artifact["sha256"]
+        assert (output / name).stat().st_size == artifact["size_bytes"]
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=root) == before == b""
+    installed = tmp_path / "outside-installed"
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--target",
+            str(installed),
+            str(output / "finance_core-0.1.7-py3-none-any.whl"),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    script = (
+        "import sys,pathlib;sys.path.insert(0,sys.argv[1]);"
+        "import finance_core.lifecycle_v2 as api;"
+        "assert api.LedgerService;"
+        "assert pathlib.Path(api.__file__).resolve().is_relative_to("
+        "pathlib.Path(sys.argv[1]).resolve())"
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-c", script, str(installed)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def test_candidate_package_complete_archive_pair_passes(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    producer.verify_distributions(wheel, sdist, payloads, "0.1.7")

@@ -70,6 +70,52 @@ jobs:
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
           fi
 
+  candidate-package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      identity: ${{ steps.identity.outputs.identity }}
+      artifact_id: ${{ steps.package-artifact.outputs.artifact-id }}
+      artifact_digest: ${{ steps.package-artifact.outputs.artifact-digest }}
+      artifact_name: candidate-package-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      receipt_sha256: ${{ steps.package.outputs.receipt_sha256 }}
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Verify candidate checkout identity
+        id: identity
+        run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
+
+      - name: Install locked package build tools
+        run: python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt
+
+      - name: Build exact tracked candidate package
+        id: package
+        run: |
+          python -I .github/scripts/build_candidate_package.py \
+            --identity "$RUNNER_TEMP/candidate-identity.json" \
+            --output "$RUNNER_TEMP/candidate-package" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload candidate build identity, not release approval
+        id: package-artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: candidate-package-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/candidate-package/
+          retention-days: 90
+          if-no-files-found: error
+
   quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -1434,7 +1480,7 @@ jobs:
 
   validate:
     if: ${{ always() }}
-    needs: [classify, quality, pytest, bridge, pytest-report]
+    needs: [classify, quality, pytest, bridge, pytest-report, candidate-package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -1458,11 +1504,13 @@ jobs:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           PYTEST_RESULT: ${{ needs.pytest.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
+          PACKAGE_RESULT: ${{ needs.candidate-package.result }}
           REPORT_RESULT: ${{ needs.pytest-report.result }}
         run: |
           set -euo pipefail
           test "$CLASSIFY_RESULT" = success
           test "$QUALITY_RESULT" = success
+          test "$PACKAGE_RESULT" = success
           test "$PYTEST_RESULT" = success
           test "$REPORT_RESULT" = success
           if test "$EVENT_NAME" = "pull_request" && test "$BRIDGE_SCOPE" = false; then
@@ -1475,12 +1523,12 @@ jobs:
       - name: Bind candidate validation evidence
         env:
           VALIDATION_NEEDS: ${{ toJSON(needs) }}
-        run: python .github/scripts/candidate_identity.py --summarize --output /tmp/candidate-validation-v1.json
+        run: python .github/scripts/candidate_identity.py --summarize --output /tmp/candidate-validation-v2.json
 
       - name: Upload candidate validation evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: candidate-validation-v1-${{ github.run_id }}-${{ github.run_attempt }}
-          path: /tmp/candidate-validation-v1.json
+          name: candidate-validation-v2-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/candidate-validation-v2.json
           retention-days: 90
           if-no-files-found: error
