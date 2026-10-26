@@ -91,6 +91,7 @@ _SQL_METADATA_PRAGMAS = frozenset(
     {
         "table_info",
         "table_xinfo",
+        "table_list",
         "index_list",
         "index_info",
         "index_xinfo",
@@ -251,6 +252,7 @@ class _Witness:
     authority_version: int
     read_only: bool
     pid: int
+    immutable_migration_digest: str | None = None
     active: bool = True
     closing: bool = False
     closed: bool = False
@@ -291,7 +293,7 @@ class _Witness:
         self.gate.assert_valid()
         # _state->_read performs the final complete shared-config proof, including
         # installed migration bytes. No proof survives this admission call.
-        state = _state(self.owner.config)
+        state = _state(self.owner.config, _proof=self if self.immutable_migration_digest else None)
         record = _record(self.owner.config, state)
         if state["version"] != self.authority_version or (
             record["maintenance"] is not None
@@ -688,7 +690,11 @@ def require_finance_read_connection(
 
 @contextmanager
 def _operation(
-    owner: ProductionOwner, *, read_only: bool, timeout_seconds: float
+    owner: ProductionOwner,
+    *,
+    read_only: bool,
+    timeout_seconds: float,
+    immutable_installation: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     from .schema_contract import SchemaContractError, validate_application_database
 
@@ -726,7 +732,15 @@ def _operation(
             uri, uri=True, detect_types=0, cached_statements=0, factory=_ProductionConnection
         )
         witness = _Witness(
-            owner, conn, control, profile, gate, state["version"], read_only, os.getpid()
+            owner,
+            conn,
+            control,
+            profile,
+            gate,
+            state["version"],
+            read_only,
+            os.getpid(),
+            owner.config._binding["migration_identity"] if immutable_installation else None,
         )
         with owner._mutex:
             _WITNESSES[id(conn)] = witness
@@ -816,17 +830,11 @@ def _lifecycle_operation(owner: ProductionOwner, *, read_only: bool, timeout_sec
     and close checks remain in every existing guarded SQL admission. Only the
     installed migration bytes proved at this operation entry are reused.
     """
-    from .authority import _IMMUTABLE_OPERATION
-
-    if _IMMUTABLE_OPERATION.get() is not None:
-        raise InstanceAdmissionError("Nested immutable operation scopes are forbidden")
     owner.assert_valid()
-    token = _IMMUTABLE_OPERATION.set(owner.config)
-    try:
-        with _operation(owner, read_only=read_only, timeout_seconds=timeout_seconds) as conn:
-            yield conn
-    finally:
-        _IMMUTABLE_OPERATION.reset(token)
+    with _operation(
+        owner, read_only=read_only, timeout_seconds=timeout_seconds, immutable_installation=True
+    ) as conn:
+        yield conn
 
 
 def lifecycle_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):

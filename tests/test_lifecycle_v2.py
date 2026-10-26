@@ -214,21 +214,73 @@ def test_source_tampering_and_offline_profile_cannot_escalate(live):
         RuntimeBinding("i", "g", "p", "c", "production")
 
 
+def test_reader_source_returns_authenticated_native_input_and_rejects_missing(live):
+    service, port, _ = live
+    source = service.capture("source1", "capture1")
+    reader = service.reader()
+    before = reader.full_audit()
+    assert reader.source(source.source_id) == port.sources["source1"]
+    with pytest.raises(LifecycleError, match="Missing l2_sources identity"):
+        reader.source("missing-source")
+    assert reader.full_audit() == before
+    assert port.observations == {}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("raw_input", TEXT + "tampered"),
+        ("original_sha256", "0" * 64),
+        ("principal_id", "other-principal"),
+        ("client_id", "other-client"),
+        ("source_timestamp", 1792800001),
+        ("timezone", "UTC"),
+    ],
+)
+def test_reader_source_rejects_native_evidence_drift(live, field, value):
+    service, port, _ = live
+    source = service.capture("source1", "capture1")
+    port.sources["source1"] = replace(port.sources["source1"], **{field: value})
+    with pytest.raises(
+        LifecycleError, match="actor/client mismatch|Source/original evidence changed"
+    ):
+        service.reader().source(source.source_id)
+
+
+def test_reader_source_can_read_archived_generation_without_new_proposal_authority(live):
+    service, port, cfg = live
+    source = service.capture("source1", "capture1")
+    before = service.reader().full_audit()
+    successor = LedgerService(
+        service.owner,
+        port,
+        RuntimeBinding(cfg.instance_id, "gen2", "wen", "chat"),
+        clock=service.clock,
+    )
+    assert successor.reader().source(source.source_id) == port.sources["source1"]
+    with pytest.raises(LifecycleError, match="Source belongs to archived generation"):
+        successor.propose(source.source_id, "archived-observation", 0, "archived-proposal")
+    assert successor.reader().full_audit() == before
+    assert port.observations == {}
+
+
 def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
     from finance_core.lifecycle_v2.recovery import (
         prepare_restored_profile,
         promote_restored_profile,
     )
 
-    service, _, old_config = live
+    service, port, old_config = live
     cut = service.seal_snapshot(tmp_path / "restore.sqlite")
     other = tmp_path / "second"
     other.mkdir(mode=0o700)
     new_config = synthetic_config(other, monkeypatch, instance_id="new-instance")
+    new_binding = RuntimeBinding(new_config.instance_id, "gen2", "wen", "chat")
     restored = prepare_restored_profile(
         new_config,
         tmp_path / "restore.sqlite",
         cut,
+        new_binding=new_binding,
         operation_id="restore-prepare",
         approval_ref="approved",
     )
@@ -236,9 +288,17 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
     assert inspect_instance_admission(new_config)["state"] == "RESTORE_HELD"
     with pytest.raises(Exception):
         admit_production_instance(new_config, operation_id="bypass", approval_ref="approved")
+    service.owner.close()
     with pytest.raises(LifecycleError, match="fenced"):
         promote_restored_profile(
-            restored, old_config, operation_id="new-admit", approval_ref="approved"
+            restored,
+            old_config,
+            designation_operation_id="designate",
+            designation_approval_ref="approved",
+            operation_id="new-admit",
+            approval_ref="approved",
+            port=port,
+            binding=new_binding,
         )
     from finance_core.profile_layout import profile_root
 
@@ -246,6 +306,7 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
         "FINANCE_RUNTIME_ROOT",
         str(profile_root(old_config.locator_root, "synthetic", old_config.layout) / "runtime"),
     )
+    service.owner = acquire_production_owner(old_config)
     fence_production_instance(old_config, operation_id="actual-old-fence", approval_ref="approved")
     monkeypatch.setenv(
         "FINANCE_RUNTIME_ROOT",
@@ -255,7 +316,14 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
 
     with pytest.raises(InstanceAdmissionBusy):
         promote_restored_profile(
-            restored, old_config, operation_id="owner-still-held", approval_ref="approved"
+            restored,
+            old_config,
+            designation_operation_id="designate",
+            designation_approval_ref="approved",
+            operation_id="owner-still-held",
+            approval_ref="approved",
+            port=port,
+            binding=new_binding,
         )
     assert inspect_instance_admission(new_config)["state"] == "RESTORE_HELD"
     assert __import__("os").environ["FINANCE_RUNTIME_ROOT"] == str(
@@ -263,14 +331,21 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
     )
     service.owner.close()
     result = promote_restored_profile(
-        restored, old_config, operation_id="new-admit", approval_ref="approved"
+        restored,
+        old_config,
+        designation_operation_id="designate",
+        designation_approval_ref="approved",
+        operation_id="new-admit",
+        approval_ref="approved",
+        port=port,
+        binding=new_binding,
     )
     assert result["state"] == "ACTIVE"
     new_config.close()
 
 
 def test_operation_reuses_only_immutable_artifacts_and_keeps_dynamic_authority(live, monkeypatch):
-    from finance_core.instance_admission import authority
+    from finance_core.instance_admission import InstanceAdmissionError, authority, sessions
     from finance_core.instance_admission.sessions import lifecycle_write_operation
 
     service, _, _ = live
@@ -283,26 +358,46 @@ def test_operation_reuses_only_immutable_artifacts_and_keeps_dynamic_authority(l
 
     monkeypatch.setattr(authority, "_migration_contract_digest", counted)
     with lifecycle_write_operation(service.owner) as conn:
+        # Fresh composition/lease checks precede the operation-local witness.
+        # Their exact count is an implementation detail; guarded SQL reuses it.
+        entry_calls = len(calls)
+        assert entry_calls > 0
         conn.execute("BEGIN IMMEDIATE")
         conn.execute("SELECT count(*) FROM l2_events").fetchone()
         conn.execute("SELECT count(*) FROM l2_sources").fetchone()
-        assert len(calls) == 1
-        from finance_core.instance_admission import sessions
-
+        assert len(calls) == entry_calls
         original_state = sessions._state
 
-        def fenced(config):
-            state = original_state(config)
+        def fenced(config, **kwargs):
+            state = original_state(config, **kwargs)
             state["instances"][config.binding_sha256]["state"] = "FENCED"
             return state
 
-        monkeypatch.setattr(sessions, "_state", fenced)
-        with pytest.raises(Exception, match="ACTIVE"):
-            conn.execute("SELECT 1").fetchone()
-        monkeypatch.setattr(sessions, "_state", original_state)
-    with lifecycle_write_operation(service.owner):
-        pass
-    assert len(calls) == 2
+        with monkeypatch.context() as changed_authority:
+            changed_authority.setattr(sessions, "_state", fenced)
+            with pytest.raises(InstanceAdmissionError, match="ACTIVE"):
+                conn.execute("SELECT 1").fetchone()
+        assert len(calls) == entry_calls
+
+    previous_calls = len(calls)
+    with lifecycle_write_operation(service.owner) as conn:
+        next_entry_calls = len(calls)
+        assert next_entry_calls > previous_calls
+        conn.execute("BEGIN IMMEDIATE")
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+        assert len(calls) == next_entry_calls
+
+    def drifted():
+        calls.append(1)
+        return "0" * 64
+
+    previous_calls = len(calls)
+    with monkeypatch.context() as changed_installation:
+        changed_installation.setattr(authority, "_migration_contract_digest", drifted)
+        with pytest.raises(InstanceAdmissionError, match="Installed migration identity"):
+            with lifecycle_write_operation(service.owner):
+                pytest.fail("A new operation reused the exited installation proof")
+    assert len(calls) > previous_calls
 
 
 def test_reader_rejects_self_consistent_rehashed_unapproved_fact(live):
@@ -387,15 +482,23 @@ def test_signed_fence_receipt_allows_restore_without_old_root(tmp_path, monkeypa
     fence_production_instance(cfg, operation_id="fence-old", approval_ref="approved")
     owner.close()
     auth = RecoveryAuthority("independent-recovery", b"r" * 32)
-    isolation = auth.issue_old_writer_isolation(cfg, cut, new_instance_id="new-restore")
-    cfg.close()
-    oldroot.rename(tmp_path / "unavailable-old")
     newroot = tmp_path / "new"
     newroot.mkdir(mode=0o700)
     new = synthetic_config(newroot, monkeypatch, instance_id="new-restore")
+    new_binding = RuntimeBinding(new.instance_id, "g2", "wen", "chat")
     held = prepare_restored_profile(
-        new, tmp_path / "sealed.sqlite", cut, operation_id="held", approval_ref="approved"
+        new,
+        tmp_path / "sealed.sqlite",
+        cut,
+        new_binding=new_binding,
+        operation_id="held",
+        approval_ref="approved",
     )
+    isolation = auth.issue_old_writer_isolation(
+        cfg, held, operation_id="designate", approval_ref="approved"
+    )
+    cfg.close()
+    oldroot.rename(tmp_path / "unavailable-old")
     with pytest.raises(LifecycleError, match="signature"):
         promote_with_isolation_receipt(
             held,
@@ -403,17 +506,33 @@ def test_signed_fence_receipt_allows_restore_without_old_root(tmp_path, monkeypa
             auth,
             operation_id="bad",
             approval_ref="approved",
+            port=service.port,
+            binding=new_binding,
         )
     from finance_core.lifecycle_v2.recovery import verify_held_profile_evidence
 
-    new_binding = RuntimeBinding(new.instance_id, "g2", "wen", "chat")
-    with pytest.raises(LifecycleError, match="held source/provider/action"):
-        promote_with_isolation_receipt(
-            held, isolation, auth, operation_id="early", approval_ref="approved"
-        )
     verify_held_profile_evidence(held, service.port, new_binding)
+    service.port.bad_actor = True
+    with pytest.raises(LifecycleError):
+        promote_with_isolation_receipt(
+            held,
+            isolation,
+            auth,
+            operation_id="early",
+            approval_ref="approved",
+            port=service.port,
+            binding=new_binding,
+        )
+    assert inspect_instance_admission(new)["state"] == "RESTORE_HELD"
+    service.port.bad_actor = False
     promote_with_isolation_receipt(
-        held, isolation, auth, operation_id="promote", approval_ref="approved"
+        held,
+        isolation,
+        auth,
+        operation_id="promote",
+        approval_ref="approved",
+        port=service.port,
+        binding=new_binding,
     )
     restored_owner = acquire_production_owner(new)
     # Actual retained proof port must remain available independently of oldroot.
@@ -665,14 +784,27 @@ def test_generic_promotion_rejects_actual_fenced_stale_cut(live, tmp_path, monke
     other = tmp_path / "restore"
     other.mkdir(mode=0o700)
     new = synthetic_config(other, monkeypatch, instance_id="new-stale-instance")
+    new_binding = RuntimeBinding(new.instance_id, "new-gen", "wen", "chat")
     held = prepare_restored_profile(
-        new, tmp_path / "stale.sqlite", cut, operation_id="prepare-held", approval_ref="approved"
+        new,
+        tmp_path / "stale.sqlite",
+        cut,
+        new_binding=new_binding,
+        operation_id="prepare-held",
+        approval_ref="approved",
     )
-    verify_held_profile_evidence(
-        held, port, RuntimeBinding(new.instance_id, "new-gen", "wen", "chat")
-    )
-    with pytest.raises(LifecycleError, match="exact signed cut"):
-        promote_restored_profile(held, old, operation_id="promote-stale", approval_ref="approved")
+    verify_held_profile_evidence(held, port, new_binding)
+    with pytest.raises(LifecycleError, match="cut"):
+        promote_restored_profile(
+            held,
+            old,
+            designation_operation_id="designate-stale",
+            designation_approval_ref="approved",
+            operation_id="promote-stale",
+            approval_ref="approved",
+            port=port,
+            binding=new_binding,
+        )
     assert inspect_instance_admission(new)["state"] == "RESTORE_HELD"
     assert __import__("os").environ["FINANCE_RUNTIME_ROOT"] == str(
         profile_root(new.locator_root, new.profile_id, new.layout) / "runtime"

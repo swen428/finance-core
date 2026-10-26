@@ -519,6 +519,7 @@ def _probe_installed_lifecycle(
         import sqlite3
         import sys
         import tempfile
+        from dataclasses import asdict
         from pathlib import Path
 
         installed = Path(sys.argv[1]).resolve()
@@ -530,6 +531,8 @@ def _probe_installed_lifecycle(
         import finance_core
         import finance_core.lifecycle_v2 as lifecycle
         import finance_core.instance_admission as admission
+        import finance_core.lifecycle_v2.recovery as recovery
+        from finance_core.lifecycle_v2.contracts import digest
         from finance_core.profile_layout import product_root, profile_root
         from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
 
@@ -582,6 +585,8 @@ def _probe_installed_lifecycle(
                 approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
             )
             owner = None
+            new_config = None
+            new_owner = None
             try:
                 admission.prepare_production_profile(
                     cfg, operation_id='prepare', approval_ref='approved').close()
@@ -590,12 +595,61 @@ def _probe_installed_lifecycle(
                 owner = admission.acquire_production_owner(cfg)
                 raw = '2026-10-24 Cafe SGD 12.00'
                 original_sha = hashlib.sha256(raw.encode()).hexdigest()
+                operations = []
+                for index, (field, value) in enumerate((
+                    ('amount', '12.00'), ('currency', 'SGD'),
+                    ('merchant', 'Cafe'), ('transaction_date', '2026-10-24'),
+                )):
+                    operation = {
+                        'operation_id': f'o{index}', 'op': 'set', 'field': field,
+                        'evidence': [{
+                            'ref': 'source', 'start': raw.index(value),
+                            'end': raw.index(value) + len(value), 'quote': value,
+                            'role': 'replacement_value',
+                        }],
+                    }
+                    if field == 'transaction_date':
+                        operation['date_expression'] = {
+                            'kind': 'absolute_date', 'year': 2026, 'month': 10, 'day': 24,
+                        }
+                    else:
+                        operation['value'] = value
+                    operations.append(operation)
+                response = json.dumps({
+                    'schema': 'finance-independent-ai-result-v2',
+                    'outcome': 'proposal', 'intent': 'personal_expense',
+                    'operations': operations, 'unresolved': [],
+                    'coverage': [{
+                        'start': 0, 'end': len(raw), 'label': 'resolved_instruction',
+                        'operation_ids': [item['operation_id'] for item in operations],
+                        'question_ids': [],
+                    }],
+                })
                 class Port:
                     bad_actor = False
+                    def __init__(self):
+                        self.observations = {}
                     def source(self, conn, evidence_id):
                         return lifecycle.VerifiedSource(
                             evidence_id, 'other' if self.bad_actor else 'actor', 'chat',
                             'message-1', raw, original_sha, 1792800000,
+                        )
+                    def provider(self, conn, evidence_id, expected):
+                        if evidence_id not in self.observations:
+                            self.observations[evidence_id] = lifecycle.VerifiedObservation(
+                                evidence_id, expected.source_id, 'actor', response,
+                                digest(asdict(expected)), expected.projection['reply_text'],
+                            )
+                        return self.observations[evidence_id]
+                    def delivery(self, conn, evidence_id, expected):
+                        return lifecycle.VerifiedDelivery(
+                            evidence_id, expected.review_id, expected.review_sha256,
+                            'actor', 'chat',
+                        )
+                    def action(self, conn, evidence_id, expected):
+                        return lifecycle.VerifiedAction(
+                            evidence_id, expected.review_id, expected.review_sha256,
+                            expected.delivery_evidence_id, 'actor', 'chat',
                         )
                 port = Port()
                 service = lifecycle.LedgerService(owner, port, binding, clock=lambda: 1792800000)
@@ -608,6 +662,10 @@ def _probe_installed_lifecycle(
                 port.bad_actor = False
                 source = service.capture('source1', 'capture1')
                 retry_same = service.capture('source1', 'capture1') == source
+                proposal = service.propose(source.source_id, 'observation1', 0, 'propose1')
+                review = service.prepare_review(proposal.proposal_id, proposal.version)
+                service.record_delivery(review.review_id, 'delivery1')
+                posted = service.confirm(review.review_id, 'action1', 'confirm1')
                 audit = service.reader().full_audit()
                 guarded_capture = {
                     'actor_refused': actor_refused,
@@ -616,14 +674,109 @@ def _probe_installed_lifecycle(
                     'event_count': audit['event_count'],
                     'fact_version_count': audit['fact_version_count'],
                 }
+                snapshot = scratch / 'sealed.sqlite'
+                cut = service.seal_snapshot(snapshot)
+                new_root = scratch / 'successor'
+                new_root.mkdir(mode=0o700)
+                new_support = new_root / (
+                    'Application Support' if layout == 'mac' else 'finance-codex'
+                )
+                new_support.mkdir(mode=0o700)
+                new_product = product_root(new_support, layout)
+                new_profile = profile_root(new_support, 'synthetic', layout)
+                if new_product != new_support:
+                    new_product.mkdir(mode=0o700)
+                for directory in (
+                    new_profile.parent, new_profile, new_profile / 'runtime',
+                    new_profile / 'runtime/database', new_profile / 'workspace',
+                    new_profile / 'workspace/database', new_profile / 'backups',
+                    new_profile / 'work', new_profile / 'restore', new_root / 'control',
+                ):
+                    directory.mkdir(mode=0o700)
+                new_manifest = new_profile / 'profile.json'
+                new_manifest.write_text(json.dumps({
+                    'profile_id': 'synthetic', 'runtime_root': str(new_profile / 'runtime'),
+                    'workspace_root': str(new_profile / 'workspace'),
+                }))
+                new_manifest.chmod(0o600)
+                new_runtime = new_profile / 'runtime'
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(new_runtime)
+                new_config = admission.TrustedInstanceConfig(
+                    new_root / 'control', new_support, 'synthetic', layout=layout,
+                    instance_id='successor-instance',
+                    config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                    approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+                )
+                new_binding = lifecycle.RuntimeBinding(
+                    new_config.instance_id, 'generation-2', 'actor', 'chat',
+                )
+                held = recovery.prepare_restored_profile(
+                    new_config, snapshot, cut, new_binding=new_binding,
+                    operation_id='restore-prepare', approval_ref='approved',
+                )
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(profile / 'runtime')
+                admission.fence_production_instance(
+                    cfg, operation_id='old-fence', approval_ref='approved',
+                )
+                owner.close()
+                owner = None
+                authority = recovery.RecoveryAuthority(
+                    'installed-synthetic-recovery', b'r' * 32,
+                )
+                isolation = authority.issue_old_writer_isolation(
+                    cfg, held, operation_id='designate', approval_ref='approved',
+                )
+                cfg.close()
+                support.rename(scratch / 'unavailable-old-support')
+                old_control = scratch / 'control'
+                old_control.rename(scratch / 'unavailable-old-control')
+                old_root_unavailable = not support.exists() and not old_control.exists()
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(new_runtime)
+                promoted = recovery.promote_with_isolation_receipt(
+                    held, isolation, authority, operation_id='restore-admit',
+                    approval_ref='approved', port=port, binding=new_binding,
+                )
+                new_owner = admission.acquire_production_owner(new_config)
+                restored_service = lifecycle.LedgerService(new_owner, port, new_binding)
+                restored_fact = restored_service.reader().get(posted.record_id)
+                recovery_proof = {
+                    'cut_format': cut.format,
+                    'logical_digest_format': cut.logical_digest_format,
+                    'logical_database_sha256': cut.logical_database_sha256,
+                    'source_binding_sha256': cut.source_binding_sha256,
+                    'snapshot_sha256': cut.database_sha256,
+                    'source_binding_matches': cut.source_binding_sha256 == cfg.binding_sha256,
+                    'snapshot_file_matches': (
+                        cut.database_sha256 == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+                    ),
+                    'cut_contains_posted_fact': cut.facts == ((
+                        posted.record_id, posted.version, posted.fact_sha256,
+                    ),),
+                    'receipt_schema': json.loads(isolation.material_json)['schema'],
+                    'held_status': held.status,
+                    'new_instance_id': new_binding.instance_id,
+                    'new_generation': new_binding.generation,
+                    'old_root_unavailable': old_root_unavailable,
+                    'promoted_state': promoted['state'],
+                    'record_id': restored_fact['record_id'],
+                    'record_version': restored_fact['version'],
+                    'record_amount': restored_fact['values']['amount'],
+                    'fact_sha256_matches': restored_fact['fact_sha256'] == posted.fact_sha256,
+                }
             finally:
+                if new_owner is not None:
+                    new_owner.close()
                 if owner is not None:
                     owner.close()
+                if new_config is not None:
+                    new_config.close()
                 cfg.close()
-        module_paths = [Path(lifecycle.__file__).resolve(),
-                        Path(sys.modules[lifecycle.LedgerService.__module__].__file__).resolve(),
-                        Path(admission.__file__).resolve(),
-                        migration.resolve()]
+        module_paths = sorted({
+            Path(module.__file__).resolve()
+            for name, module in sys.modules.items()
+            if (name == 'finance_core' or name.startswith('finance_core.'))
+            and getattr(module, '__file__', None)
+        } | {migration.resolve()})
         print(json.dumps({
             'root_api': finance_core.API_CONTRACT_VERSION,
             'lifecycle_exports': sorted(lifecycle.__all__),
@@ -635,6 +788,7 @@ def _probe_installed_lifecycle(
             'migration_sha256': hashlib.sha256(migration.read_bytes()).hexdigest(),
             'lifecycle_tables': sorted(tables),
             'guarded_capture': guarded_capture,
+            'recovery': recovery_proof,
             'module_paths': [str(path) for path in module_paths],
             'installed_only': all(path.is_relative_to(installed) for path in module_paths)
                 and not any(Path(path or '.').resolve().is_relative_to(checkout)
@@ -1342,8 +1496,27 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert lifecycle["migration_name"] == "061_lifecycle_v2.sql"
         assert lifecycle["guarded_capture"]["actor_refused"] is True
         assert lifecycle["guarded_capture"]["retry_same"] is True
-        assert lifecycle["guarded_capture"]["event_count"] == 1
-        assert lifecycle["guarded_capture"]["fact_version_count"] == 0
+        assert lifecycle["guarded_capture"]["event_count"] == 5
+        assert lifecycle["guarded_capture"]["fact_version_count"] == 1
+        recovery = lifecycle["recovery"]
+        assert recovery["cut_format"] == "lifecycle-snapshot-cut-v3"
+        assert recovery["logical_digest_format"] == "core-logical-database-v1"
+        assert len(recovery["logical_database_sha256"]) == 64
+        assert len(recovery["source_binding_sha256"]) == 64
+        assert len(recovery["snapshot_sha256"]) == 64
+        assert recovery["source_binding_matches"] is True
+        assert recovery["snapshot_file_matches"] is True
+        assert recovery["cut_contains_posted_fact"] is True
+        assert recovery["receipt_schema"] == "old-writer-isolation-v3"
+        assert recovery["held_status"] == "RESTORE_HELD"
+        assert recovery["new_instance_id"] == "successor-instance"
+        assert recovery["new_generation"] == "generation-2"
+        assert recovery["old_root_unavailable"] is True
+        assert recovery["promoted_state"] == "ACTIVE"
+        assert recovery["record_id"]
+        assert recovery["record_version"] == 1
+        assert recovery["record_amount"] == "12.00"
+        assert recovery["fact_sha256_matches"] is True
         assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
             lifecycle["lifecycle_tables"]
         )

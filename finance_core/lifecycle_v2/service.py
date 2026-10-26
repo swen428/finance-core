@@ -78,6 +78,26 @@ def _money(values):
     return values
 
 
+def _snapshot_inventory(conn):
+    facts = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
+            "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
+            "ORDER BY record_id"
+        )
+    )
+    seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
+    return facts, seq
+
+
+def _snapshot_integrity(conn):
+    if [tuple(row) for row in conn.execute("PRAGMA integrity_check")] != [("ok",)] or conn.execute(
+        "PRAGMA foreign_key_check"
+    ).fetchone() is not None:
+        raise LifecycleError("Snapshot SQLite integrity or foreign keys invalid")
+
+
 class LedgerService:
     def __init__(
         self,
@@ -346,15 +366,25 @@ class LedgerService:
             "SELECT * FROM l2_proposals WHERE observation_id=?", (observation_id,)
         ).fetchone()
         if existing:
+            from .reader import verify_proposal
+
             event = conn.execute(
                 "SELECT * FROM l2_events WHERE operation_id=?", (operation_id,)
             ).fetchone()
+            retained = verify_proposal(self, conn, existing)
             if (
                 event is None
+                or event["kind"] != "propose"
                 or event["entity_id"] != existing["proposal_id"]
                 or existing["source_id"] != source_id
                 or existing["expected_version"] != expected_version
                 or existing["record_id"] != record_id
+                or retained.binding != self.binding
+                or retained.source_id != source_id
+                or retained.expected_version != expected_version
+                or retained.record_id != record_id
+                or retained.reply_evidence_id != reply_evidence_id
+                or retained.correction_reason != correction_reason
             ):
                 raise LifecycleError("Observation replay mismatch")
             return ProposalRef(
@@ -429,16 +459,19 @@ class LedgerService:
         self._source(conn, proposal["source_id"], allow_archived=proposal["record_id"] is not None)
         if proposal["version"] != expected_version:
             raise LifecycleError("Review proposal version mismatch")
+        existing = conn.execute(
+            "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
+        ).fetchone()
+        if existing:
+            from .reader import verify_review
+
+            verify_review(self, conn, existing)
+            return self._review_dto(conn, existing)
         latest = conn.execute(
             "SELECT max(version) FROM l2_proposals WHERE source_id=?", (proposal["source_id"],)
         ).fetchone()[0]
         if latest != expected_version:
             raise LifecycleError("Superseded proposal cannot be reviewed")
-        existing = conn.execute(
-            "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
-        ).fetchone()
-        if existing:
-            return self._review_dto(conn, existing)
         review_id = _id("review")
         material = {
             "binding": asdict(self.binding),
@@ -715,56 +748,54 @@ class LedgerService:
             return result
 
     def seal_snapshot(self, destination: Path):
-        from .reader import audit_connection, verify_proposal, verify_record, verify_review
+        from finance_core.instance_admission.authority import _logical_database_digest
+        from finance_core.instance_admission.schema_contract import (
+            ledger_sha256,
+            validate_application_database,
+        )
+
+        from .reader import audit_evidence_connection
+        from .snapshot_io import _secure_snapshot_destination
 
         destination = Path(destination)
-        if destination.exists():
-            raise LifecycleError("Snapshot destination must be fresh")
-        with lifecycle_read_operation(self.owner) as conn:
-            conn.execute("BEGIN")
-            audit_connection(conn)
-            if (
-                conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
-                or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
-                or conn.execute(
-                    "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
-                ).fetchone()
-            ):
-                from .legacy import verify_import_archives
-
-                verify_import_archives(conn, self.legacy_verifier)
-            for source in conn.execute("SELECT source_id FROM l2_sources"):
-                self._source(conn, source[0], allow_archived=True)
-            for proposal in conn.execute("SELECT * FROM l2_proposals"):
-                verify_proposal(self, conn, proposal)
-            for review in conn.execute("SELECT * FROM l2_reviews"):
-                verify_review(self, conn, review)
-            for record in conn.execute("SELECT DISTINCT record_id FROM l2_facts"):
-                verify_record(self, conn, record[0])
-            facts = tuple(
-                tuple(r)
-                for r in conn.execute(
-                    "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
-                    "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
-                    "ORDER BY record_id"
-                )
+        migration = self.owner.config._binding["migration_identity"]
+        schema = self.owner.config.application_schema
+        with _secure_snapshot_destination(destination) as target:
+            with lifecycle_read_operation(self.owner) as conn:
+                conn.execute("BEGIN")
+                audit_evidence_connection(conn, self.port, self.binding, self.legacy_verifier)
+                sealed_ledger = ledger_sha256(conn)
+                validate_application_database(conn, migration, schema, sealed_ledger)
+                source_logical = _logical_database_digest(conn)
+                facts, seq = _snapshot_inventory(conn)
+                target.backup(conn)
+                conn.rollback()
+            target.check()
+            readback = sqlite3.connect(
+                destination.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=0
             )
-            seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
-            target = sqlite3.connect(destination)
             try:
-                sqlite3.Connection.backup(conn, target)
+                readback.execute("PRAGMA query_only=ON")
+                validate_application_database(readback, migration, schema, sealed_ledger)
+                _snapshot_integrity(readback)
+                if _logical_database_digest(readback) != source_logical or _snapshot_inventory(
+                    readback
+                ) != (facts, seq):
+                    raise LifecycleError("Snapshot copy differs from source transaction")
             finally:
-                target.close()
-            conn.rollback()
-        destination.chmod(0o600)
+                readback.close()
+            target.check()
+            database_sha256 = target.closed_sha256()
         return SnapshotCut(
             _id("snapshot"),
             self.binding.instance_id,
             self.binding.generation,
             seq,
             facts,
-            hashlib.sha256(destination.read_bytes()).hexdigest(),
+            database_sha256,
             self.owner.config.core_identity,
             self.owner.config._binding["migration_identity"],
             digest(self.owner.config._binding["application_schema"]),
+            logical_database_sha256=source_logical,
+            source_binding_sha256=self.owner.config.binding_sha256,
         )

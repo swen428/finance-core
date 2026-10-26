@@ -30,27 +30,110 @@ receipts, canonical values, fact predecessors and audit binding. Complete audit
 also covers unused proposals, pending reviews, all fact versions and signed
 historical import archives. Imported pending interactions remain non-executable.
 
+`LedgerReader.source(source_id)` accepts the retained lifecycle source ID and
+returns a frozen `VerifiedSource` containing authenticated original input, its
+hash, actor/client, evidence identity, timestamp and interpretation timezone.
+Native sources are checked against the trusted evidence port and original capture
+event; imported sources require the independently trusted legacy verifier and
+signed retained source capsule. Missing or inconsistent evidence is refused.
+Archived-generation sources remain readable; this read grants no current proposal
+or confirmation authority and creates no lifecycle decision or fact.
+
 Each v2 protected operation verifies installed migration artifacts at entry,
-then reuses only that immutable proof until actual SQLite close. Dynamic file,
-owner, gate, current-authority, schema, transaction and close checks remain.
-Legacy protected operations retain their original verification behavior.
+then reuses that proof only through its own active connection witness. The proof
+binds the exact config, owner, process and session; it is not an ambient context
+flag and cannot authorize another operation, copied context, child or owner.
+Dynamic file, owner, gate, current-authority, schema, transaction and close checks
+remain. Legacy protected operations retain their original verification behavior.
 
-`seal_snapshot` holds a read transaction while validating full history and
-copying SQLite through its native backup API. `SnapshotCut` records the exact
-record/version/hash set, audit sequence, database hash, and installation/schema
-identities. Private composition must pause intake while capturing its journal
-and originals into the same protected cut; this API alone makes no remote-copy
-protection claim.
+`seal_snapshot` holds one read transaction while validating the complete retained
+history, schema and migration ledger, measuring the complete logical database
+and copying SQLite through its native backup API. The logical digest includes
+all main tables, old posting tables, declared application tables, storage types,
+hidden rowids and SQLite sequence rows. It is not an economic-equivalence hash:
+a legitimate later legacy posting or other covered content change invalidates
+the cut even when the lifecycle fact watermark does not move. SQLite page/WAL
+layout is not part of this logical digest.
 
-Restore creates a genuinely new instance in durable RESTORE_HELD. Ordinary
-admission and current owners cannot open it. Promotion requires fresh approval
-and either verifiable original FENCED authority or an independently HMAC-signed
-old-writer isolation receipt. Such a receipt is issued only after the original
-writer is actually fenced, releases its lifetime lease, and the exact cut is
-compared with its actual database. The receipt permits recovery after the old
-root becomes unavailable. It proves a previously recorded fence; it cannot prove
-isolation of a machine lost before that fence. `resume_held_restore` reissues a
-held capability after restart only against the signed cut and durable held state.
+The destination must be new and under a trusted, caller-owned private 0700
+directory without expanded ACL permissions. It is reserved exclusively as a
+regular, single-link 0600 file, without following links. Parent and file identity
+remain pinned through copying, actual close, independent readback and fsync.
+Existing files, dangling links, hard links, unexpected sidecars and detected
+replacement fail closed. Failed partial output stays private and is not a
+successful cut. SQLite still opens its target by pathname; this guarantee
+depends on trusted private-directory custody and cooperative maintenance, and
+does not claim an fd-based VFS or protection against malicious same-UID races.
+
+`SnapshotCut` uses `format="lifecycle-snapshot-cut-v3"` and
+`logical_digest_format="core-logical-database-v1"`. It retains the exact
+record/version/hash set, audit sequence, installation/schema identities and
+closed snapshot file's raw `database_sha256`, and requires
+`logical_database_sha256` and `source_binding_sha256`. Independent closed-target
+readback must match the source logical digest and pass schema, ledger, integrity
+and foreign-key checks. `SnapshotCut.from_dict` strictly decodes the complete v3
+JSON shape; absent proof fields, old cuts and implicit upgrades are rejected.
+The compact authority `cut_ref` binds the complete cut hash and fixed digest
+identities without copying the potentially large fact list into the control log.
+
+Private composition must pause intake while capturing its journal and originals
+into the same protected cut. This API alone makes no remote-copy protection claim.
+
+Restore first prepares a concrete new instance and generation in durable
+RESTORE_HELD, using `prepare_restored_profile(..., new_binding=...)`. Its target
+identity includes the complete trusted config binding, runtime binding, held
+database inode and exact preparation history entry. Ordinary admission and
+current owners cannot open a held instance. A Python object or a successful
+`verify_held_profile_evidence` diagnostic grants no future admission right.
+
+After the old writer is fenced and has actually released its lifetime owner,
+`designate_restore_successor` compares the entire source cut against the actual
+old database and records one exact successor for that old authority binding.
+The `recovery_designate` action requires its own operation and approval reference.
+Both live-original and receipt promotion consume this same durable designation.
+Another operation cannot designate a second target, even with fresh approvals;
+an exact operation/reference retry returns the original designation. A lost or
+discarded target does not silently reopen successor selection. An admitted
+successor can later perform recovery under its own new authority binding.
+
+`RecoveryAuthority.issue_old_writer_isolation(old_config, restored, ...)` signs
+the existing exact designation as `old-writer-isolation-v3`. Its material binds
+the namespace, old binding and fence entry, complete target, cut and designation
+entry. It contains no fresh retry timestamp or random value, so an exact retry
+can recover the same receipt. Old v2 receipts and unbound target strings are not
+accepted. The target must be prepared before receipt issuance; a consumer cannot
+sign for a name, lose the old root, and later construct a different target.
+
+Promotion requires fresh approval plus the trusted `port` and exact new `binding`.
+Under the same target owner/control/profile leases and SQLite transaction, it
+rechecks the full cut, installed identity, schema/ledger and complete evidence,
+including historical signed archives. It writes the pending transition, rolls
+back its read-only use of the transaction and confirms actual SQLite close
+before publishing ACTIVE. Cooperative leases remain held through publication.
+A close-unknown result retains the pending state and uncertain resources;
+ordinary admission cannot use that state. Prior held diagnostics never substitute
+for these final checks.
+
+Recovery actions retain strictly validated, action-specific `recovery_context`
+in the existing hashed authority history; ordinary legacy history retains its
+original shape. This is a control-log extension, not a new SQLite migration.
+Generic authority resume cannot complete recovery designation/admission without
+their dedicated full validation. Interrupted preparation must likewise retain
+the exact v3 preparation context and recheck the target cut before publication.
+`resume_held_restore` relocates the same durable target using its signed receipt;
+it remains HELD. `resume_restore_promotion` repeats the protected content and
+evidence checks for the exact pending operation and approval. A completed retry
+only observes its original entry/current state: it creates no second admission,
+does not force a later legitimately changed ACTIVE database back to the old cut,
+and cannot revive a subsequently fenced instance.
+
+A signed receipt permits recovery when the old root becomes unavailable after
+designation and signing. It cannot prove isolation of a machine lost before
+fencing or signing. The one-successor guarantee assumes one trusted, unrolled-back
+old authority lineage, trusted configuration/approvals and cooperative local
+locks. Cloning or rolling back complete roots/keys requires an independent
+checkpoint and deployment trust outside this candidate. Off-machine copies,
+key custody and complete machine-loss recovery remain separate acceptance gates.
 
 Impact: new lifecycle callers, trusted private evidence-port composition,
 application schema inventories, migration resource manifest, snapshot manifests,
@@ -58,12 +141,18 @@ restore/admission state replay, and focused synthetic tests. Historical public
 posting APIs and migrations remain available. Installed combination validation,
 independent reviews, hosted validation, release and activation are separate gates.
 
-Head B validation strengthens recovery and retained-history checks. Exact committed
-operation retries are resolved before current-card expiry and latest-proposal
+Exact committed operation retries are resolved before current-card expiry and latest-proposal
 checks. They authenticate the original action/review/operation and verify the
 original fact/decision plus that record's retained commit inventory; they return
 the original receipt even after a later correction. A different runtime binding,
 actor, action, review or operation cannot borrow that result.
+
+Proposal/correction retries authenticate the retained original request and compare
+its exact reply evidence, reason, expected version and operation. They do not
+rebuild an old request from the latest record state. A matching old retry still
+returns its original proposal/review after a later legitimate correction;
+changed input requires a new observation and operation. Retained reply reads and
+complete audits enforce the same raw-text SHA-256 condition as initial writes.
 
 Complete audits enforce both directions between retained capture/proposal/review/
 delivery/confirmation events and their owned rows. Every native confirmation maps
@@ -77,13 +166,9 @@ detect rollback of **all** relevant state to a previously valid complete prefix
 without an independent retained checkpoint. No external commit anchor is added
 or claimed by this candidate.
 
-Both live-original promotion and signed isolation receipt issuance use the same
-proof: actual FENCED state, released original lifetime owner, exact current
-record/version/hash and audit-sequence cut, and admitted installation/schema
-identities. A stale cut remains RESTORE_HELD. To inspect the fixed original
-profile while the caller's environment names the new held profile, this proof
-holds the existing process-wide managed SQLite lock, temporarily selects only
-the trusted original runtime path, closes its read owner, and restores the
-caller's environment in `finally`. Tests cover contention, stale rejection and
-exact-cut promotion, including restoration of the new runtime environment on
-both success and failure.
+Full logical scans and complete evidence audits occur at explicit snapshot and
+recovery boundaries. Ordinary point/history readers do not scan the whole
+database. Boundary cost grows with retained data and may require deterministic
+sorting; prior benchmark results do not establish the cost of this protocol.
+The source contract defines required behavior, not a claim that a particular
+candidate has passed its focused, installed, independent-review or hosted gates.

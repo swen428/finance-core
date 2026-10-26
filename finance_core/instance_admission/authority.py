@@ -13,7 +13,6 @@ import struct
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,7 +48,6 @@ CONTROL_LOCK_FILENAME = ".authority.v1.lock"
 OWNER_LOCK_FILENAME = ".owner.v1.lock"
 MAX_DOCUMENT_BYTES = 65536
 _TOKEN = object()
-_IMMUTABLE_OPERATION: ContextVar[object | None] = ContextVar("immutable_operation", default=None)
 _REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}\Z")
 
 
@@ -174,7 +172,7 @@ class TrustedInstanceConfig:
     def binding_sha256(self) -> str:
         return self._binding_hash
 
-    def assert_valid(self) -> None:
+    def assert_valid(self, *, _proof: object = None) -> None:
         if self._pid != os.getpid() or self._closed:
             raise InstanceAdmissionError("Trusted composition cannot cross process/fork boundary")
         _trusted_ancestor(self.control_root)
@@ -184,10 +182,26 @@ class TrustedInstanceConfig:
                 raise InstanceAdmissionError("Control root identity changed")
         finally:
             os.close(fd)
-        if (
-            _IMMUTABLE_OPERATION.get() is not self
-            and self._binding["migration_identity"] != _migration_contract_digest()
-        ):
+        if _proof is not None:
+            from .sessions import _Witness, _witness_for
+
+            if (
+                not isinstance(_proof, _Witness)
+                or _proof.owner.config is not self
+                or _proof.pid != os.getpid()
+                or not _proof.active
+                or _proof.closing
+                or _proof.closed
+                or _proof.owner._uncertain
+                or _proof.owner._lease.fd < 0
+                or _proof.owner._active is not _proof
+                or _witness_for(_proof.connection) is not _proof
+                or _proof.immutable_migration_digest != self._binding["migration_identity"]
+            ):
+                raise InstanceAdmissionError(
+                    "Immutable installation proof is outside its operation"
+                )
+        elif self._binding["migration_identity"] != _migration_contract_digest():
             raise InstanceAdmissionError("Installed migration identity changed")
 
     def close(self) -> None:
@@ -228,8 +242,8 @@ def _close_sqlite_handle(conn: sqlite3.Connection) -> None:
     sqlite3.Connection.close(conn)
 
 
-def _read(config: TrustedInstanceConfig, name: str) -> dict[str, Any]:
-    config.assert_valid()
+def _read(config: TrustedInstanceConfig, name: str, *, _proof: object = None) -> dict[str, Any]:
+    config.assert_valid(_proof=_proof)
     fd = _open_checked(config.control_root / name, directory=False)
     try:
         payload = os.pread(fd, MAX_DOCUMENT_BYTES + 1, 0)
@@ -365,6 +379,194 @@ def _initial_state() -> dict[str, Any]:
     }
 
 
+_RECOVERY_ACTIONS = {"restore_prepare", "recovery_designate", "restore_admit"}
+
+
+def _recovery_hash(value: object) -> bool:
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _recovery_cut_ref(value: object) -> bool:
+    return (
+        type(value) is dict
+        and set(value)
+        == {
+            "format",
+            "cut_sha256",
+            "snapshot_id",
+            "source_binding_sha256",
+            "logical_digest_format",
+            "logical_database_sha256",
+            "database_sha256",
+        }
+        and value["format"] == "lifecycle-cut-ref-v1"
+        and value["logical_digest_format"] == "core-logical-database-v1"
+        and type(value["snapshot_id"]) is str
+        and bool(value["snapshot_id"])
+        and all(
+            _recovery_hash(value[key])
+            for key in (
+                "cut_sha256",
+                "source_binding_sha256",
+                "logical_database_sha256",
+                "database_sha256",
+            )
+        )
+    )
+
+
+def _recovery_runtime_binding(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "instance_id",
+        "generation",
+        "principal_id",
+        "client_id",
+        "environment",
+    }:
+        return False
+    return value["environment"] == "offline-synthetic" and all(
+        type(value[key]) is str and 0 < len(value[key]) <= 256
+        for key in ("instance_id", "generation", "principal_id", "client_id")
+    )
+
+
+def _recovery_binding(value: object) -> bool:
+    return (
+        type(value) is dict
+        and set(value)
+        == {
+            "instance_id",
+            "profile_id",
+            "layout",
+            "profile_root",
+            "control_root",
+            "control_identity",
+            "config_identity",
+            "core_identity",
+            "migration_identity",
+            "application_schema",
+        }
+        and all(
+            type(value[key]) is str and bool(value[key])
+            for key in (
+                "instance_id",
+                "profile_id",
+                "layout",
+                "profile_root",
+                "control_root",
+                "config_identity",
+                "core_identity",
+                "migration_identity",
+            )
+        )
+        and type(value["application_schema"]) is dict
+        and type(value["control_identity"]) is list
+        and len(value["control_identity"]) == 2
+        and all(type(part) is int and part >= 0 for part in value["control_identity"])
+    )
+
+
+def _recovery_target(value: object) -> bool:
+    if type(value) is not dict or set(value) != {
+        "binding",
+        "binding_sha256",
+        "runtime_binding",
+        "db_identity",
+        "restore_prepare_operation_id",
+        "restore_prepare_entry_sha256",
+        "record_identity",
+    }:
+        return False
+    identity = value["db_identity"]
+    return (
+        _recovery_binding(value["binding"])
+        and _recovery_hash(value["binding_sha256"])
+        and _digest(value["binding"]) == value["binding_sha256"]
+        and _recovery_runtime_binding(value["runtime_binding"])
+        and value["runtime_binding"]["instance_id"] == value["binding"]["instance_id"]
+        and type(identity) is list
+        and len(identity) == 2
+        and all(type(part) is int and part >= 0 for part in identity)
+        and type(value["restore_prepare_operation_id"]) is str
+        and _REF.fullmatch(value["restore_prepare_operation_id"]) is not None
+        and _recovery_hash(value["restore_prepare_entry_sha256"])
+        and _recovery_hash(value["record_identity"])
+    )
+
+
+def _recovery_designation(value: object) -> bool:
+    return (
+        type(value) is dict
+        and set(value)
+        == {
+            "format",
+            "old_binding_sha256",
+            "old_instance_id",
+            "fence_admission",
+            "fence_entry_sha256",
+            "cut_ref",
+            "target",
+        }
+        and value["format"] == "restore-designation-v1"
+        and _recovery_hash(value["old_binding_sha256"])
+        and type(value["old_instance_id"]) is str
+        and bool(value["old_instance_id"])
+        and type(value["fence_admission"]) is str
+        and _REF.fullmatch(value["fence_admission"]) is not None
+        and _recovery_hash(value["fence_entry_sha256"])
+        and _recovery_cut_ref(value["cut_ref"])
+        and value["cut_ref"]["source_binding_sha256"] == value["old_binding_sha256"]
+        and _recovery_target(value["target"])
+        and value["target"]["binding"]["instance_id"] != value["old_instance_id"]
+        and value["target"]["runtime_binding"]["generation"] != ""
+    )
+
+
+def _validate_recovery_context(action: str, context: object) -> None:
+    fields = {
+        "restore_prepare": {"format", "cut_ref", "runtime_binding", "target_binding_sha256"},
+        "recovery_designate": {"format", "designation"},
+        "restore_admit": {
+            "format",
+            "cut_ref",
+            "target_sha256",
+            "designation_entry_sha256",
+            "designation_sha256",
+            "receipt_sha256",
+        },
+    }[action]
+    expected_format = {
+        "restore_prepare": "restore-prepare-context-v1",
+        "recovery_designate": "restore-designation-context-v1",
+        "restore_admit": "restore-admit-context-v1",
+    }[action]
+    if type(context) is not dict or set(context) != fields or context["format"] != expected_format:
+        raise InstanceAdmissionError("Recovery context has invalid action-specific structure")
+    if action == "restore_prepare":
+        if (
+            not _recovery_runtime_binding(context["runtime_binding"])
+            or not _recovery_cut_ref(context["cut_ref"])
+            or not _recovery_hash(context["target_binding_sha256"])
+        ):
+            raise InstanceAdmissionError("Restore prepare lacks exact cut/binding")
+    elif action == "recovery_designate":
+        if not _recovery_designation(context["designation"]):
+            raise InstanceAdmissionError("Restore designation lacks complete target")
+    else:
+        if (
+            not _recovery_cut_ref(context["cut_ref"])
+            or not all(
+                _recovery_hash(context[key])
+                for key in ("target_sha256", "designation_entry_sha256", "designation_sha256")
+            )
+            or (
+                context["receipt_sha256"] is not None
+                and not _recovery_hash(context["receipt_sha256"])
+            )
+        ):
+            raise InstanceAdmissionError("Restore admission lacks exact cut")
+
+
 def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None) -> dict[str, Any]:
     """Replay compact immutable control history and bind every current byte.
 
@@ -386,6 +588,7 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
     prefix = _initial_state() if prefix_version == 0 else None
     previous = None
     operations: set[str] = set()
+    designated: set[str] = set()
     fields = {
         "version",
         "action",
@@ -402,9 +605,20 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
         "entry_sha256",
     }
     for index, entry in enumerate(state["history"], 1):
+        if not isinstance(entry, dict):
+            raise InstanceAdmissionError("Authority history entry is invalid")
+        action = entry.get("action")
+        allowed_fields: tuple[set[str], ...]
+        if action == "recovery_designate":
+            allowed_fields = (fields | {"recovery_context"},)
+        elif action in _RECOVERY_ACTIONS:
+            # The old restore_prepare/admit shape remains readable, but cannot
+            # be used by the new recovery coordinator or its dedicated resume.
+            allowed_fields = (fields, fields | {"recovery_context"})
+        else:
+            allowed_fields = (fields,)
         if (
-            not isinstance(entry, dict)
-            or set(entry) != fields
+            set(entry) not in allowed_fields
             or type(entry["version"]) is not int
             or entry["version"] != index
             or entry["previous_sha256"] != previous
@@ -470,12 +684,23 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
         ):
             raise InstanceAdmissionError("Authority history instance identity is invalid")
         action = entry["action"]
+        if action in _RECOVERY_ACTIONS and "recovery_context" in entry:
+            _validate_recovery_context(action, entry["recovery_context"])
+            if entry["context_digest"] != _digest(entry["recovery_context"]):
+                raise InstanceAdmissionError("Recovery entry context digest differs")
+        if (
+            action == "restore_prepare"
+            and "recovery_context" in entry
+            and (entry["recovery_context"]["target_binding_sha256"] != key)
+        ):
+            raise InstanceAdmissionError("Restore prepare target binding differs")
         if action != "maintenance" and entry["hold_baseline"] is not None:
             raise InstanceAdmissionError("Authority history has unrelated hold baseline")
         target = replay["instances"].get(key)
         if action in {"prepare", "restore_prepare"}:
             if (
                 target is not None
+                or replay["current"] in designated
                 or any(
                     record["binding"]["instance_id"] == final["binding"].get("instance_id")
                     for record in replay["instances"].values()
@@ -497,8 +722,28 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
         elif target is None:
             raise InstanceAdmissionError("Authority history operation precedes prepare")
         elif action in {"admit", "restore_admit"}:
+            if action == "restore_admit" and replay["current"] in designated:
+                old_designation = next(
+                    prior
+                    for prior in replay["history"]
+                    if prior["action"] == "recovery_designate"
+                    and prior["binding"] == replay["current"]
+                )
+                material = old_designation["recovery_context"]["designation"]
+                admission_context = entry.get("recovery_context")
+                if (
+                    admission_context is None
+                    or material["target"]["binding_sha256"] != key
+                    or admission_context["cut_ref"] != material["cut_ref"]
+                    or admission_context["designation_entry_sha256"]
+                    != old_designation["entry_sha256"]
+                    or admission_context["designation_sha256"] != _digest(material)
+                    or admission_context["target_sha256"] != _digest(material["target"])
+                ):
+                    raise InstanceAdmissionError("Restore admission differs from designated target")
             if (
                 target["state"] != ("RESTORE_HELD" if action == "restore_admit" else "PREPARED")
+                or (action == "admit" and replay["current"] in designated)
                 or target["maintenance"] is not None
                 or (
                     replay["current"] is not None
@@ -512,6 +757,26 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
             if target["state"] != "ACTIVE":
                 raise InstanceAdmissionError("Authority history attempts fence revival")
             target["state"] = "FENCED"
+        elif action == "recovery_designate":
+            designation = entry["recovery_context"]["designation"]
+            if (
+                target["state"] != "FENCED"
+                or replay["current"] != key
+                or key in designated
+                or designation["old_binding_sha256"] != key
+                or designation["old_instance_id"] != target["binding"]["instance_id"]
+                or designation["fence_admission"] != target["admission"]
+                or designation["fence_entry_sha256"]
+                not in {
+                    prior["entry_sha256"]
+                    for prior in replay["history"]
+                    if prior["binding"] == key and prior["action"] == "fence"
+                }
+            ):
+                raise InstanceAdmissionError(
+                    "Restore designation is not one exact fenced successor"
+                )
+            designated.add(key)
         elif action == "maintenance":
             if target["state"] != "ACTIVE" or target["maintenance"] is not None:
                 raise InstanceAdmissionError("Authority history has invalid maintenance")
@@ -581,13 +846,15 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
     return replay
 
 
-def _state(config: TrustedInstanceConfig, *, initial: bool = False) -> dict[str, Any]:
+def _state(
+    config: TrustedInstanceConfig, *, initial: bool = False, _proof: object = None
+) -> dict[str, Any]:
     if _exists(config, PENDING_FILENAME):
         raise InstanceAdmissionError("Authority transition pending; exact resume required")
     if initial and not _exists(config, STATE_FILENAME):
         _new_file(config, STATE_FILENAME, _canonical(_initial_state()))
     try:
-        state = _read(config, STATE_FILENAME)
+        state = _read(config, STATE_FILENAME, _proof=_proof)
         _validate_state(state)
         return state
     except (OSError, ProfilePathError) as exc:
@@ -643,7 +910,10 @@ def _transition(
     operation_id: str,
     approval_ref: str,
     context: object = None,
+    defer_publish: bool = False,
 ):
+    if action in _RECOVERY_ACTIONS:
+        _validate_recovery_context(action, context)
     _reference(operation_id)
     if any(entry["operation_id"] == operation_id for entry in before["history"]):
         raise InstanceAdmissionError("Authority operation reference was reused")
@@ -675,6 +945,8 @@ def _transition(
         "before_sha256": _digest(_body(before)),
         "after_sha256": _digest(_body(after)),
     }
+    if action in _RECOVERY_ACTIONS:
+        entry["recovery_context"] = context
     entry["entry_sha256"] = _digest(entry)
     after["history"].append(entry)
     _validate_state(after)
@@ -690,7 +962,7 @@ def _transition(
         "context": context,
     }
     _new_file(config, PENDING_FILENAME, _canonical(journal))
-    return _publish(config, journal)
+    return journal if defer_publish else _publish(config, journal)
 
 
 def resume_authority_transition(
@@ -718,6 +990,8 @@ def resume_authority_transition(
                     "Completed recovery does not match exact original operation"
                 )
             entry = matches[0]
+            if entry["action"] in _RECOVERY_ACTIONS:
+                raise InstanceAdmissionError("Recovery action requires dedicated verified resume")
             if (
                 config.approval_verifier(approval_ref, entry["action"], entry["approval_digest"])
                 is not True
@@ -729,6 +1003,8 @@ def resume_authority_transition(
             _verify_record_database(config, record, control)
             return _decode(_canonical(record))
         journal = _read(config, PENDING_FILENAME)
+        if journal.get("action") in _RECOVERY_ACTIONS:
+            raise InstanceAdmissionError("Recovery pending requires dedicated verified resume")
         if (
             set(journal)
             != {
@@ -922,6 +1198,7 @@ def prepare_production_profile(
     approval_ref: str,
     _restore_database: Path | None = None,
     _restore_sha256: str | None = None,
+    _restore_context: dict[str, Any] | None = None,
 ) -> ProductionProfile:
     from finance_core.reconciliation.migrations import (
         TEMP_DB_MIGRATION_PATHS,
@@ -930,6 +1207,10 @@ def prepare_production_profile(
     )
 
     _reference(operation_id)
+    if (_restore_database is None) != (_restore_context is None):
+        raise InstanceAdmissionError("Restore preparation requires exact durable context")
+    if _restore_context is not None:
+        _validate_recovery_context("restore_prepare", _restore_context)
     virgin_control = not any(config.control_root.iterdir())
     owner = _Lock(config, OWNER_LOCK_FILENAME, initialize=True)
     try:
@@ -950,11 +1231,20 @@ def prepare_production_profile(
                 and state["instances"][state["current"]]["state"] != "FENCED"
             ):
                 raise InstanceAdmissionError("Original instance must be permanently fenced first")
+            if any(
+                entry["action"] == "recovery_designate" and entry["binding"] == state["current"]
+                for entry in state["history"]
+            ):
+                raise InstanceAdmissionError("Designated writer cannot prepare another successor")
             _approve(
                 config,
                 approval_ref,
-                "prepare",
-                {"operation_id": operation_id, "before_sha256": _digest(state), "context": None},
+                "restore_prepare" if _restore_database is not None else "prepare",
+                {
+                    "operation_id": operation_id,
+                    "before_sha256": _digest(state),
+                    "context": _restore_context,
+                },
             )
             with _profile(config, expected=None) as blank:
                 expected_profile_names = {
@@ -1098,6 +1388,7 @@ def prepare_production_profile(
                     action="restore_prepare" if _restore_database is not None else "prepare",
                     operation_id=operation_id,
                     approval_ref=approval_ref,
+                    context=_restore_context,
                 )
         return _profile(config, expected=identity)
     finally:
@@ -1135,6 +1426,22 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
     sqlite_sequence and other existing SQLite tables are included. Explicit
     BINARY ordering plus hidden row identity removes declared NOCASE ties.
     """
+    # The only production-session exception is this internal, read-only scan.
+    # Its temporary bytes text_factory conflicts with the public guarded SQL
+    # preflight, so native execute is used after validating the live witness.
+    from .sessions import _witness_for
+
+    witness = _witness_for(conn)
+    if witness is not None:
+        witness.preflight()
+
+    def read(sql: str) -> sqlite3.Cursor:
+        # Native execute is confined to this synchronous digest scan; the
+        # issued session was checked above and its authorizer remains active.
+        if witness is not None:
+            return sqlite3.Connection.execute(conn, sql)
+        return conn.execute(sql)
+
     digest = hashlib.sha256()
 
     def frame(value: bytes) -> None:
@@ -1146,15 +1453,15 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
 
     tables = [
         row[0]
-        for row in conn.execute(
+        for row in read(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name COLLATE BINARY"
         )
     ]
-    without_rowid = {row[1]: bool(row[4]) for row in conn.execute("PRAGMA main.table_list")}
+    without_rowid = {row[1]: bool(row[4]) for row in read("PRAGMA main.table_list")}
     previous_factory = conn.text_factory
     try:
         for table in tables:
-            columns = [row[1] for row in conn.execute(f"PRAGMA table_xinfo({quoted(table)})")]
+            columns = [row[1] for row in read(f"PRAGMA table_xinfo({quoted(table)})")]
             expressions = [quoted(column) for column in columns]
             if not without_rowid[table]:
                 hidden = next(
@@ -1177,7 +1484,7 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
                 f"typeof({column}) COLLATE BINARY,{column} COLLATE BINARY" for column in expressions
             )
             conn.text_factory = bytes
-            for row in conn.execute(f"SELECT {selection} FROM {quoted(table)} ORDER BY {ordering}"):
+            for row in read(f"SELECT {selection} FROM {quoted(table)} ORDER BY {ordering}"):
                 frame(b"row")
                 for index in range(0, len(row), 2):
                     kind, value = row[index], row[index + 1]
@@ -1288,6 +1595,8 @@ def _change(
     evidence_ref: str | None = None,
     _restore_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if action == "restore_admit":
+        raise InstanceAdmissionError("Restore admission requires dedicated held verification")
     with _control(config) as control:
         state = _state(config)
         record = _record(config, state)
@@ -1330,6 +1639,11 @@ def _change(
                 prior = after["current"]
                 if prior is not None and after["instances"][prior]["state"] != "FENCED":
                     raise InstanceAdmissionError("Current instance is still active")
+                if action == "admit" and any(
+                    entry["action"] == "recovery_designate" and entry["binding"] == prior
+                    for entry in state["history"]
+                ):
+                    raise InstanceAdmissionError("Designated writer cannot admit another successor")
                 target["state"], target["admission"] = "ACTIVE", operation_id
                 after["current"] = config.binding_sha256
                 if action == "restore_admit":

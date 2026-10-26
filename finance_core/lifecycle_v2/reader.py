@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 from finance_core.instance_admission.sessions import lifecycle_read_operation
 
-from .contracts import LifecycleError, canonical, digest
+from .contracts import LifecycleError, VerifiedSource, canonical, digest
 from .service import _fact_material, _money
 
 
@@ -105,6 +106,25 @@ class LedgerReader:
                 audit_record_inventory(conn, record_id)
             return self._record(row)
 
+    def source(self, source_id: str) -> VerifiedSource:
+        """Read authenticated original evidence without reviving archived rights."""
+        with lifecycle_read_operation(self.service.owner) as conn:
+            row = self.service._source(conn, source_id, allow_archived=True)
+            evidence = VerifiedSource(
+                row["evidence_id"],
+                row["principal_id"],
+                row["client_id"],
+                row["source_key"],
+                row["raw_input"],
+                row["original_sha256"],
+                row["created_at"],
+            )
+            from dataclasses import asdict
+
+            if digest(asdict(evidence)) != row["source_sha256"]:
+                raise LifecycleError("Authenticated source DTO differs from retained source")
+            return evidence
+
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
             raise LifecycleError("Bounded page size required")
@@ -193,6 +213,7 @@ def verify_proposal(service, conn, proposal):
             or type(reply.source_timestamp) is not int
             or reply.source_timestamp <= 0
             or reply.timezone != "Asia/Singapore"
+            or hashlib.sha256(reply.raw_input.encode()).hexdigest() != reply.original_sha256
         ):
             raise LifecycleError("Retained reply source differs from actual authenticated input")
         anchor = reply.source_timestamp

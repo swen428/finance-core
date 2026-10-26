@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import re
+from dataclasses import asdict, dataclass, field
 from typing import Any, Protocol
 
 
@@ -167,3 +168,76 @@ class SnapshotCut:
     core_identity: str = ""
     migration_identity: str = ""
     application_schema_digest: str = ""
+    logical_database_sha256: str = field(kw_only=True)
+    source_binding_sha256: str = field(kw_only=True)
+    format: str = field(default="lifecycle-snapshot-cut-v3", kw_only=True)
+    logical_digest_format: str = field(default="core-logical-database-v1", kw_only=True)
+
+    def __post_init__(self) -> None:
+        if (
+            self.format != "lifecycle-snapshot-cut-v3"
+            or self.logical_digest_format != "core-logical-database-v1"
+        ):
+            raise LifecycleError("Unsupported snapshot cut format")
+        for value in (
+            self.snapshot_id,
+            self.instance_id,
+            self.generation,
+            self.core_identity,
+            self.migration_identity,
+        ):
+            if not isinstance(value, str) or not value:
+                raise LifecycleError("Snapshot cut requires exact identity strings")
+        if type(self.commit_seq) is not int or self.commit_seq < 0:
+            raise LifecycleError("Snapshot cut sequence must be a nonnegative integer")
+        for value in (
+            self.database_sha256,
+            self.application_schema_digest,
+            self.logical_database_sha256,
+            self.source_binding_sha256,
+        ):
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise LifecycleError("Snapshot cut requires complete lowercase SHA-256 values")
+        if type(self.facts) is not tuple:
+            raise LifecycleError("Snapshot cut facts must be an ordered tuple")
+        previous = None
+        for fact in self.facts:
+            if (
+                type(fact) is not tuple
+                or len(fact) != 3
+                or not isinstance(fact[0], str)
+                or not fact[0]
+                or type(fact[1]) is not int
+                or fact[1] < 1
+                or not isinstance(fact[2], str)
+                or re.fullmatch(r"[0-9a-f]{64}", fact[2]) is None
+                or (previous is not None and fact[0] <= previous)
+            ):
+                raise LifecycleError("Snapshot cut facts must be unique, ordered exact records")
+            previous = fact[0]
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SnapshotCut":
+        """Strict JSON decode; historical watermarks cannot become v3 cuts."""
+        if type(value) is not dict or set(value) != set(cls.__dataclass_fields__):
+            raise LifecycleError("Snapshot cut field set differs from v3")
+        data = dict(value)
+        facts = data.get("facts")
+        if type(facts) is not list or any(type(item) is not list for item in facts):
+            raise LifecycleError("Snapshot cut JSON facts must be arrays")
+        data["facts"] = tuple(tuple(item) for item in facts)
+        return cls(**data)
+
+
+def cut_ref(cut: SnapshotCut) -> dict[str, str]:
+    if type(cut) is not SnapshotCut:
+        raise LifecycleError("Exact v3 snapshot cut required")
+    return {
+        "format": "lifecycle-cut-ref-v1",
+        "cut_sha256": digest(asdict(cut)),
+        "snapshot_id": cut.snapshot_id,
+        "source_binding_sha256": cut.source_binding_sha256,
+        "logical_digest_format": cut.logical_digest_format,
+        "logical_database_sha256": cut.logical_database_sha256,
+        "database_sha256": cut.database_sha256,
+    }

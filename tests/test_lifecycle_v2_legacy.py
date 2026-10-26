@@ -381,6 +381,15 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
         imported = service.import_verified(export)
         assert len(imported) == 1 and imported[0].version == 2
         record = service.reader().get(imported[0].record_id)
+        original_source = service.reader().source(record["source_id"])
+        assert original_source.source_key.startswith("legacy:")
+        assert original_source.raw_input
+        assert original_source.principal_id == "wen"
+        assert original_source.client_id == "chat"
+        assert (
+            original_source.original_sha256
+            == __import__("hashlib").sha256(original_source.raw_input.encode()).hexdigest()
+        )
         assert record["values"]["amount"] == "15.75"
         assert record["values"]["description"] == "Human second"
         assert service.reader().pending() == []
@@ -408,6 +417,7 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
         # the old source/authority/provider objects are not passed to the reader.
         restarted = LedgerService(owner, Port(), binding, legacy_verifier=_export_verifier())
         assert restarted.reader().get(imported[0].record_id)["values"] == record["values"]
+        assert restarted.reader().source(record["source_id"]) == original_source
         assert restarted.reader().full_audit()["fact_version_count"] == 2
         wrong = LedgerService(
             owner,
@@ -417,6 +427,8 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
         )
         with pytest.raises(LegacyExportError):
             wrong.reader().get(imported[0].record_id)
+        with pytest.raises(LegacyExportError):
+            wrong.reader().source(record["source_id"])
         with pytest.raises(LegacyExportError):
             wrong.reader().full_audit()
         # A new authenticated reply/card/action can correct an imported fact;

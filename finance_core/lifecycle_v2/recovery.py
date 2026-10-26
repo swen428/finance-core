@@ -1,136 +1,76 @@
-"""Restore to a held identity; promotion requires a real independently fenced writer."""
+"""Bounded offline restore: one durable successor, held audit, then admission."""
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
-from dataclasses import dataclass, field
+import hmac
+import os
+import sqlite3
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Any, Callable
 
-from finance_core.instance_admission import (
-    TrustedInstanceConfig,
-    inspect_instance_admission,
-    prepare_production_profile,
+from finance_core.instance_admission import TrustedInstanceConfig, prepare_production_profile
+from finance_core.instance_admission.authority import (
+    OWNER_LOCK_FILENAME,
+    PENDING_FILENAME,
+    STATE_FILENAME,
+    InstanceAdmissionError,
+    _approve,
+    _canonical,
+    _close_sqlite_handle,
+    _control,
+    _decode,
+    _digest,
+    _exists,
+    _Lock,
+    _logical_database_digest,
+    _profile,
+    _publish,
+    _read,
+    _record,
+    _recovery_designation,
+    _state,
+    _transition,
+    _validate_state,
 )
-from finance_core.instance_admission.authority import _change
+from finance_core.instance_admission.schema_contract import validate_application_database
+from finance_core.profile_gate import _acquire as _acquire_profile_gate
+from finance_core.profile_paths import _MANAGED_SQLITE_LIFETIME_LOCK
+from finance_core.runtime_paths import RUNTIME_ROOT_ENV
+from finance_core.sqlite_connection import configure_sqlite_connection
 
-from .contracts import LifecycleError, SnapshotCut, digest
+from .contracts import (
+    LifecycleError,
+    RuntimeBinding,
+    SnapshotCut,
+    canonical,
+    cut_ref,
+    digest,
+)
 
-_ISSUED: dict[int, object] = {}
-_VERIFIED: set[int] = set()
+# Keep uncertain SQLite and every cooperative lease live until process exit.
+_RECOVERY_CLOSE_UNKNOWN: list[tuple[object, ...]] = []
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True)
 class RestoredProfile:
     config: TrustedInstanceConfig
     cut: SnapshotCut
-    status: str
+    new_binding: RuntimeBinding
+    restore_prepare_operation_id: str
+    restore_prepare_entry_sha256: str
+    status: str = "RESTORE_HELD"
 
 
-def prepare_restored_profile(
-    config: TrustedInstanceConfig,
-    database: Path,
-    cut: SnapshotCut,
-    *,
-    operation_id: str,
-    approval_ref: str,
-) -> RestoredProfile:
-    """Install a verified snapshot into a fresh identity without write authority."""
-    if config.instance_id == cut.instance_id:
-        raise LifecycleError("Restore must use a genuinely new instance identity")
-    database = Path(database).resolve(strict=True)
-    if hashlib.sha256(database.read_bytes()).hexdigest() != cut.database_sha256:
-        raise LifecycleError("Snapshot bytes differ from exact cut")
-    # Validate exact cut before preparing authority; no plain fixture adoption.
-    import sqlite3
-
-    from .reader import audit_connection
-
-    source = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
-    source.row_factory = sqlite3.Row
-    try:
-        audit_connection(source)
-        actual = tuple(
-            tuple(r)
-            for r in source.execute(
-                "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
-                "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
-                "ORDER BY record_id"
-            )
-        )
-        seq = source.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
-        completely_empty = not any(
-            source.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
-            for table in (
-                "l2_sources",
-                "l2_proposals",
-                "l2_reviews",
-                "l2_deliveries",
-                "l2_facts",
-                "l2_decisions",
-                "l2_events",
-                "l2_imports",
-                "l2_archives",
-            )
-        )
-        if actual != cut.facts or seq != cut.commit_seq:
-            raise LifecycleError("Snapshot record/version/hash watermark mismatch")
-    finally:
-        source.close()
-    profile = prepare_production_profile(
-        config,
-        operation_id=operation_id,
-        approval_ref=approval_ref,
-        _restore_database=database,
-        _restore_sha256=cut.database_sha256,
-    )
-    profile.close()
-    result = object.__new__(RestoredProfile)
-    object.__setattr__(result, "config", config)
-    object.__setattr__(result, "cut", cut)
-    object.__setattr__(result, "status", "RESTORE_HELD")
-    _ISSUED[id(result)] = result
-    if completely_empty and not cut.facts:
-        _VERIFIED.add(id(result))
-    return result
-
-
-def promote_restored_profile(
-    restored: RestoredProfile,
-    old_config: TrustedInstanceConfig,
-    *,
-    operation_id: str,
-    approval_ref: str,
-):
-    """Require actual old control-state fence plus fresh bound promotion approval.
-
-    This API deliberately cannot infer that an offline remote machine is fenced.
-    The original trusted configuration must be accessible and verifiably FENCED;
-    a boolean or a self-consistent restored database never grants current rights.
-    """
-    if _ISSUED.get(id(restored)) is not restored:
-        raise LifecycleError("Original held restore capability required")
-    if old_config.instance_id != restored.cut.instance_id:
-        raise LifecycleError("Old writer identity differs from snapshot")
-    if id(restored) not in _VERIFIED:
-        raise LifecycleError(
-            "All held source/provider/action evidence must be verified before promotion"
-        )
-    old = _verify_fenced_cut(old_config, restored.cut)
-    if inspect_instance_admission(restored.config)["state"] != "RESTORE_HELD":
-        raise LifecycleError("Restore is not held")
-    result = _change(
-        restored.config,
-        action="restore_admit",
-        operation_id=operation_id,
-        approval_ref=approval_ref,
-        _restore_context={
-            "actual_old_binding_sha256": old_config.binding_sha256,
-            "fenced_state_sha256": digest(old),
-        },
-    )
-    _VERIFIED.discard(id(restored))
-    _ISSUED.pop(id(restored), None)
-    return result
+@dataclass(frozen=True)
+class RestoreDesignation:
+    material: dict[str, Any]
+    operation_id: str
+    approval_ref: str
+    entry_sha256: str
 
 
 @dataclass(frozen=True)
@@ -139,169 +79,717 @@ class OldWriterIsolationReceipt:
     signature: str
 
 
+def _entry(state: dict[str, Any], operation_id: str, action: str) -> dict[str, Any]:
+    matches = [
+        item
+        for item in state["history"]
+        if item["operation_id"] == operation_id and item["action"] == action
+    ]
+    if len(matches) != 1:
+        raise LifecycleError("Exact recovery history entry is unavailable")
+    return matches[0]
+
+
+def _validate_recovery_pending(
+    config: TrustedInstanceConfig,
+    journal: dict[str, Any],
+    *,
+    action: str,
+    operation_id: str,
+    approval_ref: str,
+    context: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Bind an existing pending document to its full history and approval."""
+    try:
+        if (
+            type(journal) is not dict
+            or set(journal)
+            != {
+                "format",
+                "binding",
+                "action",
+                "operation_id",
+                "approval_ref",
+                "approval_digest",
+                "before_sha256",
+                "after",
+                "context",
+            }
+            or journal["format"] != "instance-transition-v1"
+            or journal["binding"] != config.binding_sha256
+            or journal["action"] != action
+            or journal["operation_id"] != operation_id
+            or journal["approval_ref"] != approval_ref
+            or journal["context"] != context
+        ):
+            raise LifecycleError("Pending recovery request differs")
+        after = journal["after"]
+        if type(after) is not dict or type(after.get("version")) is not int or after["version"] < 1:
+            raise LifecycleError("Pending recovery successor is malformed")
+        before = _validate_state(after, prefix_version=after["version"] - 1)
+        suffix = after["history"][-1]
+        if (
+            _digest(before) != journal["before_sha256"]
+            or _read(config, STATE_FILENAME) not in (before, after)
+            or suffix["action"] != action
+            or suffix["operation_id"] != operation_id
+            or suffix["approval_ref"] != approval_ref
+            or suffix["binding"] != config.binding_sha256
+            or suffix.get("recovery_context") != context
+            or suffix["context_digest"] != _digest(context)
+        ):
+            raise LifecycleError("Pending recovery predecessor/history differs")
+        expected = _approve(
+            config,
+            approval_ref,
+            action,
+            {
+                "operation_id": operation_id,
+                "before_sha256": _digest(before),
+                "context": context,
+            },
+        )
+        if expected != suffix["approval_digest"] or expected != journal["approval_digest"]:
+            raise LifecycleError("Pending recovery approval differs")
+        return before, after, suffix
+    except (KeyError, TypeError, IndexError, ValueError) as exc:
+        raise LifecycleError("Pending recovery journal is invalid") from exc
+
+
+def _verify_cut_connection(conn: sqlite3.Connection, cut: SnapshotCut) -> None:
+    if type(cut) is not SnapshotCut:
+        raise LifecycleError("Exact v3 snapshot cut required")
+    actual = tuple(
+        tuple(row)
+        for row in conn.execute(
+            "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
+            "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) ORDER BY record_id"
+        )
+    )
+    seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
+    if actual != cut.facts or seq != cut.commit_seq:
+        raise LifecycleError("Recovery fact watermark differs from complete cut")
+    if _logical_database_digest(conn) != cut.logical_database_sha256:
+        raise LifecycleError("Recovery database content differs from complete cut")
+
+
+def _target_from_state(
+    restored: RestoredProfile,
+    state: dict[str, Any],
+    *,
+    allow_completed: bool = False,
+):
+    config = restored.config
+    if (
+        type(restored.cut) is not SnapshotCut
+        or restored.new_binding.instance_id != config.instance_id
+    ):
+        raise LifecycleError("Restore target identity is invalid")
+    record = _record(config, state)
+    if (
+        record["state"] != "RESTORE_HELD"
+        and not (
+            allow_completed
+            and record["state"] in {"ACTIVE", "FENCED"}
+            and any(
+                entry["action"] == "restore_admit"
+                and entry["binding"] == config.binding_sha256
+                and "recovery_context" in entry
+                for entry in state["history"]
+            )
+        )
+    ) or (record["state"] == "RESTORE_HELD" and record["maintenance"] is not None):
+        raise LifecycleError("Target is not an exact held or completed restore")
+    prepare = _entry(state, restored.restore_prepare_operation_id, "restore_prepare")
+    context = prepare.get("recovery_context")
+    if (
+        context is None
+        or prepare["entry_sha256"] != restored.restore_prepare_entry_sha256
+        or context["cut_ref"] != cut_ref(restored.cut)
+        or context["runtime_binding"] != asdict(restored.new_binding)
+        or context["target_binding_sha256"] != config.binding_sha256
+        or prepare["record_identity"]
+        != _digest(
+            {
+                "binding": record["binding"],
+                "db_identity": record["db_identity"],
+                "ledger_sha256": record["ledger_sha256"],
+            }
+        )
+    ):
+        raise LifecycleError("Target lacks exact durable v3 preparation")
+    target = {
+        "binding": _decode(_canonical(config._binding)),
+        "binding_sha256": config.binding_sha256,
+        "runtime_binding": asdict(restored.new_binding),
+        "db_identity": list(record["db_identity"]),
+        "restore_prepare_operation_id": prepare["operation_id"],
+        "restore_prepare_entry_sha256": prepare["entry_sha256"],
+        "record_identity": prepare["record_identity"],
+    }
+    return target, record
+
+
+def _held_description(
+    restored: RestoredProfile,
+    *,
+    allow_pending: bool = False,
+    allow_completed: bool = False,
+):
+    config = restored.config
+    with _control(config, shared=True):
+        if allow_pending and _exists(config, PENDING_FILENAME):
+            journal = _read(config, PENDING_FILENAME)
+            if journal.get("action") != "restore_admit":
+                raise LifecycleError("Only exact pending restore admission can resume")
+            state = _validate_state(
+                journal["after"], prefix_version=journal["after"]["version"] - 1
+            )
+        else:
+            state = _state(config)
+        return _target_from_state(restored, state, allow_completed=allow_completed)
+
+
+def prepare_restored_profile(
+    config: TrustedInstanceConfig,
+    database: Path,
+    cut: SnapshotCut,
+    *,
+    new_binding: RuntimeBinding,
+    operation_id: str,
+    approval_ref: str,
+) -> RestoredProfile:
+    if (
+        type(cut) is not SnapshotCut
+        or type(new_binding) is not RuntimeBinding
+        or config.instance_id == cut.instance_id
+        or new_binding.instance_id != config.instance_id
+        or new_binding.generation == cut.generation
+    ):
+        raise LifecycleError("Restore needs a new exact offline instance and generation")
+    database = Path(database).resolve(strict=True)
+    if hashlib.sha256(database.read_bytes()).hexdigest() != cut.database_sha256:
+        raise LifecycleError("Snapshot bytes differ from exact cut")
+    from .reader import audit_connection
+
+    source = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    source.row_factory = sqlite3.Row
+    try:
+        source.execute("BEGIN")
+        audit_connection(source)
+        _verify_cut_connection(source, cut)
+    finally:
+        source.close()
+    context = {
+        "format": "restore-prepare-context-v1",
+        "cut_ref": cut_ref(cut),
+        "runtime_binding": asdict(new_binding),
+        "target_binding_sha256": config.binding_sha256,
+    }
+    profile = prepare_production_profile(
+        config,
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        _restore_database=database,
+        _restore_sha256=cut.database_sha256,
+        _restore_context=context,
+    )
+    profile.close()
+    with _control(config, shared=True):
+        state = _state(config)
+        prepare = _entry(state, operation_id, "restore_prepare")
+    result = RestoredProfile(config, cut, new_binding, operation_id, prepare["entry_sha256"])
+    _held_description(result)
+    return result
+
+
+def _protected_database_transition(
+    config: TrustedInstanceConfig,
+    owner: _Lock,
+    control: _Lock,
+    record: dict[str, Any],
+    *,
+    write: bool,
+    build: Callable[[sqlite3.Connection], dict[str, Any]],
+) -> dict[str, Any]:
+    """Hold owner/control/profile/gate through actual SQLite close and publish."""
+    profile = None
+    gate = None
+    conn = None
+    lifetime = False
+    sqlite_began = False
+    unknown = False
+    previous_runtime = None
+    runtime_switched = False
+    try:
+        _MANAGED_SQLITE_LIFETIME_LOCK.__enter__()
+        lifetime = True
+        previous_runtime = os.environ.get(RUNTIME_ROOT_ENV)
+        os.environ[RUNTIME_ROOT_ENV] = str(Path(config._binding["profile_root"]) / "runtime")
+        runtime_switched = True
+        profile = _profile(config, expected=record["db_identity"])
+        # The retained exclusive gate also excludes cooperative maintenance
+        # writers in the close-to-publication gap. Full audits may exceed the
+        # short public export-cut hold limit, so this internal lease has none.
+        gate = _acquire_profile_gate(
+            profile, fcntl.LOCK_EX, timeout_seconds=5, max_hold_seconds=None
+        )
+        _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
+        sqlite_began = True
+        conn = sqlite3.connect(
+            profile.live_database.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True
+        )
+        configure_sqlite_connection(conn)
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+        validate_application_database(
+            conn,
+            config._binding["migration_identity"],
+            config.application_schema,
+            record["ledger_sha256"],
+        )
+        journal = build(conn)
+        try:
+            conn.rollback()
+            _close_sqlite_handle(conn)
+            conn = None
+        except BaseException as exc:
+            unknown = True
+            owner._retain = control._retain = profile._retain = True
+            _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+            _RECOVERY_CLOSE_UNKNOWN.append((owner, control, profile, gate, conn))
+            raise InstanceAdmissionError(
+                "Recovery SQLite actual close unknown; pending retained"
+            ) from exc
+        _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+        sqlite_began = False
+        profile.revalidate()
+        gate.assert_valid()
+        control._assert_file_valid()
+        owner._assert_file_valid()
+        return _publish(config, journal)
+    finally:
+        if not unknown:
+            if conn is not None:
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    _close_sqlite_handle(conn)
+                except BaseException as exc:
+                    owner._retain = control._retain = True
+                    if profile is not None:
+                        profile._retain = True
+                    _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+                    _RECOVERY_CLOSE_UNKNOWN.append((owner, control, profile, gate, conn))
+                    raise InstanceAdmissionError("Recovery SQLite actual close unknown") from exc
+            try:
+                if sqlite_began:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                if gate is not None:
+                    gate.close()
+                if profile is not None:
+                    profile.close()
+            finally:
+                if runtime_switched:
+                    if previous_runtime is None:
+                        os.environ.pop(RUNTIME_ROOT_ENV, None)
+                    else:
+                        os.environ[RUNTIME_ROOT_ENV] = previous_runtime
+                if lifetime:
+                    _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
+
+
+def _designation_from_entry(entry: dict[str, Any]) -> RestoreDesignation:
+    return RestoreDesignation(
+        entry["recovery_context"]["designation"],
+        entry["operation_id"],
+        entry["approval_ref"],
+        entry["entry_sha256"],
+    )
+
+
+def resume_restore_prepare(
+    config: TrustedInstanceConfig,
+    cut: SnapshotCut,
+    new_binding: RuntimeBinding,
+    *,
+    operation_id: str,
+    approval_ref: str,
+) -> RestoredProfile:
+    """Complete only the exact v3 held preparation after a lost return/publish."""
+    if (
+        type(cut) is not SnapshotCut
+        or type(new_binding) is not RuntimeBinding
+        or config.instance_id == cut.instance_id
+        or new_binding.instance_id != config.instance_id
+        or new_binding.generation == cut.generation
+    ):
+        raise LifecycleError("Restore prepare resume has invalid exact identities")
+    context = {
+        "format": "restore-prepare-context-v1",
+        "cut_ref": cut_ref(cut),
+        "runtime_binding": asdict(new_binding),
+        "target_binding_sha256": config.binding_sha256,
+    }
+    owner = _Lock(config, OWNER_LOCK_FILENAME)
+    try:
+        owner.acquire(fcntl.LOCK_EX, 0)
+        with _control(config) as control:
+            if not _exists(config, PENDING_FILENAME):
+                state = _state(config)
+                entry = _entry(state, operation_id, "restore_prepare")
+                if (
+                    entry["binding"] != config.binding_sha256
+                    or entry["approval_ref"] != approval_ref
+                    or entry.get("recovery_context") != context
+                    or config.approval_verifier(
+                        approval_ref, "restore_prepare", entry["approval_digest"]
+                    )
+                    is not True
+                ):
+                    raise LifecycleError("Completed held preparation differs from original request")
+                result = RestoredProfile(
+                    config, cut, new_binding, operation_id, entry["entry_sha256"]
+                )
+            else:
+                journal = _read(config, PENDING_FILENAME)
+                if (
+                    journal.get("action") != "restore_prepare"
+                    or journal.get("operation_id") != operation_id
+                    or journal.get("approval_ref") != approval_ref
+                    or journal.get("binding") != config.binding_sha256
+                    or journal.get("context") != context
+                ):
+                    raise LifecycleError("Pending held preparation is not the exact request")
+                _, after, _ = _validate_recovery_pending(
+                    config,
+                    journal,
+                    action="restore_prepare",
+                    operation_id=operation_id,
+                    approval_ref=approval_ref,
+                    context=context,
+                )
+                record = _record(config, after)
+                if record["state"] != "RESTORE_HELD":
+                    raise LifecycleError("Pending preparation is not held")
+                from .reader import audit_connection
+
+                def build(conn):
+                    audit_connection(conn)
+                    _verify_cut_connection(conn, cut)
+                    return journal
+
+                published = _protected_database_transition(
+                    config, owner, control, record, write=False, build=build
+                )
+                entry = _entry(published, operation_id, "restore_prepare")
+                result = RestoredProfile(
+                    config, cut, new_binding, operation_id, entry["entry_sha256"]
+                )
+    finally:
+        owner.close()
+    verify_held_profile_evidence_content(result)
+    return result
+
+
+def designate_restore_successor(
+    old_config: TrustedInstanceConfig,
+    restored: RestoredProfile,
+    *,
+    operation_id: str,
+    approval_ref: str,
+) -> RestoreDesignation:
+    target, _ = _held_description(restored, allow_completed=True)
+    cut = restored.cut
+    if (
+        old_config.instance_id != cut.instance_id
+        or old_config.binding_sha256 != cut.source_binding_sha256
+        or old_config.core_identity != cut.core_identity
+        or old_config._binding["migration_identity"] != cut.migration_identity
+        or digest(old_config._binding["application_schema"]) != cut.application_schema_digest
+    ):
+        raise LifecycleError("Old writer does not match complete source cut")
+    owner = _Lock(old_config, OWNER_LOCK_FILENAME)
+    try:
+        owner.acquire(fcntl.LOCK_EX, 0)
+        with _control(old_config) as control:
+            pending = (
+                _read(old_config, PENDING_FILENAME)
+                if _exists(old_config, PENDING_FILENAME)
+                else None
+            )
+            if pending is not None:
+                if (
+                    pending.get("action") != "recovery_designate"
+                    or pending.get("operation_id") != operation_id
+                    or pending.get("approval_ref") != approval_ref
+                ):
+                    raise LifecycleError("An exact recovery designation remains pending")
+                after = pending["after"]
+                before = _validate_state(after, prefix_version=after["version"] - 1)
+                if _read(old_config, STATE_FILENAME) not in (before, after):
+                    raise LifecycleError("Pending designation predecessor differs")
+                state = before
+            else:
+                state = _state(old_config)
+                previous = [
+                    entry
+                    for entry in state["history"]
+                    if entry["action"] == "recovery_designate"
+                    and entry["binding"] == old_config.binding_sha256
+                ]
+                if previous:
+                    existing = previous[0]
+                    designation = _designation_from_entry(existing)
+                    if (
+                        existing["operation_id"] == operation_id
+                        and existing["approval_ref"] == approval_ref
+                        and designation.material["cut_ref"] == cut_ref(cut)
+                        and designation.material["target"] == target
+                        and old_config.approval_verifier(
+                            approval_ref, "recovery_designate", existing["approval_digest"]
+                        )
+                        is True
+                    ):
+                        return designation
+                    raise LifecycleError("Old binding already designated one successor")
+            record = _record(old_config, state)
+            if record["state"] != "FENCED" or state["current"] != old_config.binding_sha256:
+                raise LifecycleError("Old writer is not the exact fenced current authority")
+            fences = [
+                entry
+                for entry in state["history"]
+                if entry["action"] == "fence" and entry["binding"] == old_config.binding_sha256
+            ]
+            if len(fences) != 1:
+                raise LifecycleError("Exact old fence history is unavailable")
+            material = {
+                "format": "restore-designation-v1",
+                "old_binding_sha256": old_config.binding_sha256,
+                "old_instance_id": old_config.instance_id,
+                "fence_admission": record["admission"],
+                "fence_entry_sha256": fences[0]["entry_sha256"],
+                "cut_ref": cut_ref(cut),
+                "target": target,
+            }
+            context = {"format": "restore-designation-context-v1", "designation": material}
+            from .reader import audit_connection
+
+            def build(conn):
+                audit_connection(conn)
+                _verify_cut_connection(conn, cut)
+                if pending is not None:
+                    verified_before, _, _ = _validate_recovery_pending(
+                        old_config,
+                        pending,
+                        action="recovery_designate",
+                        operation_id=operation_id,
+                        approval_ref=approval_ref,
+                        context=context,
+                    )
+                    if verified_before != state:
+                        raise LifecycleError("Pending designation predecessor changed")
+                    return pending
+                after = _decode(_canonical(state))
+                return _transition(
+                    old_config,
+                    state,
+                    after,
+                    action="recovery_designate",
+                    operation_id=operation_id,
+                    approval_ref=approval_ref,
+                    context=context,
+                    defer_publish=True,
+                )
+
+            published = _protected_database_transition(
+                old_config, owner, control, record, write=False, build=build
+            )
+            return _designation_from_entry(_entry(published, operation_id, "recovery_designate"))
+    finally:
+        owner.close()
+
+
+def resume_restore_designation(
+    old_config: TrustedInstanceConfig,
+    restored: RestoredProfile,
+    *,
+    operation_id: str,
+    approval_ref: str,
+) -> RestoreDesignation:
+    """Recheck and publish one exact designation pending under its original approval."""
+    return designate_restore_successor(
+        old_config, restored, operation_id=operation_id, approval_ref=approval_ref
+    )
+
+
 @dataclass(frozen=True)
 class RecoveryAuthority:
-    """Independent trusted recovery key; never recover its trust from old data."""
-
     namespace: str
     key: bytes = field(repr=False)
 
     def __post_init__(self):
-        if not self.namespace or type(self.key) is not bytes or len(self.key) < 32:
+        if (
+            type(self.namespace) is not str
+            or not 0 < len(self.namespace) <= 256
+            or type(self.key) is not bytes
+            or len(self.key) < 32
+        ):
             raise LifecycleError("Independent recovery authority requires a 32-byte key")
 
     def issue_old_writer_isolation(
         self,
         old_config: TrustedInstanceConfig,
-        cut: SnapshotCut,
+        restored: RestoredProfile,
         *,
-        new_instance_id: str | None = None,
-        clock=None,
-    ):
-        import hmac
-        import time
-        from dataclasses import asdict
-
-        from .contracts import canonical
-
-        state = _verify_fenced_cut(old_config, cut)
+        operation_id: str,
+        approval_ref: str,
+    ) -> OldWriterIsolationReceipt:
+        designation = designate_restore_successor(
+            old_config, restored, operation_id=operation_id, approval_ref=approval_ref
+        )
         material = canonical(
             {
-                "schema": "old-writer-isolation-v2",
+                "schema": "old-writer-isolation-v3",
                 "namespace": self.namespace,
-                "old_binding_sha256": old_config.binding_sha256,
-                "old_instance_id": old_config.instance_id,
-                "cut": asdict(cut),
-                "new_instance_id": new_instance_id,
-                "issued_at": int((clock or time.time)()),
-                "fence_admission": state["admission"],
-                "fenced_state_sha256": hashlib.sha256(canonical(state).encode()).hexdigest(),
+                "designation": designation.material,
+                "designation_entry_sha256": designation.entry_sha256,
             }
         )
-        signature = hmac.new(self.key, material.encode(), hashlib.sha256).hexdigest()
-        return OldWriterIsolationReceipt(material, signature)
+        return OldWriterIsolationReceipt(
+            material, hmac.new(self.key, material.encode(), hashlib.sha256).hexdigest()
+        )
 
     def verify_old_writer_isolation(
-        self, receipt: OldWriterIsolationReceipt, restored: RestoredProfile
-    ):
-        import hmac
-        import json
-        from dataclasses import asdict
-
-        from .contracts import canonical
-
+        self,
+        receipt: OldWriterIsolationReceipt,
+        restored: RestoredProfile,
+    ) -> RestoreDesignation:
         if type(receipt) is not OldWriterIsolationReceipt:
-            raise LifecycleError("Signed old writer isolation receipt required")
+            raise LifecycleError("Signed v3 old writer isolation receipt required")
+        if (
+            type(receipt.material_json) is not str
+            or type(receipt.signature) is not str
+            or len(receipt.signature) != 64
+            or len(receipt.material_json) > 65536
+        ):
+            raise LifecycleError("Signed isolation receipt shape is invalid")
         expected = hmac.new(self.key, receipt.material_json.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, receipt.signature):
             raise LifecycleError("Old writer isolation signature invalid")
-        material = json.loads(receipt.material_json)
+        import json
+
+        try:
+            material = json.loads(receipt.material_json)
+        except (ValueError, TypeError) as exc:
+            raise LifecycleError("Signed isolation receipt JSON is invalid") from exc
+        target, _ = _held_description(restored, allow_pending=True, allow_completed=True)
         if (
-            canonical(material) != receipt.material_json
-            or material["schema"] != "old-writer-isolation-v2"
+            type(material) is not dict
+            or set(material) != {"schema", "namespace", "designation", "designation_entry_sha256"}
+            or material["schema"] != "old-writer-isolation-v3"
             or material["namespace"] != self.namespace
-            or material["cut"] != json.loads(canonical(asdict(restored.cut)))
-            or material["old_instance_id"] != restored.cut.instance_id
-            or material["new_instance_id"] not in {None, restored.config.instance_id}
+            or not _recovery_designation(material["designation"])
+            or type(material["designation_entry_sha256"]) is not str
+            or len(material["designation_entry_sha256"]) != 64
+            or canonical(material) != receipt.material_json
+            or material["designation"]["cut_ref"] != cut_ref(restored.cut)
+            or material["designation"]["target"] != target
+            or material["designation"]["old_binding_sha256"] != restored.cut.source_binding_sha256
         ):
-            raise LifecycleError("Old writer isolation receipt context mismatch")
-        return material
-
-
-def promote_with_isolation_receipt(
-    restored: RestoredProfile,
-    receipt: OldWriterIsolationReceipt,
-    recovery_authority: RecoveryAuthority,
-    *,
-    operation_id: str,
-    approval_ref: str,
-):
-    """Admit a held restore after a previously recorded real old-writer fence.
-
-    The old root may be unavailable. This proves pre-fenced recovery only: it
-    cannot assert isolation of a machine lost before its independent receipt.
-    """
-    if _ISSUED.get(id(restored)) is not restored:
-        raise LifecycleError("Original held restore capability required")
-    material = recovery_authority.verify_old_writer_isolation(receipt, restored)
-    if id(restored) not in _VERIFIED:
-        raise LifecycleError(
-            "All held source/provider/action evidence must be verified before promotion"
+            raise LifecycleError("Signed isolation does not bind exact held target and cut")
+        return RestoreDesignation(
+            material["designation"], "", "", material["designation_entry_sha256"]
         )
-    if inspect_instance_admission(restored.config)["state"] != "RESTORE_HELD":
-        raise LifecycleError("Restore is not held")
-    result = _change(
-        restored.config,
-        action="restore_admit",
-        operation_id=operation_id,
-        approval_ref=approval_ref,
-        _restore_context={
-            "isolation_receipt_sha256": hashlib.sha256(receipt.material_json.encode()).hexdigest(),
-            "isolation": material,
-        },
-    )
-    _VERIFIED.discard(id(restored))
-    _ISSUED.pop(id(restored), None)
+
+
+def _verify_held_evidence(conn, restored, port, binding, legacy_verifier):
+    from .reader import audit_evidence_connection
+
+    if binding != restored.new_binding:
+        raise LifecycleError("Evidence binding differs from designated target")
+    result = audit_evidence_connection(conn, port, binding, legacy_verifier)
+    _verify_cut_connection(conn, restored.cut)
     return result
 
 
-def resume_held_restore(
-    config: TrustedInstanceConfig,
-    cut: SnapshotCut,
-    receipt: OldWriterIsolationReceipt,
-    recovery_authority: RecoveryAuthority,
-):
-    """Reissue a held capability after restart from independent signed evidence."""
-    import sqlite3
-
-    from finance_core.instance_admission.authority import (
-        _control,
-        _profile,
-        _record,
-        _state,
-        _verify_record_database,
-    )
-
-    from .reader import audit_connection
-
-    if config.instance_id == cut.instance_id:
-        raise LifecycleError("Restore identity must differ from original writer")
-    result = object.__new__(RestoredProfile)
-    object.__setattr__(result, "config", config)
-    object.__setattr__(result, "cut", cut)
-    object.__setattr__(result, "status", "RESTORE_HELD")
-    recovery_authority.verify_old_writer_isolation(receipt, result)
+@contextmanager
+def _held_read_connection(restored: RestoredProfile):
+    """One diagnostic HELD read snapshot with fixed profile and actual close."""
+    config = restored.config
     with _control(config, shared=True) as control:
-        record = _record(config, _state(config))
-        if record["state"] != "RESTORE_HELD":
-            raise LifecycleError("Only durable held restore can be resumed")
-        _verify_record_database(config, record, control)
-        with _profile(config, expected=record["db_identity"]) as profile:
+        state = _state(config)
+        _, record = _target_from_state(restored, state)
+        profile = None
+        gate = None
+        conn = None
+        lifetime = False
+        sqlite_began = False
+        unknown = False
+        previous_runtime = None
+        runtime_switched = False
+        try:
+            _MANAGED_SQLITE_LIFETIME_LOCK.__enter__()
+            lifetime = True
+            previous_runtime = os.environ.get(RUNTIME_ROOT_ENV)
+            os.environ[RUNTIME_ROOT_ENV] = str(Path(config._binding["profile_root"]) / "runtime")
+            runtime_switched = True
+            profile = _profile(config, expected=record["db_identity"])
+            gate = _acquire_profile_gate(
+                profile, fcntl.LOCK_EX, timeout_seconds=5, max_hold_seconds=None
+            )
+            _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
+            sqlite_began = True
             conn = sqlite3.connect(profile.live_database.as_uri() + "?mode=ro", uri=True)
+            configure_sqlite_connection(conn)
             conn.row_factory = sqlite3.Row
-            try:
-                audit_connection(conn)
-                facts = tuple(
-                    tuple(r)
-                    for r in conn.execute(
-                        "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
-                        "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
-                        "ORDER BY record_id"
-                    )
-                )
-                seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
-                if facts != cut.facts or seq != cut.commit_seq:
-                    raise LifecycleError("Held restore no longer matches independently signed cut")
-            finally:
-                conn.close()
-    _ISSUED[id(result)] = result
-    return result
+            conn.execute("BEGIN")
+            validate_application_database(
+                conn,
+                config._binding["migration_identity"],
+                config.application_schema,
+                record["ledger_sha256"],
+            )
+            yield conn
+        finally:
+            if conn is not None:
+                try:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    _close_sqlite_handle(conn)
+                except BaseException as exc:
+                    unknown = True
+                    control._retain = True
+                    if profile is not None:
+                        profile._retain = True
+                    _MANAGED_SQLITE_LIFETIME_LOCK.mark_uncertain()
+                    _RECOVERY_CLOSE_UNKNOWN.append((control, profile, gate, conn))
+                    raise InstanceAdmissionError("Held diagnostic SQLite close unknown") from exc
+            if not unknown:
+                try:
+                    if sqlite_began:
+                        _MANAGED_SQLITE_LIFETIME_LOCK.end_sqlite()
+                    if gate is not None:
+                        gate.close()
+                    if profile is not None:
+                        profile.close()
+                finally:
+                    if runtime_switched:
+                        if previous_runtime is None:
+                            os.environ.pop(RUNTIME_ROOT_ENV, None)
+                        else:
+                            os.environ[RUNTIME_ROOT_ENV] = previous_runtime
+                    if lifetime:
+                        _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
+
+
+def verify_held_profile_evidence(restored: RestoredProfile, port, binding, legacy_verifier=None):
+    """Read-only diagnostic; no result grants later admission authority."""
+    with _held_read_connection(restored) as conn:
+        return _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
 
 
 def verify_snapshot_evidence(database: Path, port, binding, cut: SnapshotCut, legacy_verifier=None):
-    """Read-only complete semantic verification of an independently staged cut."""
-    import sqlite3
-
     from .reader import audit_evidence_connection
 
     database = Path(database).resolve(strict=True)
@@ -318,88 +806,253 @@ def verify_snapshot_evidence(database: Path, port, binding, cut: SnapshotCut, le
         conn.close()
 
 
-def _verify_cut_connection(conn, cut):
-    facts = tuple(
-        tuple(r)
-        for r in conn.execute(
-            "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
-            "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) ORDER BY record_id"
-        )
+def _live_designation(old_config, restored, *, operation_id, approval_ref):
+    designation = designate_restore_successor(
+        old_config, restored, operation_id=operation_id, approval_ref=approval_ref
     )
-    seq = conn.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
-    if facts != cut.facts or seq != cut.commit_seq:
-        raise LifecycleError("Restored facts differ from exact signed cut")
+    return designation, None
 
 
-def verify_held_profile_evidence(restored: RestoredProfile, port, binding, legacy_verifier=None):
-    """Verify actual RESTORE_HELD database with staged historical proof ports."""
-    import sqlite3
-
-    from finance_core.instance_admission.authority import _control, _profile, _record, _state
-
-    from .reader import audit_evidence_connection
-
-    if _ISSUED.get(id(restored)) is not restored:
-        raise LifecycleError("Original held restore capability required")
+def _promote(
+    restored,
+    designation,
+    *,
+    operation_id,
+    approval_ref,
+    port,
+    binding,
+    legacy_verifier,
+    receipt_sha256=None,
+):
+    target, _ = _held_description(restored, allow_pending=True, allow_completed=True)
+    if (
+        designation.material["target"] != target
+        or designation.material["cut_ref"] != cut_ref(restored.cut)
+        or designation.material["old_binding_sha256"] != restored.cut.source_binding_sha256
+    ):
+        raise LifecycleError("Designation does not bind the exact target")
+    context = {
+        "format": "restore-admit-context-v1",
+        "cut_ref": cut_ref(restored.cut),
+        "target_sha256": digest(target),
+        "designation_entry_sha256": designation.entry_sha256,
+        "designation_sha256": digest(designation.material),
+        "receipt_sha256": receipt_sha256,
+    }
     config = restored.config
+    owner = _Lock(config, OWNER_LOCK_FILENAME)
+    try:
+        owner.acquire(fcntl.LOCK_EX, 0)
+        with _control(config) as control:
+            pending = _read(config, PENDING_FILENAME) if _exists(config, PENDING_FILENAME) else None
+            if pending is None:
+                state = _state(config)
+                completed = [
+                    entry
+                    for entry in state["history"]
+                    if entry["action"] == "restore_admit"
+                    and entry["operation_id"] == operation_id
+                    and entry["binding"] == config.binding_sha256
+                ]
+                if completed:
+                    entry = completed[0]
+                    if (
+                        entry["approval_ref"] != approval_ref
+                        or entry.get("recovery_context") != context
+                        or binding != restored.new_binding
+                        or config.approval_verifier(
+                            approval_ref, "restore_admit", entry["approval_digest"]
+                        )
+                        is not True
+                    ):
+                        raise LifecycleError("Completed restore admission context differs")
+                    return _decode(_canonical(_record(config, state)))
+                before = state
+            else:
+                before, _, _ = _validate_recovery_pending(
+                    config,
+                    pending,
+                    action="restore_admit",
+                    operation_id=operation_id,
+                    approval_ref=approval_ref,
+                    context=context,
+                )
+            record = _record(config, before)
+            locked_target, _ = _target_from_state(restored, before, allow_completed=True)
+            if locked_target != target:
+                raise LifecycleError("Target changed before protected recovery admission")
+            if record["state"] != "RESTORE_HELD" or record["maintenance"] is not None:
+                raise LifecycleError("Only exact held target can become active")
+            from .reader import audit_connection
+
+            def build(conn):
+                audit_connection(conn)
+                _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
+                if pending is not None:
+                    return pending
+                after = _decode(_canonical(before))
+                after_record = _record(config, after)
+                if (
+                    after["current"] is not None
+                    and after["instances"][after["current"]]["state"] != "FENCED"
+                ):
+                    raise LifecycleError("Another current instance remains active")
+                after_record["state"], after_record["admission"] = "ACTIVE", operation_id
+                after["current"] = config.binding_sha256
+                return _transition(
+                    config,
+                    before,
+                    after,
+                    action="restore_admit",
+                    operation_id=operation_id,
+                    approval_ref=approval_ref,
+                    context=context,
+                    defer_publish=True,
+                )
+
+            published = _protected_database_transition(
+                config, owner, control, record, write=True, build=build
+            )
+            return _decode(_canonical(_record(config, published)))
+    finally:
+        owner.close()
+
+
+def promote_restored_profile(
+    restored: RestoredProfile,
+    old_config: TrustedInstanceConfig,
+    *,
+    designation_operation_id: str,
+    designation_approval_ref: str,
+    operation_id: str,
+    approval_ref: str,
+    port,
+    binding: RuntimeBinding,
+    legacy_verifier=None,
+):
+    designation, _ = _live_designation(
+        old_config,
+        restored,
+        operation_id=designation_operation_id,
+        approval_ref=designation_approval_ref,
+    )
+    return _promote(
+        restored,
+        designation,
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        port=port,
+        binding=binding,
+        legacy_verifier=legacy_verifier,
+    )
+
+
+def promote_with_isolation_receipt(
+    restored: RestoredProfile,
+    receipt: OldWriterIsolationReceipt,
+    recovery_authority: RecoveryAuthority,
+    *,
+    operation_id: str,
+    approval_ref: str,
+    port,
+    binding: RuntimeBinding,
+    legacy_verifier=None,
+):
+    designation = recovery_authority.verify_old_writer_isolation(receipt, restored)
+    return _promote(
+        restored,
+        designation,
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        port=port,
+        binding=binding,
+        legacy_verifier=legacy_verifier,
+        receipt_sha256=digest(asdict(receipt)),
+    )
+
+
+def resume_held_restore(
+    config: TrustedInstanceConfig,
+    cut: SnapshotCut,
+    receipt: OldWriterIsolationReceipt,
+    recovery_authority: RecoveryAuthority,
+) -> RestoredProfile:
     with _control(config, shared=True):
-        record = _record(config, _state(config))
+        state = _state(config)
+        record = _record(config, state)
         if record["state"] != "RESTORE_HELD":
-            raise LifecycleError("Semantic restore proof requires held state")
-        with _profile(config, expected=record["db_identity"]) as profile:
-            conn = sqlite3.connect(profile.live_database.as_uri() + "?mode=ro", uri=True)
-            conn.row_factory = sqlite3.Row
-            try:
-                conn.execute("BEGIN")
-                result = audit_evidence_connection(conn, port, binding, legacy_verifier)
-                _verify_cut_connection(conn, restored.cut)
-            finally:
-                conn.close()
-    _VERIFIED.add(id(restored))
-    return result
+            raise LifecycleError("Only durable held restore can be resumed")
+        entries = [
+            entry
+            for entry in state["history"]
+            if entry["action"] == "restore_prepare"
+            and entry["binding"] == config.binding_sha256
+            and "recovery_context" in entry
+        ]
+        if len(entries) != 1 or entries[0]["recovery_context"]["cut_ref"] != cut_ref(cut):
+            raise LifecycleError("Held preparation lacks exact v3 cut")
+        prepare = entries[0]
+        new_binding = RuntimeBinding(**prepare["recovery_context"]["runtime_binding"])
+    restored = RestoredProfile(
+        config, cut, new_binding, prepare["operation_id"], prepare["entry_sha256"]
+    )
+    recovery_authority.verify_old_writer_isolation(receipt, restored)
+    verify_held_profile_evidence_content(restored)
+    return restored
 
 
-def _verify_fenced_cut(old_config: TrustedInstanceConfig, cut: SnapshotCut):
-    """Shared live-original proof for both generic promotion and signed isolation.
-
-    Hold the process's existing managed SQLite lock while selecting the fixed
-    original profile's environment, then restore the caller's current environment.
-    The original lifetime owner must already be released; only a new read owner
-    may inspect its permanently fenced exact cut.
-    """
-    import os
-
-    from finance_core.instance_admission import acquire_production_owner
-    from finance_core.instance_admission.sessions import lifecycle_read_operation
-    from finance_core.profile_paths import _MANAGED_SQLITE_LIFETIME_LOCK
-    from finance_core.runtime_paths import RUNTIME_ROOT_ENV
-
-    from .contracts import digest
+def verify_held_profile_evidence_content(restored: RestoredProfile) -> None:
     from .reader import audit_connection
 
-    if old_config.instance_id != cut.instance_id:
-        raise LifecycleError("Old writer identity differs from snapshot")
-    with _MANAGED_SQLITE_LIFETIME_LOCK:
-        previous = os.environ.get(RUNTIME_ROOT_ENV)
-        os.environ[RUNTIME_ROOT_ENV] = str(Path(old_config._binding["profile_root"]) / "runtime")
-        try:
-            state = inspect_instance_admission(old_config)
-            if state["state"] != "FENCED":
-                raise LifecycleError("Actual original writer has not been permanently fenced")
-            with acquire_production_owner(old_config, timeout_seconds=0) as owner:
-                with lifecycle_read_operation(owner) as conn:
-                    audit_connection(conn)
-                    _verify_cut_connection(conn, cut)
-                    if (
-                        cut.core_identity != old_config.core_identity
-                        or cut.migration_identity != old_config._binding["migration_identity"]
-                        or cut.application_schema_digest
-                        != digest(old_config._binding["application_schema"])
-                    ):
-                        raise LifecycleError("Fenced snapshot cut installation identity differs")
-            return state
-        finally:
-            if previous is None:
-                os.environ.pop(RUNTIME_ROOT_ENV, None)
-            else:
-                os.environ[RUNTIME_ROOT_ENV] = previous
+    with _held_read_connection(restored) as conn:
+        audit_connection(conn)
+        _verify_cut_connection(conn, restored.cut)
+
+
+def resume_restore_promotion(
+    restored: RestoredProfile,
+    *,
+    operation_id: str,
+    approval_ref: str,
+    port,
+    binding: RuntimeBinding,
+    legacy_verifier=None,
+    old_config: TrustedInstanceConfig | None = None,
+    receipt: OldWriterIsolationReceipt | None = None,
+    recovery_authority: RecoveryAuthority | None = None,
+):
+    if receipt is not None and recovery_authority is not None:
+        designation = recovery_authority.verify_old_writer_isolation(receipt, restored)
+        receipt_sha256 = digest(asdict(receipt))
+    elif old_config is not None:
+        with _control(old_config, shared=True):
+            state = _state(old_config)
+            matches = [
+                entry
+                for entry in state["history"]
+                if entry["action"] == "recovery_designate"
+                and entry["binding"] == old_config.binding_sha256
+            ]
+            if len(matches) != 1:
+                raise LifecycleError("Original designation is unavailable")
+            old_operation = matches[0]["operation_id"]
+            old_approval = matches[0]["approval_ref"]
+        designation = designate_restore_successor(
+            old_config,
+            restored,
+            operation_id=old_operation,
+            approval_ref=old_approval,
+        )
+        receipt_sha256 = None
+    else:
+        raise LifecycleError("Dedicated resume needs live designation or signed receipt")
+    return _promote(
+        restored,
+        designation,
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        port=port,
+        binding=binding,
+        legacy_verifier=legacy_verifier,
+        receipt_sha256=receipt_sha256,
+    )
