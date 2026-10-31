@@ -56,6 +56,8 @@ import type { BridgeRequest, BridgeResponse, JsonObject } from "../src/protocol.
 import { BridgeCliRunner } from "../src/subprocess.js";
 
 const REPO_ROOT = resolve("../..");
+const HISTORICAL_CORE_LEDGER_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c";
+const CURRENT_CORE_LEDGER_061 = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850";
 const execFile = promisify(execFileCallback);
 const ACCEPT_TEST_EXECUTABLE = async (): Promise<void> => undefined;
 const FIXTURE_PATCH = "fixture patch\n";
@@ -266,6 +268,7 @@ async function artifact(
 async function coreDistributionFixture(
   root: string,
   coreCommit: string,
+  migrationCount: 60 | 61 = 61,
 ): Promise<{
   manifestSha256: string;
   wheelSha256: string;
@@ -276,15 +279,27 @@ import base64,csv,hashlib,io,json,pathlib,shutil,sys,zipfile
 source=pathlib.Path(sys.argv[1])/'finance_core'
 root=pathlib.Path(sys.argv[2])
 commit=sys.argv[3]
+count=int(sys.argv[4])
 allowed={'.json','.py','.sql','.txt'}
 files={}
 for path in source.rglob('*'):
     if path.is_file() and path.suffix in allowed:
         name=path.relative_to(source.parent).as_posix()
         files[name]=path.read_bytes()
-        target=root/name
-        target.parent.mkdir(parents=True,exist_ok=True)
-        target.write_bytes(files[name])
+if count == 60:
+    files.pop('finance_core/resources/migrations/061_lifecycle_v2.sql')
+    contract_name='finance_core/resources/migration-contract-v1.json'
+    contract=json.loads(files[contract_name])
+    assert contract['migration_filenames'][-1] == '061_lifecycle_v2.sql'
+    contract['migration_filenames'].pop()
+    contract['migration_ledger_digest']='0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c'
+    files[contract_name]=(json.dumps(contract,indent=2)+'\n').encode()
+else:
+    assert count == 61
+for name,payload in files.items():
+    target=root/name
+    target.parent.mkdir(parents=True,exist_ok=True)
+    target.write_bytes(payload)
 wheel_name='finance_core-0.1.0-py3-none-any.whl'
 wheel=root/wheel_name
 metadata_root_name='finance_core-0.1.0.dist-info'
@@ -325,13 +340,18 @@ checks={entry['filename']:entry['sha256'] for entry in artifacts}; checks[manife
 print(json.dumps({'manifestSha256':sha(manifest_path),'wheelSha256':sha(wheel),'migrationLedgerDigest':ledger}))
 `;
   const result = await execFile("/usr/bin/python3", [
-    "-c", program, REPO_ROOT, root, coreCommit,
+    "-c", program, REPO_ROOT, root, coreCommit, String(migrationCount),
   ]);
-  return JSON.parse(result.stdout) as {
+  const fixture = JSON.parse(result.stdout) as {
     manifestSha256: string;
     wheelSha256: string;
     migrationLedgerDigest: string;
   };
+  assert.equal(
+    fixture.migrationLedgerDigest,
+    migrationCount === 60 ? HISTORICAL_CORE_LEDGER_060 : CURRENT_CORE_LEDGER_061,
+  );
+  return fixture;
 }
 
 function platformReceipt(
@@ -444,6 +464,34 @@ function platformReceipt(
     },
   };
 }
+
+test("installed Core verifier preserves 060 pin and requires an independent 061 pin", async () => {
+  const verifier = join(REPO_ROOT, "plugins/finance-bridge/scripts/verify-core-distribution.py");
+  const python = process.env.PYTHON_EXECUTABLE ?? "/usr/bin/python3";
+  for (const count of [60, 61] as const) {
+    const root = await realpath(await mkdtemp(join(tmpdir(), `finance-core-ledger-${count}-`)));
+    const commit = "f".repeat(40);
+    const fixture = await coreDistributionFixture(root, commit, count);
+    const expected = count === 60 ? HISTORICAL_CORE_LEDGER_060 : CURRENT_CORE_LEDGER_061;
+    const wrong = count === 60 ? CURRENT_CORE_LEDGER_061 : HISTORICAL_CORE_LEDGER_060;
+    const args = (ledger: string) => [
+      verifier,
+      "--root", root,
+      "--manifest-sha256", fixture.manifestSha256,
+      "--wheel-sha256", fixture.wheelSha256,
+      "--core-version", "0.1.0",
+      "--core-commit", commit,
+      "--api-contract-version", "finance-core-api-v1",
+      "--migration-ledger-digest", ledger,
+    ];
+    const accepted = await execFile(python, args(expected));
+    assert.equal(JSON.parse(accepted.stdout).migration_ledger_digest, expected);
+    await assert.rejects(
+      execFile(python, args(wrong)),
+      /component manifest identity does not match the runtime lock/u,
+    );
+  }
+});
 
 function response(caseValue: Record<string, unknown>): string {
   const expected = caseValue.expected as Record<string, unknown>;

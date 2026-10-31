@@ -28,17 +28,32 @@ The Bridge retains its established `bridge (ubuntu-latest)` display name and
 explicit Ubuntu 24.04 runner mapping; required jobs and acceptance stay unchanged.
 
 The required `validate` job depends on classification, quality, Python tests,
-Bridge and the aggregate report. A failed, cancelled or missing required result
+Bridge, the aggregate report and the bounded `candidate-package` job. A failed, cancelled or missing required result
 blocks validation. Reporting is required because downstream consumers verify
 its job identity and success as part of their release evidence.
 
 The final `validate` job also requires matching classification/checkout
-identities and uploads `candidate-validation-v1-<run>-<attempt>`. The record
+identities and uploads `candidate-validation-v2-<run>-<attempt>`. The record
 contains repository, PR, event/run/attempt, frozen base/head, actual tested
 commit/tree, workflow ref/commit/content digest, Bridge scope and all grouped
 required results. Every source/build/provenance check uses the same candidate
 head. Changes to the Application review or its compatibility export packages
 also require both Bridge systems.
+
+The read-only `candidate-package` job is part of this same initial graph, with
+Ubuntu 24.04, Python 3.12 and a 15-minute ceiling. It builds wheel and sdist using
+hash-locked development dependencies and `build --no-isolation` from an isolated
+copy of the exact committed Git archive. It checks every tracked blob, working
+source byte/mode, complete Core/resource membership and both distribution bytes.
+Its `candidate-package-v1-<run>-<attempt>` artifact includes the distributions,
+tracked source inventory and recipe/hash receipt. The receipt is always
+`BUILT_NOT_VALIDATED`: upload supplies candidate build identity, not release or
+validation approval. Final `validate` additionally requires matching package-job
+identity, successful package result and the actual uploaded artifact ID/digest;
+the independent verifier reads that metadata from GitHub. Consumers must still
+verify the downloaded package/receipt bytes and the successful complete graph.
+No future artifact ID, tag, release, consumer admission or activation is created
+by this source contract.
 
 Independent AI parser/lineage/validation modules and their packaged
 `resources/independent_ai/` policies also require both Bridge systems, including
@@ -87,7 +102,7 @@ the exact protected-main commit, with this exact successful job inventory:
 
 - `classify`, `quality`, `pytest (0)` through `pytest (3)`;
 - `bridge (ubuntu-latest)`, `bridge (macos-15)`;
-- `pytest-report`, `validate`.
+- `candidate-package`, `pytest-report`, `validate`.
 
 Preserve its run/job identities and workflow digest. PR checks alone are not
 release evidence. A failed or cancelled authoritative run requires stopping and
@@ -270,3 +285,19 @@ See [the receipt-media contract](receipt_media_v1.md) for exact received-origina
 normalization, actual OCR fingerprint, orientation and refusal semantics. This
 is a standalone verified media evidence component; existing financial posting,
 transport and managed backup do not automatically consume its records.
+
+
+### Candidate build-proof version boundary
+
+The package-required graph emits `finance-candidate-validation-v2` and
+`candidate-validation-v2-<run>-<attempt>`; the independent candidate verifier
+returns `finance-verified-candidate-v2`. It does not reinterpret an older v1
+proof as package-complete. Checkout identity remains v1 because its fields are
+unchanged. Historical release validation receipts keep their original schema,
+exact workflow/job inventory and immutable artifact identities. In particular,
+an older consumer's active-release v1 verifier must continue checking its
+historical ten-job release proof; it must not add a nonexistent package job to
+that historical run. New candidate admission requires a separate consumer
+update that verifies candidate v2 and the package build receipt/artifact while
+retaining the old active-release rules. No active lock or historical receipt is
+changed by this candidate-package source work.
