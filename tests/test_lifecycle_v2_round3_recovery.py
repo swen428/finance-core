@@ -58,7 +58,7 @@ def original(tmp_path, monkeypatch):
     service = LedgerService(
         owner,
         port,
-        RuntimeBinding(config.instance_id, "old-generation", "wen", "chat"),
+        RuntimeBinding(config.instance_id, "old-generation", "user", "chat"),
         clock=lambda: 1792800000,
     )
     yield config, owner, service, port
@@ -76,7 +76,7 @@ def _target(tmp_path, monkeypatch, cut, path, *, name="target", operation="prepa
     root = tmp_path / name
     root.mkdir(mode=0o700)
     config = synthetic_config(root, monkeypatch, instance_id=name)
-    binding = RuntimeBinding(name, "new-generation", "wen", "chat")
+    binding = RuntimeBinding(name, "new-generation", "user", "chat")
     held = prepare_restored_profile(
         config,
         path,
@@ -262,7 +262,7 @@ def test_pending_prepare_requires_dedicated_content_recheck(
     target_root = tmp_path / "target"
     target_root.mkdir(mode=0o700)
     config = synthetic_config(target_root, monkeypatch, instance_id="target")
-    binding = RuntimeBinding("target", "new-generation", "wen", "chat")
+    binding = RuntimeBinding("target", "new-generation", "user", "chat")
     with patch.object(authority, "_publish", side_effect=OSError("synthetic prepare publish")):
         with pytest.raises(OSError, match="synthetic prepare publish"):
             prepare_restored_profile(
@@ -429,7 +429,7 @@ config = synthetic_config(root, Environment())
 prepare_production_profile(config, operation_id="prepare", approval_ref="approved").close()
 admit_production_instance(config, operation_id="admit", approval_ref="approved")
 owner = acquire_production_owner(config)
-service = LedgerService(owner, Port(), RuntimeBinding(config.instance_id, "old", "wen", "chat"))
+service = LedgerService(owner, Port(), RuntimeBinding(config.instance_id, "old", "user", "chat"))
 cut = service.seal_snapshot(root / "sealed.sqlite")
 fence_production_instance(config, operation_id="fence", approval_ref="approved")
 owner.close()
@@ -437,7 +437,7 @@ newroot = root / "new"
 newroot.mkdir(mode=0o700)
 new = synthetic_config(newroot, Environment(), instance_id="new")
 held = recovery.prepare_restored_profile(new, root / "sealed.sqlite", cut,
-    new_binding=RuntimeBinding("new", "new", "wen", "chat"),
+    new_binding=RuntimeBinding("new", "new", "user", "chat"),
     operation_id="held", approval_ref="approved")
 with patch.object(recovery, "_close_sqlite_handle", side_effect=OSError("synthetic close unknown")):
     try:
@@ -507,7 +507,7 @@ def test_mixed_legacy_lifecycle_cut_and_later_legacy_invalidation(
 
             post("round3-before")
             service = LedgerService(
-                owner, Port(), RuntimeBinding(old.instance_id, "old-generation", "wen", "chat")
+                owner, Port(), RuntimeBinding(old.instance_id, "old-generation", "user", "chat")
             )
             from test_lifecycle_v2 import ready
 
@@ -526,7 +526,7 @@ def test_mixed_legacy_lifecycle_cut_and_later_legacy_invalidation(
             new,
             tmp_path / "legacy-before.sqlite",
             cut,
-            new_binding=RuntimeBinding(new.instance_id, "new-generation", "wen", "chat"),
+            new_binding=RuntimeBinding(new.instance_id, "new-generation", "user", "chat"),
             operation_id="held-business",
             approval_ref="approved",
         )
@@ -623,7 +623,7 @@ def test_same_control_lineage_recovery_then_fresh_writes(original, tmp_path, mon
     new = synthetic_config(
         root, monkeypatch, instance_id="same-lineage", control_root=old.control_root
     )
-    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    binding = RuntimeBinding(new.instance_id, "new-generation", "user", "chat")
     held = prepare_restored_profile(
         new,
         path,
@@ -671,7 +671,7 @@ def test_same_control_lineage_recovery_then_fresh_writes(original, tmp_path, mon
             restored_service.confirm(old_review.review_id, "old-action", "old-confirm")
         port.sources["fresh-source"] = VerifiedSource(
             "fresh-source",
-            "wen",
+            "user",
             "chat",
             "fresh-message",
             TEXT,
@@ -688,7 +688,7 @@ def test_same_control_lineage_recovery_then_fresh_writes(original, tmp_path, mon
         text = "change amount to SGD 15.00; reason: correction"
         port.sources["fresh-edit"] = VerifiedSource(
             "fresh-edit",
-            "wen",
+            "user",
             "chat",
             "edit-message",
             text,
@@ -848,7 +848,7 @@ def test_pending_promotion_resume_authenticates_exact_request_and_rechecks_targe
         instance_id="resume-target",
         control_root=old.control_root if shared_control else None,
     )
-    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    binding = RuntimeBinding(new.instance_id, "new-generation", "user", "chat")
     held = prepare_restored_profile(
         new, path, cut, new_binding=binding, operation_id="prepare-resume", approval_ref="approved"
     )
@@ -984,7 +984,7 @@ def test_public_restore_reconstruction_after_process_loss(
         instance_id="cold-target",
         control_root=old.control_root if shared_control else None,
     )
-    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    binding = RuntimeBinding(new.instance_id, "new-generation", "user", "chat")
     held = prepare_restored_profile(
         new, path, cut, new_binding=binding, operation_id="prepare-cold", approval_ref="approved"
     )
@@ -1263,7 +1263,7 @@ def test_each_root_resumes_interrupted_preparation_and_designation(
         instance_id="designation-target",
         control_root=old.control_root if shared_control else None,
     )
-    binding = RuntimeBinding(new.instance_id, "new-generation", "wen", "chat")
+    binding = RuntimeBinding(new.instance_id, "new-generation", "user", "chat")
     original_unlink = authority.os.unlink
 
     def fail_pending_delete(filename, *args, **kwargs):

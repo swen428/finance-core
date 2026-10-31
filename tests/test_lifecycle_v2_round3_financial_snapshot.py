@@ -36,7 +36,7 @@ def live_case(tmp_path, monkeypatch):
     service = LedgerService(
         owner,
         Port(),
-        RuntimeBinding(config.instance_id, "gen1", "wen", "chat"),
+        RuntimeBinding(config.instance_id, "gen1", "user", "chat"),
         clock=lambda: 1792800000,
     )
     yield service, service.port, config
@@ -48,7 +48,7 @@ def live_case(tmp_path, monkeypatch):
 def _reply(port, evidence_id, text):
     port.sources[evidence_id] = VerifiedSource(
         evidence_id,
-        "wen",
+        "user",
         "chat",
         "message-" + evidence_id,
         text,

@@ -83,7 +83,7 @@ class Port:
         self.sources = {
             "source1": VerifiedSource(
                 "source1",
-                "wen",
+                "user",
                 "chat",
                 "message-1",
                 TEXT,
@@ -103,7 +103,7 @@ class Port:
             self.observations[id] = VerifiedObservation(
                 id,
                 expected.source_id,
-                "wen",
+                "user",
                 self.raw,
                 digest(asdict(expected)),
                 expected.projection["reply_text"],
@@ -111,7 +111,7 @@ class Port:
         return self.observations[id]
 
     def delivery(self, conn, id, expected):
-        return VerifiedDelivery(id, expected.review_id, expected.review_sha256, "wen", "chat")
+        return VerifiedDelivery(id, expected.review_id, expected.review_sha256, "user", "chat")
 
     def action(self, conn, id, expected):
         return VerifiedAction(
@@ -119,7 +119,7 @@ class Port:
             expected.review_id,
             expected.review_sha256,
             expected.delivery_evidence_id,
-            "other" if self.bad_actor else "wen",
+            "other" if self.bad_actor else "user",
             "chat",
         )
 
@@ -134,7 +134,7 @@ def live(tmp_path, monkeypatch):
     service = LedgerService(
         owner,
         port,
-        RuntimeBinding(cfg.instance_id, "gen1", "wen", "chat"),
+        RuntimeBinding(cfg.instance_id, "gen1", "user", "chat"),
         clock=lambda: 1792800000,
     )
     yield service, port, cfg
@@ -178,7 +178,7 @@ def test_correction_is_new_version_and_old_review_cannot_post(live):
     text = "change amount to SGD 15.00；原因：记录有误"
     port.sources["edit1"] = VerifiedSource(
         "edit1",
-        "wen",
+        "user",
         "chat",
         "message-edit",
         text,
@@ -254,7 +254,7 @@ def test_reader_source_can_read_archived_generation_without_new_proposal_authori
     successor = LedgerService(
         service.owner,
         port,
-        RuntimeBinding(cfg.instance_id, "gen2", "wen", "chat"),
+        RuntimeBinding(cfg.instance_id, "gen2", "user", "chat"),
         clock=service.clock,
     )
     assert successor.reader().source(source.source_id) == port.sources["source1"]
@@ -275,7 +275,7 @@ def test_restore_is_held_until_actual_old_fence(live, tmp_path, monkeypatch):
     other = tmp_path / "second"
     other.mkdir(mode=0o700)
     new_config = synthetic_config(other, monkeypatch, instance_id="new-instance")
-    new_binding = RuntimeBinding(new_config.instance_id, "gen2", "wen", "chat")
+    new_binding = RuntimeBinding(new_config.instance_id, "gen2", "user", "chat")
     restored = prepare_restored_profile(
         new_config,
         tmp_path / "restore.sqlite",
@@ -473,7 +473,7 @@ def test_signed_fence_receipt_allows_restore_without_old_root(tmp_path, monkeypa
     service = LedgerService(
         owner,
         Port(),
-        RuntimeBinding(cfg.instance_id, "g1", "wen", "chat"),
+        RuntimeBinding(cfg.instance_id, "g1", "user", "chat"),
         clock=lambda: 1792800000,
     )
     _, _, review = ready(service)
@@ -485,7 +485,7 @@ def test_signed_fence_receipt_allows_restore_without_old_root(tmp_path, monkeypa
     newroot = tmp_path / "new"
     newroot.mkdir(mode=0o700)
     new = synthetic_config(newroot, monkeypatch, instance_id="new-restore")
-    new_binding = RuntimeBinding(new.instance_id, "g2", "wen", "chat")
+    new_binding = RuntimeBinding(new.instance_id, "g2", "user", "chat")
     held = prepare_restored_profile(
         new,
         tmp_path / "sealed.sqlite",
@@ -537,7 +537,7 @@ def test_signed_fence_receipt_allows_restore_without_old_root(tmp_path, monkeypa
     restored_owner = acquire_production_owner(new)
     # Actual retained proof port must remain available independently of oldroot.
     restored_service = LedgerService(
-        restored_owner, service.port, RuntimeBinding(new.instance_id, "g2", "wen", "chat")
+        restored_owner, service.port, RuntimeBinding(new.instance_id, "g2", "user", "chat")
     )
     assert restored_service.reader().get(posted.record_id)["values"]["amount"] == "12.00"
     restored_owner.close()
@@ -562,7 +562,7 @@ def test_concurrent_edit_invalidates_old_card_and_retains_unused_history(live):
     text = "change amount to SGD 13.00"
     port.sources["edit1"] = VerifiedSource(
         "edit1",
-        "wen",
+        "user",
         "chat",
         "edit-message",
         text,
@@ -620,7 +620,7 @@ def _correct(service, port, posted):
     text = "change amount to SGD 15.00\n原因：记录有误"
     port.sources["edit-new"] = VerifiedSource(
         "edit-new",
-        "wen",
+        "user",
         "chat",
         "edit-new",
         text,
@@ -784,7 +784,7 @@ def test_generic_promotion_rejects_actual_fenced_stale_cut(live, tmp_path, monke
     other = tmp_path / "restore"
     other.mkdir(mode=0o700)
     new = synthetic_config(other, monkeypatch, instance_id="new-stale-instance")
-    new_binding = RuntimeBinding(new.instance_id, "new-gen", "wen", "chat")
+    new_binding = RuntimeBinding(new.instance_id, "new-gen", "user", "chat")
     held = prepare_restored_profile(
         new,
         tmp_path / "stale.sqlite",

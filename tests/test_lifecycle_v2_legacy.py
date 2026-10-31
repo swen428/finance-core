@@ -374,7 +374,7 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
     prepare_production_profile(cfg, operation_id="prepare-new", approval_ref="approved").close()
     admit_production_instance(cfg, operation_id="admit-new", approval_ref="approved")
     owner = acquire_production_owner(cfg)
-    binding = RuntimeBinding(cfg.instance_id, "generation-one", "wen", "chat")
+    binding = RuntimeBinding(cfg.instance_id, "generation-one", "user", "chat")
     verifier = _export_verifier()
     service = LedgerService(owner, Port(), binding, legacy_verifier=verifier)
     try:
@@ -384,7 +384,7 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
         original_source = service.reader().source(record["source_id"])
         assert original_source.source_key.startswith("legacy:")
         assert original_source.raw_input
-        assert original_source.principal_id == "wen"
+        assert original_source.principal_id == "user"
         assert original_source.client_id == "chat"
         assert (
             original_source.original_sha256
@@ -445,7 +445,7 @@ def test_verified_old_export_imports_through_actual_new_owner_and_survives_resta
         reply = "change amount to SGD 19.25 reason: Correct imported expense"
         service.port.sources["fresh-correction-source"] = VerifiedSource(
             "fresh-correction-source",
-            "wen",
+            "user",
             "chat",
             "fresh-correction-message",
             reply,
@@ -538,7 +538,7 @@ def test_receipt_import_retains_original_without_access_to_old_file(tmp_path, mo
         prepare_production_profile(cfg, operation_id="prepare", approval_ref="approved").close()
         admit_production_instance(cfg, operation_id="admit", approval_ref="approved")
         owner = acquire_production_owner(cfg)
-        binding = RuntimeBinding(cfg.instance_id, "new-receipt-generation", "wen", "chat")
+        binding = RuntimeBinding(cfg.instance_id, "new-receipt-generation", "user", "chat")
         service = LedgerService(owner, Port(), binding, legacy_verifier=_export_verifier())
         result = service.import_verified(export)
         original_path.unlink()
@@ -600,7 +600,7 @@ def authenticated_import_inventory(tmp_path_factory):
         service = LedgerService(
             owner,
             Port(),
-            RuntimeBinding(cfg.instance_id, "inventory-generation", "wen", "chat"),
+            RuntimeBinding(cfg.instance_id, "inventory-generation", "user", "chat"),
             legacy_verifier=_export_verifier(),
         )
         receipt = service.import_verified(export)[0]
@@ -616,7 +616,7 @@ def authenticated_import_inventory(tmp_path_factory):
         reply = "change amount to SGD 19.25 reason: Correct imported expense"
         service.port.sources["inventory-fresh-reply"] = VerifiedSource(
             "inventory-fresh-reply",
-            "wen",
+            "user",
             "chat",
             "inventory-fresh-message",
             reply,
