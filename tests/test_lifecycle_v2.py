@@ -24,7 +24,7 @@ from finance_core.lifecycle_v2 import (
     VerifiedObservation,
     VerifiedSource,
 )
-from finance_core.lifecycle_v2.contracts import digest
+from finance_core.lifecycle_v2.contracts import canonical, digest
 
 TEXT = "2026-10-24 Cafe SGD 12.00"
 
@@ -708,6 +708,251 @@ def _rehash_audit(conn):
             (previous, sha, event["seq"]),
         )
         previous = sha
+
+
+@pytest.mark.parametrize("entry", ["source", "audit", "expected", "propose", "capture-replay"])
+def test_capture_generation_column_corruption_is_refused(live, entry):
+    service, port, cfg = live
+    source = service.capture("source1", "capture1")
+    successor = LedgerService(
+        service.owner,
+        port,
+        RuntimeBinding(cfg.instance_id, "gen2", "user", "chat"),
+        clock=service.clock,
+    )
+    with pytest.raises(LifecycleError, match="archived generation"):
+        successor.expected_invocation(source.source_id, 0)
+    with _adversarial_database(service) as conn:
+        conn.execute(
+            "UPDATE l2_sources SET generation='gen2' WHERE source_id=?", (source.source_id,)
+        )
+    with pytest.raises(LifecycleError, match="capture generation"):
+        if entry == "source":
+            successor.reader().source(source.source_id)
+        elif entry == "audit":
+            successor.reader().full_audit()
+        elif entry == "expected":
+            successor.expected_invocation(source.source_id, 0)
+        elif entry == "propose":
+            successor.propose(source.source_id, "obs-corrupt", 0, "propose-corrupt")
+        else:
+            successor.capture("source1", "capture1")
+    assert not port.observations
+
+
+def _capture_payload(service):
+    from finance_core.instance_admission.sessions import lifecycle_read_operation
+
+    with lifecycle_read_operation(service.owner) as conn:
+        return json.loads(
+            conn.execute("SELECT payload_json FROM l2_events WHERE kind='capture'").fetchone()[0]
+        )
+
+
+def _replace_capture_payload(service, payload):
+    """Synthetic format/corruption fixture; restore guards and a valid ordinary event chain."""
+    with _adversarial_database(service) as conn:
+        conn.execute(
+            "UPDATE l2_events SET payload_json=? WHERE kind='capture'", (canonical(payload),)
+        )
+        _rehash_audit(conn)
+
+
+def test_capture_envelope_keeps_source_identity_and_archived_replay(live):
+    service, port, cfg = live
+    source = service.capture("source1", "capture1")
+    assert source.source_sha256 == digest(asdict(port.sources["source1"]))
+    assert _capture_payload(service) == {
+        "format": "lifecycle-capture-v2",
+        "generation": "gen1",
+        "source": asdict(port.sources["source1"]),
+    }
+    before = service.reader().full_audit()
+    successor = LedgerService(
+        service.owner, port, RuntimeBinding(cfg.instance_id, "gen2", "user", "chat")
+    )
+    assert successor.capture("source1", "capture1") == source
+    assert successor.reader().source(source.source_id) == port.sources["source1"]
+    assert successor.reader().full_audit() == before
+    assert _capture_payload(service)["generation"] == "gen1"
+    with pytest.raises(LifecycleError, match="exact original operation replay"):
+        successor.capture("source1", "another-operation")
+    with pytest.raises(LifecycleError, match="archived generation"):
+        successor.expected_invocation(source.source_id, 0)
+    assert not port.observations
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing-generation",
+        "wrong-version",
+        "extra-envelope-key",
+        "bool-generation",
+        "empty-generation",
+        "long-generation",
+        "other-generation",
+        "other-source",
+        "extra-source-key",
+        "partial-legacy",
+        "legacy-extra-key",
+        "not-object",
+    ],
+)
+def test_capture_envelope_malformed_material_refused_even_with_rehashed_chain(live, mutation):
+    service, port, _ = live
+    source = service.capture("source1", "capture1")
+    payload = _capture_payload(service)
+    if mutation == "missing-generation":
+        del payload["generation"]
+    elif mutation == "wrong-version":
+        payload["format"] = "lifecycle-capture-v99"
+    elif mutation == "extra-envelope-key":
+        payload["extra"] = "unrecognized"
+    elif mutation == "bool-generation":
+        payload["generation"] = True
+    elif mutation == "empty-generation":
+        payload["generation"] = ""
+    elif mutation == "long-generation":
+        payload["generation"] = "g" * 257
+    elif mutation == "other-generation":
+        payload["generation"] = "gen2"
+    elif mutation == "other-source":
+        payload["source"]["raw_input"] = "changed"
+    elif mutation == "extra-source-key":
+        payload["source"]["generation"] = "gen1"
+    elif mutation == "partial-legacy":
+        payload = asdict(port.sources["source1"])
+        del payload["source_timestamp"]
+    elif mutation == "legacy-extra-key":
+        payload = {**asdict(port.sources["source1"]), "generation": "gen1"}
+    else:
+        payload = []
+    _replace_capture_payload(service, payload)
+    for read in (
+        lambda: service.reader().source(source.source_id),
+        service.reader().full_audit,
+        lambda: service.capture("source1", "capture1"),
+    ):
+        with pytest.raises(LifecycleError, match="capture generation"):
+            read()
+
+
+@pytest.mark.parametrize("generation", ["gen1", "gen2"])
+def test_historical_plain_capture_is_read_only_for_initial_posting(live, generation):
+    service, port, cfg = live
+    source, proposal, review = ready(service)
+    # Exact payload emitted by the pre-envelope producer, without inventing old generation proof.
+    _replace_capture_payload(service, asdict(port.sources["source1"]))
+    if generation == "gen2":
+        with _adversarial_database(service) as conn:
+            conn.execute("UPDATE l2_sources SET generation='gen2'")
+    current = LedgerService(
+        service.owner,
+        port,
+        RuntimeBinding(cfg.instance_id, generation, "user", "chat"),
+        clock=service.clock,
+    )
+    before = current.reader().full_audit()
+    assert current.reader().source(source.source_id) == port.sources["source1"]
+    assert current.capture("source1", "capture1") == source
+    with pytest.raises(LifecycleError, match="lacks original generation authority"):
+        current.expected_invocation(source.source_id, 1)
+    with pytest.raises(LifecycleError, match="lacks original generation authority"):
+        current.propose(source.source_id, "new-observation", 1, "new-proposal")
+    with pytest.raises(LifecycleError, match="lacks original generation authority"):
+        current.prepare_review(proposal.proposal_id, proposal.version)
+    with pytest.raises(LifecycleError, match="generation authority|another binding"):
+        current.confirm(review.review_id, "action1", "confirm1")
+    assert current.reader().full_audit() == before
+    assert current.reader().recent() == []
+    assert _capture_payload(service) == asdict(port.sources["source1"])
+    assert set(port.observations) == {"obs1"}
+
+
+@pytest.mark.parametrize("historical_plain", [False, True])
+def test_archived_capture_supports_fresh_correction_of_existing_fact(live, historical_plain):
+    service, port, cfg = live
+    source, _, review = ready(service)
+    posted = service.confirm(review.review_id, "action1", "confirm1")
+    if historical_plain:
+        _replace_capture_payload(service, asdict(port.sources["source1"]))
+    original_payload = _capture_payload(service)
+    assert service.confirm(review.review_id, "action1", "confirm1") == posted
+    successor = LedgerService(
+        service.owner,
+        port,
+        RuntimeBinding(cfg.instance_id, "gen2", "user", "chat"),
+        clock=service.clock,
+    )
+    assert successor.reader().get(posted.record_id)["version"] == 1
+    text = "change amount to SGD 15.00；原因：记录有误"
+    port.sources["edit1"] = VerifiedSource(
+        "edit1",
+        "user",
+        "chat",
+        "message-edit",
+        text,
+        hashlib.sha256(text.encode()).hexdigest(),
+        1792800000,
+    )
+    port.raw = response(text, "reply", {"amount": "15.00", "currency": "SGD"})
+    correction = successor.prepare_correction(
+        posted.record_id, 1, "obs2", "correction1", "edit1", "记录有误"
+    )
+    successor.record_delivery(correction.review_id, "delivery2")
+    corrected = successor.confirm(correction.review_id, "action2", "confirm2")
+    assert (corrected.record_id, corrected.version) == (posted.record_id, 2)
+    assert successor.reader().full_audit()["fact_version_count"] == 2
+    assert len(successor.reader().recent()) == 1
+    assert successor.reader().get(posted.record_id)["values"]["amount"] == "15.00"
+    assert successor.reader().source(source.source_id) == port.sources["source1"]
+    assert _capture_payload(service) == original_payload
+
+
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "other-entity"])
+def test_capture_replay_authenticates_retained_capture_inventory(live, damage):
+    service, _, _ = live
+    source = service.capture("source1", "capture1")
+    with _adversarial_database(service) as conn:
+        if damage == "missing":
+            conn.execute("DELETE FROM l2_events WHERE kind='capture'")
+        elif damage == "duplicate":
+            conn.execute(
+                "INSERT INTO l2_events SELECT 2,'extra-capture',kind,entity_id,payload_json,"
+                "event_sha256,? FROM l2_events WHERE kind='capture'",
+                ("0" * 64,),
+            )
+        else:
+            conn.execute("UPDATE l2_events SET entity_id='foreign-source' WHERE kind='capture'")
+        _rehash_audit(conn)
+    with pytest.raises(LifecycleError):
+        service.capture("source1", "capture1")
+    with pytest.raises(LifecycleError):
+        service.reader().source(source.source_id)
+    with pytest.raises(LifecycleError):
+        service.reader().full_audit()
+
+
+@pytest.mark.parametrize("encoding", ["spaced", "duplicate-key"])
+def test_capture_envelope_requires_canonical_json_without_duplicate_keys(live, encoding):
+    service, _, _ = live
+    source = service.capture("source1", "capture1")
+    payload = _capture_payload(service)
+    if encoding == "spaced":
+        raw = json.dumps(payload, indent=2)
+    else:
+        raw = '{"format":"unrecognized",' + canonical(payload)[1:]
+    with _adversarial_database(service) as conn:
+        conn.execute("UPDATE l2_events SET payload_json=? WHERE kind='capture'", (raw,))
+        _rehash_audit(conn)
+    for read in (
+        lambda: service.reader().source(source.source_id),
+        service.reader().full_audit,
+        lambda: service.capture("source1", "capture1"),
+    ):
+        with pytest.raises(LifecycleError, match="canonical"):
+            read()
 
 
 @pytest.mark.parametrize(

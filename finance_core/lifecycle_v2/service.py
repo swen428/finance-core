@@ -98,6 +98,39 @@ def _snapshot_integrity(conn):
         raise LifecycleError("Snapshot SQLite integrity or foreign keys invalid")
 
 
+def _capture_generation(row, payload_json):
+    """Verify retained native capture material; old plain captures have no generation proof."""
+    payload = json.loads(payload_json)
+    if payload_json != canonical(payload):
+        raise LifecycleError("Capture event must retain exact canonical JSON")
+    source = {
+        "evidence_id": row["evidence_id"],
+        "principal_id": row["principal_id"],
+        "client_id": row["client_id"],
+        "source_key": row["source_key"],
+        "raw_input": row["raw_input"],
+        "original_sha256": row["original_sha256"],
+        "source_timestamp": row["created_at"],
+        "timezone": "Asia/Singapore",
+    }
+    if row["source_sha256"] != digest(source):
+        raise LifecycleError("Capture event inventory lacks its exact source")
+    if canonical(payload) == canonical(source):
+        # Historical capture bytes stay readable, but cannot prove initial-write authority.
+        return None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"format", "generation", "source"}
+        or payload["format"] != "lifecycle-capture-v2"
+        or not isinstance(payload["generation"], str)
+        or not 1 <= len(payload["generation"]) <= 256
+        or payload["generation"] != row["generation"]
+        or canonical(payload["source"]) != canonical(source)
+    ):
+        raise LifecycleError("Original capture generation or source binding changed")
+    return payload["generation"]
+
+
 class LedgerService:
     def __init__(
         self,
@@ -155,10 +188,14 @@ class LedgerService:
         captures = conn.execute(
             "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?", (source_id,)
         ).fetchall()
-        if len(captures) != 1 or captures[0][0] != canonical(asdict(evidence)):
+        if len(captures) != 1:
             raise LifecycleError("Source lacks its exact original capture event")
-        if not allow_archived and row["generation"] != self.binding.generation:
-            raise LifecycleError("Source belongs to archived generation")
+        generation = _capture_generation(row, captures[0][0])
+        if not allow_archived:
+            if generation is None:
+                raise LifecycleError("Historical capture lacks original generation authority")
+            if generation != self.binding.generation:
+                raise LifecycleError("Source belongs to archived generation")
         return row
 
     def capture(self, source_evidence_id, operation_id):
@@ -194,6 +231,7 @@ class LedgerService:
                     raise LifecycleError(
                         "Duplicate source requires exact original operation replay"
                     )
+                self._source(conn, existing["source_id"], allow_archived=True)
                 return SourceRef(existing["source_id"], sha)
             source_id = _id("source")
             conn.execute("BEGIN IMMEDIATE")
@@ -212,7 +250,17 @@ class LedgerService:
                     evidence.source_timestamp,
                 ),
             )
-            _event(conn, operation_id, "capture", source_id, asdict(evidence))
+            _event(
+                conn,
+                operation_id,
+                "capture",
+                source_id,
+                {
+                    "format": "lifecycle-capture-v2",
+                    "generation": self.binding.generation,
+                    "source": asdict(evidence),
+                },
+            )
             conn.commit()
             return SourceRef(source_id, sha)
 

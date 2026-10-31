@@ -39,6 +39,37 @@ signed retained source capsule. Missing or inconsistent evidence is refused.
 Archived-generation sources remain readable; this read grants no current proposal
 or confirmation authority and creates no lifecycle decision or fact.
 
+New native captures retain an exact `lifecycle-capture-v2` event envelope with
+`format`, original `generation`, and the original `source` DTO. The source DTO,
+`source_sha256` (the digest of that DTO), provider request identity and public
+`EvidencePort` remain unchanged. Point reads, complete audit and exact capture
+replay require the envelope's generation to equal the source row, even for an
+archived read. A changed generation column cannot borrow current initial-write
+authority. Malformed/unknown envelopes cannot fall back to historical parsing.
+Both supported capture formats require exact canonical JSON, rejecting duplicate
+keys and alternative encodings of the same parsed object.
+
+Historical plain-DTO capture events retain their original bytes and source hash.
+They remain readable and auditable as **generation-unbound history**; their
+standalone row generation is not proof of original capture authority. They cannot
+authorize a new initial proposal, initial review or first confirmation, including
+an already pending initial card. Exact capture replay returns only the original
+reference and never upgrades or rebinds the event. Already committed facts remain
+readable, auditable and eligible for fresh explicit corrections under the current
+binding, with the usual authenticated provider, delivery and human evidence.
+An exact committed confirmation retry still observes its original result. A
+retained delivery record or proposal reference by itself grants no first-fact
+authority. This compatibility restriction must be considered before any separate
+consumer upgrade; no automatic recapture, event rewrite or authority backfill is
+provided. Independently signed legacy-import capsules keep their existing rules.
+
+The envelope detects inconsistency between a source row and retained capture
+material. It does not add an independent authenticity root for generation:
+coordinated rewriting of the row, capture and ordinary event chain, or rollback
+of their complete state, still requires an external trusted checkpoint to detect.
+Historical plain events cannot retrospectively prove their original generation.
+Migration 061 and all historical migration bytes remain unchanged.
+
 Each v2 protected operation verifies installed migration artifacts at entry,
 then reuses that proof only through its own active connection witness. The proof
 binds the exact config, owner, process and session; it is not an ambient context

@@ -8,7 +8,7 @@ import json
 from finance_core.instance_admission.sessions import lifecycle_read_operation
 
 from .contracts import LifecycleError, VerifiedSource, canonical, digest
-from .service import _fact_material, _money
+from .service import _capture_generation, _fact_material, _money
 
 
 def audit_connection(conn):
@@ -609,25 +609,9 @@ def audit_owned_inventory(conn):
                 row = conn.execute(
                     "SELECT * FROM l2_sources WHERE source_id=?", (identity,)
                 ).fetchone()
-                if (
-                    row is None
-                    or row["source_key"].startswith("legacy:")
-                    or not isinstance(payload, dict)
-                    or row["source_sha256"] != digest(payload)
-                    or any(
-                        row[column] != payload.get(key)
-                        for column, key in (
-                            ("evidence_id", "evidence_id"),
-                            ("principal_id", "principal_id"),
-                            ("client_id", "client_id"),
-                            ("source_key", "source_key"),
-                            ("raw_input", "raw_input"),
-                            ("original_sha256", "original_sha256"),
-                            ("created_at", "source_timestamp"),
-                        )
-                    )
-                ):
+                if row is None or row["source_key"].startswith("legacy:"):
                     raise LifecycleError("Capture event inventory lacks its exact source")
+                _capture_generation(row, event["payload_json"])
             elif kind == "propose":
                 row = conn.execute(
                     "SELECT * FROM l2_proposals WHERE proposal_id=?", (identity,)
