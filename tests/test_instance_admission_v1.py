@@ -28,7 +28,11 @@ def test_real_production_schema_and_factory_witness(tmp_path, monkeypatch):
     with acquire_production_owner(config) as owner:
         with production_write_operation(owner) as conn:
             require_finance_write_connection(conn)
-            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 60
+            from finance_core.reconciliation.migrations import TEMP_DB_MIGRATION_PATHS
+
+            assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == len(
+                TEMP_DB_MIGRATION_PATHS
+            )
             with pytest.raises(StagingDatabaseError):
                 require_staging_database(conn)
         with pytest.raises(InstanceAdmissionError):

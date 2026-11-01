@@ -19,7 +19,8 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "scripts" / "build_release_manifest.py"
-MIGRATION_DIGEST = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
+MIGRATION_DIGEST = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
+HISTORICAL_MIGRATION_DIGEST_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 
 
 def _load_release_manifest_builder() -> ModuleType:
@@ -78,14 +79,49 @@ def test_release_manifest_migration_inventory_rejects_missing_synthetic_060(
         release_manifest_builder._migration_ledger_digest(payloads)
 
 
-def test_release_manifest_migration_inventory_rejects_extra_synthetic_061(
+def test_release_manifest_migration_inventory_rejects_extra_synthetic_062(
     release_manifest_builder: ModuleType,
 ) -> None:
-    payloads = _synthetic_060_migration_payloads()
-    payloads["finance_core/resources/migrations/061_synthetic_inventory.sql"] = (
+    payloads = {
+        f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+        for path in sorted((REPOSITORY_ROOT / "finance_core/resources/migrations").glob("*.sql"))
+    }
+    payloads["finance_core/resources/migrations/062_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
+    with pytest.raises(ValueError, match="migration inventory"):
+        release_manifest_builder._migration_ledger_digest(payloads)
+
+
+def test_release_manifest_migration_inventory_accepts_actual_060_and_061(
+    release_manifest_builder: ModuleType,
+) -> None:
+    migration_root = REPOSITORY_ROOT / "finance_core/resources/migrations"
+    current = {
+        f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+        for path in sorted(migration_root.glob("*.sql"))
+    }
+    historical = {
+        name: body for name, body in current.items() if int(name.rsplit("/", 1)[-1][:3]) <= 60
+    }
+    assert (
+        release_manifest_builder._migration_ledger_digest(historical)
+        == HISTORICAL_MIGRATION_DIGEST_060
+    )
+    assert release_manifest_builder._migration_ledger_digest(current) == MIGRATION_DIGEST
+
+
+def test_release_manifest_migration_inventory_rejects_replaced_061_with_062(
+    release_manifest_builder: ModuleType,
+) -> None:
+    migration_root = REPOSITORY_ROOT / "finance_core/resources/migrations"
+    payloads = {
+        f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+        for path in sorted(migration_root.glob("*.sql"))
+    }
+    moved = payloads.pop("finance_core/resources/migrations/061_lifecycle_v2.sql")
+    payloads["finance_core/resources/migrations/062_replacement.sql"] = moved
     with pytest.raises(ValueError, match="migration inventory"):
         release_manifest_builder._migration_ledger_digest(payloads)
 
@@ -115,6 +151,13 @@ def _reordered_migration_contract(payload: bytes) -> bytes:
     contract = json.loads(payload)
     filenames = contract["migration_filenames"]
     filenames[0], filenames[1] = filenames[1], filenames[0]
+    return (json.dumps(contract, indent=2) + "\n").encode()
+
+
+def _contract_missing_061(payload: bytes) -> bytes:
+    contract = json.loads(payload)
+    assert contract["migration_filenames"][-1] == "061_lifecycle_v2.sql"
+    contract["migration_filenames"].pop()
     return (json.dumps(contract, indent=2) + "\n").encode()
 
 
@@ -251,9 +294,33 @@ def _write_valid_release_fixture(
     extra_name: str = "media",
     media_dependencies: tuple[str, ...] = ("Pillow==13.0.0", "pillow-heif==1.8.0"),
     pypdf_dependency: str = "pypdf==6.21.2",
+    migration_count: int = 61,
+    mutate_061: bool = False,
 ) -> tuple[Path, Path, str]:
     source_root = tmp_path / "source"
     shutil.copytree(REPOSITORY_ROOT / "finance_core", source_root / "finance_core")
+    if migration_count == 60:
+        assert not mutate_061
+        (source_root / "finance_core/resources/migrations/061_lifecycle_v2.sql").unlink()
+        contract_path = source_root / "finance_core/resources/migration-contract-v1.json"
+        contract = json.loads(contract_path.read_text())
+        contract["migration_filenames"] = contract["migration_filenames"][:60]
+        contract["migration_ledger_digest"] = HISTORICAL_MIGRATION_DIGEST_060
+        contract_path.write_text(json.dumps(contract, indent=2) + "\n")
+    else:
+        assert migration_count == 61
+        if mutate_061:
+            migration = source_root / "finance_core/resources/migrations/061_lifecycle_v2.sql"
+            migration.write_bytes(migration.read_bytes() + b"\n-- synthetic tamper\n")
+            migration_root = source_root / "finance_core/resources/migrations"
+            payloads = {
+                f"finance_core/resources/migrations/{path.name}": path.read_bytes()
+                for path in sorted(migration_root.glob("*.sql"))
+            }
+            contract_path = source_root / "finance_core/resources/migration-contract-v1.json"
+            contract = json.loads(contract_path.read_text())
+            contract["migration_ledger_digest"] = _payload_ledger_digest(payloads)
+            contract_path.write_text(json.dumps(contract, indent=2) + "\n")
     (source_root / "scripts").mkdir(parents=True)
     shutil.copy2(SCRIPT, source_root / "scripts" / "build_release_manifest.py")
     release_source_names = {
@@ -273,7 +340,8 @@ def _write_valid_release_fixture(
         project.read_text(),
         flags=re.DOTALL,
     )
-    # Keep this synthetic release fixture on its fixed 0.1.6 identity.
+    # Synthetic 0.1.6 metadata exercises the manifest builder; this fixture is
+    # never an assertion about an actual published 0.1.6 artifact or identity.
     project_source = re.sub(
         r'(?m)^version = "[^"]+"$', 'version = "0.1.6"', project_source, count=1
     )
@@ -443,7 +511,7 @@ def test_release_manifest_rejects_external_migration_digest_mismatch(tmp_path: P
             artifacts,
             source_root=source_root,
             core_commit=core_commit,
-            migration_digest="0" * 64,
+            migration_digest=HISTORICAL_MIGRATION_DIGEST_060,
         ),
         capture_output=True,
         text=True,
@@ -453,6 +521,58 @@ def test_release_manifest_rejects_external_migration_digest_mismatch(tmp_path: P
     assert "migration ledger digest does not match the wheel" in completed.stderr
     assert not (artifacts / "component-manifest-v1.json").exists()
     assert not (artifacts / "SHA256SUMS").exists()
+
+
+def test_release_manifest_accepts_historical_prefix_only_with_060_identity(tmp_path: Path) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path, migration_count=60)
+    rejected = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "migration ledger digest does not match the wheel" in rejected.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
+    accepted = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=HISTORICAL_MIGRATION_DIGEST_060,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    manifest = json.loads((artifacts / "component-manifest-v1.json").read_text())
+    assert manifest["migration_ledger_digest"] == HISTORICAL_MIGRATION_DIGEST_060
+
+
+def test_release_manifest_rejects_self_consistent_061_tamper_against_trusted_digest(
+    tmp_path: Path,
+) -> None:
+    artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path, mutate_061=True)
+    with zipfile.ZipFile(artifacts / "finance_core-0.1.6-py3-none-any.whl") as archive:
+        contract = json.loads(archive.read("finance_core/resources/migration-contract-v1.json"))
+    assert contract["migration_ledger_digest"] != MIGRATION_DIGEST
+    rejected = subprocess.run(
+        _manifest_command(
+            artifacts,
+            source_root=source_root,
+            core_commit=core_commit,
+            migration_digest=MIGRATION_DIGEST,
+        ),
+        capture_output=True,
+        text=True,
+    )
+    assert rejected.returncode != 0
+    assert "migration ledger digest does not match the wheel" in rejected.stderr
+    assert not (artifacts / "component-manifest-v1.json").exists()
 
 
 def test_release_manifest_rejects_untracked_core_payload(tmp_path: Path) -> None:
@@ -653,13 +773,7 @@ def test_release_manifest_rejects_unexpected_wheel_entry_point(tmp_path: Path) -
             f'"migration_ledger_digest": "{MIGRATION_DIGEST}"'.encode(),
             b'"migration_ledger_digest": "' + b"0" * 64 + b'"',
         ),
-        lambda payload: payload.replace(
-            (
-                b'    "059_independent_ai_clarification.sql",\n'
-                b'    "060_independent_corrections.sql"\n'
-            ),
-            b'    "059_independent_ai_clarification.sql"\n',
-        ),
+        _contract_missing_061,
         _reordered_migration_contract,
     ],
 )
@@ -978,7 +1092,7 @@ def _refused_media_fixture(artifacts: Path, source_root: Path, core_commit: str)
     return result.stderr
 
 
-def test_release_manifest_preserves_historical_no_extra_metadata(tmp_path: Path) -> None:
+def test_release_manifest_preserves_no_extra_metadata_in_synthetic_fixture(tmp_path: Path) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path, media=False)
     result = subprocess.run(
         _manifest_command(

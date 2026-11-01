@@ -36,7 +36,7 @@ _WITNESSES: dict[int, "_Witness"] = {}
 # Unknown-close handles deliberately remain reachable until process exit.
 _UNCERTAIN: list["_Witness"] = []
 
-# Fixed native functions from migrations 001-060, approved Core SQL, and the
+# Fixed native functions from migrations 001-061, approved Core SQL, and the
 # admission metadata query (GLOB). This is deliberately not learned at runtime.
 _SQL_FUNCTIONS = frozenset(
     {
@@ -91,6 +91,7 @@ _SQL_METADATA_PRAGMAS = frozenset(
     {
         "table_info",
         "table_xinfo",
+        "table_list",
         "index_list",
         "index_info",
         "index_xinfo",
@@ -251,6 +252,7 @@ class _Witness:
     authority_version: int
     read_only: bool
     pid: int
+    immutable_migration_digest: str | None = None
     active: bool = True
     closing: bool = False
     closed: bool = False
@@ -291,7 +293,7 @@ class _Witness:
         self.gate.assert_valid()
         # _state->_read performs the final complete shared-config proof, including
         # installed migration bytes. No proof survives this admission call.
-        state = _state(self.owner.config)
+        state = _state(self.owner.config, _proof=self if self.immutable_migration_digest else None)
         record = _record(self.owner.config, state)
         if state["version"] != self.authority_version or (
             record["maintenance"] is not None
@@ -688,7 +690,11 @@ def require_finance_read_connection(
 
 @contextmanager
 def _operation(
-    owner: ProductionOwner, *, read_only: bool, timeout_seconds: float
+    owner: ProductionOwner,
+    *,
+    read_only: bool,
+    timeout_seconds: float,
+    immutable_installation: bool = False,
 ) -> Iterator[sqlite3.Connection]:
     from .schema_contract import SchemaContractError, validate_application_database
 
@@ -726,7 +732,15 @@ def _operation(
             uri, uri=True, detect_types=0, cached_statements=0, factory=_ProductionConnection
         )
         witness = _Witness(
-            owner, conn, control, profile, gate, state["version"], read_only, os.getpid()
+            owner,
+            conn,
+            control,
+            profile,
+            gate,
+            state["version"],
+            read_only,
+            os.getpid(),
+            owner.config._binding["migration_identity"] if immutable_installation else None,
         )
         with owner._mutex:
             _WITNESSES[id(conn)] = witness
@@ -806,3 +820,26 @@ def production_write_operation(owner: ProductionOwner, *, timeout_seconds: float
 def production_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
     """Open true mode=ro, including legitimate FENCED forensic admission."""
     return _operation(owner, read_only=True, timeout_seconds=timeout_seconds)
+
+
+@contextmanager
+def _lifecycle_operation(owner: ProductionOwner, *, read_only: bool, timeout_seconds: float):
+    """Opt-in v2 immutable artifact proof, valid for exactly one owned operation.
+
+    Dynamic authority, database/file identities, leases, write state, transaction
+    and close checks remain in every existing guarded SQL admission. Only the
+    installed migration bytes proved at this operation entry are reused.
+    """
+    owner.assert_valid()
+    with _operation(
+        owner, read_only=read_only, timeout_seconds=timeout_seconds, immutable_installation=True
+    ) as conn:
+        yield conn
+
+
+def lifecycle_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
+    return _lifecycle_operation(owner, read_only=False, timeout_seconds=timeout_seconds)
+
+
+def lifecycle_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
+    return _lifecycle_operation(owner, read_only=True, timeout_seconds=timeout_seconds)

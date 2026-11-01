@@ -25,7 +25,9 @@ def test_public_workflow_has_read_only_top_level_permissions() -> None:
     assert "id-token: write" not in source
 
 
-@pytest.mark.parametrize("job", ["classify", "quality", "pytest", "pytest-report", "validate"])
+@pytest.mark.parametrize(
+    "job", ["classify", "quality", "pytest", "pytest-report", "candidate-package", "validate"]
+)
 def test_required_linux_jobs_pin_the_declared_validation_platform(job: str) -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
     section = source.split(f"\n  {job}:\n", 1)[1]
@@ -131,7 +133,7 @@ def test_candidate_sha_diff_detects_staged_bridge_drift(tmp_path: Path) -> None:
 def test_validate_aggregates_required_and_optional_jobs() -> None:
     source = WORKFLOW.read_text(encoding="utf-8")
 
-    assert "needs: [classify, quality, pytest, bridge, pytest-report]" in source
+    assert "needs: [classify, quality, pytest, bridge, pytest-report, candidate-package]" in source
     assert 'test "$PYTEST_RESULT" = success' in source
     assert 'test "$QUALITY_RESULT" = success' in source
     assert 'test "$REPORT_RESULT" = success' in source
@@ -264,6 +266,7 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
             "CLASSIFY_RESULT": "success",
             "PYTEST_RESULT": "success",
             "QUALITY_RESULT": "success",
+            "PACKAGE_RESULT": "success",
         },
         capture_output=True,
         text=True,
@@ -1796,3 +1799,20 @@ def test_media_export_quiescent_copy_and_unsafe_refusal(tmp_path: Path, variant:
             assert list(database_path.iterdir()) == []
             database_path.rmdir()
             core_path.rmdir()
+
+
+def test_candidate_package_is_bounded_read_only_initial_graph_job():
+    source = WORKFLOW.read_text(encoding="utf-8")
+    package = source.split("\n  candidate-package:\n", 1)[1].split("\n  quality:\n", 1)[0]
+    header = package.split("    steps:\n", 1)[0]
+    assert "timeout-minutes: 15" in header
+    assert "    needs:" not in header and "    if:" not in header
+    assert "continue-on-error" not in package and "secrets." not in package
+    assert "persist-credentials: false" in package
+    assert "--only-binary=:all: --require-hashes -r requirements-dev.txt" in package
+    assert "build_candidate_package.py" in package
+    assert "candidate-package-v1-${{ github.run_id }}-${{ github.run_attempt }}" in package
+    assert "PACKAGE_RESULT: ${{ needs.candidate-package.result }}" in source
+    assert 'test "$PACKAGE_RESULT" = success' in source
+    assert "artifact_id: ${{ steps.package-artifact.outputs.artifact-id }}" in header
+    assert "release" not in package.lower().replace("not release approval", "")

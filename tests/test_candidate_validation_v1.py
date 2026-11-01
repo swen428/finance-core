@@ -11,6 +11,7 @@ import json
 import subprocess
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,7 +51,16 @@ def sample(*, bridge: bool = True) -> dict:
         "workflow_path": VERIFIER.WORKFLOW,
         "workflow_sha256": hashlib.sha256(WORKFLOW_BYTES).hexdigest(),
     }
-    results = {name: "success" for name in ("classify", "quality", "pytest", "pytest-report")}
+    results = {
+        name: "success"
+        for name in (
+            "classify",
+            "quality",
+            "pytest",
+            "pytest-report",
+            "candidate-package",
+        )
+    }
     results["bridge"] = "success" if bridge else "skipped"
     names = VERIFIER.CORE_JOBS | (VERIFIER.BRIDGE_JOBS if bridge else {"bridge"})
     jobs = [
@@ -87,10 +97,16 @@ def sample(*, bridge: bool = True) -> dict:
         },
         "workflow": {"id": 123, "path": VERIFIER.WORKFLOW, "state": "active"},
         "proof": {
-            "schema": "finance-candidate-validation-v1",
+            "schema": "finance-candidate-validation-v2",
             "identity": identity,
             "bridge_required": bridge,
             "results": results,
+            "package": {
+                "artifact_id": 789,
+                "artifact_name": "candidate-package-v1-42-1",
+                "artifact_digest": "sha256:" + "d" * 64,
+                "receipt_sha256": "a" * 64,
+            },
         },
         "head_commit": {"sha": HEAD, "tree": {"sha": TREE}},
         "event_commit": {
@@ -109,12 +125,20 @@ def sample(*, bridge: bool = True) -> dict:
         "jobs": {"total_count": len(jobs), "jobs": jobs},
         "artifact": {
             "id": 456,
-            "name": "candidate-validation-v1-42-1",
+            "name": "candidate-validation-v2-42-1",
             "expired": False,
             "digest": "sha256:" + "f" * 64,
             "workflow_run": {"id": 42, "head_sha": HEAD},
         },
         "artifact_sha256": "f" * 64,
+        "package_artifact": {
+            "id": 789,
+            "name": "candidate-package-v1-42-1",
+            "digest": "sha256:" + "d" * 64,
+            "expired": False,
+            "size_in_bytes": 1234,
+            "workflow_run": {"id": 42, "head_sha": HEAD},
+        },
     }
 
 
@@ -228,7 +252,7 @@ def test_renaming_a_bridge_input_outside_its_directory_still_requires_bridge() -
         (("artifact", "workflow_run", "head_sha"), "d" * 40),
         (("artifact", "digest"), "sha256:" + "0" * 64),
         (("artifact", "expired"), True),
-        (("artifact", "name"), "candidate-validation-v1-41-1"),
+        (("artifact", "name"), "candidate-validation-v2-41-1"),
     ],
 )
 def test_stale_or_mismatched_identity_is_rejected(path: tuple, value: object) -> None:
@@ -276,11 +300,25 @@ def test_duplicate_or_truncated_job_and_comparison_inventory_rejected() -> None:
 def test_summary_identity_and_aggregate_contract(event: str) -> None:
     record = sample()["proof"]["identity"]
     record["event"] = event
-    needs = {
+    needs: dict[str, Any] = {
         name: {"result": "success"}
-        for name in ("classify", "quality", "pytest", "bridge", "pytest-report")
+        for name in (
+            "classify",
+            "quality",
+            "pytest",
+            "bridge",
+            "pytest-report",
+            "candidate-package",
+        )
     }
     needs["classify"]["outputs"] = {"identity": json.dumps(record), "bridge": "true"}
+    needs["candidate-package"]["outputs"] = {
+        "identity": json.dumps(record),
+        "artifact_id": "789",
+        "artifact_name": "candidate-package-v1-42-1",
+        "artifact_digest": "d" * 64,
+        "receipt_sha256": "a" * 64,
+    }
     assert IDENTITY.summarize(record, needs)["bridge_required"] is True
     bad = copy.deepcopy(needs)
     bad["classify"]["outputs"]["identity"] = json.dumps({**record, "tested_sha": EVENT})
@@ -361,8 +399,8 @@ def test_identity_reads_actual_checkout_and_refuses_wrong_or_dirty_head(
     "members",
     [
         ["../proof.json"],
-        ["candidate-validation-v1.json", "extra"],
-        ["candidate-validation-v1.json"],
+        ["candidate-validation-v2.json", "extra"],
+        ["candidate-validation-v2.json"],
     ],
 )
 def test_archive_members_and_size_are_bounded(members: list[str]) -> None:
@@ -370,8 +408,8 @@ def test_archive_members_and_size_are_bounded(members: list[str]) -> None:
     with zipfile.ZipFile(out, "w") as archive:
         for name in members:
             archive.writestr(name, json.dumps(sample()["proof"]))
-    if members == ["candidate-validation-v1.json"]:
-        assert VERIFIER.unpack_proof(out.getvalue())["schema"] == "finance-candidate-validation-v1"
+    if members == ["candidate-validation-v2.json"]:
+        assert VERIFIER.unpack_proof(out.getvalue())["schema"] == "finance-candidate-validation-v2"
     else:
         with pytest.raises(ValueError):
             VERIFIER.unpack_proof(out.getvalue())
@@ -384,7 +422,7 @@ def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
     assert source.count(
         "ref: ${{ github.event.pull_request.head.sha || github.sha }}"
     ) == source.count("uses: actions/checkout@")
-    assert source.count("Verify candidate checkout identity") == 5
+    assert source.count("Verify candidate checkout identity") == 6
     assert "Bind candidate validation evidence" in source
     assert (
         "REVIEWED_CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in source
@@ -401,6 +439,7 @@ def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
         "bridge (ubuntu-latest)",
         "bridge (macos-15)",
         "pytest-report",
+        "candidate-package",
         "validate",
     }
 
@@ -409,7 +448,7 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
     fixture = sample()
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as stream:
-        stream.writestr("candidate-validation-v1.json", json.dumps(fixture["proof"]))
+        stream.writestr("candidate-validation-v2.json", json.dumps(fixture["proof"]))
     payload = archive.getvalue()
     fixture["artifact"]["size_in_bytes"] = len(payload)
     fixture["artifact"]["digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
@@ -421,6 +460,7 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
             "artifacts": [fixture["artifact"]],
         },
         f"{prefix}/actions/workflows/validate.yml": fixture["workflow"],
+        f"{prefix}/actions/artifacts/789": fixture["package_artifact"],
         f"{prefix}/actions/runs/42/attempts/1/jobs?per_page=100": fixture["jobs"],
         f"{prefix}/git/commits/{HEAD}": fixture["head_commit"],
         f"{prefix}/git/commits/{EVENT}": fixture["event_commit"],
@@ -497,12 +537,22 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         "scripts/prepare_linux_ocr.py",
     ],
 )
-def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(path: str) -> None:
+def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(
+    path: str,
+) -> None:
     for item in (
         {"filename": path, "status": "modified"},
         {"filename": path, "status": "removed"},
-        {"filename": "archived/example.txt", "previous_filename": path, "status": "renamed"},
-        {"filename": path, "previous_filename": "archived/example.txt", "status": "renamed"},
+        {
+            "filename": "archived/example.txt",
+            "previous_filename": path,
+            "status": "renamed",
+        },
+        {
+            "filename": path,
+            "previous_filename": "archived/example.txt",
+            "status": "renamed",
+        },
     ):
         evidence = sample(bridge=True)
         evidence["comparison"]["files"] = [item]
@@ -525,3 +575,56 @@ def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(path:
         missing["jobs"]["total_count"] = len(missing["jobs"]["jobs"])
         with pytest.raises(ValueError, match="required job inventory mismatch"):
             verify(missing)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("artifact_id", 0),
+        ("artifact_name", "release-latest"),
+        ("artifact_digest", "sha256:" + "e" * 64),
+        ("receipt_sha256", "incomplete"),
+    ],
+)
+def test_candidate_package_proof_rejects_forged_identity(field, value):
+    evidence = sample()
+    evidence["proof"]["package"][field] = value
+    with pytest.raises(ValueError):
+        verify(evidence)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("expired", True),
+        ("id", 790),
+        ("size_in_bytes", 0),
+        ("workflow_run", {"id": 43, "head_sha": HEAD}),
+    ],
+)
+def test_candidate_package_requires_actual_same_run_artifact(field, value):
+    evidence = sample()
+    evidence["package_artifact"][field] = value
+    with pytest.raises(ValueError, match="package artifact"):
+        verify(evidence)
+
+
+def test_candidate_package_missing_or_skipped_job_cannot_validate():
+    evidence = sample()
+    evidence["jobs"]["jobs"] = [
+        job for job in evidence["jobs"]["jobs"] if job["name"] != "candidate-package"
+    ]
+    evidence["jobs"]["total_count"] -= 1
+    with pytest.raises(ValueError, match="job inventory"):
+        verify(evidence)
+    evidence = sample()
+    evidence["proof"]["results"]["candidate-package"] = "skipped"
+    with pytest.raises(ValueError, match="required results"):
+        verify(evidence)
+
+
+def test_new_candidate_contract_does_not_reinterpret_historical_v1_proof():
+    evidence = sample()
+    evidence["proof"]["schema"] = "finance-candidate-validation-v1"
+    with pytest.raises(ValueError, match="unknown proof schema"):
+        verify(evidence)

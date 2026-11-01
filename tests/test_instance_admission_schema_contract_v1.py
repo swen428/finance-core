@@ -510,7 +510,7 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
 
     # A real owner/connection close and a new owner/session retain the pinned
     # application table, its declared foreign key/index, and its trigger effect.
-    assert _read_valid_extension(config) == (60, "event-1:a  b")
+    assert _read_valid_extension(config) == (61, "event-1:a  b")
     with acquire_production_owner(config) as owner:
         with production_read_operation(owner) as conn:
             foreign_keys = conn.execute(
@@ -559,7 +559,7 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
         database_identity_before_internal_tamper
     )
     assert active_authority_path.read_bytes() == active_authority_bytes
-    assert _read_valid_extension(config) == (60, "event-1:a  b")
+    assert _read_valid_extension(config) == (61, "event-1:a  b")
     assert _read_sequence_value(config) == 2
 
     # Process death after pending-journal sync produces no successful fence
@@ -622,7 +622,7 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
     assert state_path.read_bytes() == published_state
     history = json.loads(published_state)["history"]
     assert sum(entry["operation_id"] == "schema-fence-pending" for entry in history) == 1
-    assert _read_valid_extension(config) == (60, "event-1:a  b")
+    assert _read_valid_extension(config) == (61, "event-1:a  b")
 
     # Each mutation is applied to the same disposable SQLite file and then
     # restored byte-for-byte while preserving its pinned inode. This keeps the
@@ -645,6 +645,6 @@ def test_declared_schema_is_bound_reopens_and_seals_complete_database(
         assert after_id == before_id, label
         assert state_path.read_bytes() == authority_bytes, label
         assert not pending_path.exists(), label
-        assert _read_valid_extension(config) == (60, "event-1:a  b"), label
+        assert _read_valid_extension(config) == (61, "event-1:a  b"), label
 
     config.close()

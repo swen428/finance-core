@@ -52,7 +52,14 @@ def identity(env: dict[str, str]) -> dict[str, object]:
 
 
 def summarize(record: dict[str, object], needs: dict[str, object]) -> dict[str, object]:
-    if set(needs) != {"classify", "quality", "pytest", "bridge", "pytest-report"}:
+    if set(needs) != {
+        "classify",
+        "quality",
+        "pytest",
+        "bridge",
+        "pytest-report",
+        "candidate-package",
+    }:
         raise ValueError("required validation needs are missing or unexpected")
     classify = needs["classify"]
     if not isinstance(classify, dict):
@@ -71,11 +78,34 @@ def summarize(record: dict[str, object], needs: dict[str, object]) -> dict[str, 
         if not isinstance(job, dict) or job.get("result") != expected:
             raise ValueError(f"missing or unsuccessful required validation: {name}")
         results[name] = expected
+    package = needs["candidate-package"]
+    if not isinstance(package, dict) or not isinstance(package.get("outputs"), dict):
+        raise ValueError("candidate package outputs are missing")
+    package_outputs = package["outputs"]
+    if json.loads(str(package_outputs.get("identity", "null"))) != record:
+        raise ValueError("package and final checkout identities disagree")
+    artifact_id = str(package_outputs.get("artifact_id", ""))
+    artifact_digest = str(package_outputs.get("artifact_digest", "")).removeprefix("sha256:")
+    receipt_digest = str(package_outputs.get("receipt_sha256", ""))
+    artifact_name = f"candidate-package-v1-{record['run_id']}-{record['run_attempt']}"
+    if (
+        re.fullmatch(r"[1-9][0-9]*", artifact_id) is None
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_digest) is None
+        or re.fullmatch(r"[0-9a-f]{64}", receipt_digest) is None
+        or package_outputs.get("artifact_name") != artifact_name
+    ):
+        raise ValueError("candidate package artifact identity is incomplete")
     return {
-        "schema": "finance-candidate-validation-v1",
+        "schema": "finance-candidate-validation-v2",
         "identity": record,
         "bridge_required": bridge == "true",
         "results": results,
+        "package": {
+            "artifact_id": int(artifact_id),
+            "artifact_name": artifact_name,
+            "artifact_digest": "sha256:" + artifact_digest,
+            "receipt_sha256": receipt_digest,
+        },
     }
 
 

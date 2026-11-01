@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import sysconfig
 import tarfile
+import tempfile
 import textwrap
 import tomllib
 import zipfile
@@ -54,7 +56,8 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
+EXPECTED_LEDGER_DIGEST = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
+HISTORICAL_LEDGER_DIGEST_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
 EXPECTED_LEDGER_PREFIX_057 = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
 EXPECTED_AI_FEATURE_CONSTANTS = {
@@ -193,11 +196,11 @@ def test_bridge_distribution_inventory_rejects_missing_synthetic_060(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_rejects_extra_synthetic_061(
+def test_bridge_distribution_inventory_rejects_extra_synthetic_062(
     bridge_distribution_verifier,
 ) -> None:
-    payloads = _synthetic_060_migration_payloads()
-    payloads["finance_core/resources/migrations/061_synthetic_inventory.sql"] = (
+    payloads = _bridge_migration_payloads()
+    payloads["finance_core/resources/migrations/062_synthetic_inventory.sql"] = (
         b"-- synthetic inventory member; never written to source\n"
     )
 
@@ -205,16 +208,29 @@ def test_bridge_distribution_inventory_rejects_extra_synthetic_061(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_060(
+def test_bridge_distribution_inventory_accepts_reviewed_complete_061(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 60
+    assert len(payloads) == 61
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
 
 
+def test_bridge_distribution_inventory_accepts_actual_historical_060_prefix(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = {
+        name: body
+        for name, body in _bridge_migration_payloads().items()
+        if int(PurePosixPath(name).name[:3]) <= 60
+    }
+    assert len(payloads) == 60
+    assert bridge_distribution_verifier._migration_digest(payloads) == HISTORICAL_LEDGER_DIGEST_060
+
+
 @pytest.mark.parametrize(
-    "mutation", ["missing_060", "missing_middle", "extra_061", "duplicate_055"]
+    "mutation",
+    ["missing_060", "missing_middle", "extra_062", "replace_061_with_062", "duplicate_055"],
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
@@ -224,8 +240,11 @@ def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
         sequence = "060_" if mutation == "missing_060" else "028_"
         missing = next(name for name in payloads if PurePosixPath(name).name.startswith(sequence))
         del payloads[missing]
+    elif mutation == "replace_061_with_062":
+        removed = next(name for name in payloads if PurePosixPath(name).name.startswith("061_"))
+        payloads["finance_core/resources/migrations/062_replacement.sql"] = payloads.pop(removed)
     else:
-        sequence = "061" if mutation == "extra_061" else "055"
+        sequence = "062" if mutation == "extra_062" else "055"
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -269,10 +288,11 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 61))
+    assert len(paths) == 61
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 62))
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
+    assert _ledger_digest(paths[:60]) == HISTORICAL_LEDGER_DIGEST_060
     assert _ledger_digest(paths[:58]) == EXPECTED_LEDGER_PREFIX_058
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
 
@@ -280,7 +300,7 @@ def test_migration_resources_have_one_package_owned_source() -> None:
 def test_previous_migration_bytes_remain_unchanged_through_057() -> None:
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
+    assert len(paths) == 61
     assert _ledger_digest(paths[:57]) == EXPECTED_LEDGER_PREFIX_057
 
 
@@ -293,7 +313,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 60
+    assert len(paths) == 61
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 
@@ -462,6 +482,575 @@ def _probe_installed_package(
     return json.loads(completed.stdout)
 
 
+def _installed_runtime_dependencies(outside_dir: Path) -> Path:
+    """Provide the same pinned third-party bytes to every site-disabled package probe."""
+
+    dependency_root = outside_dir / "independent-correction-fixtures" / "runtime-dependencies"
+    dependency_root.mkdir(parents=True, exist_ok=True)
+    dependency_site = Path(sysconfig.get_paths()["purelib"])
+    for name in (
+        "pypdf",
+        "pypdf-6.21.2.dist-info",
+        "typing_extensions.py",
+        "typing_extensions-4.16.0.dist-info",
+    ):
+        source = dependency_site / name
+        target = dependency_root / name
+        if target.exists():
+            continue
+        if source.is_dir():
+            shutil.copytree(source, target)
+        elif source.is_file():
+            shutil.copyfile(source, target)
+        else:
+            raise AssertionError(f"required pinned runtime dependency is missing: {source}")
+    return dependency_root
+
+
+def _installed_recovery_restart_program() -> str:
+    """Fresh installed-only consumers reconstruct synthetic retained recovery material."""
+    return textwrap.dedent(
+        """
+        import hashlib
+        import json
+        import os
+        import sqlite3
+        import sys
+        from dataclasses import replace
+        from pathlib import Path
+
+        installed, dependencies, checkout, material_path = map(Path, sys.argv[1:5])
+        mode = sys.argv[5]
+        sys.path[:0] = [str(installed), str(dependencies)]
+        import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.lifecycle_v2.recovery as recovery
+        import finance_core.instance_admission as admission
+        m = json.loads(material_path.read_text())
+        b = m['config']
+        os.environ['FINANCE_RUNTIME_ROOT'] = str(Path(b['profile_root']) / 'runtime')
+        config = admission.TrustedInstanceConfig(
+            Path(b['control_root']), Path(m['support_root']), b['profile_id'],
+            layout=b['layout'], instance_id=b['instance_id'],
+            config_identity=b['config_identity'], core_identity=b['core_identity'],
+            approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+        )
+        cut = lifecycle.SnapshotCut.from_dict(m['cut'])
+        receipt = recovery.OldWriterIsolationReceipt(**m['receipt'])
+        authority = recovery.RecoveryAuthority('installed-synthetic-recovery', b'r' * 32)
+        binding = lifecycle.RuntimeBinding(**m['binding'])
+        class Port:
+            def source(self, conn, evidence_id):
+                return lifecycle.VerifiedSource(
+                    evidence_id, 'actor', 'chat',
+                    'message-1' if evidence_id == 'source1' else evidence_id,
+                    m['raw'], m['original_sha'], 1792800000,
+                )
+            def provider(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedObservation(**m['observations'][evidence_id])
+            def delivery(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedDelivery(
+                    evidence_id, expected.review_id, expected.review_sha256, 'actor', 'chat',
+                )
+            def action(self, conn, evidence_id, expected):
+                return lifecycle.VerifiedAction(
+                    evidence_id, expected.review_id, expected.review_sha256,
+                    expected.delivery_evidence_id, 'actor', 'chat',
+                )
+        port = Port()
+        pending = config.control_root / admission.PENDING_FILENAME
+        state_path = config.control_root / admission.STATE_FILENAME
+        def reconstruct(selected_cut=cut, selected_receipt=receipt):
+            return recovery.resume_held_restore(config, selected_cut, selected_receipt, authority)
+        def resume(held, operation_id='restore-admit', selected_receipt=receipt):
+            return recovery.resume_restore_promotion(
+                held, operation_id=operation_id, approval_ref='approved',
+                port=port, binding=binding, receipt=selected_receipt,
+                recovery_authority=authority,
+            )
+        refused = []
+        owner = None
+        try:
+            held = reconstruct()
+            assert held.new_binding == binding
+            observed_status = held.status
+            if mode == 'pending':
+                assert observed_status == 'RESTORE_ADMIT_PENDING'
+                pending_bytes = pending.read_bytes()
+                def refuse(name, action):
+                    try:
+                        action()
+                    except (lifecycle.LifecycleError, admission.InstanceAdmissionError):
+                        refused.append(name)
+                    else:
+                        raise AssertionError(name + ' unexpectedly accepted')
+                    assert pending.read_bytes() == pending_bytes
+                refuse('owner_while_pending', lambda: admission.acquire_production_owner(config))
+                refuse('generic_resume', lambda: admission.resume_authority_transition(
+                    config, operation_id='restore-admit', approval_ref='approved'))
+                refuse('wrong_operation', lambda: resume(held, operation_id='wrong-operation'))
+                wrong_cut = replace(cut, logical_database_sha256='0' * 64)
+                refuse('wrong_cut', lambda: resume(reconstruct(wrong_cut)))
+                wrong_receipt = replace(receipt, signature='0' * 64)
+                refuse('wrong_receipt', lambda: resume(
+                    reconstruct(selected_receipt=wrong_receipt), selected_receipt=wrong_receipt))
+                database = Path(b['profile_root']) / 'runtime/database/finance.db'
+                original_database = database.read_bytes()
+                with sqlite3.connect(database) as offline:
+                    offline.execute(
+                        "INSERT INTO participants(public_id,display_name) VALUES "
+                        "('installed-tamper','Installed tamper')")
+                offline.close()
+                try:
+                    refuse('changed_content', lambda: resume(reconstruct()))
+                finally:
+                    with database.open('r+b') as restored:
+                        restored.write(original_database)
+                        restored.truncate()
+                assert pending.read_bytes() == pending_bytes
+                assert resume(reconstruct())['state'] == 'ACTIVE'
+                assert not pending.exists()
+            else:
+                assert mode == 'completed' and observed_status == 'ACTIVE'
+                authority_before = state_path.read_bytes()
+                assert resume(held)['state'] == 'ACTIVE'
+                assert state_path.read_bytes() == authority_before
+                assert hashlib.sha256(authority_before).hexdigest() == m['completed_expectation'][
+                    'authority_sha256']
+            owner = admission.acquire_production_owner(config)
+            service = lifecycle.LedgerService(owner, port, binding, clock=lambda: 1792800001)
+            restored_fact = service.reader().get(m['posted']['record_id'])
+            assert restored_fact['fact_sha256'] == m['posted']['fact_sha256']
+            assert restored_fact['version'] == m['posted']['version']
+            if mode == 'pending':
+                active_source = service.capture('source-after-recovery', 'capture-after-recovery')
+                active_source_id = active_source.source_id
+            else:
+                active_source_id = m['completed_expectation']['post_promotion_source_id']
+                assert service.reader().source(active_source_id) is not None
+            audit = service.reader().full_audit()
+            assert audit['fact_version_count'] == 1 and audit['event_count'] == 6
+            state_bytes = state_path.read_bytes()
+            state = json.loads(state_bytes)
+            assert sum(entry['action'] == 'restore_admit' for entry in state['history']) == 1
+            if mode == 'completed':
+                assert audit == m['completed_expectation']['audit']
+                assert state['version'] == m['completed_expectation']['authority_version']
+            module_paths = [
+                Path(module.__file__).resolve()
+                for name, module in sys.modules.items()
+                if (name == 'finance_core' or name.startswith('finance_core.'))
+                and getattr(module, '__file__', None)
+            ]
+            installed_only = all(path.is_relative_to(installed) for path in module_paths)
+            assert installed_only and not any(
+                Path(entry or '.').resolve().is_relative_to(checkout) for entry in sys.path)
+            print(json.dumps({
+                'mode': mode, 'pid': os.getpid(), 'installed_only': installed_only,
+                'observed_status': observed_status, 'refused': refused,
+                'pending_retained_on_refusal': mode == 'pending',
+                'authority_sha256': hashlib.sha256(state_bytes).hexdigest(),
+                'authority_version': state['version'], 'audit': audit,
+                'post_promotion_source_id': active_source_id,
+                'record_id': restored_fact['record_id'],
+                'record_version': restored_fact['version'],
+                'fact_sha256': restored_fact['fact_sha256'],
+                'prepare_entry_sha256': held.restore_prepare_entry_sha256,
+            }, sort_keys=True))
+        finally:
+            if owner is not None:
+                owner.close()
+            config.close()
+        """
+    )
+
+
+def _probe_installed_lifecycle(
+    runtime_python: Path, install_dir: Path, outside_dir: Path
+) -> dict[str, object]:
+    """Exercise the opt-in API and appended schema using only installed bytes."""
+
+    program = textwrap.dedent(
+        """
+        import hashlib
+        import json
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+        import tempfile
+        from dataclasses import asdict
+        from pathlib import Path
+        from unittest.mock import patch
+
+        installed = Path(sys.argv[1]).resolve()
+        checkout = Path(sys.argv[2]).resolve()
+        outside = Path(sys.argv[3]).resolve()
+        dependency_root = Path(sys.argv[4]).resolve()
+        restart_program = sys.argv[5]
+        sys.path.insert(0, str(dependency_root))
+        sys.path.insert(0, str(installed))
+        import finance_core
+        import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.instance_admission as admission
+        import finance_core.lifecycle_v2.recovery as recovery
+        from finance_core.lifecycle_v2.contracts import digest
+        from finance_core.profile_layout import product_root, profile_root
+        from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
+
+        binding = lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat')
+        refused_owner = False
+        try:
+            lifecycle.LedgerService(None, None, binding)
+        except lifecycle.LifecycleError:
+            refused_owner = True
+        refused_runtime = False
+        try:
+            lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat',
+                                     environment='production')
+        except lifecycle.LifecycleError:
+            refused_runtime = True
+
+        paths = migration_resource_paths()
+        migration = paths[-1]
+        connection = sqlite3.connect(':memory:')
+        connection.executescript(migration.read_text())
+        tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'l2_%'")}
+        connection.close()
+        with tempfile.TemporaryDirectory(prefix='installed-lifecycle-', dir=outside) as scratch:
+            scratch = Path(scratch)
+            layout = 'mac' if sys.platform == 'darwin' else 'linux'
+            support = scratch / ('Application Support' if layout == 'mac' else 'finance-codex')
+            support.mkdir(mode=0o700)
+            product = product_root(support, layout)
+            profile = profile_root(support, 'synthetic', layout)
+            if product != support:
+                product.mkdir(mode=0o700)
+            for directory in (
+                profile.parent, profile, profile / 'runtime', profile / 'runtime/database',
+                profile / 'workspace', profile / 'workspace/database', profile / 'backups',
+                profile / 'work', profile / 'restore', scratch / 'control',
+            ):
+                directory.mkdir(mode=0o700)
+            manifest = profile / 'profile.json'
+            manifest.write_text(json.dumps({
+                'profile_id': 'synthetic', 'runtime_root': str(profile / 'runtime'),
+                'workspace_root': str(profile / 'workspace'),
+            }))
+            manifest.chmod(0o600)
+            os.environ['FINANCE_RUNTIME_ROOT'] = str(profile / 'runtime')
+            cfg = admission.TrustedInstanceConfig(
+                scratch / 'control', support, 'synthetic', layout=layout,
+                instance_id='synthetic-instance',
+                config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+            )
+            owner = None
+            new_config = None
+            new_owner = None
+            try:
+                admission.prepare_production_profile(
+                    cfg, operation_id='prepare', approval_ref='approved').close()
+                admission.admit_production_instance(
+                    cfg, operation_id='admit', approval_ref='approved')
+                owner = admission.acquire_production_owner(cfg)
+                raw = '2026-10-24 Cafe SGD 12.00'
+                original_sha = hashlib.sha256(raw.encode()).hexdigest()
+                operations = []
+                for index, (field, value) in enumerate((
+                    ('amount', '12.00'), ('currency', 'SGD'),
+                    ('merchant', 'Cafe'), ('transaction_date', '2026-10-24'),
+                )):
+                    operation = {
+                        'operation_id': f'o{index}', 'op': 'set', 'field': field,
+                        'evidence': [{
+                            'ref': 'source', 'start': raw.index(value),
+                            'end': raw.index(value) + len(value), 'quote': value,
+                            'role': 'replacement_value',
+                        }],
+                    }
+                    if field == 'transaction_date':
+                        operation['date_expression'] = {
+                            'kind': 'absolute_date', 'year': 2026, 'month': 10, 'day': 24,
+                        }
+                    else:
+                        operation['value'] = value
+                    operations.append(operation)
+                response = json.dumps({
+                    'schema': 'finance-independent-ai-result-v2',
+                    'outcome': 'proposal', 'intent': 'personal_expense',
+                    'operations': operations, 'unresolved': [],
+                    'coverage': [{
+                        'start': 0, 'end': len(raw), 'label': 'resolved_instruction',
+                        'operation_ids': [item['operation_id'] for item in operations],
+                        'question_ids': [],
+                    }],
+                })
+                class Port:
+                    bad_actor = False
+                    def __init__(self):
+                        self.observations = {}
+                    def source(self, conn, evidence_id):
+                        return lifecycle.VerifiedSource(
+                            evidence_id, 'other' if self.bad_actor else 'actor', 'chat',
+                            'message-1', raw, original_sha, 1792800000,
+                        )
+                    def provider(self, conn, evidence_id, expected):
+                        if evidence_id not in self.observations:
+                            self.observations[evidence_id] = lifecycle.VerifiedObservation(
+                                evidence_id, expected.source_id, 'actor', response,
+                                digest(asdict(expected)), expected.projection['reply_text'],
+                            )
+                        return self.observations[evidence_id]
+                    def delivery(self, conn, evidence_id, expected):
+                        return lifecycle.VerifiedDelivery(
+                            evidence_id, expected.review_id, expected.review_sha256,
+                            'actor', 'chat',
+                        )
+                    def action(self, conn, evidence_id, expected):
+                        return lifecycle.VerifiedAction(
+                            evidence_id, expected.review_id, expected.review_sha256,
+                            expected.delivery_evidence_id, 'actor', 'chat',
+                        )
+                port = Port()
+                service = lifecycle.LedgerService(owner, port, binding, clock=lambda: 1792800000)
+                port.bad_actor = True
+                actor_refused = False
+                try:
+                    service.capture('source1', 'capture-bad-actor')
+                except lifecycle.LifecycleError:
+                    actor_refused = True
+                port.bad_actor = False
+                source = service.capture('source1', 'capture1')
+                retry_same = service.capture('source1', 'capture1') == source
+                proposal = service.propose(source.source_id, 'observation1', 0, 'propose1')
+                review = service.prepare_review(proposal.proposal_id, proposal.version)
+                service.record_delivery(review.review_id, 'delivery1')
+                posted = service.confirm(review.review_id, 'action1', 'confirm1')
+                audit = service.reader().full_audit()
+                guarded_capture = {
+                    'actor_refused': actor_refused,
+                    'retry_same': retry_same,
+                    'source_sha256': source.source_sha256,
+                    'event_count': audit['event_count'],
+                    'fact_version_count': audit['fact_version_count'],
+                }
+                snapshot = scratch / 'sealed.sqlite'
+                cut = service.seal_snapshot(snapshot)
+                new_root = scratch / 'successor'
+                new_root.mkdir(mode=0o700)
+                new_support = new_root / (
+                    'Application Support' if layout == 'mac' else 'finance-codex'
+                )
+                new_support.mkdir(mode=0o700)
+                new_product = product_root(new_support, layout)
+                new_profile = profile_root(new_support, 'synthetic', layout)
+                if new_product != new_support:
+                    new_product.mkdir(mode=0o700)
+                for directory in (
+                    new_profile.parent, new_profile, new_profile / 'runtime',
+                    new_profile / 'runtime/database', new_profile / 'workspace',
+                    new_profile / 'workspace/database', new_profile / 'backups',
+                    new_profile / 'work', new_profile / 'restore', new_root / 'control',
+                ):
+                    directory.mkdir(mode=0o700)
+                new_manifest = new_profile / 'profile.json'
+                new_manifest.write_text(json.dumps({
+                    'profile_id': 'synthetic', 'runtime_root': str(new_profile / 'runtime'),
+                    'workspace_root': str(new_profile / 'workspace'),
+                }))
+                new_manifest.chmod(0o600)
+                new_runtime = new_profile / 'runtime'
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(new_runtime)
+                new_config = admission.TrustedInstanceConfig(
+                    new_root / 'control', new_support, 'synthetic', layout=layout,
+                    instance_id='successor-instance',
+                    config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                    approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+                )
+                new_binding = lifecycle.RuntimeBinding(
+                    new_config.instance_id, 'generation-2', 'actor', 'chat',
+                )
+                held = recovery.prepare_restored_profile(
+                    new_config, snapshot, cut, new_binding=new_binding,
+                    operation_id='restore-prepare', approval_ref='approved',
+                )
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(profile / 'runtime')
+                admission.fence_production_instance(
+                    cfg, operation_id='old-fence', approval_ref='approved',
+                )
+                owner.close()
+                owner = None
+                authority = recovery.RecoveryAuthority(
+                    'installed-synthetic-recovery', b'r' * 32,
+                )
+                isolation = authority.issue_old_writer_isolation(
+                    cfg, held, operation_id='designate', approval_ref='approved',
+                )
+                cfg.close()
+                support.rename(scratch / 'unavailable-old-support')
+                old_control = scratch / 'control'
+                old_control.rename(scratch / 'unavailable-old-control')
+                old_root_unavailable = not support.exists() and not old_control.exists()
+                os.environ['FINANCE_RUNTIME_ROOT'] = str(new_runtime)
+                with patch.object(recovery, '_publish', side_effect=OSError(
+                    'synthetic installed process loss before authority publication'
+                )):
+                    try:
+                        recovery.promote_with_isolation_receipt(
+                            held, isolation, authority, operation_id='restore-admit',
+                            approval_ref='approved', port=port, binding=new_binding,
+                        )
+                    except OSError as error:
+                        assert 'synthetic installed process loss' in str(error)
+                    else:
+                        raise AssertionError('Synthetic promotion interruption did not run')
+                assert (new_config.control_root / admission.PENDING_FILENAME).is_file()
+                retained = {
+                    'config': new_config._binding, 'support_root': str(new_support),
+                    'cut': asdict(cut), 'receipt': asdict(isolation),
+                    'binding': asdict(new_binding), 'raw': raw, 'original_sha': original_sha,
+                    'observations': {key: asdict(value)
+                                     for key, value in port.observations.items()},
+                    'posted': asdict(posted),
+                }
+                material_path = scratch / 'retained-recovery.json'
+                material_path.write_text(json.dumps(retained))
+                material_path.chmod(0o600)
+                new_config.close()
+                new_config = None
+                fresh_proofs = []
+                for mode in ('pending', 'completed'):
+                    child = subprocess.run(
+                        [sys.executable, '-I', '-S', '-c', restart_program,
+                         str(installed), str(dependency_root), str(checkout),
+                         str(material_path), mode],
+                        cwd=outside,
+                        env={'PATH': os.environ.get('PATH', ''),
+                             'FINANCE_RUNTIME_ROOT': str(new_runtime)},
+                        capture_output=True, text=True, timeout=180,
+                    )
+                    assert child.returncode == 0, child.stdout[-32768:] + child.stderr[-32768:]
+                    fresh = json.loads(child.stdout)
+                    assert fresh['pid'] != os.getpid() and fresh['installed_only']
+                    fresh_proofs.append(fresh)
+                    if mode == 'pending':
+                        retained['completed_expectation'] = fresh
+                        material_path.write_text(json.dumps(retained))
+                assert fresh_proofs[0]['pid'] != fresh_proofs[1]['pid']
+                new_config = admission.TrustedInstanceConfig(
+                    new_root / 'control', new_support, 'synthetic', layout=layout,
+                    instance_id='successor-instance',
+                    config_identity='synthetic-config-v1', core_identity='synthetic-core-v1',
+                    approval_verifier=lambda ref, action, owner_binding: ref == 'approved',
+                )
+                promoted = admission.inspect_instance_admission(new_config)
+                new_owner = admission.acquire_production_owner(new_config)
+                restored_service = lifecycle.LedgerService(new_owner, port, new_binding)
+                restored_fact = restored_service.reader().get(posted.record_id)
+                recovery_proof = {
+                    'cut_format': cut.format,
+                    'logical_digest_format': cut.logical_digest_format,
+                    'logical_database_sha256': cut.logical_database_sha256,
+                    'source_binding_sha256': cut.source_binding_sha256,
+                    'snapshot_sha256': cut.database_sha256,
+                    'source_binding_matches': cut.source_binding_sha256 == cfg.binding_sha256,
+                    'snapshot_file_matches': (
+                        cut.database_sha256 == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+                    ),
+                    'cut_contains_posted_fact': cut.facts == ((
+                        posted.record_id, posted.version, posted.fact_sha256,
+                    ),),
+                    'receipt_schema': json.loads(isolation.material_json)['schema'],
+                    'held_status': held.status,
+                    'new_instance_id': new_binding.instance_id,
+                    'new_generation': new_binding.generation,
+                    'old_root_unavailable': old_root_unavailable,
+                    'promoted_state': promoted['state'],
+                    'record_id': restored_fact['record_id'],
+                    'record_version': restored_fact['version'],
+                    'record_amount': restored_fact['values']['amount'],
+                    'fact_sha256_matches': restored_fact['fact_sha256'] == posted.fact_sha256,
+                    'fresh_process_retries': fresh_proofs,
+                }
+            finally:
+                if new_owner is not None:
+                    new_owner.close()
+                if owner is not None:
+                    owner.close()
+                if new_config is not None:
+                    new_config.close()
+                cfg.close()
+        module_paths = sorted({
+            Path(module.__file__).resolve()
+            for name, module in sys.modules.items()
+            if (name == 'finance_core' or name.startswith('finance_core.'))
+            and getattr(module, '__file__', None)
+        } | {migration.resolve()})
+        print(json.dumps({
+            'root_api': finance_core.API_CONTRACT_VERSION,
+            'lifecycle_exports': sorted(lifecycle.__all__),
+            'refused_owner': refused_owner,
+            'refused_runtime': refused_runtime,
+            'migration_count': len(paths),
+            'migration_digest': MIGRATION_LEDGER_DIGEST,
+            'migration_name': migration.name,
+            'migration_sha256': hashlib.sha256(migration.read_bytes()).hexdigest(),
+            'lifecycle_tables': sorted(tables),
+            'guarded_capture': guarded_capture,
+            'recovery': recovery_proof,
+            'module_paths': [str(path) for path in module_paths],
+            'installed_only': all(path.is_relative_to(installed) for path in module_paths)
+                and not any(Path(path or '.').resolve().is_relative_to(checkout)
+                            for path in sys.path),
+        }, sort_keys=True))
+        """
+    )
+    with tempfile.TemporaryDirectory(prefix="installed-lifecycle-import-", dir=outside_dir) as root:
+        dependency_root = _installed_runtime_dependencies(outside_dir)
+        import_runtime = Path(root) / "runtime"
+        import_runtime.mkdir(mode=0o700)
+        (import_runtime / "database").mkdir(mode=0o700)
+        command = [
+            str(runtime_python),
+            "-I",
+            "-S",
+            "-c",
+            program,
+            str(install_dir),
+            str(REPOSITORY_ROOT),
+            str(outside_dir),
+            str(dependency_root),
+            _installed_recovery_restart_program(),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                cwd=outside_dir,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "FINANCE_RUNTIME_ROOT": str(import_runtime.resolve(strict=True)),
+                },
+                capture_output=True,
+                text=True,
+                timeout=INSTALLED_INSTANCE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError(
+                f"installed lifecycle probe timeout after {INSTALLED_INSTANCE_TIMEOUT_SECONDS}s; "
+                f"stdout={_bounded_instance_output(error.stdout)!r}; "
+                f"stderr={_bounded_instance_output(error.stderr)!r}"
+            ) from None
+    if completed.returncode != 0:
+        raise AssertionError(
+            f"installed lifecycle probe exit {completed.returncode}; "
+            f"stdout={completed.stdout[-INSTALLED_INSTANCE_STREAM_LIMIT:]!r}; "
+            f"stderr={completed.stderr[-INSTALLED_INSTANCE_STREAM_LIMIT:]!r}"
+        )
+    return json.loads(completed.stdout)
+
+
 def _probe_installed_correction_flow(
     runtime_python: Path,
     install_dir: Path,
@@ -510,23 +1099,7 @@ def _probe_installed_correction_flow(
         "class MonkeyPatch: pass\n",
         encoding="utf-8",
     )
-    dependency_root = helper_root / "runtime-dependencies"
-    dependency_root.mkdir(exist_ok=True)
-    if not any(dependency_root.iterdir()):
-        dependency_site = Path(sysconfig.get_paths()["purelib"])
-        for name in (
-            "pypdf",
-            "pypdf-6.21.2.dist-info",
-            "typing_extensions.py",
-            "typing_extensions-4.16.0.dist-info",
-        ):
-            source = dependency_site / name
-            if source.is_dir():
-                shutil.copytree(source, dependency_root / name)
-            elif source.is_file():
-                shutil.copyfile(source, dependency_root / name)
-            else:
-                raise AssertionError(f"required pinned runtime dependency is missing: {source}")
+    _installed_runtime_dependencies(outside_dir)
     probe_path = helper_root / "installed_correction_probe.py"
     shutil.copyfile(REPOSITORY_ROOT / "tests" / "installed_correction_probe.py", probe_path)
     completed = subprocess.run(
@@ -1123,6 +1696,87 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
 
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
+        lifecycle = _probe_installed_lifecycle(runtime_python, install_dir, outside_dir)
+        assert lifecycle["root_api"] == "finance-core-api-v1"
+        assert {"LedgerService", "LedgerReader", "RuntimeBinding", "VerifiedSource"}.issubset(
+            lifecycle["lifecycle_exports"]
+        )
+        assert lifecycle["refused_owner"] and lifecycle["refused_runtime"]
+        assert lifecycle["migration_count"] == 61
+        assert lifecycle["migration_digest"] == EXPECTED_LEDGER_DIGEST
+        assert lifecycle["migration_name"] == "061_lifecycle_v2.sql"
+        assert lifecycle["guarded_capture"]["actor_refused"] is True
+        assert lifecycle["guarded_capture"]["retry_same"] is True
+        assert lifecycle["guarded_capture"]["event_count"] == 5
+        assert lifecycle["guarded_capture"]["fact_version_count"] == 1
+        recovery = lifecycle["recovery"]
+        assert recovery["cut_format"] == "lifecycle-snapshot-cut-v3"
+        assert recovery["logical_digest_format"] == "core-logical-database-v1"
+        assert len(recovery["logical_database_sha256"]) == 64
+        assert len(recovery["source_binding_sha256"]) == 64
+        assert len(recovery["snapshot_sha256"]) == 64
+        assert recovery["source_binding_matches"] is True
+        assert recovery["snapshot_file_matches"] is True
+        assert recovery["cut_contains_posted_fact"] is True
+        assert recovery["receipt_schema"] == "old-writer-isolation-v3"
+        assert recovery["held_status"] == "RESTORE_HELD"
+        assert recovery["new_instance_id"] == "successor-instance"
+        assert recovery["new_generation"] == "generation-2"
+        assert recovery["old_root_unavailable"] is True
+        assert recovery["promoted_state"] == "ACTIVE"
+        assert recovery["record_id"]
+        assert recovery["record_version"] == 1
+        assert recovery["record_amount"] == "12.00"
+        assert recovery["fact_sha256_matches"] is True
+        pending_retry, completed_retry = recovery["fresh_process_retries"]
+        assert pending_retry["observed_status"] == "RESTORE_ADMIT_PENDING"
+        assert completed_retry["observed_status"] == "ACTIVE"
+        assert pending_retry["mode"] == "pending" and completed_retry["mode"] == "completed"
+        assert pending_retry["pid"] != completed_retry["pid"]
+        assert pending_retry["installed_only"] and completed_retry["installed_only"]
+        assert pending_retry["pending_retained_on_refusal"] is True
+        assert set(pending_retry["refused"]) == {
+            "owner_while_pending",
+            "generic_resume",
+            "wrong_operation",
+            "wrong_cut",
+            "wrong_receipt",
+            "changed_content",
+        }
+        for key in (
+            "authority_sha256",
+            "authority_version",
+            "audit",
+            "post_promotion_source_id",
+            "record_id",
+            "record_version",
+            "fact_sha256",
+            "prepare_entry_sha256",
+        ):
+            assert pending_retry[key] == completed_retry[key]
+        assert completed_retry["audit"]["event_count"] == 6
+        assert completed_retry["audit"]["fact_version_count"] == 1
+        assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
+            lifecycle["lifecycle_tables"]
+        )
+        assert lifecycle["installed_only"] is True
+        print(
+            "INSTALLED_LIFECYCLE_PROOF "
+            + json.dumps(
+                {
+                    "artifact": install_dir.name,
+                    "artifact_sha256": hashlib.sha256(
+                        (
+                            wheels[0]
+                            if install_dir == wheel_install_dir
+                            else source_distributions[0]
+                        ).read_bytes()
+                    ).hexdigest(),
+                    **lifecycle,
+                },
+                sort_keys=True,
+            )
+        )
         assert "pypdf==6.21.2" in payload["runtime_dependencies"]
         assert 'Pillow==13.0.0; extra == "media"' in payload["runtime_dependencies"]
         assert 'pillow-heif==1.8.0; extra == "media"' in payload["runtime_dependencies"]
@@ -1259,9 +1913,9 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.7"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 60
-        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 61))
-        assert payload["migration_filenames"][-1] == "060_independent_corrections.sql"
+        assert payload["migration_count"] == 61
+        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 62))
+        assert payload["migration_filenames"][-1] == "061_lifecycle_v2.sql"
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
@@ -1372,3 +2026,363 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         for name, expected_payload in expected_package_payloads.items():
             assert observed_source_payloads[name] == expected_payload
         _assert_safe_text_payloads(payloads)
+
+
+def _candidate_package_producer():
+    path = REPOSITORY_ROOT / ".github/scripts/build_candidate_package.py"
+    spec = importlib.util.spec_from_file_location("candidate_package_producer_test", path)
+    assert spec and spec.loader
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+def _candidate_package_repository(tmp_path, *, complete_core=False):
+    producer = _candidate_package_producer()
+    root = tmp_path / "tracked-source"
+    root.mkdir()
+    paths = producer.PROJECT_INPUTS | {
+        "requirements-dev.txt",
+        ".github/scripts/build_candidate_package.py",
+    }
+    if complete_core:
+        tracked = subprocess.check_output(
+            ["git", "ls-files", "-z", "--", "finance_core"], cwd=REPOSITORY_ROOT
+        )
+        paths |= {name.decode() for name in tracked.split(b"\0") if name}
+    for name in paths:
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(REPOSITORY_ROOT / name, target)
+        target.chmod((REPOSITORY_ROOT / name).stat().st_mode & 0o777)
+    if not complete_core:
+        for name, body in {
+            "finance_core/__init__.py": b'"""Synthetic package only."""\n',
+            "finance_core/resources/__init__.py": b"",
+            "finance_core/resources/example.json": b"{}\n",
+            "finance_core/resources/migrations/001_fixture.sql": b"-- synthetic\n",
+        }.items():
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Candidate Package Test",
+            "-c",
+            "user.email=package@example.invalid",
+            "commit",
+            "-qm",
+            "synthetic tracked fixture",
+        ],
+        cwd=root,
+        check=True,
+    )
+    identity = {
+        "head_sha": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "tested_sha": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip(),
+        "tested_tree": subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip(),
+    }
+    return producer, root, identity
+
+
+@pytest.mark.parametrize("change", ["dirty", "untracked", "wrong-head", "symlink", "export-ignore"])
+def test_candidate_package_snapshot_refuses_source_drift(tmp_path, change):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    if change == "dirty":
+        (root / "finance_core/__init__.py").write_bytes(b"unreviewed\n")
+    elif change == "untracked":
+        (root / "finance_core/untracked.py").write_bytes(b"untracked\n")
+    elif change == "wrong-head":
+        identity["head_sha"] = "a" * 40
+    elif change == "symlink":
+        (root / "finance_core/link.py").symlink_to("__init__.py")
+    else:
+        (root / ".gitattributes").write_text("finance_core/__init__.py export-ignore\n")
+    if change in {"symlink", "export-ignore"}:
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Package Test",
+                "-c",
+                "user.email=package@example.invalid",
+                "commit",
+                "-qm",
+                "unsafe synthetic fixture",
+            ],
+            cwd=root,
+            check=True,
+        )
+        identity["head_sha"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        identity["tested_tree"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip()
+    with pytest.raises(ValueError):
+        producer.tracked_snapshot(root, identity)
+
+
+def _candidate_package_archives(tmp_path, payloads, *, kind=None, mutation=None):
+    producer = _candidate_package_producer()
+    core = producer.package_payloads(payloads)
+    wheel = tmp_path / "finance_core-0.1.7-py3-none-any.whl"
+    sdist = tmp_path / "finance_core-0.1.7.tar.gz"
+    wheel_members = {
+        **core,
+        "finance_core-0.1.7.dist-info/METADATA": producer.sdist_metadata(payloads, "0.1.7")[
+            "PKG-INFO"
+        ],
+        "finance_core-0.1.7.dist-info/RECORD": b"",
+        "finance_core-0.1.7.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
+    }
+    sdist_members = {
+        **core,
+        **{name: payloads[name] for name in producer.PROJECT_INPUTS},
+        **producer.sdist_metadata(payloads, "0.1.7"),
+    }
+    source_paths = (
+        set(core)
+        | producer.PROJECT_INPUTS
+        | {name for name in sdist_members if name.startswith("finance_core.egg-info/")}
+        | {"finance_core.egg-info/SOURCES.txt"}
+    )
+    sdist_members["finance_core.egg-info/SOURCES.txt"] = (
+        "\n".join(sorted(source_paths)) + "\n"
+    ).encode()
+    selected = wheel_members if kind == "wheel" else sdist_members
+    first = "finance_core/__init__.py"
+    if mutation == "missing":
+        del selected[first]
+    elif mutation == "changed":
+        selected[first] = b"changed\n"
+    elif mutation == "extra":
+        selected["finance_core/extra.py"] = b"extra\n"
+    elif mutation == "unsafe":
+        selected["../escape.py"] = b"unsafe\n"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for name, body in wheel_members.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (
+                0o120777
+                if kind == "wheel" and mutation == "symlink" and name == first
+                else 0o100644
+            ) << 16
+            archive.writestr(info, body)
+        if kind == "wheel" and mutation == "duplicate":
+            archive.writestr(first, core[first])
+    with tarfile.open(sdist, "w:gz") as archive:
+        for name, body in sdist_members.items():
+            member = tarfile.TarInfo("finance_core-0.1.7/" + name)
+            member.size = len(body)
+            if kind == "sdist" and mutation == "symlink" and name == first:
+                member.type = tarfile.SYMTYPE
+                member.linkname = "/outside"
+            archive.addfile(member, io.BytesIO(body))
+        if kind == "sdist" and mutation == "duplicate":
+            member = tarfile.TarInfo("finance_core-0.1.7/" + first)
+            member.size = len(core[first])
+            archive.addfile(member, io.BytesIO(core[first]))
+    return wheel, sdist
+
+
+@pytest.mark.parametrize("kind", ["wheel", "sdist"])
+@pytest.mark.parametrize(
+    "mutation", ["missing", "changed", "extra", "unsafe", "symlink", "duplicate"]
+)
+def test_candidate_package_archives_reject_incomplete_or_unsafe_bytes(tmp_path, kind, mutation):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads, kind=kind, mutation=mutation)
+    with pytest.raises(ValueError):
+        producer.verify_distributions(wheel, sdist, payloads, "0.1.7")
+
+
+def test_candidate_package_real_locked_build_and_outside_import(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path, complete_core=True)
+    output = tmp_path / "candidate-artifact"
+    before = subprocess.check_output(["git", "status", "--porcelain"], cwd=root)
+    record = producer.build(root, output, identity)
+    assert record["status"] == "BUILT_NOT_VALIDATED"
+    assert record["identity"] == identity
+    assert record["recipe"]["tools"] == {"build": "1.6.1", "setuptools": "84.1.0"}
+    inventory_bytes = (output / "source-inventory.json").read_bytes()
+    assert hashlib.sha256(inventory_bytes).hexdigest() == record["source_inventory_sha256"]
+    files = json.loads(inventory_bytes)["files"]
+    assert (
+        len(files)
+        == len(subprocess.check_output(["git", "ls-files", "-z"], cwd=root).split(b"\0")) - 1
+    )
+    assert set(record["artifacts"]) == {
+        "finance_core-0.1.7-py3-none-any.whl",
+        "finance_core-0.1.7.tar.gz",
+    }
+    for name, artifact in record["artifacts"].items():
+        assert hashlib.sha256((output / name).read_bytes()).hexdigest() == artifact["sha256"]
+        assert (output / name).stat().st_size == artifact["size_bytes"]
+    assert subprocess.check_output(["git", "status", "--porcelain"], cwd=root) == before == b""
+    installed = tmp_path / "outside-installed"
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            "--target",
+            str(installed),
+            str(output / "finance_core-0.1.7-py3-none-any.whl"),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+    script = (
+        "import sys,pathlib;sys.path.insert(0,sys.argv[1]);"
+        "import finance_core.lifecycle_v2 as api;"
+        "assert api.LedgerService;"
+        "assert pathlib.Path(api.__file__).resolve().is_relative_to("
+        "pathlib.Path(sys.argv[1]).resolve())"
+    )
+    subprocess.run(
+        [sys.executable, "-I", "-c", script, str(installed)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def test_candidate_package_complete_archive_pair_passes(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    producer.verify_distributions(wheel, sdist, payloads, "0.1.7")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "setup.py",
+        "arbitrary.txt",
+        "bin/launcher",
+        "finance_core.egg-info/entry_points.txt",
+        "changed-config",
+        "changed-requires",
+        "changed-pkg-info",
+        "changed-top-level",
+        "changed-links",
+        "sources-extra",
+        "sources-missing",
+        "sources-duplicate",
+        "sources-traversal",
+        "executable-config",
+        "missing-metadata",
+        "unknown-directory",
+        "duplicate-directory",
+    ],
+)
+def test_candidate_package_sdist_rejects_undeclared_or_changed_metadata(tmp_path, mutation):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    members = []
+    with tarfile.open(sdist, "r:gz") as archive:
+        for member in archive:
+            members.append((member, archive.extractfile(member).read()))
+    prefix = "finance_core-0.1.7/"
+    sources = "finance_core.egg-info/SOURCES.txt"
+    target = {
+        "changed-config": "setup.cfg",
+        "executable-config": "setup.cfg",
+        "changed-requires": "finance_core.egg-info/requires.txt",
+        "changed-pkg-info": "PKG-INFO",
+        "changed-top-level": "finance_core.egg-info/top_level.txt",
+        "changed-links": "finance_core.egg-info/dependency_links.txt",
+        "missing-metadata": "finance_core.egg-info/top_level.txt",
+        **{
+            name: sources
+            for name in (
+                "sources-extra",
+                "sources-missing",
+                "sources-duplicate",
+                "sources-traversal",
+            )
+        },
+    }.get(mutation)
+    revised = []
+    for member, body in members:
+        if member.name == prefix + str(target):
+            if mutation == "missing-metadata":
+                continue
+            if mutation == "executable-config":
+                member.mode = 0o755
+            elif mutation == "sources-extra":
+                body += b"setup.py\n"
+            elif mutation == "sources-missing":
+                body = body.split(b"\n", 1)[1]
+            elif mutation == "sources-duplicate":
+                body += body.split(b"\n", 1)[0] + b"\n"
+            elif mutation == "sources-traversal":
+                body += b"../outside.py\n"
+            else:
+                body = b"undeclared generated metadata\n"
+            member.size = len(body)
+        revised.append((member, body))
+    if target is None:
+        if mutation in {"unknown-directory", "duplicate-directory"}:
+            member = tarfile.TarInfo(
+                prefix + ("unexpected" if mutation == "unknown-directory" else "finance_core")
+            )
+            member.type = tarfile.DIRTYPE
+            revised.append((member, b""))
+            if mutation == "duplicate-directory":
+                revised.append((member, b""))
+        else:
+            member = tarfile.TarInfo(prefix + mutation)
+            body = b"raise RuntimeError('undeclared root hook')\n"
+            member.size = len(body)
+            member.mode = 0o755 if mutation in {"setup.py", "bin/launcher"} else 0o644
+            revised.append((member, body))
+    altered = tmp_path / "altered-sdist.tar.gz"
+    with tarfile.open(altered, "w:gz") as archive:
+        for member, body in revised:
+            archive.addfile(member, io.BytesIO(body))
+    with pytest.raises(ValueError):
+        producer.verify_distributions(wheel, altered, payloads, "0.1.7")
+
+
+def test_candidate_package_metadata_cannot_collectively_override_source_dependencies(tmp_path):
+    producer, root, identity = _candidate_package_repository(tmp_path)
+    payloads, _ = producer.tracked_snapshot(root, identity)
+    wheel, sdist = _candidate_package_archives(tmp_path, payloads)
+    altered_wheel = tmp_path / "altered-wheel.whl"
+    with zipfile.ZipFile(wheel) as original, zipfile.ZipFile(altered_wheel, "w") as altered:
+        for member in original.infolist():
+            body = original.read(member)
+            if member.filename.endswith("/METADATA"):
+                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+            altered.writestr(member, body)
+    altered_sdist = tmp_path / "altered-sdist.tar.gz"
+    with tarfile.open(sdist, "r:gz") as original, tarfile.open(altered_sdist, "w:gz") as altered:
+        for member in original:
+            body = original.extractfile(member).read()
+            if member.name.endswith("/PKG-INFO"):
+                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+            member.size = len(body)
+            altered.addfile(member, io.BytesIO(body))
+    with pytest.raises(ValueError, match="metadata differs from source recipe"):
+        producer.verify_distributions(altered_wheel, altered_sdist, payloads, "0.1.7")
