@@ -7,7 +7,7 @@ Finance Bridge declares its Node dependencies in
 
 Direct runtime dependencies and their declared licenses:
 
-- `pypdf` 6.21.2 — BSD-3-Clause.
+- `pypdf` 6.21.4 — BSD-3-Clause.
 - `typing-extensions` 4.16.0 — PSF-2.0.
 - `fs-ext` 2.1.1 — MIT.
 - `typebox` 1.3.3 — MIT.

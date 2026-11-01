@@ -71,7 +71,7 @@ PYTHON_METADATA_SINGLE_FIELDS = {
 PYTHON_METADATA_MULTI_FIELDS = {"Requires-Dist", "License-File", "Dynamic"}
 # This reviewed allowlist is independent of candidate package metadata. Keep
 # wheel and sdist checks bound to the same explicitly approved dependencies.
-APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.21.2", "typing-extensions==4.16.0")
+APPROVED_RUNTIME_DEPENDENCIES = ("pypdf==6.21.4", "typing-extensions==4.16.0")
 APPROVED_MEDIA_DEPENDENCIES = ("Pillow==13.0.0", "pillow-heif==1.8.0")
 
 

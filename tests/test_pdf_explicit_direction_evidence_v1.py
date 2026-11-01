@@ -218,6 +218,7 @@ def test_fingerprint_binds_page_row_sign_dates_versions_and_direction() -> None:
         replace(base, parser_version="pdf-template-parser-v3"),
         replace(base, template_version="synthetic-bank-v3"),
         replace(base, extraction_version="pypdf-6.16.1-text-extraction-v3"),
+        replace(base, extraction_version="pypdf-6.21.2-text-extraction-v4"),
         replace(base, extraction_version=PDF_TEXT_EXTRACTION_VERSION),
         replace(base, amount_direction=StatementAmountDirection.CREDIT),
     )
@@ -240,6 +241,10 @@ def test_fingerprint_binds_page_row_sign_dates_versions_and_direction() -> None:
         (
             "pypdf-6.16.1-text-extraction-v3",
             "04f5f7cec884c9840d08178ccd28ae3e5bde87e9ec91525c0aa8b15193e8325d",
+        ),
+        (
+            "pypdf-6.21.2-text-extraction-v4",
+            "b9459de05b46f259392d0d56f81c01ce19192cdc20d12676f918269443149146",
         ),
     ],
 )
@@ -699,7 +704,12 @@ def test_parse_result_preserves_multipage_duplicate_text(monkeypatch: pytest.Mon
 
 @pytest.mark.parametrize(
     "extraction_version",
-    ["pypdf-text-extraction-v2", "pypdf-6.16.1-text-extraction-v3", PDF_TEXT_EXTRACTION_VERSION],
+    [
+        "pypdf-text-extraction-v2",
+        "pypdf-6.16.1-text-extraction-v3",
+        "pypdf-6.21.2-text-extraction-v4",
+        PDF_TEXT_EXTRACTION_VERSION,
+    ],
 )
 def test_persistence_reload_and_audit_preserve_pdf_evidence(
     migrated_temp_db_connection: sqlite3.Connection,
