@@ -30,19 +30,23 @@ Python source distribution, generic Bridge package, `component-manifest-v1.json`
 and `SHA256SUMS`. The manifest binds the release to the exact core commit, API
 contract, migration ledger, artifact names, sizes, and SHA-256 digests.
 
-After building the three packages in one artifact directory, create the two
-identity files with:
+For the current unreleased 0.1.7 candidate, build all three packages from the
+same clean commit. Create the two identity files with:
 
 ```bash
 python scripts/build_release_manifest.py \
   --artifacts-dir dist/release \
   --source-root . \
-  --core-version 0.1.6 \
+  --core-version 0.1.7 \
   --core-commit <40-character-release-commit> \
   --api-contract-version finance-core-api-v1 \
   --migration-ledger-digest \
-  53c86dadfc67d57c93d8a08a8e27a240188dcd506642a7829eac8983b866a5c5
+  d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850
 ```
+
+Preparing these artifacts does not publish a release. Publication still requires
+the exact protected-main validation, tag verification and owner approval in
+[the release contract](docs/development/release_validation_v1.md).
 
 Consumers must verify the manifest and checksums before installing. They must
 not follow a floating branch or tag.
@@ -87,10 +91,11 @@ Pillow 13.0.0 with pillow-heif 1.8.0. Historical Pillow 12.3.0 evidence remains
 read-only under its complete recorded profile; new operations require 13.0.0.
 No historical evidence is migrated or re-decoded.
 
-The unreleased source candidate pins pypdf 6.21.2 and records new PDF text
-extraction as `pypdf-6.21.2-text-extraction-v4`. This dependency update does not
+The unreleased source candidate pins pypdf 6.21.4 and records new PDF text
+extraction as `pypdf-6.21.4-text-extraction-v5`. This dependency update does not
 change the PDF evidence/fingerprint contract or financial review rules. Retained
-`pypdf-text-extraction-v2` and `pypdf-6.16.1-text-extraction-v3` evidence keeps
+`pypdf-text-extraction-v2`, `pypdf-6.16.1-text-extraction-v3` and
+`pypdf-6.21.2-text-extraction-v4` evidence keeps
 its original identity and fingerprint; nothing is automatically reimported or
 migrated. This source change does not announce a new release or activate PDF
 runtime processing.

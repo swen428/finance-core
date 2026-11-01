@@ -490,7 +490,7 @@ def _installed_runtime_dependencies(outside_dir: Path) -> Path:
     dependency_site = Path(sysconfig.get_paths()["purelib"])
     for name in (
         "pypdf",
-        "pypdf-6.21.2.dist-info",
+        "pypdf-6.21.4.dist-info",
         "typing_extensions.py",
         "typing_extensions-4.16.0.dist-info",
     ):
@@ -1591,8 +1591,8 @@ def _probe_installed_pdf(
     assert payload["actual_small_codec_helper"] and not payload["linux_worker_qualification"]
     assert Path(payload["media_module"]).resolve().is_relative_to(install_dir.resolve())
     assert Path(payload["pillow_module"]).resolve().is_relative_to(dependency_root.resolve())
-    assert payload["pypdf_version"] == "6.21.2"
-    assert payload["extraction_version"] == "pypdf-6.21.2-text-extraction-v4"
+    assert payload["pypdf_version"] == "6.21.4"
+    assert payload["extraction_version"] == "pypdf-6.21.4-text-extraction-v5"
     assert payload["row_extraction_version"] == payload["extraction_version"]
     assert payload["raw_line"] == "01/07/2026 \u2206 12.50 D"
     assert payload["amount"] == "12.50" and payload["source_hash_matches"]
@@ -1777,7 +1777,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
                 sort_keys=True,
             )
         )
-        assert "pypdf==6.21.2" in payload["runtime_dependencies"]
+        assert "pypdf==6.21.4" in payload["runtime_dependencies"]
         assert 'Pillow==13.0.0; extra == "media"' in payload["runtime_dependencies"]
         assert 'pillow-heif==1.8.0; extra == "media"' in payload["runtime_dependencies"]
         correction_flow = _probe_installed_correction_flow(
@@ -2374,14 +2374,16 @@ def test_candidate_package_metadata_cannot_collectively_override_source_dependen
         for member in original.infolist():
             body = original.read(member)
             if member.filename.endswith("/METADATA"):
-                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+                assert b"pypdf==6.21.4" in body
+                body = body.replace(b"pypdf==6.21.4", b"pypdf==0.0.1")
             altered.writestr(member, body)
     altered_sdist = tmp_path / "altered-sdist.tar.gz"
     with tarfile.open(sdist, "r:gz") as original, tarfile.open(altered_sdist, "w:gz") as altered:
         for member in original:
             body = original.extractfile(member).read()
             if member.name.endswith("/PKG-INFO"):
-                body = body.replace(b"pypdf==6.21.2", b"pypdf==0.0.1")
+                assert b"pypdf==6.21.4" in body
+                body = body.replace(b"pypdf==6.21.4", b"pypdf==0.0.1")
             member.size = len(body)
             altered.addfile(member, io.BytesIO(body))
     with pytest.raises(ValueError, match="metadata differs from source recipe"):

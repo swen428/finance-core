@@ -30,7 +30,7 @@ from finance_core.reconciliation.pdf_statement_template_adapter import (
     convert_parsed_statement_row_to_adapter_row,
 )
 
-EXPECTED_IDENTITY = "pypdf-6.21.2-text-extraction-v4"
+EXPECTED_IDENTITY = "pypdf-6.21.4-text-extraction-v5"
 
 
 def _write_symbol_statement(path: Path) -> None:
@@ -56,7 +56,12 @@ def _write_symbol_statement(path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "stale_identity", ["pypdf-text-extraction-v2", "pypdf-6.16.1-text-extraction-v3"]
+    "stale_identity",
+    [
+        "pypdf-text-extraction-v2",
+        "pypdf-6.16.1-text-extraction-v3",
+        "pypdf-6.21.2-text-extraction-v4",
+    ],
 )
 def test_symbol_mapping_records_actual_extractor_not_stale_template(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_identity: str
@@ -75,7 +80,7 @@ def test_symbol_mapping_records_actual_extractor_not_stale_template(
     assert result.rows[0].raw_line == "01/07/2026 \u2206 12.50 D"
     assert result.rows[0].amount == Decimal("12.50")
     assert result.rows[0].source_content_hash == hashlib.sha256(source.read_bytes()).hexdigest()
-    assert version("pypdf") == "6.21.2"
+    assert version("pypdf") == "6.21.4"
     assert result.extraction.extraction_version == EXPECTED_IDENTITY
     assert result.template.extraction_version == EXPECTED_IDENTITY
     assert result.rows[0].extraction_version == EXPECTED_IDENTITY

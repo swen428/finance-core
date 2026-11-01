@@ -15,9 +15,9 @@ PDF_EVIDENCE_CONTRACT_VERSION = "pdf-row-evidence-v2"
 PDF_ROW_FINGERPRINT_VERSION = "pdf-row-fingerprint-v2"
 PDF_TEMPLATE_PARSER_NAME = "finance-pdf-template-parser"
 PDF_TEMPLATE_PARSER_VERSION = "pdf-template-parser-v2"
-# Dependency charset changes affect raw financial evidence. Keep new extraction
+# Dependency changes affect extraction behavior. Keep new extraction
 # identity distinct while preserving historical rows and their fingerprints.
-PDF_TEXT_EXTRACTION_VERSION = "pypdf-6.21.2-text-extraction-v4"
+PDF_TEXT_EXTRACTION_VERSION = "pypdf-6.21.4-text-extraction-v5"
 
 
 class PdfRowReviewStatus(str, Enum):

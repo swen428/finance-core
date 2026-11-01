@@ -293,7 +293,7 @@ def _write_valid_release_fixture(
     media: bool = True,
     extra_name: str = "media",
     media_dependencies: tuple[str, ...] = ("Pillow==13.0.0", "pillow-heif==1.8.0"),
-    pypdf_dependency: str = "pypdf==6.21.2",
+    pypdf_dependency: str = "pypdf==6.21.4",
     migration_count: int = 61,
     mutate_061: bool = False,
 ) -> tuple[Path, Path, str]:
@@ -345,7 +345,7 @@ def _write_valid_release_fixture(
     project_source = re.sub(
         r'(?m)^version = "[^"]+"$', 'version = "0.1.6"', project_source, count=1
     )
-    project_source = project_source.replace("pypdf==6.21.2", pypdf_dependency)
+    project_source = project_source.replace("pypdf==6.21.4", pypdf_dependency)
     if media:
         extra = "\n[project.optional-dependencies]\n" + json.dumps(extra_name)
         extra += " = " + json.dumps(list(media_dependencies)) + "\n"
@@ -662,7 +662,9 @@ def test_release_manifest_rejects_dirty_release_source(tmp_path: Path) -> None:
     [
         "pypdf==6.14.2",
         "pypdf==6.16.1",
+        "pypdf==6.21.2",
         "pypdf>=6.21.2",
+        "pypdf>=6.21.4",
         "pypdf @ https://example.invalid/package.whl",
     ],
 )
@@ -672,7 +674,7 @@ def test_release_manifest_rejects_unapproved_runtime_dependency(
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     project = source_root / "pyproject.toml"
     project.write_text(
-        project.read_text(encoding="utf-8").replace("pypdf==6.21.2", unapproved_dependency),
+        project.read_text(encoding="utf-8").replace("pypdf==6.21.4", unapproved_dependency),
         encoding="utf-8",
     )
     completed = subprocess.run(
@@ -686,7 +688,9 @@ def test_release_manifest_rejects_unapproved_runtime_dependency(
     assert not (artifacts / "SHA256SUMS").exists()
 
 
-@pytest.mark.parametrize("dependency", ["pypdf==6.16.1", "pypdf>=6.21.2"])
+@pytest.mark.parametrize(
+    "dependency", ["pypdf==6.16.1", "pypdf==6.21.2", "pypdf>=6.21.2", "pypdf>=6.21.4"]
+)
 def test_release_manifest_rejects_consistent_unapproved_runtime_dependency(
     tmp_path: Path, dependency: str
 ) -> None:
@@ -699,8 +703,9 @@ def test_release_manifest_rejects_consistent_unapproved_runtime_dependency(
 
 
 @pytest.mark.parametrize("location", ["wheel", "PKG-INFO", "finance_core.egg-info/PKG-INFO"])
+@pytest.mark.parametrize("stale_dependency", [b"pypdf==6.16.1", b"pypdf==6.21.2"])
 def test_release_manifest_rejects_stale_pypdf_in_each_artifact_metadata(
-    tmp_path: Path, location: str
+    tmp_path: Path, location: str, stale_dependency: bytes
 ) -> None:
     artifacts, source_root, core_commit = _write_valid_release_fixture(tmp_path)
     wheel = artifacts / "finance_core-0.1.6-py3-none-any.whl"
@@ -709,14 +714,14 @@ def test_release_manifest_rejects_stale_pypdf_in_each_artifact_metadata(
         name = "finance_core-0.1.6.dist-info/METADATA"
         with zipfile.ZipFile(wheel) as archive:
             before = archive.read(name)
-        after = before.replace(b"pypdf==6.21.2", b"pypdf==6.16.1")
+        after = before.replace(b"pypdf==6.21.4", stale_dependency)
         assert before != after
         _rewrite_wheel(wheel, {name: after})
     else:
         name = "finance_core-0.1.6/" + location
         with tarfile.open(sdist) as archive:
             before = archive.extractfile(name).read()
-        after = before.replace(b"pypdf==6.21.2", b"pypdf==6.16.1")
+        after = before.replace(b"pypdf==6.21.4", stale_dependency)
         assert before != after
         _rewrite_sdist(sdist, {name: after})
     assert "metadata" in _refused_media_fixture(artifacts, source_root, core_commit)
@@ -1112,7 +1117,7 @@ def test_release_manifest_preserves_no_extra_metadata_in_synthetic_fixture(tmp_p
         requires = archive.extractfile(
             "finance_core-0.1.6/finance_core.egg-info/requires.txt"
         ).read()
-    assert requires == b"pypdf==6.21.2\ntyping-extensions==4.16.0\n"
+    assert requires == b"pypdf==6.21.4\ntyping-extensions==4.16.0\n"
 
 
 @pytest.mark.parametrize(
@@ -1220,9 +1225,9 @@ def test_release_rejects_each_unapproved_optional_metadata_record(
 @pytest.mark.parametrize(
     "requires",
     [
-        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n",
-        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n\n[other]\nPillow==13.0.0\npillow-heif==1.8.0\n",
-        b"pypdf==6.21.2\ntyping-extensions==4.16.0\n\n[media]\nPillow>=13.0.0\npillow-heif==1.8.0\n",
+        b"pypdf==6.21.4\ntyping-extensions==4.16.0\n",
+        b"pypdf==6.21.4\ntyping-extensions==4.16.0\n\n[other]\nPillow==13.0.0\npillow-heif==1.8.0\n",
+        b"pypdf==6.21.4\ntyping-extensions==4.16.0\n\n[media]\nPillow>=13.0.0\npillow-heif==1.8.0\n",
     ],
 )
 def test_release_rejects_sdist_optional_requires_inventory(tmp_path: Path, requires: bytes) -> None:
