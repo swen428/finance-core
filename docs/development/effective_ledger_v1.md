@@ -147,6 +147,8 @@ ID is `lifecycle-v2:<record_id>`; it is never a fabricated legacy row ID.
 The evidence locator includes record, version and fact hash. Currency, amount,
 merchant and date come from the current fact, type is explicitly EXPENSE, and
 transport, attachment path and posted date remain unknown.
+Candidate amount conversion preserves the verified value independently of the
+caller's Decimal precision, without changing that caller's context.
 
 The existing deterministic matcher may read each wrapper's `candidate`. Keep
 the wrapper and its ID association with the result so its exact version/hash

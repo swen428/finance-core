@@ -3,7 +3,7 @@
 import hashlib
 from dataclasses import replace
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, localcontext
 
 import pytest
 from test_lifecycle_v2 import live, ready, response  # noqa: F401
@@ -132,3 +132,17 @@ def test_native_adapter_empty_and_rejects_arbitrary_fact_input(live):  # noqa: F
     assert collection.complete and collection.candidates == ()
     with pytest.raises(TypeError, match="EffectiveLedgerReaderV1"):
         NativeReconciliationAdapterV1([])
+
+
+def test_native_candidate_preserves_amount_under_low_ambient_precision(live):  # noqa: F811
+    service, _, _ = live
+    _, _, review = ready(service)
+    posted = service.confirm(review.review_id, "action1", "confirm1")
+    adapter = NativeReconciliationAdapterV1(EffectiveLedgerReaderV1(service))
+    with localcontext() as context:
+        context.prec = 2
+        actual = adapter.fetch_candidates()
+        assert context.prec == 2
+    assert actual.complete and len(actual.candidates) == 1
+    assert actual.candidates[0].fact_ref.fact_sha256 == posted.fact_sha256
+    assert actual.candidates[0].candidate.amount == Decimal("12.00")

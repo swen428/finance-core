@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import localcontext
 
 from finance_core.lifecycle_v2.effective_v1 import (
     EffectiveFilterV1,
@@ -77,11 +78,15 @@ class NativeReconciliationAdapterV1:
                 fact.fact_sha256,
                 fact.commit_seq,
             )
+            # Match the reader's bounded canonical-money validation context.
+            with localcontext() as context:
+                context.prec = 1024
+                amount = Money.from_string(fact.amount, fact.currency).amount
             candidate = InternalCandidate(
                 internal_id=f"lifecycle-v2:{fact.record_id}",
                 transaction_date=date.fromisoformat(fact.transaction_date),
                 merchant=fact.merchant,
-                amount=Money.from_string(fact.amount, fact.currency).amount,
+                amount=amount,
                 currency=fact.currency,
                 transaction_type=ReconciliationTransactionType.EXPENSE,
                 source_type="native-lifecycle-v2",
