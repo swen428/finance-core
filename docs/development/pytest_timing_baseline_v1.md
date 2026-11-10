@@ -133,3 +133,29 @@ maximum-to-mean ratio is at most 1.20, assessed separately from correctness
 and complete test coverage. Preserve and evaluate a failed run or a performance
 miss as observed; do not select a later, faster retry as the result. The
 120-minute timeout remains an upper bound, not a duration target.
+
+## November 10, 2026 inventory admission repair
+
+PR run `42834478417`, attempt 1, stopped in inventory planning before any of
+its four Python shards executed. The retained baseline covered 258 files:
+protected main had 13 unknown files out of 271, while the candidate's two
+additional files raised that to 15 out of 273, exceeding the unchanged 5%
+limit. This is failed preparation evidence, not a completed test result.
+
+The baseline is regenerated with the existing builder from successful
+first-attempt protected-main push runs `41357073470`, `41262670970` and
+`40055204728`. Each run's repository, workflow, ancestor commit, complete
+successful job inventory and unexpired aggregate artifact binding were
+verified. The downloaded ZIP matched GitHub's SHA-256; the extracted complete
+JSON has its own recorded digest. The first two workflows require eleven
+jobs, including candidate-package; the older workflow retains its original
+ten-job contract.
+
+The refreshed manifest covers 271 files, 12,872 tests and 38,345 timing
+samples. The two new candidate files still receive the measured P95 fallback;
+no timing is invented for them. The source minimum, 30-day freshness limit,
+5% unknown-file limit, four shards, complete once-only Git inventory and LPT
+assignment remain unchanged. This repair responds to an actual admission
+failure, separate from the advisory performance-warning review above. A new
+complete candidate run, including both Bridge platforms required by this
+baseline path, must establish authoritative validation.
