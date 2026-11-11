@@ -53,6 +53,7 @@ from .contracts import (
     ExpectedAction,
     ExpectedDisplay,
     ExpectedInvocation,
+    LifecycleError,
     RuntimeBinding,
     VerifiedAction,
     VerifiedDelivery,
@@ -724,6 +725,12 @@ def _rebuild(packages, *, authenticator, expected_identity, expected_frontier, l
         # Final proof remains separate from each segment's assertion.
         rows, inventory = _audit(conn, expected_identity, entries, limits)
         result = ClosureCheckV1(expected_identity, previous, inventory, _current_values(conn))
+    except RecoveryMaterialError:
+        raise
+    except LifecycleError as exc:
+        raise RecoveryMaterialError(
+            "invalid_material", "Native closure content audit failed"
+        ) from exc
     except sqlite3.Error as exc:
         raise RecoveryMaterialError("invalid_material", "Fixed native row replay failed") from exc
     finally:
