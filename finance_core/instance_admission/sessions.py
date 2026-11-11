@@ -120,7 +120,39 @@ def _install_write_protocol(witness: "_Witness") -> None:
         if action in _SQL_READ_ACTIONS:
             return sqlite3.SQLITE_OK
         if action in _SQL_WRITE_ACTIONS:
-            return sqlite3.SQLITE_OK if writable_transaction else sqlite3.SQLITE_DENY
+            if not writable_transaction:
+                return sqlite3.SQLITE_DENY
+            controls = {
+                "l2_finalization_intents",
+                "l2_finalization_materials",
+                "l2_finalization_outcomes",
+            }
+            if witness.finalization_mode is None:
+                # SQLite reports DDL object names in first and their target table
+                # in second; UPDATE's second argument is only a column name.
+                target = (
+                    second
+                    if action
+                    in {
+                        sqlite3.SQLITE_CREATE_INDEX,
+                        sqlite3.SQLITE_DROP_INDEX,
+                        sqlite3.SQLITE_CREATE_TRIGGER,
+                        sqlite3.SQLITE_DROP_TRIGGER,
+                        sqlite3.SQLITE_ALTER_TABLE,
+                    }
+                    else first
+                )
+                return sqlite3.SQLITE_DENY if target in controls else sqlite3.SQLITE_OK
+            allowed = {
+                "prepare": {"l2_finalization_intents", "l2_finalization_materials"},
+                "apply": {"l2_events", "l2_facts", "l2_decisions", "l2_finalization_outcomes"},
+                "cancel": {"l2_finalization_outcomes"},
+            }[witness.finalization_mode]
+            return (
+                sqlite3.SQLITE_OK
+                if action == sqlite3.SQLITE_INSERT and first in allowed
+                else sqlite3.SQLITE_DENY
+            )
         if action == sqlite3.SQLITE_TRANSACTION:
             return sqlite3.SQLITE_OK if first in {"BEGIN", "COMMIT"} else sqlite3.SQLITE_DENY
         if action == sqlite3.SQLITE_SAVEPOINT:
@@ -253,6 +285,8 @@ class _Witness:
     read_only: bool
     pid: int
     immutable_migration_digest: str | None = None
+    finalization_mode: str | None = None
+    finalization_operation_id: str | None = None
     active: bool = True
     closing: bool = False
     closed: bool = False
@@ -695,6 +729,7 @@ def _operation(
     read_only: bool,
     timeout_seconds: float,
     immutable_installation: bool = False,
+    _finalization: tuple[str, str] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     from .schema_contract import SchemaContractError, validate_application_database
 
@@ -758,6 +793,28 @@ def _operation(
         require_finance_read_connection(conn)
         if not read_only:
             require_finance_write_connection(conn)
+        if not read_only:
+            from finance_core.lifecycle_v2._finalization_journal_v1 import _verify_journal
+
+            journal = _verify_journal(conn)
+            pending = [key for key, entry in journal.items() if entry.outcome is None]
+            if _finalization is None:
+                if pending:
+                    raise InstanceAdmissionError(
+                        "Pending exact finalization blocks ordinary writes"
+                    )
+            else:
+                mode, operation_id = _finalization
+                if (
+                    mode not in {"prepare", "apply", "cancel"}
+                    or type(operation_id) is not str
+                    or not operation_id
+                ):
+                    raise InstanceAdmissionError("Exact private finalization operation required")
+                if pending and pending != [operation_id]:
+                    raise InstanceAdmissionError("Another exact finalization remains pending")
+                witness.finalization_mode = mode
+                witness.finalization_operation_id = operation_id
         _install_write_protocol(witness)
         yield conn
     finally:
@@ -843,3 +900,15 @@ def lifecycle_write_operation(owner: ProductionOwner, *, timeout_seconds: float 
 
 def lifecycle_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
     return _lifecycle_operation(owner, read_only=True, timeout_seconds=timeout_seconds)
+
+
+def _prepared_finalization_operation(owner: ProductionOwner, operation_id: str, mode: str):
+    """Private exact-operation resolver; no public pending bypass capability."""
+    owner.assert_valid()
+    return _operation(
+        owner,
+        read_only=False,
+        timeout_seconds=5.0,
+        immutable_installation=True,
+        _finalization=(mode, operation_id),
+    )

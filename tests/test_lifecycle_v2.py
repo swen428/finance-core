@@ -602,7 +602,7 @@ def test_061_upgrade_preserves_complete_old_ledger_and_native_rows():
         "INSERT INTO participants(public_id,display_name) VALUES('old-person','Preserved')"
     )
     conn.commit()
-    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[60:])
+    apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[60:61])
     assert migration_ledger_rows(conn)[:60] == old
     assert migration_ledger_rows(conn)[-1]["migration_id"] == "061"
     assert (
@@ -612,8 +612,128 @@ def test_061_upgrade_preserves_complete_old_ledger_and_native_rows():
         == "Preserved"
     )
     assert conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0] == 0
-    verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
+    verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS[:61])
     conn.close()
+
+
+def test_062_upgrade_preserves_historical_native_rows_and_ledger():
+    import base64
+    import sqlite3
+    from pathlib import Path
+
+    from finance_core.lifecycle_v2.recovery_material_v1 import decode_native_closure_v1
+    from finance_core.reconciliation.migrations import (
+        TEMP_DB_MIGRATION_PATHS,
+        apply_migration_paths,
+        migration_ledger_rows,
+        verify_migration_history,
+    )
+
+    fixture = Path(__file__).parent / "fixtures/native_recovery_material_v1_061.json"
+    fixture_bytes = fixture.read_bytes()
+    assert hashlib.sha256(fixture_bytes).hexdigest() == (
+        "840c8f7975e229189a5b511bd667a2ba4e571fce07a7fef5977de04290855072"
+    )
+    fixture_value = json.loads(fixture_bytes)
+    native_rows = {
+        name: []
+        for name in (
+            "sources",
+            "proposals",
+            "reviews",
+            "deliveries",
+            "facts",
+            "decisions",
+            "events",
+        )
+    }
+    for encoded in fixture_value["packages_b64"]:
+        segment = decode_native_closure_v1(base64.b64decode(encoded, validate=True))
+        for name, rows in segment.rows.wire().items():
+            native_rows[name].extend(rows)
+    assert {name: len(rows) for name, rows in native_rows.items()} == {
+        "sources": 2,
+        "proposals": 3,
+        "reviews": 3,
+        "deliveries": 2,
+        "facts": 2,
+        "decisions": 2,
+        "events": 12,
+    }
+
+    table_order = (
+        "sources",
+        "proposals",
+        "reviews",
+        "deliveries",
+        "events",
+        "facts",
+        "decisions",
+    )
+    order_by = {
+        "sources": "source_id",
+        "proposals": "proposal_id",
+        "reviews": "review_id",
+        "deliveries": "review_id",
+        "events": "seq",
+        "facts": "record_id, version",
+        "decisions": "action_evidence_id",
+    }
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[:61])
+        conn.execute(
+            "INSERT INTO participants(public_id,display_name) VALUES('old-person','Preserved')"
+        )
+        for table in table_order:
+            rows = native_rows[table]
+            columns = tuple(rows[0])
+            insert = (
+                f"INSERT INTO l2_{table} ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})"
+            )
+            conn.executemany(
+                insert,
+                [tuple(row[column] for column in columns) for row in rows],
+            )
+        conn.commit()
+        old_ledger = migration_ledger_rows(conn)
+        old_rows = {
+            table: tuple(
+                tuple(row)
+                for row in conn.execute(f"SELECT * FROM l2_{table} ORDER BY {order_by[table]}")
+            )
+            for table in table_order
+        }
+
+        apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS[61:62])
+
+        assert migration_ledger_rows(conn)[:61] == old_ledger
+        assert migration_ledger_rows(conn)[-1]["migration_id"] == "062"
+        assert (
+            conn.execute(
+                "SELECT display_name FROM participants WHERE public_id='old-person'"
+            ).fetchone()[0]
+            == "Preserved"
+        )
+        for table in table_order:
+            current = tuple(
+                tuple(row)
+                for row in conn.execute(f"SELECT * FROM l2_{table} ORDER BY {order_by[table]}")
+            )
+            assert current == old_rows[table]
+        for table in (
+            "l2_finalization_intents",
+            "l2_finalization_materials",
+            "l2_finalization_outcomes",
+        ):
+            assert conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+        verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
+    finally:
+        conn.close()
 
 
 def _correct(service, port, posted):
