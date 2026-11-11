@@ -120,7 +120,7 @@ def _walk(value, limits, depth=0, path=()):
         ):
             limit(len(value), 4 * ((limits.max_artifact_bytes + 2) // 3))
         elif archive_path == ("authentication_b64",):
-            limit(len(value), 4 * ((min(limits.max_artifact_bytes, 65536) + 2) // 3))
+            limit(len(value), 4 * ((65536 + 2) // 3))
         else:
             text(value, limits)
     elif type(value) is list:

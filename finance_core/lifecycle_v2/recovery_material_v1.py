@@ -255,7 +255,7 @@ def _inventory_value(value, limits):
 def _b64(value, limits, *, nonempty=False, authentication=False):
     if type(value) is not str:
         fail("invalid_material", "Base64 must be text")
-    maximum = min(limits.max_artifact_bytes, 65536) if authentication else limits.max_artifact_bytes
+    maximum = 65536 if authentication else limits.max_artifact_bytes
     limit(len(value), 4 * ((maximum + 2) // 3))
     try:
         raw = base64.b64decode(value, validate=True)
@@ -589,11 +589,20 @@ def _audit(conn, identity, entries, limits, *, schema=None, isolated=True):
         )
     with localcontext() as context:
         context.prec = 1024
-        for row in rows.wire()["facts"]:
-            _business_fields(row["values_json"])
-        audit = audit_evidence_connection(
-            conn, _ArchivedEvidencePortV1(entries, limits), identity.source_binding
-        )
+        try:
+            for row in rows.wire()["facts"]:
+                _business_fields(row["values_json"])
+            audit = audit_evidence_connection(
+                conn, _ArchivedEvidencePortV1(entries, limits), identity.source_binding
+            )
+        except LifecycleError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            # Existing readers assume nested retained JSON has the expected
+            # fields and mapping methods; archive material is untrusted here.
+            raise RecoveryMaterialError(
+                "invalid_material", "Native closure content shape is invalid"
+            ) from exc
     inventory = _inventory(conn, rows, entries, audit)
     return rows, inventory
 

@@ -16,11 +16,13 @@ from types import SimpleNamespace
 import pytest
 from lifecycle_recovery_material_support_v1 import (
     RecordingEvidencePortV1,
+    SizedSyntheticAuthenticatorV1,
     SyntheticAuthenticatorV1,
     correct_expense,
     encoded,
     make_service,
     resign,
+    resign_provider_context,
     response,
     sha,
     stage_expense,
@@ -579,6 +581,127 @@ def test_chain_limits_apply_to_total_not_only_each_segment(detached_case):
     )
 
 
+@pytest.mark.parametrize("location", ["row-text", "row-json", "archive-context"])
+def test_utf8_text_byte_limit_accepts_exact_cap_and_rejects_one_over(detached_case, location):
+    case = detached_case
+    data = wire(case.packages[0])
+    cap = 8192
+    # Multibyte input distinguishes UTF-8 bytes from Python character counts.
+    if location == "row-json":
+        exact = canonical({"note": "界" * 2727})
+    else:
+        exact = "界" * 2730 + "ab"
+    assert len(exact.encode("utf-8")) == cap and len(exact) < cap
+
+    def put(value):
+        if location == "row-text":
+            data["rows"]["sources"][0]["raw_input"] = value
+        elif location == "row-json":
+            data["rows"]["proposals"][0]["values_json"] = value
+        else:
+            entry = next(entry for entry in data["evidence"] if entry["kind"] == "provider")
+            entry["context"]["projection"]["boundary_note"] = value
+            resign_provider_context(entry, case.authenticator)
+
+    limits = ClosureLimitsV1(max_text_bytes=cap)
+    put(exact)
+    # These controlled structural vectors are intentionally not content-audit claims.
+    decode_native_closure_v1(encoded(data), limits=limits)
+    one_over = canonical({"note": "界" * 2727 + "x"}) if location == "row-json" else exact + "x"
+    assert len(one_over.encode("utf-8")) == cap + 1
+    put(one_over)
+    refused(
+        lambda: decode_native_closure_v1(encoded(data), limits=limits),
+        "material_limit_exceeded",
+    )
+
+
+@pytest.mark.parametrize("location", ["row-json", "archive-context"])
+def test_json_depth_accepts_exact_cap_and_rejects_one_over(detached_case, location):
+    case = detached_case
+    data = wire(case.packages[0])
+    limits = ClosureLimitsV1(max_json_depth=16)
+
+    def put(nesting):
+        if location == "row-json":
+            # JSON-text columns start their own depth at zero, independently of the wire.
+            data["rows"]["proposals"][0]["values_json"] = "[" * nesting + "null" + "]" * nesting
+        else:
+            entry = next(entry for entry in data["evidence"] if entry["kind"] == "provider")
+            value = None
+            for _ in range(nesting):
+                value = [value]
+            entry["context"]["projection"]["boundary_note"] = value
+            resign_provider_context(entry, case.authenticator)
+
+    # context.projection.boundary_note starts five levels below the package root.
+    exact_nesting = 16 if location == "row-json" else 11
+    put(exact_nesting)
+    decode_native_closure_v1(encoded(data), limits=limits)
+    put(exact_nesting + 1)
+    refused(
+        lambda: decode_native_closure_v1(encoded(data), limits=limits),
+        "material_limit_exceeded",
+    )
+
+
+@pytest.mark.parametrize("authentication_size", [2048, 65536])
+def test_authentication_capacity_is_independent_of_artifact_limit(
+    material_live, authentication_size
+):
+    service, _, _, _ = material_live
+    auth = SizedSyntheticAuthenticatorV1(authentication_size)
+    port = RecordingEvidencePortV1(auth)
+    service.port = port
+    stage_expense(service, port, "small-artifact", stage="capture")
+    limits = ClosureLimitsV1(max_artifact_bytes=1024)
+    payload = collect(service, port, auth, limits=limits)
+    data = wire(payload)
+    assert all(a["size"] <= 1024 for entry in data["evidence"] for a in entry["artifacts"])
+    assert all(
+        len(base64.b64decode(entry["authentication_b64"], validate=True)) == authentication_size
+        for entry in data["evidence"]
+    )
+    decoded = decode_native_closure_v1(payload, limits=limits)
+    assert auth.calls > 0
+    calls = auth.calls
+    result = check_native_closure_v1(
+        (payload,),
+        authenticator=auth,
+        expected_identity=decoded.identity,
+        expected_frontier=frontier(payload),
+        limits=limits,
+    )
+    assert result.status == "CONTENT_VERIFIED_OFFLINE" and auth.calls > calls
+
+
+def test_authentication_one_byte_above_fixed_cap_rejects_public_paths(material_live):
+    service, port, _, auth = material_live
+    stage_expense(service, port, "authentication-cap", stage="capture")
+    original = collect(service, port, auth)
+    decoded = decode_native_closure_v1(original)
+    data = wire(original)
+    too_large = SizedSyntheticAuthenticatorV1(65537)
+    for entry in data["evidence"]:
+        resign(entry, too_large)
+        assert len(base64.b64decode(entry["authentication_b64"], validate=True)) == 65537
+        port.archives[(entry["kind"], entry["evidence_id"])] = encoded(entry)
+    payload = encoded(data)
+    limits = ClosureLimitsV1(max_artifact_bytes=1024)
+    refused(lambda: collect(service, port, too_large, limits=limits), "material_limit_exceeded")
+    refused(lambda: decode_native_closure_v1(payload, limits=limits), "material_limit_exceeded")
+    refused(
+        lambda: check_native_closure_v1(
+            (payload,),
+            authenticator=too_large,
+            expected_identity=decoded.identity,
+            expected_frontier=replace(frontier(original), package_sha256=sha(payload)),
+            limits=limits,
+        ),
+        "material_limit_exceeded",
+    )
+
+
 def test_collector_no_new_material_and_failed_export_leave_owner_unchanged(material_live):
     service, port, cfg, auth = material_live
     stage_expense(service, port, "first")
@@ -791,6 +914,48 @@ def test_checker_closes_its_private_database_on_inventory_failure(detached_case,
     monkeypatch.setattr(sqlite3, "connect", record)
     refused(
         lambda: checked(case, (payload,), expected_frontier=frontier(payload)), "inventory_mismatch"
+    )
+    assert connections
+    for conn in connections:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            conn.execute("SELECT 1")
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing", "null", "array", "missing-source-text", "null-interpretation-context"]
+)
+def test_malformed_retained_projection_has_public_error_and_closes_database(
+    detached_case, monkeypatch, damage
+):
+    case = detached_case
+    data = wire(case.packages[0])
+    proposal = data["rows"]["proposals"][0]
+    observation = json.loads(proposal["observation_json"])
+    expected = observation["expected"]
+    if damage == "missing":
+        del expected["projection"]
+    elif damage == "null":
+        expected["projection"] = None
+    elif damage == "array":
+        expected["projection"] = []
+    elif damage == "missing-source-text":
+        del expected["projection"]["source_text"]
+    else:
+        expected["projection"]["interpretation_context"] = None
+    proposal["observation_json"] = canonical(observation)
+    payload = encoded(data)
+    real_connect = sqlite3.connect
+    connections = []
+
+    def record(database, *args, **kwargs):
+        assert database == ":memory:"
+        conn = real_connect(database, *args, **kwargs)
+        connections.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", record)
+    refused(
+        lambda: checked(case, (payload,), expected_frontier=frontier(payload)), "invalid_material"
     )
     assert connections
     for conn in connections:

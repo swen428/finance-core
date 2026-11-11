@@ -104,6 +104,18 @@ class SyntheticAuthenticatorV1:
             raise ValueError("Untrusted synthetic archive authentication")
 
 
+class SizedSyntheticAuthenticatorV1(SyntheticAuthenticatorV1):
+    """Valid HMAC plus fixed padding to exercise authentication wire capacity."""
+
+    def __init__(self, size):
+        super().__init__()
+        self.size = size
+
+    def authenticate(self, payload):
+        signature = super().authenticate(payload)
+        return signature + b"\x00" * (self.size - len(signature))
+
+
 def resign(entry, authenticator):
     """Adversarial tests may hold the test key; finance audit must still run."""
     unsigned = {key: value for key, value in entry.items() if key != "authentication_b64"}
@@ -111,6 +123,17 @@ def resign(entry, authenticator):
         authenticator.authenticate(canonical(unsigned).encode())
     ).decode()
     return entry
+
+
+def resign_provider_context(entry, authenticator):
+    """Keep an adversarial archive's actual request bytes aligned with its context."""
+    request = canonical(entry["context"]).encode()
+    artifact = next(item for item in entry["artifacts"] if item["role"] == "request")
+    artifact.update(
+        bytes_b64=base64.b64encode(request).decode(), size=len(request), sha256=sha(request)
+    )
+    entry["value"]["request_sha256"] = sha(request)
+    return resign(entry, authenticator)
 
 
 class RecordingEvidencePortV1:
