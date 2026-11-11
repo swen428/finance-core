@@ -838,7 +838,10 @@ def _probe_installed_lifecycle(
         )
         from finance_core.reconciliation.native_lifecycle_v1 import NativeReconciliationAdapterV1
         from finance_core.profile_layout import product_root, profile_root
-        from finance_core.reconciliation.migrations import apply_migration_paths
+        from finance_core.reconciliation.migrations import (
+            TEMP_DB_MIGRATION_PATHS,
+            apply_migration_paths,
+        )
         from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
 
         binding = lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat')
@@ -860,7 +863,8 @@ def _probe_installed_lifecycle(
         connection.row_factory = sqlite3.Row
         connection.execute('PRAGMA foreign_keys = ON')
         apply_migration_paths(
-            connection, paths, clock=lambda: '2026-11-11T00:00:00+00:00',
+            connection, TEMP_DB_MIGRATION_PATHS,
+            clock=lambda: '2026-11-11T00:00:00+00:00',
             application_version='installed-package-probe',
         )
         tables = {row[0] for row in connection.execute(
