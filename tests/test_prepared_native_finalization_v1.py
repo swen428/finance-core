@@ -671,3 +671,151 @@ def test_terminal_journal_limits_do_not_cap_later_actual_native_growth(live):
 @pytest.mark.parametrize(("phase", "fault"), [("prepare", "cursor-close"), ("apply", "rollback")])
 def test_preparation_cursor_and_rollback_unknown_retain_custody(tmp_path, phase, fault):
     test_unknown_commit_actual_close_and_cleanup_never_release_result(tmp_path, phase, fault)
+
+
+@pytest.mark.parametrize("writer", ["capture", "propose"])
+def test_cancelled_operation_is_reserved_at_every_native_event_append(live, writer):
+    from lifecycle_recovery_material_support_v1 import response
+
+    service, port, _, _, api = live
+    _, _, _, ref = prepare(live)
+    assert (
+        api.cancel_offline("finalize", expected_intent_sha256=ref.intent_sha256).state
+        == "CANCELLED_OFFLINE"
+    )
+    if writer == "capture":
+        port.register_source("later", "2026-10-24 Cafe SGD 9.00")
+
+        def append(operation):
+            return service.capture("later", operation)
+    else:
+        source, _, _, _ = stage_expense(service, port, "later", amount="9.00", stage="capture")
+        expected = service.expected_invocation(source.source_id, 0)
+        port.register_provider(
+            "later-observation",
+            expected,
+            response(
+                "2026-10-24 Cafe SGD 9.00",
+                fields={
+                    "amount": "9.00",
+                    "currency": "SGD",
+                    "merchant": "Cafe",
+                    "transaction_date": "2026-10-24",
+                },
+            ),
+        )
+
+        def append(operation):
+            return service.propose(source.source_id, "later-observation", 0, operation)
+
+    before = native_rows(service)
+    with pytest.raises(LifecycleError, match="reserved"):
+        append("finalize")
+    assert native_rows(service) == before
+    assert api.inspect("finalize").state == "CANCELLED_OFFLINE"
+    append("later-" + writer)
+    assert api.inspect("finalize").state == "CANCELLED_OFFLINE"
+
+
+def test_reserved_event_sql_guard_is_exact_pending_only_and_rejects_cancelled_reuse(live):
+    import json
+    import sqlite3
+
+    from finance_core.instance_admission.sessions import _prepared_finalization_operation
+
+    service, _, _, _, api = live
+    _, _, _, ref = prepare(live)
+    before = native_rows(service)
+    with lifecycle_read_operation(service.owner) as conn:
+        body = json.loads(
+            conn.execute(
+                "SELECT body_json FROM l2_finalization_intents WHERE operation_id=?", ("finalize",)
+            ).fetchone()[0]
+        )
+    columns = (
+        "seq",
+        "operation_id",
+        "kind",
+        "entity_id",
+        "payload_json",
+        "previous_sha256",
+        "event_sha256",
+    )
+    planned = tuple(body["append"]["event"][column] for column in columns)
+    assert planned[5] is not None
+    mutations = (
+        (0, planned[0] + 1),
+        (2, "capture"),
+        (3, "different-record"),
+        (4, planned[4] + " "),
+        (5, None),
+        (6, "f" * 64),
+    )
+    with _prepared_finalization_operation(service.owner, "finalize", "apply") as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for verb in ("INSERT", "INSERT OR IGNORE", "INSERT OR REPLACE"):
+            for index, value in mutations:
+                changed = list(planned)
+                changed[index] = value
+                with pytest.raises(sqlite3.IntegrityError, match="reserved"):
+                    conn.execute(verb + " INTO l2_events VALUES(?,?,?,?,?,?,?)", changed)
+        conn.rollback()
+    assert native_rows(service) == before
+    assert api.inspect("finalize").state == "PREPARED_OFFLINE"
+    api.cancel_offline("finalize", expected_intent_sha256=ref.intent_sha256)
+    with production_write_operation(service.owner) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for verb in ("INSERT", "INSERT OR IGNORE", "INSERT OR REPLACE"):
+            with pytest.raises(sqlite3.IntegrityError, match="reserved"):
+                conn.execute(verb + " INTO l2_events VALUES(?,?,?,?,?,?,?)", planned)
+        conn.rollback()
+    assert native_rows(service) == before
+    assert api.inspect("finalize").state == "CANCELLED_OFFLINE"
+
+
+def test_reserved_event_guard_survives_ordinary_schema_operations(live):
+    import sqlite3
+
+    service, _, _, _, api = live
+    _, _, _, ref = prepare(live)
+    api.cancel_offline("finalize", expected_intent_sha256=ref.intent_sha256)
+    before = native_rows(service)
+    statements = (
+        "DROP TRIGGER l2_events_finalization_reservation",
+        "DROP TRIGGER l2_events_no_update",
+        "DROP TRIGGER l2_events_no_delete",
+        "ALTER TABLE l2_events RENAME TO unrelated_event_table",
+        "DROP TABLE l2_events",
+        "CREATE TRIGGER unrelated_event_trigger BEFORE INSERT ON l2_events BEGIN SELECT 1; END",
+        "CREATE INDEX unrelated_event_index ON l2_events(kind)",
+        "DROP INDEX l2_events_entity",
+    )
+    with production_write_operation(service.owner) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in statements:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                conn.execute(statement)
+        conn.execute("CREATE INDEX temporary_source_index ON l2_sources(created_at)")
+        conn.rollback()
+    assert native_rows(service) == before
+    assert api.inspect("finalize").state == "CANCELLED_OFFLINE"
+
+
+def test_reserved_event_schema_guard_uses_sqlite_canonical_names(live):
+    import sqlite3
+
+    service, _, _, _, _ = live
+    statements = (
+        "DROP TRIGGER MAIN.L2_EVENTS_FINALIZATION_RESERVATION",
+        'DROP TRIGGER "main"."l2_events_no_update"',
+        "ALTER TABLE MAIN.L2_EVENTS RENAME TO unrelated_event_table",
+        "DROP INDEX MAIN.L2_EVENTS_ENTITY",
+        "CREATE INDEX main.UNRELATED_EVENT_INDEX ON L2_EVENTS(kind)",
+    )
+    with production_write_operation(service.owner) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for statement in statements:
+            with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                conn.execute(statement)
+        conn.execute("CREATE INDEX main.UNRELATED_SOURCE_INDEX ON L2_SOURCES(created_at)")
+        conn.rollback()

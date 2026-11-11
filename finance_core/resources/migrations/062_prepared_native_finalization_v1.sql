@@ -44,3 +44,20 @@ BEGIN SELECT RAISE(ABORT,'finalization material identity collision'); END;
 CREATE TRIGGER l2_finalization_outcomes_no_collision BEFORE INSERT ON l2_finalization_outcomes
 WHEN EXISTS(SELECT 1 FROM l2_finalization_outcomes WHERE operation_id=NEW.operation_id)
 BEGIN SELECT RAISE(ABORT,'finalization outcome identity collision'); END;
+
+-- Reserved operations can only append their exact pending compiled confirm.
+-- Ordinary SQL cannot repurpose a cancelled operation and poison its journal.
+CREATE TRIGGER l2_events_finalization_reservation BEFORE INSERT ON l2_events
+WHEN EXISTS(
+ SELECT 1 FROM l2_finalization_intents i WHERE i.operation_id=NEW.operation_id AND (
+  EXISTS(SELECT 1 FROM l2_finalization_outcomes o WHERE o.operation_id=i.operation_id)
+  OR NEW.kind IS NOT 'confirm'
+  OR NEW.seq IS NOT json_extract(i.body_json,'$.append.event.seq')
+  OR NEW.operation_id IS NOT json_extract(i.body_json,'$.append.event.operation_id')
+  OR NEW.kind IS NOT json_extract(i.body_json,'$.append.event.kind')
+  OR NEW.entity_id IS NOT json_extract(i.body_json,'$.append.event.entity_id')
+  OR NEW.payload_json IS NOT json_extract(i.body_json,'$.append.event.payload_json')
+  OR NEW.previous_sha256 IS NOT json_extract(i.body_json,'$.append.event.previous_sha256')
+  OR NEW.event_sha256 IS NOT json_extract(i.body_json,'$.append.event.event_sha256')
+ ))
+BEGIN SELECT RAISE(ABORT,'operation identity is permanently reserved for finalization'); END;

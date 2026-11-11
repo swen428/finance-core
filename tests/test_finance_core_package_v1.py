@@ -56,7 +56,7 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "a58b9333b63b5f188393942c9fbae1eb70db543cd7e42777cb6cb458f48911dc"
+EXPECTED_LEDGER_DIGEST = "b5f631a2c3f193a3c67748ba0c408232a5813a2b422f5bedd57c536aac95ea16"
 HISTORICAL_LEDGER_DIGEST_061 = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
 HISTORICAL_LEDGER_DIGEST_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
@@ -1571,7 +1571,7 @@ def _probe_installed_lifecycle(
 def _probe_installed_native_recovery_material(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
-    """Exercise exact 062 prepare/reopen/apply and fixed historical 061 checking."""
+    """Exercise current 062 round trips, prepare/reopen/apply and historical 061."""
     helper_root = outside_dir / "prepared-finalization-fixtures"
     helper_root.mkdir(exist_ok=True)
     # These are synthetic acquisition fixtures and a pinned historical vector;
@@ -1615,7 +1615,7 @@ def _probe_installed_native_recovery_material(
         )
         from finance_core.resources import MIGRATION_LEDGER_DIGEST
         from lifecycle_recovery_material_support_v1 import (
-            SyntheticAuthenticatorV1, make_service, stage_expense,
+            SyntheticAuthenticatorV1, correct_expense, make_service, stage_expense,
         )
 
         class Environment:
@@ -1623,6 +1623,92 @@ def _probe_installed_native_recovery_material(
                 os.environ[name] = value
 
         previous_runtime = os.environ['FINANCE_RUNTIME_ROOT']
+        with tempfile.TemporaryDirectory(prefix='native-material-', dir=outside) as scratch:
+            roundtrip_source_root = Path(scratch)
+            service, roundtrip_port, config, roundtrip_authenticator = make_service(
+                roundtrip_source_root, Environment(),
+            )
+            try:
+                source, _, _, first = stage_expense(service, roundtrip_port, 'initial')
+                first_package = current_material.collect_native_closure_v2(
+                    service, archive_source=roundtrip_port,
+                    authenticator=roundtrip_authenticator,
+                )
+                first_decoded = decode_native_closure_v2(first_package)
+                assert first_decoded.inventory.fact_version_count == 1
+                _, corrected = correct_expense(service, roundtrip_port, source, first)
+                stage_expense(service, roundtrip_port, 'usd', amount='7.00', currency='USD')
+                _, _, unused_review, unused_fact = stage_expense(
+                    service, roundtrip_port, 'unconfirmed', stage='delivery',
+                )
+                assert unused_fact is None
+                second_package = current_material.collect_native_closure_v2(
+                    service, archive_source=roundtrip_port,
+                    authenticator=roundtrip_authenticator,
+                    previous_packages=(first_package,),
+                )
+                roundtrip_decoded = decode_native_closure_v2(second_package)
+                # Pin source-owned identity/frontier and audit before removing it.
+                roundtrip_identity = ClosureIdentityV2(
+                    source_binding=service.binding,
+                    core_identity=config.core_identity,
+                    migration_identity=config._binding['migration_identity'],
+                    migration_ledger_digest=MIGRATION_LEDGER_DIGEST,
+                )
+                roundtrip_frontier = ClosureFrontierV2(
+                    package_sha256=hashlib.sha256(second_package).hexdigest(),
+                    event_seq=roundtrip_decoded.last_event_seq,
+                    event_sha256=roundtrip_decoded.last_event_sha256,
+                )
+                source_audit = service.reader().full_audit()
+                source_inventory = roundtrip_decoded.inventory
+                assert source_inventory.event_count == source_audit['event_count']
+                assert source_inventory.event_sha256 == source_audit['audit_sha256']
+                assert source_inventory.fact_version_count == source_audit['fact_version_count']
+                expected = {
+                    fact.record_id: (fact.version, fact.fact_sha256, fact.amount, fact.currency)
+                    for fact in EffectiveLedgerReaderV1(service).collect().facts
+                }
+                assert expected[first.record_id][:2] == (2, corrected.fact_sha256)
+                assert sorted((item[2], item[3]) for item in expected.values()) == [
+                    ('15.00', 'SGD'), ('7.00', 'USD'),
+                ]
+                assert roundtrip_decoded.previous.package_sha256 == (
+                    hashlib.sha256(first_package).hexdigest()
+                )
+                assert source_inventory.fact_version_count == 3
+                retained = roundtrip_decoded.rows.wire()
+                assert any(row['review_id'] == unused_review.review_id
+                           for row in retained['reviews'])
+                assert any(row['review_id'] == unused_review.review_id
+                           for row in retained['deliveries'])
+                assert not any(row['review_id'] == unused_review.review_id
+                               for row in retained['facts'])
+            finally:
+                if service.owner._lease.fd >= 0:
+                    service.owner.close()
+                config.close()
+                roundtrip_port.destroy()
+                os.environ['FINANCE_RUNTIME_ROOT'] = previous_runtime
+        assert not roundtrip_source_root.exists() and roundtrip_port.disabled
+        roundtrip_checked = check_native_closure_v2(
+            (first_package, second_package), authenticator=roundtrip_authenticator,
+            expected_identity=roundtrip_identity, expected_frontier=roundtrip_frontier,
+        )
+        reconstructed = {}
+        for record_id, _, version, fact_sha256, _, _, values_json in (
+            roundtrip_checked.current_values
+        ):
+            values = json.loads(values_json)
+            reconstructed[record_id] = (
+                version, fact_sha256, values['amount'], values['currency'],
+            )
+        assert reconstructed == expected
+        assert roundtrip_checked.status == 'CONTENT_VERIFIED_OFFLINE'
+        assert roundtrip_checked.inventory == source_inventory
+        assert roundtrip_checked.identity == roundtrip_identity
+        assert roundtrip_checked.frontier == roundtrip_frontier
+
         packages = None
         expected_identity = None
         expected_frontier = None
@@ -1798,6 +1884,17 @@ def _probe_installed_native_recovery_material(
         print(json.dumps({
             'status': checked.status,
             'segments': len(packages),
+            'roundtrip_status': roundtrip_checked.status,
+            'roundtrip_segments': 2,
+            'roundtrip_fact_versions': roundtrip_checked.inventory.fact_version_count,
+            'roundtrip_current_records': len(roundtrip_checked.current_values),
+            'roundtrip_currencies': sorted({item[3] for item in reconstructed.values()}),
+            'roundtrip_correction_version': reconstructed[first.record_id][0],
+            'roundtrip_unused_delivered_review': unused_fact is None,
+            'roundtrip_inventory_matches_source': roundtrip_checked.inventory == source_inventory,
+            'roundtrip_matches_effective_reader': reconstructed == expected,
+            'roundtrip_source_removed': not roundtrip_source_root.exists(),
+            'roundtrip_original_port_disabled': roundtrip_port.disabled,
             'prepare_kept_source_fact_count': prepare_fact_count,
             'reopened_in_distinct_process': reopened['pid'] != os.getpid(),
             'reopen_installed_only': reopened['installed_only'],
@@ -2509,6 +2606,16 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
             runtime_python, install_dir, outside_dir
         )
         assert material["status"] == "CONTENT_VERIFIED_OFFLINE"
+        assert material["roundtrip_status"] == "CONTENT_VERIFIED_OFFLINE"
+        assert material["roundtrip_segments"] == 2
+        assert material["roundtrip_fact_versions"] == 3
+        assert material["roundtrip_current_records"] == 2
+        assert material["roundtrip_currencies"] == ["SGD", "USD"]
+        assert material["roundtrip_correction_version"] == 2
+        assert material["roundtrip_unused_delivered_review"]
+        assert material["roundtrip_inventory_matches_source"]
+        assert material["roundtrip_matches_effective_reader"]
+        assert material["roundtrip_source_removed"] and material["roundtrip_original_port_disabled"]
         assert material["segments"] == 1
         assert material["prepare_kept_source_fact_count"] == 0
         assert material["reopened_in_distinct_process"]

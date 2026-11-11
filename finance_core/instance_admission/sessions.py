@@ -142,7 +142,18 @@ def _install_write_protocol(witness: "_Witness") -> None:
                     }
                     else first
                 )
-                return sqlite3.SQLITE_DENY if target in controls else sqlite3.SQLITE_OK
+                if target in controls:
+                    return sqlite3.SQLITE_DENY
+                # The native event table owns the finalization reservation guard.
+                # Keep its schema/append-only constraints immutable in ordinary
+                # sessions while preserving guarded native row insertion.
+                if target == "l2_events" and action not in {
+                    sqlite3.SQLITE_INSERT,
+                    sqlite3.SQLITE_UPDATE,
+                    sqlite3.SQLITE_DELETE,
+                }:
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
             allowed = {
                 "prepare": {"l2_finalization_intents", "l2_finalization_materials"},
                 "apply": {"l2_events", "l2_facts", "l2_decisions", "l2_finalization_outcomes"},

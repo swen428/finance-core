@@ -49,6 +49,13 @@ def _row(conn, table, column, value):
 def _event(conn, operation_id, kind, entity_id, payload):
     if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 256:
         raise LifecycleError("Exact operation identity required")
+    if (
+        conn.execute(
+            "SELECT 1 FROM l2_finalization_intents WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        is not None
+    ):
+        raise LifecycleError("Operation identity is permanently reserved for finalization")
     last = conn.execute(
         "SELECT seq,event_sha256 FROM l2_events ORDER BY seq DESC LIMIT 1"
     ).fetchone()

@@ -322,13 +322,25 @@ and protected-close exceptions retain their established semantics.
 
 ## Required validation and installed-package proof
 
-Installed wheel and source-distribution checks run outside the source tree. The
-current 062 package probe exercises `recovery_material_v2` with an actual
-synthetic lifecycle owner and a prepared operation, then checks the resulting
-closure after applying in a distinct installed process. Historical v1 coverage
-uses a fixed complete 061 package chain and the installed v1 checker. Do not
-regenerate that historical chain with a 062 source collector. All Core module
-paths in the installed probes must resolve to the installed artifact.
+Acceptance must exercise the built wheel and source distribution from isolated
+installations outside the source tree. Import current `recovery_material_v2`
+from each installed artifact and run a strict-evidence, two-segment round trip
+using the actual lifecycle service and synthetic data. Create the lifecycle
+through guarded capture, proposal, review, delivery, action and confirmation;
+include at least two currencies, a correction to version 2 of one event, and
+an unconfirmed delivered review. The first segment ends after the original fact;
+the second includes the correction and new unused events. Compare the checked
+inventory with the source-side inventory and audit, and compare current values
+with the source effective reader after removing the source and disabling its
+evidence port.
+
+The same installed artifacts also exercise a prepared operation, prove that
+preparation leaves the source facts unchanged, apply it in a distinct installed
+process, and check its detached v2 closure. Historical v1 coverage uses a fixed
+complete 061 package chain and the installed v1 checker. Do not regenerate that
+historical chain with a 062 source collector or use the historical vector in
+place of the current two-segment round trip. All Core module paths in these
+installed probes must resolve to the installed artifact.
 
 The fixture must pre-register all evidence during acquisition, including
 request/response/original bytes, original envelopes, delivery and action
