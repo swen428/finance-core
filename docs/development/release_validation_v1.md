@@ -172,6 +172,26 @@ records, as `linux-media-acceptance-<run>-<attempt>`.
 
 ### Hosted bootstrap failure and recovery boundary
 
+Linux dependency preparation selects the official Ubuntu HTTPS archive and
+security mirrors, in that priority order, through the ephemeral runner's existing
+`/etc/apt/apt-mirrors.txt`. It first requires that the runner's APT sources actually
+use that mirror file. Suites, components, signing keys, `Signed-By` and signature
+verification remain unchanged; no new trust source is added. Bounded same-runner
+DNS diagnostics are informational because APT can still acquire through another
+mirror. Actual signed index acquisition remains mandatory: `--error-on=any`
+refuses incomplete updates, including transient errors, before installation.
+Acquisition has no automatic file retries and 20-second HTTP/HTTPS transport
+timeouts. Failed mirror publication, update or installation stops before pinned
+OCR preparation. The existing 15-minute job bound and every actual OCR/media
+and Bridge acceptance requirement remain unchanged.
+
+Two earlier Linux jobs failed fetching the Azure mirror during dependency
+preparation, before executing those acceptance stages. Their retained errors do
+not prove a global DNS outage. Local shell tests exercise the actual workflow
+step with fake system commands to verify routing and failure ordering; they do
+not establish runner connectivity or native Linux acceptance. A corrected
+candidate still requires both actual Bridge jobs and the full validation graph.
+
 Run `37709785108`, attempt 1, used candidate
 `c0b8ad02a22b23939631b0734843b357f0a28d07`. The existing Linux OCR acceptance
 completed all 13 tests without skips, failures or errors. The media stage then
