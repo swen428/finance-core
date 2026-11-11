@@ -1426,6 +1426,148 @@ def _probe_installed_lifecycle(
     return json.loads(completed.stdout)
 
 
+def _probe_installed_native_recovery_material(
+    runtime_python: Path, install_dir: Path, outside_dir: Path
+) -> dict[str, object]:
+    """Reconstruct two material segments after deleting their synthetic source."""
+    helper_root = outside_dir / "native-recovery-fixtures"
+    helper_root.mkdir(exist_ok=True)
+    # These are acquisition fixtures, not Core implementation. All finance_core
+    # imports in the isolated process must resolve to the installed artifact.
+    for name in (
+        "instance_admission_support_v1.py",
+        "lifecycle_recovery_material_support_v1.py",
+    ):
+        shutil.copyfile(REPOSITORY_ROOT / "tests" / name, helper_root / name)
+    program = textwrap.dedent(
+        """
+        import hashlib
+        import json
+        import os
+        import sys
+        import tempfile
+        from pathlib import Path
+
+        installed, checkout, outside, dependencies, helpers = (
+            Path(value).resolve() for value in sys.argv[1:]
+        )
+        sys.path[:0] = [str(installed), str(dependencies), str(helpers)]
+        import finance_core.lifecycle_v2.recovery_material_v1 as recovery_material
+        from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
+        from lifecycle_recovery_material_support_v1 import (
+            correct_expense, make_service, stage_expense,
+        )
+
+        class Environment:
+            def setenv(self, name, value):
+                os.environ[name] = value
+
+        previous_runtime = os.environ['FINANCE_RUNTIME_ROOT']
+        with tempfile.TemporaryDirectory(prefix='native-material-', dir=outside) as scratch:
+            source_root = Path(scratch)
+            service, port, config, authenticator = make_service(source_root, Environment())
+            try:
+                source, _, _, first = stage_expense(service, port, 'initial')
+                first_package = recovery_material.collect_native_closure_v1(
+                    service, archive_source=port, authenticator=authenticator,
+                )
+                _, corrected = correct_expense(service, port, source, first)
+                stage_expense(service, port, 'usd', amount='7.00', currency='USD')
+                stage_expense(service, port, 'unconfirmed', stage='delivery')
+                second_package = recovery_material.collect_native_closure_v1(
+                    service, archive_source=port, authenticator=authenticator,
+                    previous_packages=(first_package,),
+                )
+                decoded = recovery_material.decode_native_closure_v1(second_package)
+                # Pin the producer's identity and exact frontier before removing
+                # the source. The checker may not trust a package's own endpoint.
+                identity = decoded.identity
+                frontier = recovery_material.ClosureFrontierV1(
+                    package_sha256=hashlib.sha256(second_package).hexdigest(),
+                    event_seq=decoded.last_event_seq,
+                    event_sha256=decoded.last_event_sha256,
+                )
+                expected = {
+                    fact.record_id: (fact.version, fact.fact_sha256, fact.amount, fact.currency)
+                    for fact in EffectiveLedgerReaderV1(service).collect().facts
+                }
+                assert expected[first.record_id][:2] == (2, corrected.fact_sha256)
+                assert decoded.previous.package_sha256 == hashlib.sha256(first_package).hexdigest()
+                assert decoded.inventory.fact_version_count == 3
+            finally:
+                service.owner.close()
+                config.close()
+                port.destroy()
+                os.environ['FINANCE_RUNTIME_ROOT'] = previous_runtime
+        assert not source_root.exists()
+        checked = recovery_material.check_native_closure_v1(
+            (first_package, second_package), authenticator=authenticator,
+            expected_identity=identity, expected_frontier=frontier,
+        )
+        reconstructed = {}
+        for record_id, _, version, fact_sha256, _, _, values_json in checked.current_values:
+            values = json.loads(values_json)
+            reconstructed[record_id] = (
+                version, fact_sha256, values['amount'], values['currency'],
+            )
+        assert reconstructed == expected
+        assert checked.status == 'CONTENT_VERIFIED_OFFLINE'
+        assert checked.inventory == decoded.inventory
+        assert checked.frontier == frontier and checked.identity == identity
+        module_paths = sorted({
+            Path(module.__file__).resolve()
+            for name, module in sys.modules.items()
+            if (name == 'finance_core' or name.startswith('finance_core.'))
+            and getattr(module, '__file__', None)
+        })
+        print(json.dumps({
+            'status': checked.status,
+            'segments': 2,
+            'source_removed': not source_root.exists(),
+            'original_port_disabled': port.disabled,
+            'fact_versions': checked.inventory.fact_version_count,
+            'current_records': len(checked.current_values),
+            'reconstructed_matches_effective_reader': reconstructed == expected,
+            'module_file': str(Path(recovery_material.__file__).resolve()),
+            'installed_only': all(path.is_relative_to(installed) for path in module_paths)
+                and not any(Path(path or '.').resolve().is_relative_to(checkout)
+                            for path in sys.path),
+        }, sort_keys=True))
+        """
+    )
+    dependency_root = _installed_runtime_dependencies(outside_dir)
+    with tempfile.TemporaryDirectory(prefix="native-material-import-", dir=outside_dir) as root:
+        runtime = Path(root) / "runtime"
+        runtime.mkdir(mode=0o700)
+        (runtime / "database").mkdir(mode=0o700)
+        completed = subprocess.run(
+            [
+                str(runtime_python),
+                "-I",
+                "-S",
+                "-c",
+                program,
+                str(install_dir),
+                str(REPOSITORY_ROOT),
+                str(outside_dir),
+                str(dependency_root),
+                str(helper_root),
+            ],
+            cwd=outside_dir,
+            env={"PATH": os.environ.get("PATH", ""), "FINANCE_RUNTIME_ROOT": str(runtime)},
+            capture_output=True,
+            text=True,
+            timeout=INSTALLED_INSTANCE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    assert completed.returncode == 0, (
+        f"installed native material probe exit {completed.returncode}; "
+        f"stdout={_bounded_instance_output(completed.stdout)!r}; "
+        f"stderr={_bounded_instance_output(completed.stderr)!r}"
+    )
+    return json.loads(completed.stdout)
+
+
 def _probe_installed_correction_flow(
     runtime_python: Path,
     install_dir: Path,
@@ -2072,6 +2214,17 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
         lifecycle = _probe_installed_lifecycle(runtime_python, install_dir, outside_dir)
+        material = _probe_installed_native_recovery_material(
+            runtime_python, install_dir, outside_dir
+        )
+        assert material["status"] == "CONTENT_VERIFIED_OFFLINE"
+        assert material["segments"] == 2 and material["fact_versions"] == 3
+        assert material["current_records"] == 2
+        assert material["source_removed"] and material["original_port_disabled"]
+        assert material["reconstructed_matches_effective_reader"]
+        assert material["installed_only"]
+        assert Path(material["module_file"]).resolve().is_relative_to(install_dir.resolve())
+        print("INSTALLED_NATIVE_RECOVERY_MATERIAL_PROOF " + json.dumps(material, sort_keys=True))
         assert lifecycle["root_api"] == "finance-core-api-v1"
         assert {"LedgerService", "LedgerReader", "RuntimeBinding", "VerifiedSource"}.issubset(
             lifecycle["lifecycle_exports"]
