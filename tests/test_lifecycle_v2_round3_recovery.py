@@ -1179,8 +1179,14 @@ if pending_bytes is not None:
     pending.write_text(json.dumps(changed))
     denied(lambda: resume_held_restore(new, cut, **route_args))
     pending.write_bytes(pending_bytes)
+# Rebuild the complete synthetic evidence fixture in every cold process, and
+# share it between promotion checks and the later lawful capture.
+port = Port()
+port.sources["later-source"] = replace(
+    port.sources["source1"], evidence_id="later-source", source_key="later-message"
+)
 args = dict(
-    operation_id="promote-cold", approval_ref="approved", port=Port(), binding=held.new_binding
+    operation_id="promote-cold", approval_ref="approved", port=port, binding=held.new_binding
 )
 if pending_bytes is not None:
     for change in (
@@ -1217,10 +1223,6 @@ if phase:
     sys.exit(0)
 os.environ["FINANCE_RUNTIME_ROOT"] = str(Path(new._binding["profile_root"]) / "runtime")
 owner = acquire_production_owner(new)
-port = Port()
-port.sources["later-source"] = replace(
-    port.sources["source1"], evidence_id="later-source", source_key="later-message"
-)
 service = LedgerService(owner, port, held.new_binding)
 source = service.capture("later-source", "later-capture")
 owner.close()
