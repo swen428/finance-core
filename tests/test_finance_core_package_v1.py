@@ -540,9 +540,13 @@ def _installed_recovery_restart_program() -> str:
         binding = lifecycle.RuntimeBinding(**m['binding'])
         class Port:
             def source(self, conn, evidence_id):
+                if evidence_id in m['sources']:
+                    return lifecycle.VerifiedSource(**m['sources'][evidence_id])
+                if evidence_id != 'source-after-recovery':
+                    raise AssertionError('Unexpected installed recovery source: ' + evidence_id)
                 return lifecycle.VerifiedSource(
                     evidence_id, 'actor', 'chat',
-                    'message-1' if evidence_id == 'source1' else evidence_id,
+                    evidence_id,
                     m['raw'], m['original_sha'], 1792800000,
                 )
             def provider(self, conn, evidence_id, expected):
@@ -628,7 +632,7 @@ def _installed_recovery_restart_program() -> str:
                 active_source_id = m['completed_expectation']['post_promotion_source_id']
                 assert service.reader().source(active_source_id) is not None
             audit = service.reader().full_audit()
-            assert audit['fact_version_count'] == 1 and audit['event_count'] == 6
+            assert audit['fact_version_count'] == 2 and audit['event_count'] == 10
             state_bytes = state_path.read_bytes()
             state = json.loads(state_bytes)
             assert sum(entry['action'] == 'restore_admit' for entry in state['history']) == 1
@@ -678,7 +682,8 @@ def _probe_installed_lifecycle(
         import subprocess
         import sys
         import tempfile
-        from dataclasses import asdict
+        from dataclasses import asdict, replace
+        from decimal import Decimal
         from pathlib import Path
         from unittest.mock import patch
 
@@ -691,9 +696,15 @@ def _probe_installed_lifecycle(
         sys.path.insert(0, str(installed))
         import finance_core
         import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.lifecycle_v2.effective_v1 as effective
         import finance_core.instance_admission as admission
         import finance_core.lifecycle_v2.recovery as recovery
+        import finance_core.reconciliation.native_lifecycle_v1 as native_reconciliation
         from finance_core.lifecycle_v2.contracts import digest
+        from finance_core.lifecycle_v2.effective_v1 import (
+            EffectiveLedgerReaderV1, EffectiveFilterV1, ReadLimitsV1,
+        )
+        from finance_core.reconciliation.native_lifecycle_v1 import NativeReconciliationAdapterV1
         from finance_core.profile_layout import product_root, profile_root
         from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
 
@@ -786,19 +797,56 @@ def _probe_installed_lifecycle(
                         'question_ids': [],
                     }],
                 })
+                def correction_response(text, amount):
+                    fields = (('amount', amount), ('currency', 'SGD'))
+                    operations = []
+                    for index, (field, value) in enumerate(fields):
+                        start = text.index(value)
+                        operations.append({
+                            'operation_id': f'o{index}', 'op': 'set', 'field': field,
+                            'value': value,
+                            'evidence': [{
+                                'ref': 'reply', 'start': start, 'end': start + len(value),
+                                'quote': value, 'role': 'replacement_value',
+                            }],
+                        })
+                    return json.dumps({
+                        'schema': 'finance-independent-ai-result-v2',
+                        'outcome': 'proposal', 'intent': 'personal_expense',
+                        'operations': operations, 'unresolved': [],
+                        'coverage': [{
+                            'start': 0, 'end': len(text), 'label': 'resolved_instruction',
+                            'operation_ids': [item['operation_id'] for item in operations],
+                            'question_ids': [],
+                        }],
+                    })
+                initial_source = lifecycle.VerifiedSource(
+                    'source1', 'actor', 'chat', 'message-1', raw, original_sha, 1792800000,
+                )
                 class Port:
                     bad_actor = False
                     def __init__(self):
+                        self.sources = {'source1': initial_source}
+                        self.responses = {'observation1': response}
                         self.observations = {}
                     def source(self, conn, evidence_id):
-                        return lifecycle.VerifiedSource(
-                            evidence_id, 'other' if self.bad_actor else 'actor', 'chat',
-                            'message-1', raw, original_sha, 1792800000,
-                        )
+                        if (
+                            evidence_id == 'source-after-recovery'
+                            and evidence_id not in self.sources
+                        ):
+                            return lifecycle.VerifiedSource(
+                                evidence_id, 'actor', 'chat', evidence_id,
+                                raw, original_sha, 1792800000,
+                            )
+                        source = self.sources[evidence_id]
+                        if self.bad_actor and evidence_id == 'source1':
+                            return replace(source, principal_id='other')
+                        return source
                     def provider(self, conn, evidence_id, expected):
                         if evidence_id not in self.observations:
                             self.observations[evidence_id] = lifecycle.VerifiedObservation(
-                                evidence_id, expected.source_id, 'actor', response,
+                                evidence_id, expected.source_id, 'actor',
+                                self.responses[evidence_id],
                                 digest(asdict(expected)), expected.projection['reply_text'],
                             )
                         return self.observations[evidence_id]
@@ -827,13 +875,138 @@ def _probe_installed_lifecycle(
                 review = service.prepare_review(proposal.proposal_id, proposal.version)
                 service.record_delivery(review.review_id, 'delivery1')
                 posted = service.confirm(review.review_id, 'action1', 'confirm1')
-                audit = service.reader().full_audit()
+                initial_audit = service.reader().full_audit()
                 guarded_capture = {
                     'actor_refused': actor_refused,
                     'retry_same': retry_same,
                     'source_sha256': source.source_sha256,
-                    'event_count': audit['event_count'],
-                    'fact_version_count': audit['fact_version_count'],
+                    'event_count': initial_audit['event_count'],
+                    'fact_version_count': initial_audit['fact_version_count'],
+                }
+
+                correction_text = 'change amount to SGD 15.00; reason: corrected amount'
+                port.sources['edit1'] = lifecycle.VerifiedSource(
+                    'edit1', 'actor', 'chat', 'message-edit-1', correction_text,
+                    hashlib.sha256(correction_text.encode()).hexdigest(), 1792800000,
+                )
+                port.responses['observation2'] = correction_response(correction_text, '15.00')
+                correction = service.prepare_correction(
+                    posted.record_id, posted.version, 'observation2', 'propose-correction',
+                    reply_evidence_id='edit1', reason='corrected amount',
+                )
+                service.record_delivery(correction.review_id, 'delivery2')
+                corrected = service.confirm(correction.review_id, 'action2', 'confirm2')
+                original_retry_same = (
+                    service.confirm(review.review_id, 'action1', 'confirm1') == posted
+                )
+                original_new_operation_refused = False
+                try:
+                    service.confirm(review.review_id, 'action1', 'confirm1-new-operation')
+                except lifecycle.LifecycleError:
+                    original_new_operation_refused = True
+                correction_retry_same = (
+                    service.confirm(correction.review_id, 'action2', 'confirm2') == corrected
+                )
+                correction_new_operation_refused = False
+                try:
+                    service.confirm(
+                        correction.review_id, 'action2', 'confirm2-new-operation'
+                    )
+                except lifecycle.LifecycleError:
+                    correction_new_operation_refused = True
+                corrected_audit = service.reader().full_audit()
+                assert corrected.record_id == posted.record_id
+                assert posted.version == 1 and corrected.version == 2
+                assert original_retry_same and correction_retry_same
+                assert original_new_operation_refused and correction_new_operation_refused
+                assert corrected_audit['event_count'] == 9
+                assert corrected_audit['fact_version_count'] == 2
+                correction_proof = {
+                    'record_id': corrected.record_id,
+                    'v1_fact_sha256': posted.fact_sha256,
+                    'v2_fact_sha256': corrected.fact_sha256,
+                    'version': corrected.version,
+                    'retries_same': original_retry_same and correction_retry_same,
+                    'new_operations_refused': (
+                        original_new_operation_refused and correction_new_operation_refused
+                    ),
+                    'event_count': corrected_audit['event_count'],
+                    'fact_versions': corrected_audit['fact_version_count'],
+                }
+                effective_reader = EffectiveLedgerReaderV1(service)
+                read_filter = EffectiveFilterV1(currency='sgd')
+                read_limits = ReadLimitsV1(max_records=1, max_fact_versions=2)
+                effective_fact = effective_reader.get(posted.record_id)
+                effective_history = effective_reader.history(
+                    posted.record_id, limits=read_limits,
+                )
+                effective_collection = effective_reader.collect(read_filter, read_limits)
+                effective_summary = effective_reader.summary(read_filter, read_limits)
+                exported = effective_reader.export_json(read_filter, read_limits)
+                exported_retry = effective_reader.export_json(read_filter, read_limits)
+                native_candidates = NativeReconciliationAdapterV1(
+                    effective_reader
+                ).fetch_candidates(read_filter, read_limits)
+                assert effective_fact is not None
+                assert effective_fact.version == corrected.version == 2
+                assert effective_fact.fact_sha256 == corrected.fact_sha256
+                assert effective_fact.amount == '15.00' and effective_fact.currency == 'SGD'
+                assert effective_fact.account_status == 'unknown'
+                assert effective_fact.account_id is None
+                assert effective_fact.status == 'LOCAL_POSTED'
+                assert effective_history is not None
+                assert effective_history.current_version == 2
+                assert tuple(item.version for item in effective_history.versions) == (1, 2)
+                assert effective_history.versions[0].fact_sha256 == posted.fact_sha256
+                assert effective_history.versions[1].fact_sha256 == corrected.fact_sha256
+                assert effective_collection.complete
+                assert effective_collection.scope == 'native-lifecycle-v2'
+                assert effective_collection.filters.currency == 'SGD'
+                assert len(effective_collection.facts) == 1
+                assert effective_summary.complete
+                assert effective_summary.scope == 'native-lifecycle-v2'
+                assert len(effective_summary.items) == 1
+                assert effective_summary.items[0].currency == 'SGD'
+                assert effective_summary.items[0].event_count == 1
+                assert effective_summary.items[0].total_amount == '15.00'
+                assert exported == exported_retry
+                assert json.loads(exported)['facts'][0]['fact_sha256'] == corrected.fact_sha256
+                assert native_candidates.complete
+                assert native_candidates.scope == 'native-lifecycle-v2'
+                assert native_candidates.filters.currency == 'SGD'
+                assert len(native_candidates.candidates) == 1
+                native_candidate = native_candidates.candidates[0]
+                assert native_candidate.fact_ref.record_id == posted.record_id
+                assert native_candidate.fact_ref.economic_event_id == (
+                    effective_fact.economic_event_id
+                )
+                assert native_candidate.fact_ref.version == 2
+                assert native_candidate.fact_ref.fact_sha256 == corrected.fact_sha256
+                assert native_candidate.fact_ref.commit_seq == corrected.commit_seq
+                assert native_candidate.source == effective_fact.source
+                assert native_candidate.candidate.internal_id == (
+                    'lifecycle-v2:' + posted.record_id
+                )
+                assert native_candidate.candidate.amount == Decimal('15.00')
+                assert native_candidate.candidate.currency == 'SGD'
+                assert native_candidate.account_status == 'unknown'
+                assert native_candidate.account_id is None
+                effective_proof = {
+                    'record_id': effective_fact.record_id,
+                    'economic_event_id': effective_fact.economic_event_id,
+                    'version': effective_fact.version,
+                    'fact_sha256': effective_fact.fact_sha256,
+                    'source_id': effective_fact.source.source_id,
+                    'history_versions': [item.version for item in effective_history.versions],
+                    'history_fact_sha256': [
+                        item.fact_sha256 for item in effective_history.versions
+                    ],
+                    'candidate_count': len(native_candidates.candidates),
+                    'candidate_version': native_candidate.fact_ref.version,
+                    'candidate_fact_sha256': native_candidate.fact_ref.fact_sha256,
+                    'runtime_binding_sha256': (
+                        effective_collection.read_identity.runtime_binding_sha256
+                    ),
                 }
                 snapshot = scratch / 'sealed.sqlite'
                 cut = service.seal_snapshot(snapshot)
@@ -910,9 +1083,10 @@ def _probe_installed_lifecycle(
                     'config': new_config._binding, 'support_root': str(new_support),
                     'cut': asdict(cut), 'receipt': asdict(isolation),
                     'binding': asdict(new_binding), 'raw': raw, 'original_sha': original_sha,
+                    'sources': {key: asdict(value) for key, value in port.sources.items()},
                     'observations': {key: asdict(value)
                                      for key, value in port.observations.items()},
-                    'posted': asdict(posted),
+                    'posted': asdict(corrected), 'original': asdict(posted),
                 }
                 material_path = scratch / 'retained-recovery.json'
                 material_path.write_text(json.dumps(retained))
@@ -948,30 +1122,224 @@ def _probe_installed_lifecycle(
                 new_owner = admission.acquire_production_owner(new_config)
                 restored_service = lifecycle.LedgerService(new_owner, port, new_binding)
                 restored_fact = restored_service.reader().get(posted.record_id)
+                restored_reader = EffectiveLedgerReaderV1(restored_service)
+                restored_limits = ReadLimitsV1(max_records=1, max_fact_versions=2)
+                effective_v2_restored = restored_reader.get(posted.record_id)
+                history_v2_restored = restored_reader.history(
+                    posted.record_id, limits=restored_limits,
+                )
+                candidates_v2_restored = NativeReconciliationAdapterV1(
+                    restored_reader
+                ).fetch_candidates(limits=restored_limits)
+                assert effective_v2_restored is not None
+                assert history_v2_restored is not None
+                assert effective_v2_restored.record_id == effective_fact.record_id
+                assert effective_v2_restored.economic_event_id == effective_fact.economic_event_id
+                assert effective_v2_restored.source.source_id == effective_fact.source.source_id
+                assert effective_v2_restored.version == effective_fact.version == 2
+                assert effective_v2_restored.fact_sha256 == effective_fact.fact_sha256
+                assert effective_v2_restored.amount == effective_fact.amount == '15.00'
+                assert effective_v2_restored.currency == effective_fact.currency == 'SGD'
+                assert tuple(item.version for item in history_v2_restored.versions) == (1, 2)
+                assert tuple(item.fact_sha256 for item in history_v2_restored.versions) == (
+                    posted.fact_sha256, corrected.fact_sha256,
+                )
+                assert candidates_v2_restored.complete
+                assert candidates_v2_restored.scope == 'native-lifecycle-v2'
+                assert len(candidates_v2_restored.candidates) == 1
+                restored_candidate_v2 = candidates_v2_restored.candidates[0]
+                assert restored_candidate_v2.fact_ref.record_id == posted.record_id
+                assert restored_candidate_v2.fact_ref.economic_event_id == (
+                    effective_fact.economic_event_id
+                )
+                assert restored_candidate_v2.fact_ref.version == 2
+                assert restored_candidate_v2.fact_ref.fact_sha256 == corrected.fact_sha256
+                assert candidates_v2_restored.read_identity.runtime_binding_sha256 != (
+                    effective_collection.read_identity.runtime_binding_sha256
+                )
+                restored_old_review_new_operation_refused = False
+                try:
+                    restored_service.confirm(
+                        correction.review_id, 'action2', 'confirm2-after-restore',
+                    )
+                except lifecycle.LifecycleError:
+                    restored_old_review_new_operation_refused = True
+                else:
+                    raise AssertionError('Old correction review crossed the restored binding')
+                still_v2 = restored_reader.get(posted.record_id)
+                assert still_v2 is not None and still_v2.version == 2
+                assert still_v2.fact_sha256 == corrected.fact_sha256
+                source_binding_matches = cut.source_binding_sha256 == cfg.binding_sha256
+                snapshot_file_matches = (
+                    cut.database_sha256 == hashlib.sha256(snapshot.read_bytes()).hexdigest()
+                )
+                cut_contains_current_fact = cut.facts == ((
+                    corrected.record_id, corrected.version, corrected.fact_sha256,
+                ),)
+                assert source_binding_matches and snapshot_file_matches
+                assert cut_contains_current_fact
+                assert restored_fact['record_id'] == corrected.record_id
+                assert restored_fact['version'] == corrected.version
+                assert restored_fact['values']['amount'] == '15.00'
+                assert restored_fact['fact_sha256'] == corrected.fact_sha256
+                assert restored_old_review_new_operation_refused
+                pending_retry, completed_retry = fresh_proofs
+                assert pending_retry['observed_status'] == 'RESTORE_ADMIT_PENDING'
+                assert completed_retry['observed_status'] == 'ACTIVE'
+                assert pending_retry['mode'] == 'pending'
+                assert completed_retry['mode'] == 'completed'
+                assert pending_retry['pid'] != completed_retry['pid']
+                assert pending_retry['installed_only'] and completed_retry['installed_only']
+                assert pending_retry['pending_retained_on_refusal']
+                assert set(pending_retry['refused']) == {
+                    'owner_while_pending', 'generic_resume', 'wrong_operation', 'wrong_cut',
+                    'wrong_receipt', 'changed_content',
+                }
+                for key in (
+                    'authority_sha256', 'authority_version', 'audit',
+                    'post_promotion_source_id', 'record_id', 'record_version',
+                    'fact_sha256', 'prepare_entry_sha256',
+                ):
+                    assert pending_retry[key] == completed_retry[key]
+                assert completed_retry['audit']['event_count'] == 10
+                assert completed_retry['audit']['fact_version_count'] == 2
                 recovery_proof = {
-                    'cut_format': cut.format,
-                    'logical_digest_format': cut.logical_digest_format,
-                    'logical_database_sha256': cut.logical_database_sha256,
-                    'source_binding_sha256': cut.source_binding_sha256,
-                    'snapshot_sha256': cut.database_sha256,
-                    'source_binding_matches': cut.source_binding_sha256 == cfg.binding_sha256,
-                    'snapshot_file_matches': (
-                        cut.database_sha256 == hashlib.sha256(snapshot.read_bytes()).hexdigest()
-                    ),
-                    'cut_contains_posted_fact': cut.facts == ((
-                        posted.record_id, posted.version, posted.fact_sha256,
-                    ),),
-                    'receipt_schema': json.loads(isolation.material_json)['schema'],
-                    'held_status': held.status,
-                    'new_instance_id': new_binding.instance_id,
-                    'new_generation': new_binding.generation,
+                    'snapshot_verified': source_binding_matches and snapshot_file_matches,
+                    'cut_contains_current_fact': cut_contains_current_fact,
                     'old_root_unavailable': old_root_unavailable,
-                    'promoted_state': promoted['state'],
-                    'record_id': restored_fact['record_id'],
-                    'record_version': restored_fact['version'],
-                    'record_amount': restored_fact['values']['amount'],
-                    'fact_sha256_matches': restored_fact['fact_sha256'] == posted.fact_sha256,
-                    'fresh_process_retries': fresh_proofs,
+                    'promoted': promoted['state'] == 'ACTIVE',
+                    'restored_record_id': restored_fact['record_id'],
+                    'restored_version': restored_fact['version'],
+                    'restored_fact_sha256': restored_fact['fact_sha256'],
+                    'effective_v2_preserved': (
+                        effective_v2_restored.record_id == effective_fact.record_id
+                        and effective_v2_restored.economic_event_id
+                        == effective_fact.economic_event_id
+                        and effective_v2_restored.source.source_id
+                        == effective_fact.source.source_id
+                        and effective_v2_restored.version == effective_fact.version == 2
+                        and effective_v2_restored.fact_sha256 == effective_fact.fact_sha256
+                        and effective_v2_restored.amount == effective_fact.amount == '15.00'
+                        and effective_v2_restored.currency == effective_fact.currency == 'SGD'
+                    ),
+                    'runtime_binding_changed': (
+                        candidates_v2_restored.read_identity.runtime_binding_sha256
+                        != effective_collection.read_identity.runtime_binding_sha256
+                    ),
+                    'restart_processes': [{
+                        'mode': item['mode'],
+                        'pid': item['pid'],
+                        'status': item['observed_status'],
+                        'installed_only': item['installed_only'],
+                        'pending_retained_on_refusal': item['pending_retained_on_refusal'],
+                        'refused': sorted(item['refused']),
+                    } for item in fresh_proofs],
+                }
+
+                restored_text = 'change amount to SGD 16.50; reason: restored review correction'
+                restored_source = lifecycle.VerifiedSource(
+                    'edit-after-restore', 'actor', 'chat', 'message-edit-after-restore',
+                    restored_text, hashlib.sha256(restored_text.encode()).hexdigest(), 1792800000,
+                )
+                port.sources[restored_source.evidence_id] = restored_source
+                port.responses['observation3'] = correction_response(restored_text, '16.50')
+                restored_correction = restored_service.prepare_correction(
+                    restored_fact['record_id'], restored_fact['version'],
+                    'observation3', 'propose-correction-after-restore',
+                    reply_evidence_id=restored_source.evidence_id,
+                    reason='restored review correction',
+                )
+                restored_service.record_delivery(restored_correction.review_id, 'delivery3')
+                corrected_after_restore = restored_service.confirm(
+                    restored_correction.review_id, 'action3', 'confirm3',
+                )
+                restored_correction_retry_same = (
+                    restored_service.confirm(
+                        restored_correction.review_id, 'action3', 'confirm3',
+                    ) == corrected_after_restore
+                )
+                restored_correction_new_operation_refused = False
+                try:
+                    restored_service.confirm(
+                        restored_correction.review_id, 'action3', 'confirm3-new-operation',
+                    )
+                except lifecycle.LifecycleError:
+                    restored_correction_new_operation_refused = True
+
+                restored_limits = ReadLimitsV1(max_records=1, max_fact_versions=3)
+                effective_v3 = restored_reader.get(posted.record_id)
+                history_v3 = restored_reader.history(posted.record_id, limits=restored_limits)
+                collection_v3 = restored_reader.collect(limits=restored_limits)
+                summary_v3 = restored_reader.summary(limits=restored_limits)
+                export_v3 = restored_reader.export_json(limits=restored_limits)
+                export_v3_retry = restored_reader.export_json(limits=restored_limits)
+                native_v3 = NativeReconciliationAdapterV1(restored_reader).fetch_candidates(
+                    limits=restored_limits,
+                )
+                assert effective_v3 is not None
+                assert effective_v3.record_id == posted.record_id
+                assert effective_v3.economic_event_id == effective_fact.economic_event_id
+                assert effective_v3.version == corrected_after_restore.version == 3
+                assert effective_v3.fact_sha256 == corrected_after_restore.fact_sha256
+                assert effective_v3.amount == '16.50' and effective_v3.currency == 'SGD'
+                assert effective_v3.source.source_id == source.source_id
+                assert history_v3 is not None and history_v3.current_version == 3
+                assert tuple(item.version for item in history_v3.versions) == (1, 2, 3)
+                assert history_v3.versions[0].fact_sha256 == posted.fact_sha256
+                assert history_v3.versions[1].fact_sha256 == corrected.fact_sha256
+                assert history_v3.versions[2].fact_sha256 == corrected_after_restore.fact_sha256
+                assert collection_v3.complete and collection_v3.scope == 'native-lifecycle-v2'
+                assert len(collection_v3.facts) == 1
+                assert summary_v3.complete and summary_v3.scope == 'native-lifecycle-v2'
+                assert len(summary_v3.items) == 1
+                assert summary_v3.items[0].currency == 'SGD'
+                assert summary_v3.items[0].event_count == 1
+                assert summary_v3.items[0].total_amount == '16.50'
+                assert export_v3 == export_v3_retry
+                assert json.loads(export_v3)['facts'][0]['fact_sha256'] == (
+                    corrected_after_restore.fact_sha256
+                )
+                assert native_v3.complete and native_v3.scope == 'native-lifecycle-v2'
+                assert len(native_v3.candidates) == 1
+                native_candidate_v3 = native_v3.candidates[0]
+                assert native_candidate_v3.fact_ref.record_id == posted.record_id
+                assert native_candidate_v3.fact_ref.economic_event_id == (
+                    effective_v3.economic_event_id
+                )
+                assert native_candidate_v3.fact_ref.version == 3
+                assert native_candidate_v3.fact_ref.fact_sha256 == (
+                    corrected_after_restore.fact_sha256
+                )
+                assert native_candidate_v3.candidate.internal_id == (
+                    'lifecycle-v2:' + posted.record_id
+                )
+                assert native_candidate_v3.candidate.amount == Decimal('16.50')
+                assert native_candidate_v3.candidate.currency == 'SGD'
+                restored_audit = restored_service.reader().full_audit()
+                assert restored_correction_retry_same
+                assert restored_correction_new_operation_refused
+                assert restored_old_review_new_operation_refused
+                assert restored_audit['fact_version_count'] == 3
+                assert restored_audit['event_count'] == 14
+                post_restore_proof = {
+                    'fresh_source_id': restored_source.evidence_id,
+                    'fresh_observation_id': 'observation3',
+                    'retry_same': restored_correction_retry_same,
+                    'new_operation_refused': restored_correction_new_operation_refused,
+                    'old_review_new_operation_refused': restored_old_review_new_operation_refused,
+                    'record_id': effective_v3.record_id,
+                    'economic_event_id': effective_v3.economic_event_id,
+                    'source_id': effective_v3.source.source_id,
+                    'version': effective_v3.version,
+                    'fact_sha256': effective_v3.fact_sha256,
+                    'history_versions': [item.version for item in history_v3.versions],
+                    'history_fact_sha256': [
+                        item.fact_sha256 for item in history_v3.versions
+                    ],
+                    'candidate_count': len(native_v3.candidates),
+                    'audit': [
+                        restored_audit['fact_version_count'], restored_audit['event_count'],
+                    ],
                 }
             finally:
                 if new_owner is not None:
@@ -998,7 +1366,14 @@ def _probe_installed_lifecycle(
             'migration_sha256': hashlib.sha256(migration.read_bytes()).hexdigest(),
             'lifecycle_tables': sorted(tables),
             'guarded_capture': guarded_capture,
+            'correction': correction_proof,
+            'effective_v2': effective_proof,
             'recovery': recovery_proof,
+            'post_restore_v3': post_restore_proof,
+            'effective_module_file': str(Path(effective.__file__).resolve()),
+            'native_reconciliation_module_file': str(
+                Path(native_reconciliation.__file__).resolve()
+            ),
             'module_paths': [str(path) for path in module_paths],
             'installed_only': all(path.is_relative_to(installed) for path in module_paths)
                 and not any(Path(path or '.').resolve().is_relative_to(checkout)
@@ -1709,28 +2084,45 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert lifecycle["guarded_capture"]["retry_same"] is True
         assert lifecycle["guarded_capture"]["event_count"] == 5
         assert lifecycle["guarded_capture"]["fact_version_count"] == 1
+        correction = lifecycle["correction"]
+        assert correction["version"] == 2
+        assert correction["retries_same"] is True
+        assert correction["new_operations_refused"] is True
+        assert correction["event_count"] == 9
+        assert correction["fact_versions"] == 2
+        effective_v2 = lifecycle["effective_v2"]
+        assert effective_v2["record_id"] == correction["record_id"]
+        assert effective_v2["version"] == 2
+        assert effective_v2["fact_sha256"] == correction["v2_fact_sha256"]
+        assert effective_v2["history_versions"] == [1, 2]
+        assert effective_v2["history_fact_sha256"] == [
+            correction["v1_fact_sha256"],
+            correction["v2_fact_sha256"],
+        ]
+        assert effective_v2["candidate_count"] == 1
+        assert effective_v2["candidate_version"] == 2
+        assert effective_v2["candidate_fact_sha256"] == correction["v2_fact_sha256"]
+        assert (
+            Path(lifecycle["effective_module_file"]).resolve().is_relative_to(install_dir.resolve())
+        )
+        assert (
+            Path(lifecycle["native_reconciliation_module_file"])
+            .resolve()
+            .is_relative_to(install_dir.resolve())
+        )
         recovery = lifecycle["recovery"]
-        assert recovery["cut_format"] == "lifecycle-snapshot-cut-v3"
-        assert recovery["logical_digest_format"] == "core-logical-database-v1"
-        assert len(recovery["logical_database_sha256"]) == 64
-        assert len(recovery["source_binding_sha256"]) == 64
-        assert len(recovery["snapshot_sha256"]) == 64
-        assert recovery["source_binding_matches"] is True
-        assert recovery["snapshot_file_matches"] is True
-        assert recovery["cut_contains_posted_fact"] is True
-        assert recovery["receipt_schema"] == "old-writer-isolation-v3"
-        assert recovery["held_status"] == "RESTORE_HELD"
-        assert recovery["new_instance_id"] == "successor-instance"
-        assert recovery["new_generation"] == "generation-2"
+        assert recovery["snapshot_verified"] is True
+        assert recovery["cut_contains_current_fact"] is True
         assert recovery["old_root_unavailable"] is True
-        assert recovery["promoted_state"] == "ACTIVE"
-        assert recovery["record_id"]
-        assert recovery["record_version"] == 1
-        assert recovery["record_amount"] == "12.00"
-        assert recovery["fact_sha256_matches"] is True
-        pending_retry, completed_retry = recovery["fresh_process_retries"]
-        assert pending_retry["observed_status"] == "RESTORE_ADMIT_PENDING"
-        assert completed_retry["observed_status"] == "ACTIVE"
+        assert recovery["promoted"] is True
+        assert recovery["restored_record_id"] == effective_v2["record_id"]
+        assert recovery["restored_version"] == 2
+        assert recovery["restored_fact_sha256"] == effective_v2["fact_sha256"]
+        assert recovery["effective_v2_preserved"] is True
+        assert recovery["runtime_binding_changed"] is True
+        pending_retry, completed_retry = recovery["restart_processes"]
+        assert pending_retry["status"] == "RESTORE_ADMIT_PENDING"
+        assert completed_retry["status"] == "ACTIVE"
         assert pending_retry["mode"] == "pending" and completed_retry["mode"] == "completed"
         assert pending_retry["pid"] != completed_retry["pid"]
         assert pending_retry["installed_only"] and completed_retry["installed_only"]
@@ -1743,19 +2135,24 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
             "wrong_receipt",
             "changed_content",
         }
-        for key in (
-            "authority_sha256",
-            "authority_version",
-            "audit",
-            "post_promotion_source_id",
-            "record_id",
-            "record_version",
-            "fact_sha256",
-            "prepare_entry_sha256",
-        ):
-            assert pending_retry[key] == completed_retry[key]
-        assert completed_retry["audit"]["event_count"] == 6
-        assert completed_retry["audit"]["fact_version_count"] == 1
+        post_restore = lifecycle["post_restore_v3"]
+        assert post_restore["fresh_source_id"] == "edit-after-restore"
+        assert post_restore["fresh_observation_id"] == "observation3"
+        assert post_restore["retry_same"] is True
+        assert post_restore["new_operation_refused"] is True
+        assert post_restore["old_review_new_operation_refused"] is True
+        assert post_restore["record_id"] == effective_v2["record_id"]
+        assert post_restore["economic_event_id"] == effective_v2["economic_event_id"]
+        assert post_restore["source_id"] == effective_v2["source_id"]
+        assert post_restore["version"] == 3
+        assert post_restore["history_versions"] == [1, 2, 3]
+        assert post_restore["history_fact_sha256"] == [
+            correction["v1_fact_sha256"],
+            correction["v2_fact_sha256"],
+            post_restore["fact_sha256"],
+        ]
+        assert post_restore["candidate_count"] == 1
+        assert post_restore["audit"] == [3, 14]
         assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
             lifecycle["lifecycle_tables"]
         )

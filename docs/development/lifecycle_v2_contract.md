@@ -4,6 +4,11 @@ This opt-in API is an offline-synthetic feasibility candidate. It does not admit
 production bindings, publish a release, replace historical facts or activate a
 runtime. Migration 061 appends new tables; migrations 001 through 060 are unchanged.
 
+The additive [native effective-ledger read contract](effective_ledger_v1.md)
+defines an explicit opt-in current-fact collection, history, export, separate
+currency summaries and version-bound read-only reconciliation candidates. It
+preserves this lifecycle's financial, evidence and runtime boundaries.
+
 The root `finance_core.API_CONTRACT_VERSION` remains `finance-core-api-v1` because
 its existing exports and behavior are unchanged. `finance_core.lifecycle_v2` is a
 separately named, opt-in additive API; consumers must explicitly import it and

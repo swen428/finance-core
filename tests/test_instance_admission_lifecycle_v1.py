@@ -349,7 +349,7 @@ class _ProcessEnvironment:
         os.environ[name] = value
 
 
-def _uncertain_close_worker(tmp_root: Path, sender) -> None:
+def _uncertain_close_worker(tmp_root: Path, channel) -> None:
     import finance_core.instance_admission.sessions as session_module
     from tests.instance_admission_support_v1 import synthetic_config
 
@@ -377,7 +377,7 @@ def _uncertain_close_worker(tmp_root: Path, sender) -> None:
         except ProductionCloseUncertain as exc:
             uncertain = exc
         else:
-            sender.send(("error", "close uncertainty was not reported"))
+            channel.send(("error", "close uncertainty was not reported"))
             os._exit(2)
     finally:
         session_module._close_sqlite_handle = real_close
@@ -392,21 +392,20 @@ def _uncertain_close_worker(tmp_root: Path, sender) -> None:
     except InstanceAdmissionError:
         owner_close_refused = True
 
-    process, receiver = _start_spawn_process(
-        _owner_attempt, (config.control_root, config.locator_root)
-    )
-    owner_result = _receive(receiver, process)
-    sender.send(
+    # Keep the actual connection and owner alive while the parent independently
+    # checks that another process cannot acquire the lease.
+    channel.send(
         (
             "retained",
             uncertain.connection is conn,
             uncertain.owner is owner,
             retained_handle_live,
             owner_close_refused,
-            owner_result[0] == "busy",
+            config.control_root,
+            config.locator_root,
         )
     )
-    os._exit(0)
+    os._exit(0 if channel.recv() == "release" else 3)
 
 
 def _forked_connection_attempt(conn: sqlite3.Connection, owner, sender) -> None:
@@ -1320,10 +1319,69 @@ def test_process_exit_rolls_back_open_sqlite_transaction_and_releases_owner(
 def test_uncertain_close_retains_connection_and_owner_lease_until_process_exit(
     tmp_path: Path,
 ) -> None:
-    process, receiver = _start_spawn_process(_uncertain_close_worker, (tmp_path,))
-    result = _receive(receiver, process)
-    assert result == ("retained", True, True, True, True, True)
-    assert process.exitcode == 0
+    def reap(process, channel) -> None:
+        channel.close()
+        if process.pid is None:
+            return
+        if process.is_alive():
+            process.terminate()
+        process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        assert not process.is_alive(), "uncertain-close test left a spawned child running"
+
+    def receive_phase(receiver, process, phase: str):
+        assert receiver.poll(10), f"{phase}: child produced no result (exit={process.exitcode})"
+        try:
+            result = receiver.recv()
+        except EOFError:
+            pytest.fail(f"{phase}: child closed its result pipe without a result")
+        process.join(10)
+        assert not process.is_alive(), f"{phase}: child did not exit after sending its result"
+        return result
+
+    context = mp.get_context("spawn")
+    parent_channel, child_channel = context.Pipe()
+    worker = context.Process(target=_uncertain_close_worker, args=(tmp_path, child_channel))
+    try:
+        worker.start()
+        child_channel.close()
+        assert parent_channel.poll(10), (
+            f"uncertain-close setup: no retained-state result (exit={worker.exitcode})"
+        )
+        try:
+            ready = parent_channel.recv()
+        except EOFError:
+            pytest.fail("uncertain-close setup: worker exited without retained-state result")
+        assert len(ready) == 7, f"uncertain-close setup: unexpected result {ready!r}"
+        assert ready[:5] == ("retained", True, True, True, True)
+        assert worker.is_alive(), "uncertain-close setup: worker exited before owner probe"
+        control_root, locator_root = ready[5:]
+
+        contender, receiver = _start_spawn_process(_owner_attempt, (control_root, locator_root))
+        try:
+            owner_result = receive_phase(receiver, contender, "owner-held probe")
+            assert contender.exitcode == 0, "owner-held probe: child exited unsuccessfully"
+        finally:
+            reap(contender, receiver)
+        assert worker.is_alive(), "owner-held probe: retaining worker exited early"
+        assert ("retained", *ready[1:5], owner_result[0] == "busy") == (
+            "retained",
+            True,
+            True,
+            True,
+            True,
+            True,
+        ), f"owner-held probe: expected busy, got {owner_result!r}"
+
+        parent_channel.send("release")
+        worker.join(10)
+        assert not worker.is_alive(), "uncertain-close release: worker did not exit"
+        assert worker.exitcode == 0, "uncertain-close release: worker exited unsuccessfully"
+    finally:
+        child_channel.close()
+        reap(worker, parent_channel)
 
 
 def test_maintenance_hold_denies_operations_until_bound_safe_abort(
