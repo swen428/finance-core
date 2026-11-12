@@ -10,18 +10,22 @@ inputs and the public acceptance receipt. No standalone identity file is made.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import importlib.metadata
 import json
 import os
 import platform
 import re
+import selectors
 import shutil
+import stat
 import struct
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SCHEMA = "finance-prepared-envelope-acceptance-v1"
@@ -62,6 +66,7 @@ HELPERS = (
 )
 LOCKED_DEPENDENCIES = {"pypdf": "6.21.4", "typing-extensions": "4.16.0"}
 MAX_SECONDS = 900
+MAX_PHASE_RESPONSE_BYTES = 128 * 1024
 NATIVE_STAGE_CODES = frozenset(
     {
         "NATIVE_PREFLIGHT_REGISTRY",
@@ -156,7 +161,17 @@ def counts(checks):
     return {"required": len(checks), "passed": len(checks), "skipped": 0, "failed": 0, "errors": 0}
 
 
-def _run(command, *, cwd, deadline, stage, environment=None, input_bytes=None):
+def _run(
+    command,
+    *,
+    cwd,
+    deadline,
+    stage,
+    environment=None,
+    input_bytes=None,
+    pass_fds=(),
+    quiet_success=False,
+):
     remaining = deadline - time.monotonic()
     require(remaining > 0, "acceptance deadline expired")
     result = subprocess.run(
@@ -166,6 +181,7 @@ def _run(command, *, cwd, deadline, stage, environment=None, input_bytes=None):
         input=input_bytes,
         capture_output=True,
         timeout=min(remaining, 360),
+        pass_fds=pass_fds,
     )
     require(
         len(result.stdout) <= 128 * 1024 and len(result.stderr) <= 128 * 1024, stage + " output"
@@ -195,7 +211,114 @@ def _run(command, *, cwd, deadline, stage, environment=None, input_bytes=None):
         except (ValueError, AttributeError, TypeError):
             pass
         raise ValueError(stage + " failed" + detail)
+    if quiet_success:
+        require(not result.stdout and not result.stderr, stage + " unexpected diagnostic output")
     return result.stdout
+
+
+def _private_response_fd(descriptor):
+    # A numeric descriptor is not a secret. Refuse standard streams, regular
+    # files and aliases of a standard stream before reading any private input.
+    require(type(descriptor) is int and descriptor > 2, "private response pipe required")
+    info = os.fstat(descriptor)
+    require(stat.S_ISFIFO(info.st_mode), "private response pipe required")
+    require(
+        fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY,
+        "writable private response pipe required",
+    )
+    for standard in (0, 1, 2):
+        try:
+            other = os.fstat(standard)
+        except OSError:
+            continue
+        require(
+            (info.st_dev, info.st_ino) != (other.st_dev, other.st_ino),
+            "private response pipe aliases a standard stream",
+        )
+    return descriptor
+
+
+def _write_private_response(descriptor, data):
+    require(len(data) <= MAX_PHASE_RESPONSE_BYTES, "private response exceeds bound")
+    deadline = time.monotonic() + 360
+    os.set_blocking(descriptor, False)
+    with selectors.DefaultSelector() as selector:
+        selector.register(descriptor, selectors.EVENT_WRITE)
+        remaining = memoryview(data)
+        while remaining:
+            wait = deadline - time.monotonic()
+            require(wait > 0, "private response deadline expired")
+            require(selector.select(wait), "private response deadline expired")
+            try:
+                written = os.write(descriptor, remaining)
+            except BlockingIOError:
+                continue
+            require(written > 0, "private response write refused")
+            remaining = remaining[written:]
+
+
+def _read_private_response(descriptor, deadline):
+    # The reader owns this descriptor, including timeout/overflow/close failure.
+    # A deadline also bounds a descendant that incorrectly retains a writer.
+    try:
+        data = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while True:
+                wait = deadline - time.monotonic()
+                require(wait > 0, "private response deadline expired")
+                require(selector.select(wait), "private response deadline expired")
+                chunk = os.read(descriptor, min(65536, MAX_PHASE_RESPONSE_BYTES + 1 - len(data)))
+                if not chunk:
+                    return bytes(data)
+                data.extend(chunk)
+                require(len(data) <= MAX_PHASE_RESPONSE_BYTES, "private response exceeds bound")
+    finally:
+        # A refused close withholds success; never retry an ambiguous close.
+        os.close(descriptor)
+
+
+def _run_private_phase(command, *, cwd, deadline, stage, environment=None, input_bytes=None):
+    phase_deadline = min(deadline, time.monotonic() + 360)
+    require(phase_deadline > time.monotonic(), "acceptance deadline expired")
+    read_fd, write_fd = os.pipe()
+    try:
+        # Drain while the subprocess runs: responses may exceed pipe capacity.
+        # The reader's own deadline bounds executor shutdown on every path.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            response = executor.submit(_read_private_response, read_fd, phase_deadline)
+            read_fd = None  # ownership transferred to the reader
+            try:
+                _run(
+                    [*command, "--response-fd", str(write_fd)],
+                    cwd=cwd,
+                    deadline=phase_deadline,
+                    stage=stage,
+                    environment=environment,
+                    input_bytes=input_bytes,
+                    pass_fds=(write_fd,),
+                    quiet_success=True,
+                )
+            finally:
+                descriptor, write_fd = write_fd, None
+                os.close(descriptor)
+            data = response.result()
+        try:
+            packet = json.loads(data)
+        except (ValueError, UnicodeError):
+            raise ValueError("private response JSON refused") from None
+        require(type(packet) is dict, "private response object required")
+        return data
+    finally:
+        # Clear ownership before closing so no error path retries a close.
+        try:
+            if write_fd is not None:
+                descriptor, write_fd = write_fd, None
+                os.close(descriptor)
+        finally:
+            if read_fd is not None:
+                descriptor, read_fd = read_fd, None
+                os.close(descriptor)
 
 
 def _copy_distribution(name, version, destination):
@@ -525,8 +648,8 @@ def _native(config, toolchain):
         )
         _native_stage(code, required_rejection)
         checks[name] = True
-    # This child stdout is an anonymous pipe captured by the parent, never a
-    # diagnostic stream or acceptance receipt. The parent removes this field.
+    # Only the dedicated inherited response pipe carries this private field;
+    # the parent removes it before constructing any public receipt.
     return {
         "checks": checks,
         "recovery_recipient": recipients[0],
@@ -630,23 +753,27 @@ def _reader(config, toolchain, secrets):
     }
 
 
-def child(phase, config_path):
-    config = load(config_path)
-    secret_input = sys.stdin.buffer.read(8193)
-    require(len(secret_input) <= 8192, "secret pipe exceeds bound")
-    secrets = json.loads(secret_input)
-    toolchain, module_file = _activate(config)
-    if phase == "native":
-        result = _native(config, toolchain)
-    elif phase == "writer":
-        result = _writer(config, toolchain, module_file, secrets)
-    elif phase == "restart":
-        result = _restart(config, toolchain, secrets)
-    else:
-        require(phase == "reader", "unknown child phase")
-        result = _reader(config, toolchain, secrets)
-    result["import_bootstrap"] = _check_import_runtime(config)
-    print(encoded(result).decode(), end="")
+def child(phase, config_path, response_fd=None):
+    descriptor = _private_response_fd(response_fd)
+    try:
+        config = load(config_path)
+        secret_input = sys.stdin.buffer.read(8193)
+        require(len(secret_input) <= 8192, "secret pipe exceeds bound")
+        secrets = json.loads(secret_input)
+        toolchain, module_file = _activate(config)
+        if phase == "native":
+            result = _native(config, toolchain)
+        elif phase == "writer":
+            result = _writer(config, toolchain, module_file, secrets)
+        elif phase == "restart":
+            result = _restart(config, toolchain, secrets)
+        else:
+            require(phase == "reader", "unknown child phase")
+            result = _reader(config, toolchain, secrets)
+        result["import_bootstrap"] = _check_import_runtime(config)
+        _write_private_response(descriptor, encoded(result))
+    finally:
+        os.close(descriptor)
 
 
 def acceptance(args):
@@ -747,7 +874,7 @@ def acceptance(args):
                 config_path = artifact_root / (phase + ".json")
                 private_write(config_path, encoded({**common, **values}))
                 return json.loads(
-                    _run(
+                    _run_private_phase(
                         [
                             str(python),
                             "-I",
@@ -868,6 +995,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("native", "writer", "restart", "reader"))
     parser.add_argument("--phase-config", type=Path)
+    parser.add_argument("--response-fd", type=int)
     parser.add_argument("--candidate-identity", type=Path)
     parser.add_argument("--package-dir", type=Path)
     parser.add_argument("--qualification-result", type=Path)
@@ -879,7 +1007,7 @@ def main():
     try:
         if args.phase:
             require(args.phase_config is not None, "child config required")
-            child(args.phase, args.phase_config)
+            child(args.phase, args.phase_config, args.response_fd)
             return
         require(
             all(
@@ -911,7 +1039,7 @@ def main():
             "failure_type": type(error).__name__,
             "code": _native_failure_code(error),
             "reason": (
-                str(error)[:256] if type(error) is ValueError and args.phase != "native" else ""
+                str(error)[:256] if type(error) is ValueError and args.phase is None else ""
             ),
         }
         if args.output is not None:

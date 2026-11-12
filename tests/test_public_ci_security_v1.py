@@ -2297,6 +2297,345 @@ def test_installed_probe_parent_does_not_relay_forged_child_diagnostics(
     assert private not in str(caught.value)
 
 
+def _synthetic_private_phase_child_command(
+    phase: str, config_path: Path, response_fd: int, result_field: str
+) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import runpy, sys
+        probe_path, phase, config_path, response_fd, result_field = sys.argv[1:]
+        sentinel = {
+            'native': 'SYNTHETIC_NATIVE_RESULT_SENTINEL',
+            'writer': 'SYNTHETIC_WRITER_RESULT_SENTINEL',
+        }[phase]
+        probe = runpy.run_path(probe_path)
+        namespace = probe['main'].__globals__
+        namespace['_activate'] = lambda config: (None, 'synthetic-installed-module')
+        namespace['_check_import_runtime'] = lambda config: {'empty': True}
+        namespace['_native'] = lambda config, toolchain: {result_field: sentinel}
+        namespace['_writer'] = lambda config, toolchain, module_file, secrets: {
+            result_field: sentinel
+        }
+        sys.argv = [
+            probe_path,
+            '--phase', phase,
+            '--phase-config', config_path,
+            '--response-fd', response_fd,
+        ]
+        probe['main']()
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        phase,
+        str(config_path),
+        str(response_fd),
+        result_field,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("phase", "result_field", "sentinel"),
+    [
+        ("native", "recovery_identity_hex", "SYNTHETIC_NATIVE_RESULT_SENTINEL"),
+        ("writer", "evidence_root", "SYNTHETIC_WRITER_RESULT_SENTINEL"),
+    ],
+)
+def test_installed_child_sends_native_and_writer_results_only_over_private_fd(
+    tmp_path: Path, phase: str, result_field: str, sentinel: str
+) -> None:
+    config = tmp_path / "phase-config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    read_fd, response_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            _synthetic_private_phase_child_command(phase, config, response_fd, result_field),
+            cwd=tmp_path,
+            input=json.dumps({"authentication_key_hex": "SYNTHETIC_INPUT_SENTINEL"}).encode(),
+            capture_output=True,
+            pass_fds=(response_fd,),
+            timeout=10,
+        )
+    finally:
+        os.close(response_fd)
+    try:
+        response = bytearray()
+        while chunk := os.read(read_fd, 65536):
+            response.extend(chunk)
+    finally:
+        os.close(read_fd)
+
+    assert completed.returncode == 0 and completed.stderr == b""
+    assert completed.stdout == b""
+    assert json.loads(response)[result_field] == sentinel
+    assert sentinel.encode() not in completed.stdout + completed.stderr
+
+
+def _invalid_private_fd_child_command(kind: str, config_path: Path, marker: Path) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import os, runpy, sys
+        from pathlib import Path
+        probe_path, kind, config_path, marker_path = sys.argv[1:]
+        secret_input = b'SYNTHETIC_INPUT_SENTINEL'
+        probe = runpy.run_path(probe_path)
+        namespace = probe['main'].__globals__
+        def mark_and_load(path):
+            Path(marker_path).write_text('load\\n', encoding='utf-8')
+            return {}
+        def activate(config):
+            Path(marker_path).write_text('activate\\n', encoding='utf-8')
+            return None, 'synthetic-installed-module'
+        namespace['load'] = mark_and_load
+        namespace['_activate'] = activate
+        descriptor = {
+            'stdin': 0,
+            'stdout': 1,
+            'stderr': 2,
+        }.get(kind)
+        if kind == 'closed':
+            read_fd, descriptor = os.pipe()
+            os.close(descriptor)
+            os.close(read_fd)
+        elif kind == 'readonly_pipe':
+            descriptor, write_fd = os.pipe()
+        elif kind == 'file':
+            descriptor = os.open(marker_path + '.response', os.O_WRONLY | os.O_CREAT, 0o600)
+        elif kind == 'stdio_alias':
+            descriptor = os.dup(1)
+        arguments = [probe_path, '--phase', 'native', '--phase-config', config_path]
+        if descriptor is not None:
+            arguments.extend(['--response-fd', str(descriptor)])
+        sys.argv = arguments
+        try:
+            probe['main']()
+        except SystemExit as error:
+            if error.code != 1 or sys.stdin.buffer.read() != secret_input:
+                raise SystemExit(23)
+            raise
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        kind,
+        str(config_path),
+        str(marker),
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["missing", "stdin", "stdout", "stderr", "closed", "readonly_pipe", "file", "stdio_alias"],
+)
+def test_installed_child_refuses_invalid_fd_before_config_input_or_activation(
+    tmp_path: Path, kind: str
+) -> None:
+    marker = tmp_path / "phase-activated"
+    completed = subprocess.run(
+        _invalid_private_fd_child_command(kind, tmp_path / "not-read.json", marker),
+        cwd=tmp_path,
+        input=b"SYNTHETIC_INPUT_SENTINEL",
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 1 and completed.stderr == b""
+    failure = json.loads(completed.stdout)
+    assert failure["status"] == "REFUSED"
+    assert failure["reason"] == ""
+    assert not marker.exists()
+    assert b"SYNTHETIC_INPUT_SENTINEL" not in completed.stdout + completed.stderr
+
+
+def _private_runner_child_command(mode: str) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import json, os, sys, time
+        mode = sys.argv[1]
+        descriptor = int(sys.argv[sys.argv.index('--response-fd') + 1])
+        if mode == 'timeout':
+            time.sleep(5)
+            raise SystemExit(0)
+        if mode == 'eof':
+            raise SystemExit(0)
+        if mode == 'overflow':
+            payload = b'{"padding":"' + b'x' * (128 * 1024) + b'"}'
+        elif mode == 'malformed':
+            payload = b'not-json'
+        elif mode == 'nonobject':
+            payload = b'[]'
+        elif mode == 'partial':
+            payload = b'{"result":'
+        elif mode == 'large':
+            payload = json.dumps({'padding': 'x' * (100 * 1024)}, separators=(',', ':')).encode()
+        else:
+            payload = b'{"result":"SYNTHETIC_PRIVATE_RESULT_SENTINEL"}'
+        if mode == 'stdout':
+            os.write(1, b'SYNTHETIC_PUBLIC_STREAM_SENTINEL')
+        if mode == 'stderr':
+            os.write(2, b'SYNTHETIC_PUBLIC_STREAM_SENTINEL')
+        remaining = memoryview(payload)
+        while remaining:
+            remaining = remaining[os.write(descriptor, remaining):]
+        if mode == 'nonzero':
+            raise SystemExit(17)
+        """
+    )
+    return [sys.executable, "-I", "-B", "-c", program, mode]
+
+
+def _run_synthetic_private_phase(
+    probe: dict[str, Any], tmp_path: Path, mode: str, *, duration: float = 10
+) -> bytes:
+    return probe["_run_private_phase"](
+        _private_runner_child_command(mode),
+        cwd=tmp_path,
+        deadline=time.monotonic() + duration,
+        stage="synthetic phase",
+    )
+
+
+def test_private_phase_parent_concurrently_drains_response_larger_than_pipe_buffer(
+    tmp_path: Path,
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+
+    response = _run_synthetic_private_phase(probe, tmp_path, "large")
+
+    assert len(response) > 64 * 1024
+    assert len(response) <= probe["MAX_PHASE_RESPONSE_BYTES"]
+    assert len(json.loads(response)["padding"]) == 100 * 1024
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["eof", "malformed", "nonobject", "partial", "overflow", "nonzero", "stdout", "stderr"],
+)
+def test_private_phase_parent_refuses_incomplete_or_public_child_results(
+    tmp_path: Path, mode: str
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+
+    with pytest.raises(ValueError) as caught:
+        _run_synthetic_private_phase(probe, tmp_path, mode)
+
+    assert "SYNTHETIC_PRIVATE_RESULT_SENTINEL" not in str(caught.value)
+    assert "SYNTHETIC_PUBLIC_STREAM_SENTINEL" not in str(caught.value)
+
+
+def test_private_phase_parent_kills_timed_out_child_and_refuses_result(tmp_path: Path) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_synthetic_private_phase(probe, tmp_path, "timeout", duration=0.25)
+
+    assert time.monotonic() - started < 2
+
+
+def test_installed_private_response_writer_handles_partial_pipe_writes() -> None:
+    from threading import Thread
+
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    read_fd, write_fd = os.pipe()
+    payload = json.dumps({"padding": "x" * (100 * 1024)}, separators=(",", ":")).encode()
+    failures: list[BaseException] = []
+
+    def write_response() -> None:
+        try:
+            probe["_write_private_response"](write_fd, payload)
+        except Exception as error:
+            failures.append(error)
+        finally:
+            os.close(write_fd)
+
+    writer = Thread(target=write_response)
+    writer.start()
+    received = bytearray()
+    try:
+        while True:
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            received.extend(chunk)
+    finally:
+        os.close(read_fd)
+    writer.join(timeout=2)
+
+    assert not writer.is_alive() and failures == []
+    assert bytes(received) == payload
+
+
+@pytest.mark.parametrize("end", [0, 1])
+def test_private_phase_parent_refuses_response_close_failure_without_fd_leak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, end: int
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    runtime_os = probe["_run_private_phase"].__globals__["os"]
+    original_pipe = runtime_os.pipe
+    original_close = runtime_os.close
+    owned_fds: list[int] = []
+    faulted = False
+
+    def track_pipe() -> tuple[int, int]:
+        pair = original_pipe()
+        if not owned_fds:
+            owned_fds.extend(pair)
+        return pair
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal faulted
+        if len(owned_fds) == 2 and descriptor == owned_fds[end] and not faulted:
+            faulted = True
+            original_close(descriptor)
+            raise OSError("synthetic close refusal")
+        original_close(descriptor)
+
+    monkeypatch.setattr(runtime_os, "pipe", track_pipe)
+    monkeypatch.setattr(runtime_os, "close", close_then_fail)
+    with pytest.raises(OSError) as caught:
+        _run_synthetic_private_phase(probe, tmp_path, "small")
+
+    assert faulted and "SYNTHETIC_PRIVATE_RESULT_SENTINEL" not in str(caught.value)
+    assert len(owned_fds) == 2
+    for descriptor in owned_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_private_phase_deadline_bounds_retained_writer_after_child_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    retained: list[int] = []
+
+    def exited_child(*args, pass_fds, **kwargs):
+        # A real extra writer keeps the read end from observing EOF, as a
+        # descendant retaining an inherited descriptor would. No crypto mock.
+        retained.append(os.dup(pass_fds[0]))
+        return b""
+
+    monkeypatch.setitem(probe["_run_private_phase"].__globals__, "_run", exited_child)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ValueError, match="deadline"):
+            _run_synthetic_private_phase(probe, tmp_path, "small", duration=0.15)
+        assert time.monotonic() - started < 2
+    finally:
+        for descriptor in retained:
+            os.close(descriptor)
+
+
 @pytest.mark.parametrize(
     "step",
     [

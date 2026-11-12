@@ -119,7 +119,24 @@ visibility: isolated children import Core only from the selected installation.
 The code checkout itself is not removed or placed behind an OS sandbox. The
 synthetic source ledger/control and capsule directories are actually removed
 before the fresh recovery reader starts; recovery keys arrive through an
-anonymous pipe, independently of the public object and saved reference.
+anonymous stdin pipe, independently of the public object and saved reference.
+Secret-bearing phase results use a separate anonymous response pipe. The
+parent passes only its numeric file descriptor with `--response-fd`; key or
+result contents are not passed in arguments or environment variables, and
+keys or secret-bearing results are not written to separate result files.
+Before reading the phase configuration or stdin, activating the installed
+runtime, or running native key generation, the child requires this descriptor
+to be a writable FIFO above descriptors 0–2 and not an inode alias of a
+standard stream. It writes a JSON object under the 128 KiB response bound and
+closes the descriptor once. The parent drains the pipe while the child runs
+under its deadline and accepts a result only after successful child exit, an
+empty stdout and stderr, and a complete valid response. Missing, malformed,
+empty or oversized responses, unexpected diagnostic output, timeout and close
+failures withhold success. Public refusals contain only the failure type and,
+where applicable, a fixed stage code; they omit arbitrary child output and
+exception text. This enforces the probe's supported transport path; it is not
+an operating-system isolation boundary.
+
 The existing installed-Core import contract also requires an explicit runtime
 root. The probe supplies a separate empty read-only runtime/database directory
 for imports, checks it remains empty, and never admits it as a profile or owner.
