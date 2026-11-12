@@ -55,6 +55,27 @@ verify the downloaded package/receipt bytes and the successful complete graph.
 No future artifact ID, tag, release, consumer admission or activation is created
 by this source contract.
 
+The same package job additionally performs mandatory pinned native-age
+qualification and prepared-envelope execution from that exact wheel and a
+separately installed sdist, outside the checkout. It uploads the separate
+`prepared-envelope-acceptance-v1-<run>-<attempt>` artifact, binding candidate
+identity, receipt and both distribution digests, actual platform/tool versions
+and hashes, and required executed positive/negative/source-free/large-frame
+outcomes. Missing tools, skips or incomplete outcomes fail the job. Each Python
+shard also prepares its own task-local qualified tools for the actual native
+tests. Existing OCR/media minima and the eleven-job graph remain unchanged.
+The package receipt remains `BUILT_NOT_VALIDATED`, and the exact
+`candidate-validation-v2` schema/package fields remain unchanged.
+
+The Core independent candidate verifier additionally checks actual native
+acceptance ZIP bytes and package receipt/digest correspondence. Source pins
+reuse the already authenticated fixed age archive/proof identities; matching
+those bytes is not a platform runtime result. Final candidate Linux runtime
+and both installed closures must execute before merge. New native-age,
+prepared-content/envelope/store, crypto resource and related test inputs require
+matching Bridge scope in workflow and independent verification. See the
+[prepared-envelope contract](prepared_envelope_v1.md).
+
 Independent AI parser/lineage/validation modules and their packaged
 `resources/independent_ai/` policies also require both Bridge systems, including
 modification, deletion and rename. The workflow and independent candidate

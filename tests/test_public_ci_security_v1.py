@@ -15,6 +15,24 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "validate.yml"
 FULL_SHA_ACTION = re.compile(r"^\s*uses:\s*[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$", re.MULTILINE)
+PREPARED_ENVELOPE_SCOPE_PATHS = (
+    "finance_core/_native_age_v1.py",
+    "finance_core/resources/crypto/age_toolchain_v1.json",
+    "finance_core/resources/crypto/nested/future-tool.json",
+    "finance_core/lifecycle_v2/prepared_envelope_v1.py",
+    "finance_core/lifecycle_v2/prepared_finalization_v1.py",
+    "finance_core/lifecycle_v2/_prepared_content_v1.py",
+    "finance_core/lifecycle_v2/_prepared_envelope_store_v1.py",
+    "tests/test_native_age_v1.py",
+    "tests/test_prepared_content_export_v1.py",
+    "tests/test_prepared_envelope_v1.py",
+    "tests/test_prepared_envelope_faults_v1.py",
+    "tests/test_age_toolchain_qualification_v1.py",
+    "tests/installed_prepared_envelope_probe.py",
+    "tests/prepared_envelope_test_support.py",
+    "tests/lifecycle_recovery_material_support_v1.py",
+    "tests/instance_admission_support_v1.py",
+)
 
 
 def test_public_workflow_has_read_only_top_level_permissions() -> None:
@@ -211,6 +229,7 @@ def _inline_namespace(step: str, label: str) -> dict[str, Any]:
         ("pull_request", "requirements-dev.txt", "true"),
         ("pull_request", "pyproject.toml", "true"),
         ("pull_request", ".github/workflows/validate.yml", "true"),
+        *(("pull_request", path, "true") for path in PREPARED_ENVELOPE_SCOPE_PATHS),
     ],
 )
 def test_actual_scope_script_produces_release_compatible_evidence(
@@ -322,6 +341,7 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "tests/fixtures/linux_receipt_ocr/provenance.json",
         "scripts/linux_ocr_assets_v1.json",
         "scripts/prepare_linux_ocr.py",
+        *PREPARED_ENVELOPE_SCOPE_PATHS,
         "README.md",
     ],
 )
@@ -504,15 +524,32 @@ def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> 
     workflow_pattern = re.search(r"if grep -Eq '([^']+)' ", source)
     assert workflow_pattern
     tree = ast.parse((REPOSITORY_ROOT / "scripts" / "verify_candidate_validation.py").read_text())
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and type(node.value.value) is str
+    }
     patterns = [
-        ast.literal_eval(node.args[0])
+        (
+            constants[node.args[0].id]
+            if isinstance(node.args[0], ast.Name)
+            else ast.literal_eval(node.args[0])
+        )
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "compile"
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and str(node.args[0].value).startswith(r"^(\.github/")
+        and (
+            isinstance(node.args[0], ast.Constant)
+            and str(node.args[0].value).startswith(r"^(\.github/")
+            or isinstance(node.args[0], ast.Name)
+            and constants.get(node.args[0].id, "").startswith(r"^(\.github/")
+        )
     ]
     assert patterns == [workflow_pattern.group(1)]
     assert 'totals["tests"] < 13' in source
@@ -1929,3 +1966,202 @@ def test_candidate_package_is_bounded_read_only_initial_graph_job():
     assert 'test "$PACKAGE_RESULT" = success' in source
     assert "artifact_id: ${{ steps.package-artifact.outputs.artifact-id }}" in header
     assert "release" not in package.lower().replace("not release approval", "")
+
+
+def _workflow_job_source(name: str) -> str:
+    source = WORKFLOW.read_text(encoding="utf-8").split(f"\n  {name}:\n", 1)[1]
+    return re.split(r"\n  [a-z][a-z-]+:\n", source, maxsplit=1)[0]
+
+
+def _workflow_step_source(job: str, name: str) -> str:
+    source = _workflow_job_source(job).split(f"      - name: {name}\n", 1)[1]
+    return source.split("\n      - name:", 1)[0]
+
+
+def _require_unconditional_fail_closed_step(step: str) -> None:
+    assert not re.search(r"^\s*(?:if|continue-on-error):", step, re.MULTILINE)
+    assert not re.search(r"\|\|\s*(?:true|:)|\bexit\s+0\b|\bset\s+\+e\b", step)
+    assert not re.search(r"--(?:allow|skip|no-native)[-\w]*", step)
+    assert "secrets." not in step
+
+
+def test_prepared_envelope_acceptance_is_mandatory_before_candidate_publication() -> None:
+    package = _workflow_job_source("candidate-package")
+    names = (
+        "Build exact tracked candidate package",
+        "Prepare pinned Linux age tools",
+        "Require installed wheel and sdist prepared-envelope acceptance",
+        "Upload prepared-envelope acceptance proof",
+        "Upload candidate build identity, not release approval",
+    )
+    positions = [package.index(f"      - name: {name}\n") for name in names]
+    assert positions == sorted(positions)
+    for name in names:
+        _require_unconditional_fail_closed_step(_workflow_step_source("candidate-package", name))
+
+    qualification = _step_script("Prepare pinned Linux age tools")
+    assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
+    assert '--output-dir "$RUNNER_TEMP/prepared-age-qualification"' in qualification
+    assert '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"' in qualification
+    acceptance = _step_script("Require installed wheel and sdist prepared-envelope acceptance")
+    assert "python -I tests/installed_prepared_envelope_probe.py" in acceptance
+    for argument in (
+        '--candidate-identity "$RUNNER_TEMP/candidate-identity.json"',
+        '--package-dir "$RUNNER_TEMP/candidate-package"',
+        "--qualification-result "
+        '"$RUNNER_TEMP/prepared-age-qualification/qualification-result.json"',
+        '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"',
+        '--output "$RUNNER_TEMP/prepared-envelope-acceptance-v1.json"',
+        '--run-id "${{ github.run_id }}"',
+        '--run-attempt "${{ github.run_attempt }}"',
+    ):
+        assert argument in acceptance
+    upload = _workflow_step_source("candidate-package", "Upload prepared-envelope acceptance proof")
+    assert "uses: actions/upload-artifact@" in upload
+    assert (
+        "name: prepared-envelope-acceptance-v1-${{ github.run_id }}-${{ github.run_attempt }}"
+        in upload
+    )
+    assert "path: ${{ runner.temp }}/prepared-envelope-acceptance-v1.json" in upload
+    assert "if-no-files-found: error" in upload
+    assert "retention-days: 90" in upload
+    assert "candidate-package/" not in upload
+
+
+def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_execution() -> None:
+    job = _workflow_job_source("pytest")
+    assert "shard: [0, 1, 2, 3]" in job
+    names = (
+        "Prepare pinned Linux age tools for this shard",
+        "Plan exact test inventory",
+        "Run shard",
+    )
+    positions = [job.index(f"      - name: {name}\n") for name in names]
+    assert positions == sorted(positions)
+    qualification = _workflow_step_source("pytest", names[0])
+    _require_unconditional_fail_closed_step(qualification)
+    assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
+    assert '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"' in qualification
+    assert (
+        'echo "FINANCE_PREPARED_AGE_TOOL_DIR=$RUNNER_TEMP/prepared-age-tools/linux-x86_64" '
+        '>> "$GITHUB_ENV"'
+    ) in qualification
+    run = _workflow_step_source("pytest", "Run shard")
+    assert not re.search(r"^\s*(?:if|continue-on-error):", run, re.MULTILINE)
+    assert 'exit "$rc"' in run
+
+
+def test_prepared_envelope_keeps_the_existing_eleven_job_graph() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8").split("\njobs:\n", 1)[1]
+    jobs = re.findall(r"^  ([a-z][a-z-]+):$", source, re.MULTILINE)
+    assert set(jobs) == {
+        "classify",
+        "candidate-package",
+        "quality",
+        "pytest",
+        "bridge",
+        "pytest-report",
+        "validate",
+    }
+    assert len(jobs) == 7
+    assert "shard: [0, 1, 2, 3]" in _workflow_job_source("pytest")
+    assert "os: [ubuntu-latest, macos-15]" in _workflow_job_source("bridge")
+    assert len(jobs) - 2 + 4 + 2 == 11
+    package = _workflow_job_source("candidate-package")
+    assert "runs-on: ubuntu-24.04" in package
+    assert "    needs:" not in package.split("    steps:\n", 1)[0]
+    assert "    if:" not in package.split("    steps:\n", 1)[0]
+
+
+def test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap() -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    source = script.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    constants = {
+        node.targets[0].id: ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"RELEASE", "SOURCE_COMMIT", "SIGSUM_POLICY", "LINUX"}
+    }
+    assert constants["RELEASE"] == "v1.3.2"
+    assert constants["SOURCE_COMMIT"] == "b74dce4cdbe35b5e5f66c06d9612b72f89028758"
+    assert constants["SIGSUM_POLICY"] == "sigsum-generic-2025-1"
+    assert constants["LINUX"]["archive_sha256"] == (
+        "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
+    )
+    assert constants["LINUX"]["proof_sha256"] == (
+        "98402fa59b4e433426156b4a7e74a32e44902e0434c61158f7de18ffc84f1f97"
+    )
+    registry = json.loads(
+        (REPOSITORY_ROOT / "finance_core/resources/crypto/age_toolchain_v1.json").read_bytes()
+    )
+    assert constants["LINUX"]["tools"] == registry["platforms"]["linux-x86_64"]
+    assert '"status": "PREQUALIFIED_SIGSUM_PROOF_REUSED"' in source
+    assert "observed == expected_sha256" in source
+    assert 'download(\n        base + proof.name, proof, LINUX["proof_sha256"]' in source
+    arguments = {
+        ast.literal_eval(node.args[0])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+    }
+    assert arguments == {"--output-dir", "--tool-directory"}
+    workflow_setup = _step_script("Prepare pinned Linux age tools")
+    assert not re.search(
+        r"\bgo\s+(?:build|install|run)\b|GOTOOLCHAIN|setup-go@", source + workflow_setup
+    )
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "Prepare pinned Linux age tools",
+        "Require installed wheel and sdist prepared-envelope acceptance",
+    ],
+)
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_actual_prepared_acceptance_commands_preserve_failure_exit(
+    tmp_path: Path, step: str, exit_code: int
+) -> None:
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    trace = tmp_path / "command.json"
+    python = commands / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['COMMAND_TRACE']).write_text(json.dumps(sys.argv[1:]))\n"
+        "raise SystemExit(int(os.environ['COMMAND_EXIT']))\n"
+    )
+    python.chmod(0o700)
+    script = (
+        _step_script(step)
+        .replace("${{ github.run_id }}", "123")
+        .replace("${{ github.run_attempt }}", "1")
+    )
+    result = subprocess.run(
+        ["/bin/bash", "-e", "-o", "pipefail", "-c", script],
+        env={
+            **os.environ,
+            "PATH": str(commands),
+            "RUNNER_TEMP": str(tmp_path),
+            "COMMAND_TRACE": str(trace),
+            "COMMAND_EXIT": str(exit_code),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == exit_code, result.stderr
+    arguments = json.loads(trace.read_text())
+    assert arguments[0] == "-I"
+    assert arguments[1] == (
+        ".github/scripts/qualify_age_toolchain_v1.py"
+        if step == "Prepare pinned Linux age tools"
+        else "tests/installed_prepared_envelope_probe.py"
+    )

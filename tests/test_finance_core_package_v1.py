@@ -295,6 +295,45 @@ def test_pdf_dependency_inventory_matches_packaged_notice_and_lock_summary() -> 
     assert any(line.startswith(f"{pin} ") for line in lock.splitlines())
 
 
+def test_native_age_registry_pins_are_fixed_and_included_by_both_package_builders() -> None:
+    expected = {
+        "format": "native-age-toolchain-v1",
+        "release": "v1.3.2",
+        "source_commit": "b74dce4cdbe35b5e5f66c06d9612b72f89028758",
+        "platforms": {
+            "darwin-arm64": {
+                "age": {
+                    "sha256": "4012dfc2725883beafb710894af4f599b7a94f8c8e0f51f02cc96ab8df33915e",
+                    "size_bytes": 6502258,
+                },
+                "age_keygen": {
+                    "sha256": "c16e229245123d0ad27442317461d63915416cad0294395cd19ca93feb3211ea",
+                    "size_bytes": 3806562,
+                },
+            },
+            "linux-x86_64": {
+                "age": {
+                    "sha256": "eb7dd1b518f0a307c99cd97782623c5321da049154b04acd2d98d21aa7bc9b2c",
+                    "size_bytes": 6977014,
+                },
+                "age_keygen": {
+                    "sha256": "0a0009db842259d6717f7eeb30acb6b90d2a2eb924c6acd0a0db0ca1f1537899",
+                    "size_bytes": 4051278,
+                },
+            },
+        },
+    }
+    registry = REPOSITORY_ROOT / "finance_core/resources/crypto/age_toolchain_v1.json"
+    assert json.loads(registry.read_bytes()) == expected
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    package_data = project["tool"]["setuptools"]["package-data"]["finance_core.resources"]
+    assert "crypto/*.json" in package_data
+    assert (
+        "recursive-include finance_core *.json *.py *.sql *.txt"
+        in (REPOSITORY_ROOT / "MANIFEST.in").read_text()
+    )
+
+
 def _ledger_digest(paths: tuple[Path, ...]) -> str:
     digest = hashlib.sha256()
     for path in paths:

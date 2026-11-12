@@ -1,0 +1,27 @@
+{
+  "format": "native-age-toolchain-v1",
+  "release": "v1.3.2",
+  "source_commit": "b74dce4cdbe35b5e5f66c06d9612b72f89028758",
+  "platforms": {
+    "darwin-arm64": {
+      "age": {
+        "sha256": "4012dfc2725883beafb710894af4f599b7a94f8c8e0f51f02cc96ab8df33915e",
+        "size_bytes": 6502258
+      },
+      "age_keygen": {
+        "sha256": "c16e229245123d0ad27442317461d63915416cad0294395cd19ca93feb3211ea",
+        "size_bytes": 3806562
+      }
+    },
+    "linux-x86_64": {
+      "age": {
+        "sha256": "eb7dd1b518f0a307c99cd97782623c5321da049154b04acd2d98d21aa7bc9b2c",
+        "size_bytes": 6977014
+      },
+      "age_keygen": {
+        "sha256": "0a0009db842259d6717f7eeb30acb6b90d2a2eb924c6acd0a0db0ca1f1537899",
+        "size_bytes": 4051278
+      }
+    }
+  }
+}

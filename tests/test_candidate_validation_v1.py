@@ -31,6 +31,168 @@ VERIFIER = load("candidate_verifier", "scripts/verify_candidate_validation.py")
 BASE, HEAD, EVENT, TREE = (char * 40 for char in "abce")
 REPO = "example/finance-core"
 WORKFLOW_BYTES = b"reviewed workflow fixture\n"
+AGE_RELEASE = "v1.3.2"
+AGE_SOURCE_COMMIT = "b74dce4cdbe35b5e5f66c06d9612b72f89028758"
+
+
+def canonical(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+    )
+
+
+def digest(payload):
+    return hashlib.sha256(payload).hexdigest()
+
+
+def acceptance_fixture(identity):
+    payloads = {
+        "finance_core-0.1.7-py3-none-any.whl": b"synthetic wheel bytes",
+        "finance_core-0.1.7.tar.gz": b"synthetic sdist bytes",
+    }
+    distribution_records = {
+        name: {"size_bytes": len(body), "sha256": digest(body)} for name, body in payloads.items()
+    }
+    inventory = {
+        "schema": "finance-candidate-source-inventory-v1",
+        "identity": identity,
+        "files": [],
+    }
+    inventory_bytes = canonical(inventory)
+    recipe = {"command": ["fixture"]}
+    receipt = {
+        "schema": "finance-candidate-package-v1",
+        "status": "BUILT_NOT_VALIDATED",
+        "identity": identity,
+        "source_inventory_sha256": digest(inventory_bytes),
+        "recipe": recipe,
+        "recipe_sha256": digest(canonical(recipe)),
+        "artifacts": distribution_records,
+    }
+    receipt_bytes = canonical(receipt)
+    package_archive = io.BytesIO()
+    with zipfile.ZipFile(package_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("package-receipt.json", receipt_bytes)
+        archive.writestr("source-inventory.json", inventory_bytes)
+        for name, body in payloads.items():
+            archive.writestr(name, body)
+    package_zip = package_archive.getvalue()
+    bundle_artifacts = {
+        "wheel": {
+            "filename": "finance_core-0.1.7-py3-none-any.whl",
+            **distribution_records["finance_core-0.1.7-py3-none-any.whl"],
+        },
+        "sdist": {
+            "filename": "finance_core-0.1.7.tar.gz",
+            **distribution_records["finance_core-0.1.7.tar.gz"],
+        },
+    }
+    native_checks = {name: True for name in VERIFIER.NATIVE_CHECKS}
+    installed_checks = {name: True for name in VERIFIER.INSTALLED_CHECKS}
+    qualification = {
+        "release": AGE_RELEASE,
+        "source_commit": AGE_SOURCE_COMMIT,
+        "platform": "linux-x86_64",
+        "source_authentication": {
+            "status": "PREQUALIFIED_SIGSUM_PROOF_REUSED",
+            "source_commit": AGE_SOURCE_COMMIT,
+            "archive_sha256": VERIFIER.AGE_SOURCE_ARCHIVE_SHA256,
+            "proof_sha256": VERIFIER.AGE_SOURCE_PROOF_SHA256,
+            "policy": "sigsum-generic-2025-1",
+            "verifier_version": "sigsum-verify (sigsum-go module) v0.13.1",
+        },
+        "archive": {
+            "filename": VERIFIER.AGE_SOURCE_ARCHIVE,
+            "size_bytes": 2048,
+            "sha256": VERIFIER.AGE_SOURCE_ARCHIVE_SHA256,
+        },
+        "proof": {
+            "filename": VERIFIER.AGE_SOURCE_ARCHIVE + ".proof",
+            "size_bytes": 128,
+            "sha256": VERIFIER.AGE_SOURCE_PROOF_SHA256,
+        },
+        "tools": {
+            name: {
+                "path": f"/tmp/age/{'age-keygen' if name == 'age_keygen' else 'age'}",
+                "sha256": pin[0],
+                "size_bytes": pin[1],
+                "version": AGE_RELEASE,
+            }
+            for name, pin in VERIFIER.AGE_TOOL_PINS.items()
+        },
+    }
+    acceptance = {
+        "schema": "finance-prepared-envelope-acceptance-v1",
+        "status": "ACCEPTED",
+        "identity": identity,
+        "run_id": identity["run_id"],
+        "run_attempt": identity["run_attempt"],
+        "platform": "linux-x86_64",
+        "qualification": qualification,
+        "package": {
+            "receipt_sha256": digest(receipt_bytes),
+            "source_inventory_sha256": digest(inventory_bytes),
+            "artifacts": bundle_artifacts,
+        },
+        "runtime_dependencies": {
+            "pypdf": {"version": "6.21.4", "files_sha256": "1" * 64},
+            "typing-extensions": {"version": "4.16.0", "files_sha256": "2" * 64},
+        },
+        "sdist_build_backend": {"version": "84.1.0", "files_sha256": "3" * 64},
+        "native": {
+            "checks": native_checks,
+            "required": 7,
+            "passed": 7,
+            "skipped": 0,
+            "failed": 0,
+            "errors": 0,
+        },
+        "artifacts": {
+            kind: {
+                "checks": installed_checks,
+                "required": 7,
+                "passed": 7,
+                "skipped": 0,
+                "failed": 0,
+                "errors": 0,
+                "status": "PASS",
+                "content_status": "CONTENT_VERIFIED_OFFLINE",
+                "content_kind": "PREPARED_PROJECTION",
+                "source_finalization": "NOT_ESTABLISHED",
+                "source_checkout_visible": False,
+                "native_checks": native_checks,
+                "module_file": f"/tmp/{kind}/installed/finance_core/__init__.py",
+                "frame_size_bytes": 9 * 1024 * 1024,
+                "envelope_size_bytes": 2500000,
+                "envelope_sha256": "4" * 64,
+                "ciphertext_sha256": "5" * 64,
+                "intent_sha256": "6" * 64,
+                "inventory_rows_sha256": "7" * 64,
+                "inventory_evidence_sha256": "8" * 64,
+            }
+            for kind in ("wheel", "sdist")
+        },
+        "totals": {"required": 21, "passed": 21, "skipped": 0, "failed": 0, "errors": 0},
+    }
+    acceptance_bytes = canonical(acceptance)
+    acceptance_archive = io.BytesIO()
+    with zipfile.ZipFile(acceptance_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("prepared-envelope-acceptance-v1.json", acceptance_bytes)
+    return {
+        "package_zip": package_zip,
+        "package_bundle": {
+            "archive_sha256": digest(package_zip),
+            "members": sorted({"package-receipt.json", "source-inventory.json", *payloads}),
+            "receipt": receipt,
+            "receipt_sha256": digest(receipt_bytes),
+            "inventory_sha256": digest(inventory_bytes),
+            "inventory": inventory,
+            "artifacts": bundle_artifacts,
+        },
+        "acceptance": acceptance,
+        "acceptance_file_sha256": digest(acceptance_bytes),
+        "acceptance_zip": acceptance_archive.getvalue(),
+    }
 
 
 def sample(*, bridge: bool = True) -> dict:
@@ -72,10 +234,86 @@ def sample(*, bridge: bool = True) -> dict:
             "head_sha": HEAD,
             "status": "completed",
             "conclusion": "skipped" if name == "bridge" else "success",
+            "steps": (
+                [
+                    {
+                        "name": "Prepare pinned Linux age tools",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "Require installed wheel and sdist prepared-envelope acceptance",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "Upload prepared-envelope acceptance proof",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                    {
+                        "name": "Upload candidate build identity, not release approval",
+                        "status": "completed",
+                        "conclusion": "success",
+                    },
+                ]
+                if name == "candidate-package"
+                else [
+                    {
+                        "name": "Prepare pinned Linux age tools for this shard",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+                if name.startswith("pytest (")
+                else []
+            ),
         }
         for index, name in enumerate(sorted(names))
     ]
     workflow = {"content": base64.b64encode(WORKFLOW_BYTES).decode()}
+    bundle = acceptance_fixture(identity)
+    proof = {
+        "schema": "finance-candidate-validation-v2",
+        "identity": identity,
+        "bridge_required": bridge,
+        "results": results,
+        "package": {
+            "artifact_id": 789,
+            "artifact_name": "candidate-package-v1-42-1",
+            "artifact_digest": "sha256:" + digest(bundle["package_zip"]),
+            "receipt_sha256": bundle["package_bundle"]["receipt_sha256"],
+        },
+    }
+    proof_archive = io.BytesIO()
+    with zipfile.ZipFile(proof_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("candidate-validation-v2.json", canonical(proof))
+    proof_zip = proof_archive.getvalue()
+    acceptance_zip = bundle["acceptance_zip"]
+    proof_artifact = {
+        "id": 456,
+        "name": "candidate-validation-v2-42-1",
+        "expired": False,
+        "digest": "sha256:" + digest(proof_zip),
+        "size_in_bytes": len(proof_zip),
+        "workflow_run": {"id": 42, "run_attempt": 1, "head_sha": HEAD},
+    }
+    package_artifact = {
+        "id": 789,
+        "name": "candidate-package-v1-42-1",
+        "digest": "sha256:" + digest(bundle["package_zip"]),
+        "expired": False,
+        "size_in_bytes": len(bundle["package_zip"]),
+        "workflow_run": {"id": 42, "run_attempt": 1, "head_sha": HEAD},
+    }
+    acceptance_artifact = {
+        "id": 790,
+        "name": "prepared-envelope-acceptance-v1-42-1",
+        "digest": "sha256:" + digest(acceptance_zip),
+        "expired": False,
+        "size_in_bytes": len(acceptance_zip),
+        "workflow_run": {"id": 42, "run_attempt": 1, "head_sha": HEAD},
+    }
     return {
         "pr": {
             "number": 7,
@@ -96,18 +334,7 @@ def sample(*, bridge: bool = True) -> dict:
             "path": VERIFIER.WORKFLOW,
         },
         "workflow": {"id": 123, "path": VERIFIER.WORKFLOW, "state": "active"},
-        "proof": {
-            "schema": "finance-candidate-validation-v2",
-            "identity": identity,
-            "bridge_required": bridge,
-            "results": results,
-            "package": {
-                "artifact_id": 789,
-                "artifact_name": "candidate-package-v1-42-1",
-                "artifact_digest": "sha256:" + "d" * 64,
-                "receipt_sha256": "a" * 64,
-            },
-        },
+        "proof": proof,
         "head_commit": {"sha": HEAD, "tree": {"sha": TREE}},
         "event_commit": {
             "sha": EVENT,
@@ -123,22 +350,22 @@ def sample(*, bridge: bool = True) -> dict:
         "head_workflow": workflow,
         "executed_workflow": copy.deepcopy(workflow),
         "jobs": {"total_count": len(jobs), "jobs": jobs},
-        "artifact": {
-            "id": 456,
-            "name": "candidate-validation-v2-42-1",
-            "expired": False,
-            "digest": "sha256:" + "f" * 64,
-            "workflow_run": {"id": 42, "head_sha": HEAD},
-        },
-        "artifact_sha256": "f" * 64,
-        "package_artifact": {
-            "id": 789,
-            "name": "candidate-package-v1-42-1",
-            "digest": "sha256:" + "d" * 64,
-            "expired": False,
-            "size_in_bytes": 1234,
-            "workflow_run": {"id": 42, "head_sha": HEAD},
-        },
+        "artifact": proof_artifact,
+        "artifact_sha256": digest(proof_zip),
+        "artifact_inventory": [
+            copy.deepcopy(proof_artifact),
+            copy.deepcopy(package_artifact),
+            copy.deepcopy(acceptance_artifact),
+        ],
+        "artifact_total_count": 3,
+        "package_artifact": package_artifact,
+        "package_bundle": bundle["package_bundle"],
+        "package_zip_payload": bundle["package_zip"],
+        "acceptance_artifact": acceptance_artifact,
+        "acceptance_artifact_sha256": digest(acceptance_zip),
+        "acceptance_zip_payload": acceptance_zip,
+        "acceptance": bundle["acceptance"],
+        "acceptance_file_sha256": bundle["acceptance_file_sha256"],
     }
 
 
@@ -417,6 +644,39 @@ def test_archive_members_and_size_are_bounded(members: list[str]) -> None:
         VERIFIER.unpack_proof(b"x" * (VERIFIER.MAX_ARTIFACT_BYTES + 1))
 
 
+def test_downloaded_package_bundle_has_exact_four_safe_members_and_bound_bytes() -> None:
+    evidence = sample()
+    package = VERIFIER.unpack_package_bundle(evidence["package_zip_payload"])
+    assert package["archive_sha256"] == evidence["package_bundle"]["archive_sha256"]
+    assert package["receipt_sha256"] == evidence["package_bundle"]["receipt_sha256"]
+    assert package["artifacts"] == evidence["package_bundle"]["artifacts"]
+
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("package-receipt.json", b"{}")
+        archive.writestr("source-inventory.json", b"{}")
+        archive.writestr("finance_core-0.1.7-py3-none-any.whl", b"wheel")
+        archive.writestr("finance_core-0.1.7.tar.gz", b"sdist")
+        archive.writestr("unexpected", b"extra")
+    with pytest.raises(ValueError, match="one wheel and one sdist|exactly four"):
+        VERIFIER.unpack_package_bundle(out.getvalue())
+    with pytest.raises(ValueError):
+        VERIFIER.unpack_package_bundle(b"x" * (VERIFIER.MAX_PACKAGE_ARCHIVE_BYTES + 1))
+
+
+def test_acceptance_archive_has_one_bounded_report() -> None:
+    evidence = sample()
+    acceptance, content_sha = VERIFIER.unpack_acceptance(evidence["acceptance_zip_payload"])
+    assert acceptance == evidence["acceptance"]
+    assert content_sha == evidence["acceptance_file_sha256"]
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        archive.writestr("prepared-envelope-acceptance-v1.json", b"{}")
+        archive.writestr("extra.json", b"{}")
+    with pytest.raises(ValueError, match="unexpected acceptance archive members"):
+        VERIFIER.unpack_acceptance(out.getvalue())
+
+
 def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
     source = (ROOT / VERIFIER.WORKFLOW).read_text()
     assert source.count(
@@ -446,21 +706,26 @@ def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
 
 def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) -> None:
     fixture = sample()
-    archive = io.BytesIO()
-    with zipfile.ZipFile(archive, "w") as stream:
+    proof_archive = io.BytesIO()
+    with zipfile.ZipFile(proof_archive, "w") as stream:
         stream.writestr("candidate-validation-v2.json", json.dumps(fixture["proof"]))
-    payload = archive.getvalue()
-    fixture["artifact"]["size_in_bytes"] = len(payload)
-    fixture["artifact"]["digest"] = "sha256:" + hashlib.sha256(payload).hexdigest()
+    proof_payload = proof_archive.getvalue()
+    fixture["artifact"]["size_in_bytes"] = len(proof_payload)
+    fixture["artifact"]["digest"] = "sha256:" + hashlib.sha256(proof_payload).hexdigest()
     prefix = f"repos/{REPO}"
     replies = {
         f"{prefix}/actions/runs/42": fixture["run"],
         f"{prefix}/actions/runs/42/artifacts?per_page=100": {
-            "total_count": 1,
-            "artifacts": [fixture["artifact"]],
+            "total_count": 3,
+            "artifacts": [
+                fixture["artifact"],
+                fixture["package_artifact"],
+                fixture["acceptance_artifact"],
+            ],
         },
         f"{prefix}/actions/workflows/validate.yml": fixture["workflow"],
         f"{prefix}/actions/artifacts/789": fixture["package_artifact"],
+        f"{prefix}/actions/artifacts/790": fixture["acceptance_artifact"],
         f"{prefix}/actions/runs/42/attempts/1/jobs?per_page=100": fixture["jobs"],
         f"{prefix}/git/commits/{HEAD}": fixture["head_commit"],
         f"{prefix}/git/commits/{EVENT}": fixture["event_commit"],
@@ -477,8 +742,12 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         return copy.deepcopy(replies[endpoint])
 
     def download(command):
-        assert command == ["gh", "api", f"{prefix}/actions/artifacts/456/zip"]
-        return payload
+        assert command[:2] == ["gh", "api"]
+        return {
+            f"{prefix}/actions/artifacts/456/zip": proof_payload,
+            f"{prefix}/actions/artifacts/789/zip": fixture["package_zip_payload"],
+            f"{prefix}/actions/artifacts/790/zip": fixture["acceptance_zip_payload"],
+        }[command[2]]
 
     monkeypatch.setattr(VERIFIER, "api", api)
     monkeypatch.setattr(VERIFIER.subprocess, "check_output", download)
@@ -506,6 +775,23 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         "MANIFEST.in",
         "plugins/finance-bridge/src/controller.ts",
         "native/example.swift",
+        "finance_core/_native_age_v1.py",
+        "finance_core/resources/crypto/age_toolchain_v1.json",
+        "finance_core/resources/crypto/nested/future-tool.json",
+        "finance_core/lifecycle_v2/prepared_envelope_v1.py",
+        "finance_core/lifecycle_v2/prepared_future_v1.py",
+        "finance_core/lifecycle_v2/_prepared_content_v1.py",
+        "finance_core/lifecycle_v2/_prepared_future_v1.py",
+        "tests/test_native_age_v1.py",
+        "tests/test_prepared_content_export_v1.py",
+        "tests/test_prepared_envelope_v1.py",
+        "tests/test_prepared_envelope_faults_v1.py",
+        "tests/test_age_toolchain_qualification_v1.py",
+        "tests/test_finance_core_package_v1.py",
+        "tests/installed_prepared_envelope_probe.py",
+        "tests/prepared_envelope_test_support.py",
+        "tests/lifecycle_recovery_material_support_v1.py",
+        "tests/instance_admission_support_v1.py",
         "finance_core/openclaw_staging_bridge/commands.py",
         "finance_core/application/example.py",
         "finance_core/intake/__init__.py",
@@ -537,7 +823,7 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         "scripts/prepare_linux_ocr.py",
     ],
 )
-def test_each_linux_ocr_input_requires_bridge_for_modify_delete_and_rename(
+def test_each_high_risk_bridge_input_requires_bridge_for_modify_delete_and_rename(
     path: str,
 ) -> None:
     for item in (
@@ -609,6 +895,64 @@ def test_candidate_package_requires_actual_same_run_artifact(field, value):
         verify(evidence)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda item: item.__setitem__("status", "REFUSED"),
+        lambda item: item.__setitem__("platform", "darwin-arm64"),
+        lambda item: item["qualification"]["source_authentication"].__setitem__(
+            "status", "VERIFIED"
+        ),
+        lambda item: item["qualification"]["tools"]["age"].__setitem__("sha256", "0" * 64),
+        lambda item: item["native"]["checks"].pop("wrong_key_refused"),
+        lambda item: item["native"].__setitem__("skipped", 1),
+        lambda item: item["native"].__setitem__("skipped", False),
+        lambda item: item["artifacts"]["wheel"].__setitem__("status", "FAIL"),
+        lambda item: item["artifacts"]["sdist"]["checks"].__setitem__(
+            "detached_source_free", False
+        ),
+        lambda item: item["package"].__setitem__("receipt_sha256", "0" * 64),
+        lambda item: item["totals"].__setitem__("skipped", 1),
+        lambda item: item["totals"].__setitem__("skipped", False),
+    ],
+)
+def test_prepared_envelope_acceptance_rejects_incomplete_or_forged_results(mutation):
+    evidence = sample()
+    mutation(evidence["acceptance"])
+    evidence["acceptance_file_sha256"] = digest(canonical(evidence["acceptance"]))
+    with pytest.raises(ValueError):
+        verify(evidence)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("expired", True),
+        ("id", 791),
+        ("digest", "sha256:" + "0" * 64),
+        ("size_in_bytes", 0),
+        ("workflow_run", {"id": 43, "head_sha": HEAD}),
+    ],
+)
+def test_prepared_envelope_artifact_requires_exact_same_run_bytes(field, value):
+    evidence = sample()
+    evidence["acceptance_artifact"][field] = value
+    with pytest.raises(ValueError, match="acceptance artifact"):
+        verify(evidence)
+
+
+def test_prepared_envelope_package_receipt_and_archive_are_cross_checked():
+    for mutation in (
+        lambda item: item.__setitem__("archive_sha256", "0" * 64),
+        lambda item: item["receipt"].__setitem__("status", "VALIDATED"),
+        lambda item: item["artifacts"]["wheel"].__setitem__("sha256", "0" * 64),
+    ):
+        evidence = sample()
+        mutation(evidence["package_bundle"])
+        with pytest.raises(ValueError):
+            verify(evidence)
+
+
 def test_candidate_package_missing_or_skipped_job_cannot_validate():
     evidence = sample()
     evidence["jobs"]["jobs"] = [
@@ -621,6 +965,33 @@ def test_candidate_package_missing_or_skipped_job_cannot_validate():
     evidence["proof"]["results"]["candidate-package"] = "skipped"
     with pytest.raises(ValueError, match="required results"):
         verify(evidence)
+
+
+@pytest.mark.parametrize(
+    "job_name,step_name",
+    [
+        ("candidate-package", "Prepare pinned Linux age tools"),
+        (
+            "candidate-package",
+            "Require installed wheel and sdist prepared-envelope acceptance",
+        ),
+        ("candidate-package", "Upload prepared-envelope acceptance proof"),
+        ("pytest (2)", "Prepare pinned Linux age tools for this shard"),
+    ],
+)
+def test_native_qualification_and_installed_acceptance_steps_must_execute(
+    job_name: str, step_name: str
+) -> None:
+    for outcome in ("missing", "skipped", "failure"):
+        evidence = sample()
+        job = next(item for item in evidence["jobs"]["jobs"] if item["name"] == job_name)
+        if outcome == "missing":
+            job["steps"] = [step for step in job["steps"] if step["name"] != step_name]
+        else:
+            step = next(step for step in job["steps"] if step["name"] == step_name)
+            step["conclusion"] = "skipped" if outcome == "skipped" else "failure"
+        with pytest.raises(ValueError, match="required job step"):
+            verify(evidence)
 
 
 def test_new_candidate_contract_does_not_reinterpret_historical_v1_proof():

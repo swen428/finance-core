@@ -64,7 +64,7 @@ jobs:
           fi
           changed_paths="$RUNNER_TEMP/finance-core-changed-paths.txt"
           git diff --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > "$changed_paths"
-          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_|independent_ai_)|resources/independent_ai/)|tests/(test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
+          if grep -Eq '^(\.github/|scripts/|pyproject\.toml$|requirements-dev\.txt$|MANIFEST\.in$|plugins/finance-bridge/|native/|finance_core/_native_age_v1\.py$|finance_core/resources/crypto/|finance_core/lifecycle_v2/(prepared_[^/]+\.py|_prepared_[^/]+\.py)$|finance_core/(openclaw_staging_bridge|application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|ai_|independent_ai_)|resources/independent_ai/)|tests/(test_(native_age|prepared_content_export|prepared_envelope(_faults)?|age_toolchain_qualification|finance_core_package|candidate_validation|public_ci_security)_v1\.py$|prepared_envelope_test_support\.py$|installed_prepared_envelope_probe\.py$|lifecycle_recovery_material_support_v1\.py$|instance_admission_support_v1\.py$|test_receipt_media(_vectors)?_v1\.py$|fixtures/receipt_media_v1/|test_receipt_total_parser_hierarchy_v2\.py$|fixtures/receipt_total_parser_v2/|test_tesseract_pinned_resources_v1\.py$|test_linux_receipt_ocr_acceptance_v1\.py$|test_receipt_ocr_evidence\.py$|test_openclaw_staging_bridge_ocr_production_boundary_v1\.py$|fixtures/linux_receipt_ocr/))' "$changed_paths"; then
             echo 'bridge=true' >> "$GITHUB_OUTPUT"
           else
             echo 'bridge=false' >> "$GITHUB_OUTPUT"
@@ -106,6 +106,31 @@ jobs:
             --identity "$RUNNER_TEMP/candidate-identity.json" \
             --output "$RUNNER_TEMP/candidate-package" \
             --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare pinned Linux age tools
+        run: |
+          python -I .github/scripts/qualify_age_toolchain_v1.py \
+            --output-dir "$RUNNER_TEMP/prepared-age-qualification" \
+            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"
+
+      - name: Require installed wheel and sdist prepared-envelope acceptance
+        run: |
+          python -I tests/installed_prepared_envelope_probe.py \
+            --candidate-identity "$RUNNER_TEMP/candidate-identity.json" \
+            --package-dir "$RUNNER_TEMP/candidate-package" \
+            --qualification-result "$RUNNER_TEMP/prepared-age-qualification/qualification-result.json" \
+            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64" \
+            --output "$RUNNER_TEMP/prepared-envelope-acceptance-v1.json" \
+            --run-id "${{ github.run_id }}" \
+            --run-attempt "${{ github.run_attempt }}"
+
+      - name: Upload prepared-envelope acceptance proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: prepared-envelope-acceptance-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/prepared-envelope-acceptance-v1.json
+          retention-days: 90
+          if-no-files-found: error
 
       - name: Upload candidate build identity, not release approval
         id: package-artifact
@@ -201,6 +226,13 @@ jobs:
       - name: Verify candidate checkout identity
         id: identity
         run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepare pinned Linux age tools for this shard
+        run: |
+          python -I .github/scripts/qualify_age_toolchain_v1.py \
+            --output-dir "$RUNNER_TEMP/prepared-age-qualification" \
+            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"
+          echo "FINANCE_PREPARED_AGE_TOOL_DIR=$RUNNER_TEMP/prepared-age-tools/linux-x86_64" >> "$GITHUB_ENV"
 
       - name: Install locked development dependencies
         run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
