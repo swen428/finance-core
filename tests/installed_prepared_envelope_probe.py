@@ -62,6 +62,57 @@ HELPERS = (
 )
 LOCKED_DEPENDENCIES = {"pypdf": "6.21.4", "typing-extensions": "4.16.0"}
 MAX_SECONDS = 900
+NATIVE_STAGE_CODES = frozenset(
+    {
+        "NATIVE_PREFLIGHT_REGISTRY",
+        "NATIVE_PREFLIGHT_AGE_PATH",
+        "NATIVE_PREFLIGHT_AGE_ANCESTOR",
+        "NATIVE_PREFLIGHT_AGE_PIN",
+        "NATIVE_PREFLIGHT_AGE_RECHECK",
+        "NATIVE_PREFLIGHT_AGE_CLOSE",
+        "NATIVE_PREFLIGHT_KEYGEN_PATH",
+        "NATIVE_PREFLIGHT_KEYGEN_ANCESTOR",
+        "NATIVE_PREFLIGHT_KEYGEN_PIN",
+        "NATIVE_PREFLIGHT_KEYGEN_RECHECK",
+        "NATIVE_PREFLIGHT_KEYGEN_CLOSE",
+        "NATIVE_AGE_VERSION",
+        "NATIVE_KEYGEN_VERSION",
+        "NATIVE_GENERATE_RECOVERY",
+        "NATIVE_GENERATE_TEMPORARY",
+        "NATIVE_GENERATE_WRONG",
+        "NATIVE_DERIVE_RECOVERY",
+        "NATIVE_DERIVE_TEMPORARY",
+        "NATIVE_ENCRYPT_TWO_RECIPIENTS",
+        "NATIVE_DECRYPT_RECOVERY",
+        "NATIVE_DECRYPT_TEMPORARY",
+        "NATIVE_WRONG_KEY_REJECTION",
+        "NATIVE_CORRUPT_TAIL_REJECTION",
+    }
+)
+
+
+class NativeProbeStageError(RuntimeError):
+    """Fixed diagnostic stage only; no underlying exception or child output."""
+
+    def __init__(self, code):
+        if code not in NATIVE_STAGE_CODES:
+            raise ValueError("unknown native diagnostic stage")
+        self.code = code
+        super().__init__("Native probe stage refused")
+
+
+def _native_stage(code, operation):
+    if code not in NATIVE_STAGE_CODES:
+        raise ValueError("unknown native diagnostic stage")
+    try:
+        return operation()
+    except Exception:
+        raise NativeProbeStageError(code) from None
+
+
+def _native_failure_code(error):
+    code = getattr(error, "code", "")
+    return code if type(error) is NativeProbeStageError and code in NATIVE_STAGE_CODES else ""
 
 
 def require(value, reason):
@@ -124,7 +175,23 @@ def _run(command, *, cwd, deadline, stage, environment=None, input_bytes=None):
         detail = ""
         try:
             failure = json.loads(result.stdout)
-            detail = ":" + failure.get("failure_type", "") + ":" + failure.get("code", "")
+            if failure.get("code") in NATIVE_STAGE_CODES:
+                raise NativeProbeStageError(failure["code"]) from None
+            # Positive native calls expose only fixed stages. Never relay an
+            # arbitrary child's code, diagnostics, exception text or arguments.
+            if failure.get("failure_type") in {
+                "NativeAgeError",
+                "RuntimePathConfigurationError",
+                "PreparedEnvelopeErrorV1",
+                "InstanceAdmissionError",
+                "ValueError",
+                "RuntimeError",
+                "AssertionError",
+                "OSError",
+                "ModuleNotFoundError",
+                "ImportError",
+            }:
+                detail = ":" + failure["failure_type"]
         except (ValueError, AttributeError, TypeError):
             pass
         raise ValueError(stage + " failed" + detail)
@@ -365,7 +432,36 @@ def _store(config, toolchain, authenticator, secrets):
     )
 
 
+def _native_preflight(toolchain):
+    """Run unchanged production custody checks before creating any identity."""
+    from finance_core import _native_age_v1 as native
+
+    registry = _native_stage("NATIVE_PREFLIGHT_REGISTRY", lambda: native._registry(toolchain))
+    for role, label, path in (
+        ("age", "AGE", toolchain.age),
+        ("age_keygen", "KEYGEN", toolchain.age_keygen),
+    ):
+        prefix = "NATIVE_PREFLIGHT_" + label + "_"
+        _native_stage(
+            prefix + "PATH",
+            lambda: require(
+                isinstance(path, Path) and path.is_absolute() and path.resolve(strict=True) == path,
+                "canonical native tool path required",
+            ),
+        )
+        _native_stage(prefix + "ANCESTOR", lambda: native._trusted_ancestor(path.parent))
+        fd, identity = _native_stage(prefix + "PIN", lambda: native._pin(path, registry[role]))
+        try:
+            _native_stage(
+                prefix + "RECHECK", lambda: native._verify_pin(path, fd, identity, registry[role])
+            )
+        finally:
+            # Do not retry an uncertain close or turn it into a positive check.
+            _native_stage(prefix + "CLOSE", lambda: os.close(fd))
+
+
 def _native(config, toolchain):
+    from finance_core import _native_age_v1 as native
     from finance_core._native_age_v1 import (
         NativeAgeError,
         decrypt_v1,
@@ -374,33 +470,61 @@ def _native(config, toolchain):
         generate_identity_v1,
     )
 
+    _native_preflight(toolchain)
     checks = {}
-    for key in ("age", "age_keygen"):
-        output = subprocess.run([config[key], "--version"], capture_output=True, timeout=10)
-        require(
-            output.returncode == 0 and output.stdout.strip() == RELEASE.encode(), "tool version"
-        )
+    for key, label in (("age", "AGE"), ("age_keygen", "KEYGEN")):
+
+        def version():
+            # The production invocation repeats both actual pins/versions and
+            # closes its custody FDs. Output remains bounded and nonsecret.
+            output = native._invoke(toolchain, key, ["--version"], b"", 128, 30)
+            require(output.strip() == RELEASE.encode(), "tool version")
+
+        _native_stage("NATIVE_" + label + "_VERSION", version)
         checks[key + "_version"] = True
-    recovery, temporary, wrong = (generate_identity_v1(toolchain) for _ in range(3))
-    recipients = tuple(derive_recipient_v1(item, toolchain) for item in (recovery, temporary))
+    recovery, temporary, wrong = (
+        _native_stage("NATIVE_GENERATE_" + label, lambda: generate_identity_v1(toolchain))
+        for label in ("RECOVERY", "TEMPORARY", "WRONG")
+    )
+    recipients = tuple(
+        _native_stage("NATIVE_DERIVE_" + label, lambda: derive_recipient_v1(identity, toolchain))
+        for label, identity in (("RECOVERY", recovery), ("TEMPORARY", temporary))
+    )
     plaintext = b"installed native two-recipient acceptance\n"
-    ciphertext = encrypt_v1(plaintext, recipients, toolchain, maximum_output=1024 * 1024)
+    ciphertext = _native_stage(
+        "NATIVE_ENCRYPT_TWO_RECIPIENTS",
+        lambda: encrypt_v1(plaintext, recipients, toolchain, maximum_output=1024 * 1024),
+    )
     checks["two_recipient_encrypt"] = True
     for name, identity in (("recovery", recovery), ("temporary", temporary)):
-        require(
-            decrypt_v1(ciphertext, identity, toolchain, maximum_output=1024) == plaintext, "decrypt"
-        )
+
+        def positive_decrypt():
+            require(
+                decrypt_v1(ciphertext, identity, toolchain, maximum_output=1024) == plaintext,
+                "decrypt",
+            )
+
+        _native_stage("NATIVE_DECRYPT_" + name.upper(), positive_decrypt)
         checks[name + "_decrypt"] = True
     for name, payload, identity in (
         ("wrong_key_refused", ciphertext, wrong),
         ("corrupt_tail_refused", ciphertext[:-1] + bytes([ciphertext[-1] ^ 1]), recovery),
     ):
-        try:
-            decrypt_v1(payload, identity, toolchain, maximum_output=1024)
-        except NativeAgeError:
-            checks[name] = True
-        else:
+
+        def required_rejection():
+            try:
+                decrypt_v1(payload, identity, toolchain, maximum_output=1024)
+            except NativeAgeError:
+                return
             raise AssertionError("native rejection failed")
+
+        code = (
+            "NATIVE_WRONG_KEY_REJECTION"
+            if name == "wrong_key_refused"
+            else "NATIVE_CORRUPT_TAIL_REJECTION"
+        )
+        _native_stage(code, required_rejection)
+        checks[name] = True
     # This child stdout is an anonymous pipe captured by the parent, never a
     # diagnostic stream or acceptance receipt. The parent removes this field.
     return {
@@ -785,8 +909,10 @@ def main():
             "schema": SCHEMA,
             "status": "REFUSED",
             "failure_type": type(error).__name__,
-            "code": getattr(error, "code", ""),
-            "reason": str(error)[:256] if type(error) is ValueError else "",
+            "code": _native_failure_code(error),
+            "reason": (
+                str(error)[:256] if type(error) is ValueError and args.phase != "native" else ""
+            ),
         }
         if args.output is not None:
             args.output.write_bytes(encoded(failure))

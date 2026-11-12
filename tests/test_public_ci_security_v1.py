@@ -4,9 +4,11 @@ import ast
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -2073,18 +2075,36 @@ def test_prepared_envelope_keeps_the_existing_eleven_job_graph() -> None:
     assert "    if:" not in package.split("    steps:\n", 1)[0]
 
 
+def _literal_named_constants(source: str, names: set[str]) -> dict[str, Any]:
+    """Inspect fixed module literals without executing either assignment form."""
+    tree = ast.parse(source)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        else:
+            continue
+        if not isinstance(target, ast.Name) or target.id not in names:
+            continue
+        assert target.id not in constants, "Fixed constant must have exactly one assignment"
+        assert value is not None, "Fixed constant requires a literal value"
+        try:
+            constants[target.id] = ast.literal_eval(value)
+        except (ValueError, TypeError) as exc:
+            raise AssertionError("Fixed constant requires a literal value") from exc
+    assert set(constants) == names, "Required fixed constant is missing"
+    return constants
+
+
 def test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap() -> None:
     script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
     source = script.read_text(encoding="utf-8")
     tree = ast.parse(source)
-    constants = {
-        node.targets[0].id: ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and node.targets[0].id in {"RELEASE", "SOURCE_COMMIT", "SIGSUM_POLICY", "LINUX"}
-    }
+    constants = _literal_named_constants(
+        source, {"RELEASE", "SOURCE_COMMIT", "SIGSUM_POLICY", "LINUX"}
+    )
     assert constants["RELEASE"] == "v1.3.2"
     assert constants["SOURCE_COMMIT"] == "b74dce4cdbe35b5e5f66c06d9612b72f89028758"
     assert constants["SIGSUM_POLICY"] == "sigsum-generic-2025-1"
@@ -2114,6 +2134,140 @@ def test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootst
     assert not re.search(
         r"\bgo\s+(?:build|install|run)\b|GOTOOLCHAIN|setup-go@", source + workflow_setup
     )
+
+
+@pytest.mark.parametrize("form", ["plain", "annotated"])
+def test_fixed_source_guard_accepts_both_literal_assignment_forms(monkeypatch, form: str) -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    actual_read = Path.read_text
+    source = actual_read(script, encoding="utf-8")
+    declaration = "LINUX =" if form == "plain" else "LINUX: dict[str, Any] ="
+    amended, changes = re.subn(
+        r"^LINUX(?:\s*:\s*dict\[str, Any\])?\s*=", declaration, source, count=1, flags=re.MULTILINE
+    )
+    assert changes == 1
+
+    def adapted_read(path, *args, **kwargs):
+        return amended if path == script else actual_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", adapted_read)
+    test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap()
+
+
+@pytest.mark.parametrize("unsafe", ["missing", "nonliteral", "duplicate", "wrong_pin"])
+def test_fixed_source_guard_rejects_unproven_or_changed_constants(monkeypatch, unsafe: str) -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    actual_read = Path.read_text
+    source = actual_read(script, encoding="utf-8")
+    declaration = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "LINUX" for t in node.targets)
+        or isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "LINUX"
+    )
+    lines = source.splitlines(keepends=True)
+    if unsafe in {"missing", "nonliteral"}:
+        lines[declaration.lineno - 1 : declaration.end_lineno] = (
+            [] if unsafe == "missing" else ["LINUX = untrusted_runtime_lookup()\n"]
+        )
+        amended = "".join(lines)
+    elif unsafe == "duplicate":
+        amended = source + "\nLINUX = {}\n"
+    else:
+        amended = source.replace(
+            "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10", "0" * 64, 1
+        )
+
+    def adapted_read(path, *args, **kwargs):
+        return amended if path == script else actual_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", adapted_read)
+    with pytest.raises(AssertionError):
+        test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap()
+
+
+def _probe_diagnostic_child(code: str) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import runpy, sys
+        probe = runpy.run_path(sys.argv[1])
+        code = sys.argv[2]
+        def refuse():
+            error = ValueError('synthetic-private-diagnostic-value')
+            error.code = 'synthetic-private-diagnostic-value'
+            raise error
+        def child(*args):
+            if code:
+                probe['_native_stage'](code, refuse)
+            refuse()
+        probe['main'].__globals__['child'] = child
+        sys.argv = [sys.argv[1], '--phase', 'native', '--phase-config', 'unused']
+        probe['main']()
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        code,
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["NATIVE_PREFLIGHT_AGE_ANCESTOR", "NATIVE_GENERATE_RECOVERY", "NATIVE_DECRYPT_TEMPORARY"],
+)
+def test_installed_native_failure_preserves_only_fixed_stage(tmp_path: Path, code: str) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    command = _probe_diagnostic_child(code)
+    child = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=10)
+    assert child.returncode == 1 and child.stderr == b""
+    failure = json.loads(child.stdout)
+    assert failure["code"] == code and failure["reason"] == ""
+    assert b"synthetic-private-diagnostic-value" not in child.stdout
+    with pytest.raises(probe["NativeProbeStageError"]) as caught:
+        probe["_run"](command, cwd=tmp_path, deadline=time.monotonic() + 10, stage="native probe")
+    assert caught.value.code == code
+    assert str(caught.value) == "Native probe stage refused"
+
+
+def test_installed_native_failure_never_emits_arbitrary_exception_code(tmp_path: Path) -> None:
+    command = _probe_diagnostic_child("")
+    child = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=10)
+    assert child.returncode == 1 and child.stderr == b""
+    failure = json.loads(child.stdout)
+    assert failure["failure_type"] == "ValueError"
+    assert failure["code"] == failure["reason"] == ""
+    assert b"synthetic-private-diagnostic-value" not in child.stdout
+
+
+@pytest.mark.parametrize("failure_type", ["NativeAgeError", "synthetic-private-diagnostic-value"])
+def test_installed_probe_parent_does_not_relay_forged_child_diagnostics(
+    tmp_path: Path, failure_type: str
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    private = "synthetic-private-diagnostic-value"
+    payload = json.dumps(
+        {"failure_type": failure_type, "code": private, "reason": private}
+    ).encode()
+    program = (
+        f"import os; os.write(1,{payload!r}); os.write(2,{private.encode()!r}); raise SystemExit(1)"
+    )
+    with pytest.raises(ValueError) as caught:
+        probe["_run"](
+            [sys.executable, "-I", "-c", program],
+            cwd=tmp_path,
+            deadline=time.monotonic() + 10,
+            stage="native probe",
+        )
+    assert type(caught.value) is ValueError and not getattr(caught.value, "code", "")
+    assert private not in str(caught.value)
 
 
 @pytest.mark.parametrize(
