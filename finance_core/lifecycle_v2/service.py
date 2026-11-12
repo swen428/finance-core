@@ -21,9 +21,7 @@ from finance_core.money import Money, canonical_money_str
 from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
 from .contracts import (
-    CommitReceipt,
     EvidencePort,
-    ExpectedAction,
     ExpectedDisplay,
     ExpectedInvocation,
     LifecycleError,
@@ -51,6 +49,13 @@ def _row(conn, table, column, value):
 def _event(conn, operation_id, kind, entity_id, payload):
     if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 256:
         raise LifecycleError("Exact operation identity required")
+    if (
+        conn.execute(
+            "SELECT 1 FROM l2_finalization_intents WHERE operation_id=?", (operation_id,)
+        ).fetchone()
+        is not None
+    ):
+        raise LifecycleError("Operation identity is permanently reserved for finalization")
     last = conn.execute(
         "SELECT seq,event_sha256 FROM l2_events ORDER BY seq DESC LIMIT 1"
     ).fetchone()
@@ -622,133 +627,22 @@ class LedgerService:
             return self._review_dto(conn, row)
 
     def confirm(self, review_id, action_evidence_id, operation_id):
+        from ._finalization_plan_v1 import (
+            _append_finalization,
+            _compile_finalization,
+            _confirmed_receipt,
+        )
+
         with lifecycle_write_operation(self.owner) as conn:
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute(
-                "SELECT * FROM l2_decisions WHERE operation_id=?", (operation_id,)
-            ).fetchone()
-            if existing:
-                if (
-                    existing["action_evidence_id"] != action_evidence_id
-                    or existing["review_id"] != review_id
-                ):
-                    raise LifecycleError("Commit replay mismatch")
-                original_review = _row(conn, "l2_reviews", "review_id", review_id)
-                if json.loads(original_review["material_json"])["binding"] != asdict(self.binding):
-                    raise LifecycleError("Committed replay belongs to another runtime binding")
-                fact = conn.execute(
-                    "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
-                    (existing["record_id"], existing["version"]),
-                ).fetchone()
-                if fact is None:
-                    raise LifecycleError("Committed replay fact is absent")
-                from .reader import verify_record
-
-                verify_record(self, conn, existing["record_id"])
-                # verify_record authenticates the exact original provider, display,
-                # action, decision and commit. This observes an existing result;
-                # current expiry/latest-card gates apply only to fresh decisions.
-                return CommitReceipt(
-                    fact["record_id"], fact["version"], fact["fact_sha256"], fact["commit_seq"]
+            result = _confirmed_receipt(self, conn, review_id, action_evidence_id, operation_id)
+            if result is None:
+                plan = _compile_finalization(
+                    self, conn, review_id, action_evidence_id, operation_id
                 )
-            row = _row(conn, "l2_reviews", "review_id", review_id)
-            from .reader import verify_review
-
-            verify_review(self, conn, row)
-            material = json.loads(row["material_json"])
-            accepted_at = self._now()
-            if (
-                material["binding"] != asdict(self.binding)
-                or digest(material) != row["review_sha256"]
-                or not material["created_at"] <= accepted_at < material["expires_at"]
-            ):
-                raise LifecycleError("Review belongs to another binding or was altered")
-            proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
-            source = self._source(
-                conn, proposal["source_id"], allow_archived=row["record_id"] is not None
-            )
-            latest = conn.execute(
-                "SELECT max(version) FROM l2_proposals WHERE source_id=?", (source["source_id"],)
-            ).fetchone()[0]
-            if latest != proposal["version"]:
-                raise LifecycleError("Stale review after concurrent edit")
-            delivery = _row(conn, "l2_deliveries", "review_id", review_id)
-            expected = ExpectedAction(
-                self.binding, review_id, row["review_sha256"], delivery["evidence_id"]
-            )
-            action = self.port.action(conn, action_evidence_id, expected)
-            self._actor(action)
-            if (
-                action.evidence_id != action_evidence_id
-                or action.review_id != review_id
-                or action.review_sha256 != expected.review_sha256
-                or action.delivery_evidence_id != expected.delivery_evidence_id
-                or action.action != "confirm"
-            ):
-                raise LifecycleError("Confirmation action mismatch")
-            record_id = row["record_id"] or _id("record")
-            predecessor = conn.execute(
-                "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-                (record_id,),
-            ).fetchone()
-            version = predecessor["version"] if predecessor else 0
-            if version != row["expected_version"]:
-                raise LifecycleError("Correction target changed")
-            if (
-                predecessor is None
-                and conn.execute(
-                    "SELECT 1 FROM l2_facts WHERE source_id=?", (source["source_id"],)
-                ).fetchone()
-            ):
-                raise LifecycleError("Economic source already posted")
-            economic = predecessor["economic_event_id"] if predecessor else source["source_key"]
-            values = _money(json.loads(row["values_json"]))
-            previous = predecessor["fact_sha256"] if predecessor else None
-            sha = digest(
-                _fact_material(
-                    record_id, version + 1, economic, source["source_id"], values, previous
-                )
-            )
-            seq = _event(
-                conn,
-                operation_id,
-                "confirm",
-                record_id,
-                {
-                    "review_id": review_id,
-                    "action": asdict(action),
-                    "fact_sha256": sha,
-                    "version": version + 1,
-                    "accepted_at": accepted_at,
-                },
-            )
-            conn.execute(
-                "INSERT INTO l2_facts VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    record_id,
-                    version + 1,
-                    economic,
-                    source["source_id"],
-                    review_id,
-                    canonical(values),
-                    previous,
-                    sha,
-                    seq,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO l2_decisions VALUES(?,?,?,?,?,?)",
-                (
-                    action_evidence_id,
-                    review_id,
-                    operation_id,
-                    record_id,
-                    version + 1,
-                    canonical(asdict(action)),
-                ),
-            )
-            conn.commit()
-            return CommitReceipt(record_id, version + 1, sha, seq)
+                result = _append_finalization(conn, plan)
+                conn.commit()
+        return result
 
     def prepare_correction(
         self,

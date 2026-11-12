@@ -891,10 +891,10 @@ def test_migration_ledger_tests_never_target_live_database(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_authoritative_manifest_contains_migration_001_through_061_in_order() -> None:
-    """The current authoritative manifest has ordered migration IDs 001–061
+def test_authoritative_manifest_contains_migration_001_through_062_in_order() -> None:
+    """The current authoritative manifest has ordered migration IDs 001–062
     with no gaps, duplicates or reordered entries."""
-    assert len(TEMP_DB_MIGRATION_PATHS) == 61
+    assert len(TEMP_DB_MIGRATION_PATHS) == 62
     assert tuple(TEMP_DB_MIGRATION_PATHS.paths) == tuple(
         path
         for mid, path in sorted(
@@ -906,9 +906,9 @@ def test_authoritative_manifest_contains_migration_001_through_061_in_order() ->
         )
     )
     # Verify every expected migration ID is present
-    identifiers = [f"{n:03d}" for n in range(1, 62)]
+    identifiers = [f"{n:03d}" for n in range(1, 63)]
     assert identifiers == [p.name.partition("_")[0] for p in TEMP_DB_MIGRATION_PATHS]
-    assert TEMP_DB_MIGRATION_PATHS[-1].name == "061_lifecycle_v2.sql"
+    assert TEMP_DB_MIGRATION_PATHS[-1].name == "062_prepared_native_finalization_v1.sql"
 
 
 def test_migration_030_is_sql_only_with_no_preflight_binding() -> None:
@@ -924,15 +924,27 @@ def test_migration_030_is_sql_only_with_no_preflight_binding() -> None:
     assert spec_030.preflight_bytes is None
 
 
-def test_fresh_migration_001_through_061_replay_is_deterministic() -> None:
-    """A fresh temporary database must apply 001–061, record all ledger rows
+def test_fresh_migration_001_through_062_replay_is_deterministic() -> None:
+    """A fresh temporary database must apply 001–062, record all ledger rows
     in order, pass history verification, and remain unchanged on replay."""
     conn = _connection()
     try:
         apply_migration_paths(conn, TEMP_DB_MIGRATION_PATHS, clock=_clock)
         rows = migration_ledger_rows(conn)
-        assert len(rows) == 61
-        assert rows[-1]["migration_id"] == "061"
+        assert len(rows) == 62
+        assert rows[-1]["migration_id"] == "062"
+        assert {
+            "l2_finalization_intents",
+            "l2_finalization_materials",
+            "l2_finalization_outcomes",
+        }.issubset(
+            {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+        )
         assert all(row["adoption_mode"] == "applied" for row in rows)
         verify_migration_history(conn, TEMP_DB_MIGRATION_PATHS)
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []

@@ -157,6 +157,9 @@ def _validate_recovery_pending(
 
 
 def _verify_cut_connection(conn: sqlite3.Connection, cut: SnapshotCut) -> None:
+    from ._finalization_journal_v1 import _verify_journal
+
+    _verify_journal(conn)
     if type(cut) is not SnapshotCut:
         raise LifecycleError("Exact v3 snapshot cut required")
     actual = tuple(
@@ -311,8 +314,11 @@ def _protected_database_transition(
     *,
     write: bool,
     build: Callable[[sqlite3.Connection], dict[str, Any]],
+    publish: bool = True,
 ) -> dict[str, Any]:
     """Hold owner/control/profile/gate through actual SQLite close and publish."""
+    if not publish and write:
+        raise LifecycleError("Unpublished recovery verification must be read-only")
     profile = None
     gate = None
     conn = None
@@ -367,7 +373,7 @@ def _protected_database_transition(
         gate.assert_valid()
         control._assert_file_valid()
         owner._assert_file_valid()
-        return _publish(config, journal)
+        return _publish(config, journal) if publish else journal
     finally:
         if not unknown:
             if conn is not None:
@@ -889,6 +895,26 @@ def _promote(
                         is not True
                     ):
                         raise LifecycleError("Completed restore admission context differs")
+
+                    def verify_completed(conn):
+                        from ._finalization_journal_v1 import _verify_journal
+
+                        if any(entry.outcome is None for entry in _verify_journal(conn).values()):
+                            raise LifecycleError("Pending exact finalization keeps recovery held")
+                        from .reader import audit_evidence_connection
+
+                        audit_evidence_connection(conn, port, binding, legacy_verifier)
+                        return state
+
+                    _protected_database_transition(
+                        config,
+                        owner,
+                        control,
+                        _record(config, state),
+                        write=False,
+                        build=verify_completed,
+                        publish=False,
+                    )
                     return _decode(_canonical(_record(config, state)))
                 before = state
             else:
@@ -909,6 +935,11 @@ def _promote(
             from .reader import audit_connection
 
             def build(conn):
+                from ._finalization_journal_v1 import _verify_journal
+
+                journal = _verify_journal(conn)
+                if any(entry.outcome is None for entry in journal.values()):
+                    raise LifecycleError("Pending exact finalization keeps recovery held")
                 audit_connection(conn)
                 _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
                 if pending is not None:

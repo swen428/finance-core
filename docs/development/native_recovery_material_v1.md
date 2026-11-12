@@ -9,6 +9,12 @@ or runtime activation, and it does not prove remote durability, currentness,
 independent custody, or protection against rollback of the pinned checkpoint.
 This contract assigns no release identity.
 
+This is the historical 061 material format. Its identity and reconstruction use
+the exact 001–061 migration prefix and schema. A current 062 source must use
+`recovery_material_v2`; the v1 collector refuses to label that source as v1. The
+v1 checker still accepts a pinned historical 061 chain using its fixed 061
+schema, including when called from a package that also contains migration 062.
+
 ## Public API
 
 Import the feature explicitly; the package root and existing lifecycle exports
@@ -81,8 +87,10 @@ complete model fields are:
 `generation`, `principal_id`, `client_id`, and `environment`. Its environment
 must be `offline-synthetic`. `core_identity`, `migration_identity`, and
 `migration_ledger_digest` identify the actual source owner and installed Core.
-This format requires the complete installed migration ledger 001–061, with the
-installed migration identity and ledger digest matching exactly.
+The v1 identity pins the exact historical 001–061 migration prefix. The source
+collector requires its source identity to match that prefix. Historical checking
+replays against the fixed v1 schema and does not substitute the current 062
+schema or reinterpret 062 material as v1.
 
 `ClosureFrontierV1.package_sha256` is SHA-256 of the complete package bytes;
 `event_seq` and `event_sha256` identify that package's final event. An empty
@@ -280,13 +288,13 @@ network access; callers may store returned bytes after the protected operation
 has closed.
 
 The source-side collector follows the existing protected connection policy. It
-checks the installed migration/schema identity, complete lifecycle evidence
-audit, event-to-row ownership and the foreign-key checks permitted by the
+checks the historical 001–061 migration/schema identity, complete lifecycle
+evidence audit, event-to-row ownership and the foreign-key checks permitted by the
 owner; it does not issue an owner-prohibited `PRAGMA integrity_check` or relax
 the connection authorizer. Checking creates its own in-memory SQLite database
 using only trusted Core migrations and fixed table/column/parameterized insert
-constants. The installed 001–061 ledger and schema must match
-`expected_identity`. Package fields cannot select SQL or DDL. Rows replay in
+constants. The historical identity and schema must match `expected_identity`.
+Package fields cannot select SQL or DDL. Rows replay in
 event order without replace, ignore, update, delete, trigger/FK disabling or
 migration modification. At each segment and at the final endpoint, the
 independent checker validates the complete migration history, schema, full
@@ -315,15 +323,24 @@ and protected-close exceptions retain their established semantics.
 ## Required validation and installed-package proof
 
 Acceptance must exercise the built wheel and source distribution from isolated
-installations outside the source tree. Import `recovery_material_v1` from each
-installed artifact and run a strict-evidence, two-segment round trip using the
-actual lifecycle service and synthetic data. The test must create the lifecycle
+installations outside the source tree. Import current `recovery_material_v2`
+from each installed artifact and run a strict-evidence, two-segment round trip
+using the actual lifecycle service and synthetic data. Create the lifecycle
 through guarded capture, proposal, review, delivery, action and confirmation;
 include at least two currencies, a correction to version 2 of one event, and
 an unconfirmed delivered review. The first segment ends after the original fact;
 the second includes the correction and new unused events. Compare the checked
-inventory and current values with the source-side inventory and effective reader.
-All Core module paths must resolve to the installed artifact.
+inventory with the source-side inventory and audit, and compare current values
+with the source effective reader after removing the source and disabling its
+evidence port.
+
+The same installed artifacts also exercise a prepared operation, prove that
+preparation leaves the source facts unchanged, apply it in a distinct installed
+process, and check its detached v2 closure. Historical v1 coverage uses a fixed
+complete 061 package chain and the installed v1 checker. Do not regenerate that
+historical chain with a 062 source collector or use the historical vector in
+place of the current two-segment round trip. All Core module paths in these
+installed probes must resolve to the installed artifact.
 
 The fixture must pre-register all evidence during acquisition, including
 request/response/original bytes, original envelopes, delivery and action
@@ -358,7 +375,8 @@ temporary database, and its result must not change any instance ACTIVE/HELD
 state or supply a usable restore profile.
 
 Install compatibility checks preserve existing package imports and APIs, the
-001–061 migration ledger, rejection of non-offline `RuntimeBinding` values,
+historical 001–061 v1 format and current 001–062 migration ledger, rejection of
+non-offline `RuntimeBinding` values,
 `SnapshotCut` v3 behavior, and the directly related existing lifecycle,
 effective-ledger and recovery regressions. The proof assigns no package version,
 release identity, runtime activation or production-readiness claim.

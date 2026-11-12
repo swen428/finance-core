@@ -2,7 +2,8 @@
 
 This opt-in API is an offline-synthetic feasibility candidate. It does not admit
 production bindings, publish a release, replace historical facts or activate a
-runtime. Migration 061 appends new tables; migrations 001 through 060 are unchanged.
+runtime. Migration 062 appends prepared-finalization control tables; migrations
+001 through 061 are unchanged.
 
 The additive [native effective-ledger read contract](effective_ledger_v1.md)
 defines an explicit opt-in current-fact collection, history, export, separate
@@ -12,7 +13,7 @@ preserves this lifecycle's financial, evidence and runtime boundaries.
 The root `finance_core.API_CONTRACT_VERSION` remains `finance-core-api-v1` because
 its existing exports and behavior are unchanged. `finance_core.lifecycle_v2` is a
 separately named, opt-in additive API; consumers must explicitly import it and
-bind the installed package, API marker and 061 migration ledger together. This
+bind the installed package, API marker and 062 migration ledger together. This
 source change alone assigns no new immutable release or active consumer identity.
 
 `LedgerService` requires the actual `ProductionOwner`, a fixed `RuntimeBinding`,
@@ -73,7 +74,28 @@ material. It does not add an independent authenticity root for generation:
 coordinated rewriting of the row, capture and ordinary event chain, or rollback
 of their complete state, still requires an external trusted checkpoint to detect.
 Historical plain events cannot retrospectively prove their original generation.
-Migration 061 and all historical migration bytes remain unchanged.
+Migration 062 adds the prepared-finalization control journal; migrations 001–061
+and their historical bytes remain unchanged.
+
+## Prepared native finalization
+
+The explicit `PreparedFinalizationServiceV1` stages one exact delivered review
+and pre-registered human action in the local 062 control journal. A
+`PREPARED_OFFLINE` operation adds no native fact, decision or event. While it is
+pending, supported lifecycle writes remain held; reads may inspect the existing
+history. The caller must pin the returned intent hash. Offline apply rechecks the
+same review, action, binding and intended append, then writes the native fact,
+decision and event once and returns the original `LOCAL_POSTED` receipt. Offline
+cancel is permanent for that review/action pair; a new proposal and action are
+required for another attempt. If protected close is uncertain, the state remains
+pending and its owner/resources stay held for exact inspection or cancellation.
+
+This path is limited to offline-synthetic personal expenses. It does not provide
+an online writer, encryption, independent durability, cross-machine takeover or
+production activation. Native closure v1 remains the historical 061 format;
+current 062 material uses v2. Native closure material excludes the 062 control
+journal and is not a complete application backup. A pending operation can be
+read during held restore inspection, but cannot be promoted or used to post.
 
 Each v2 protected operation verifies installed migration artifacts at entry,
 then reuses that proof only through its own active connection witness. The proof

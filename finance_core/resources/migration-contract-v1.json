@@ -1,6 +1,6 @@
 {
   "schema": "finance-core-migration-contract-v1",
-  "migration_ledger_digest": "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850",
+  "migration_ledger_digest": "b5f631a2c3f193a3c67748ba0c408232a5813a2b422f5bedd57c536aac95ea16",
   "migration_filenames": [
     "001_create_core_schema.sql",
     "002_receipt_split_schema.sql",
@@ -62,6 +62,7 @@
     "058_independent_ai_invocations.sql",
     "059_independent_ai_clarification.sql",
     "060_independent_corrections.sql",
-    "061_lifecycle_v2.sql"
+    "061_lifecycle_v2.sql",
+    "062_prepared_native_finalization_v1.sql"
   ]
 }

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 from typing import Any, cast
@@ -367,6 +369,117 @@ def test_actual_scope_script_keeps_renamed_bridge_input_in_scope(
     assert completed.returncode == 0, completed.stderr
     expected = "false" if path == "README.md" else "true"
     assert output.read_text(encoding="utf-8") == f"bridge={expected}\n"
+
+
+@pytest.mark.parametrize("failure", [None, "dns", "mirror", "update", "install"])
+def test_linux_apt_bootstrap_routes_and_stops_before_unprepared_acceptance(
+    tmp_path: Path, failure: str | None
+) -> None:
+    """Run the real Bash step with fake system commands, not native Linux acceptance."""
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    trace = tmp_path / "trace.jsonl"
+    stub = f"#!{sys.executable}\n" + textwrap.dedent(
+        """\
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        name = Path(sys.argv[0]).name
+        args = sys.argv[1:]
+        entry = {"command": name, "args": args}
+        if name == "sudo" and args[:1] == ["tee"]:
+            entry["input"] = sys.stdin.read()
+        with open(os.environ["BOOTSTRAP_TRACE"], "a", encoding="utf-8") as output:
+            output.write(json.dumps(entry) + "\\n")
+        failure = os.environ["BOOTSTRAP_FAILURE"]
+        if name == "timeout":
+            assert args[:3] == ["15s", "getent", "ahostsv4"]
+            raise SystemExit(124 if failure == "dns" else 0)
+        if name == "python":
+            assert args[:2] == ["-I", "scripts/prepare_linux_ocr.py"]
+            raise SystemExit(0)
+        assert name == "sudo"
+        if args[:1] == ["tee"]:
+            assert args == ["tee", "/etc/apt/apt-mirrors.txt"]
+            raise SystemExit(1 if failure == "mirror" else 0)
+        if args[:1] in (["test"], ["grep"]):
+            raise SystemExit(0)
+        assert args[:1] == ["apt-get"]
+        if "update" in args:
+            # apt's default tolerates partial indexes; strict update must refuse.
+            raise SystemExit(100 if failure == "update" and "--error-on=any" in args else 0)
+        assert "install" in args
+        raise SystemExit(100 if failure == "install" else 0)
+        """
+    )
+    for path in (commands / "sudo", commands / "timeout", tmp_path / ".venv/bin/python"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(stub, encoding="utf-8")
+        path.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            "-e",
+            "-o",
+            "pipefail",
+            "-c",
+            _step_script("Prepare pinned Linux OCR acceptance assets"),
+        ],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(commands) + os.pathsep + os.defpath,
+            "RUNNER_TEMP": str(tmp_path),
+            "BOOTSTRAP_TRACE": str(trace),
+            "BOOTSTRAP_FAILURE": failure or "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    entries = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    mirrors = [entry for entry in entries if entry["args"][:1] == ["tee"]]
+    assert len(mirrors) == 1
+    assert mirrors[0]["input"] == (
+        "https://archive.ubuntu.com/ubuntu/\tpriority:1\n"
+        "https://security.ubuntu.com/ubuntu/\tpriority:2\n"
+    )
+    assert "azure.archive.ubuntu.com" not in mirrors[0]["input"]
+    apt = [entry["args"] for entry in entries if entry["args"][:1] == ["apt-get"]]
+    for args in apt:
+        assert args.count("Acquire::Retries=0") == 1
+        assert args.count("Acquire::http::Timeout=20") == 1
+        assert args.count("Acquire::https::Timeout=20") == 1
+        assert not any("allow-" in arg or "Trusted" in arg or "Verify" in arg for arg in args)
+    prepared = any(entry["command"] == "python" for entry in entries)
+    if failure == "mirror":
+        assert result.returncode != 0 and not apt and not prepared
+    elif failure == "update":
+        assert result.returncode == 100 and len(apt) == 1 and not prepared
+    elif failure == "install":
+        assert result.returncode == 100 and len(apt) == 2 and not prepared
+    else:
+        assert result.returncode == 0, result.stderr
+        assert len(apt) == 2 and prepared
+    if apt:
+        assert "--error-on=any" in apt[0] and apt[0][-1] == "update"
+    if len(apt) == 2:
+        assert apt[1][:6] == [
+            "apt-get",
+            "install",
+            "--no-install-recommends",
+            "-y",
+            "tesseract-ocr",
+            "acl",
+        ]
+    if failure != "mirror":
+        probes = [entry["args"] for entry in entries if entry["command"] == "timeout"]
+        assert probes == [
+            ["15s", "getent", "ahostsv4", "archive.ubuntu.com"],
+            ["15s", "getent", "ahostsv4", "security.ubuntu.com"],
+        ]
 
 
 def test_linux_ocr_is_mandatory_in_existing_bridge_lane() -> None:

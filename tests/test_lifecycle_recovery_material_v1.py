@@ -1,4 +1,9 @@
-"""Detached native closure proof, strict hostile codec, and actual owner close gate."""
+"""Preserved native safety corpus, explicitly exercised on current 062/v2 sources.
+
+Test IDs remain stable from the original v1 suite. Genuine historical 061/v1
+bytes and cross-format rejection live in test_native_recovery_material_v2.py;
+current sources cannot generate new material pretending to be historical v1.
+"""
 
 from __future__ import annotations
 
@@ -34,13 +39,21 @@ from finance_core.instance_admission.sessions import lifecycle_read_operation
 from finance_core.lifecycle_v2 import LifecycleError
 from finance_core.lifecycle_v2.contracts import canonical, digest
 from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
-from finance_core.lifecycle_v2.recovery_material_v1 import (
-    ClosureFrontierV1,
+from finance_core.lifecycle_v2.recovery_material_v2 import (
+    ClosureFrontierV2 as ClosureFrontierV1,
+)
+from finance_core.lifecycle_v2.recovery_material_v2 import (
     ClosureLimitsV1,
     RecoveryMaterialError,
-    check_native_closure_v1,
-    collect_native_closure_v1,
-    decode_native_closure_v1,
+)
+from finance_core.lifecycle_v2.recovery_material_v2 import (
+    check_native_closure_v2 as check_native_closure_v1,
+)
+from finance_core.lifecycle_v2.recovery_material_v2 import (
+    collect_native_closure_v2 as collect_native_closure_v1,
+)
+from finance_core.lifecycle_v2.recovery_material_v2 import (
+    decode_native_closure_v2 as decode_native_closure_v1,
 )
 from finance_core.profile_layout import profile_root
 
@@ -775,7 +788,7 @@ def test_authenticator_must_be_independent_and_return_none(detached_case):
 
 
 def test_collector_transaction_and_cleanup_complete_before_bytes_escape(material_live, monkeypatch):
-    import finance_core.lifecycle_v2.recovery_material_v1 as material
+    import finance_core.lifecycle_v2._recovery_material_engine as material
 
     service, port, _, auth = material_live
     stage_expense(service, port, "first")
@@ -1053,7 +1066,9 @@ from lifecycle_recovery_material_support_v1 import make_service, stage_expense
 from finance_core.instance_admission import (
     InstanceAdmissionError, ProductionCloseUncertain, acquire_production_owner,
 )
-from finance_core.lifecycle_v2.recovery_material_v1 import collect_native_closure_v1
+from finance_core.lifecycle_v2.recovery_material_v2 import (
+    collect_native_closure_v2 as collect_native_closure_v1,
+)
 import finance_core.instance_admission.sessions as sessions
 
 class Environment:

@@ -303,8 +303,21 @@ jobs:
       - name: Prepare pinned Linux OCR acceptance assets
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y tesseract-ocr acl
+          set -euo pipefail
+          # Change only the ephemeral runner's mirror transport, not APT trust or suites.
+          sudo test -f /etc/apt/apt-mirrors.txt
+          sudo grep -R -Fq 'mirror+file:/etc/apt/apt-mirrors.txt' /etc/apt/sources.list.d/
+          printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://security.ubuntu.com/ubuntu/\tpriority:2\n' | \
+            sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+          for mirror_host in archive.ubuntu.com security.ubuntu.com; do
+            if ! timeout 15s getent ahostsv4 "$mirror_host"; then
+              echo "Bounded DNS diagnostic failed for $mirror_host; signed APT acquisition still required."
+            fi
+          done
+          sudo apt-get --error-on=any \
+            -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+          sudo apt-get install --no-install-recommends -y tesseract-ocr acl \
+            -o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
           .venv/bin/python -I scripts/prepare_linux_ocr.py \
             --executable /usr/bin/tesseract \
             --destination "$RUNNER_TEMP/linux-ocr"

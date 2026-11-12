@@ -56,7 +56,8 @@ PRIVATE_ARTIFACT_MARKERS = (
     b"example-private-owner",
     b"finance-" + b"automation",
 )
-EXPECTED_LEDGER_DIGEST = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
+EXPECTED_LEDGER_DIGEST = "b5f631a2c3f193a3c67748ba0c408232a5813a2b422f5bedd57c536aac95ea16"
+HISTORICAL_LEDGER_DIGEST_061 = "d333fff715b95938005bfb7a5bfc31ee94c29bd8c081db62b52932610e7d3850"
 HISTORICAL_LEDGER_DIGEST_060 = "0df321b0357d9093181d1446ac0972d071ed167a305b35abb30759252480427c"
 EXPECTED_LEDGER_PREFIX_058 = "06b2f093c0d1d718236768f6bfc474b6e96c0eaded1f1db108842004a0365e1b"
 EXPECTED_LEDGER_PREFIX_057 = "9b27f55d431a837eaa4fb685d4c70f0d54250f1ff2e67b55fa63ce9307490ab4"
@@ -196,7 +197,7 @@ def test_bridge_distribution_inventory_rejects_missing_synthetic_060(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_rejects_extra_synthetic_062(
+def test_bridge_distribution_inventory_rejects_duplicate_synthetic_062(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
@@ -208,12 +209,24 @@ def test_bridge_distribution_inventory_rejects_extra_synthetic_062(
         bridge_distribution_verifier._migration_digest(payloads)
 
 
-def test_bridge_distribution_inventory_accepts_reviewed_complete_061(
+def test_bridge_distribution_inventory_accepts_current_complete_062(
     bridge_distribution_verifier,
 ) -> None:
     payloads = _bridge_migration_payloads()
-    assert len(payloads) == 61
+    assert len(payloads) == 62
     assert bridge_distribution_verifier._migration_digest(payloads) == EXPECTED_LEDGER_DIGEST
+
+
+def test_bridge_distribution_inventory_accepts_historical_complete_061(
+    bridge_distribution_verifier,
+) -> None:
+    payloads = {
+        name: body
+        for name, body in _bridge_migration_payloads().items()
+        if int(PurePosixPath(name).name[:3]) <= 61
+    }
+    assert len(payloads) == 61
+    assert bridge_distribution_verifier._migration_digest(payloads) == HISTORICAL_LEDGER_DIGEST_061
 
 
 def test_bridge_distribution_inventory_accepts_actual_historical_060_prefix(
@@ -230,7 +243,14 @@ def test_bridge_distribution_inventory_accepts_actual_historical_060_prefix(
 
 @pytest.mark.parametrize(
     "mutation",
-    ["missing_060", "missing_middle", "extra_062", "replace_061_with_062", "duplicate_055"],
+    [
+        "missing_060",
+        "missing_middle",
+        "duplicate_062",
+        "unknown_063",
+        "replace_061_with_062",
+        "duplicate_055",
+    ],
 )
 def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
     bridge_distribution_verifier, mutation: str
@@ -244,7 +264,9 @@ def test_bridge_distribution_inventory_rejects_incomplete_or_extra_migrations(
         removed = next(name for name in payloads if PurePosixPath(name).name.startswith("061_"))
         payloads["finance_core/resources/migrations/062_replacement.sql"] = payloads.pop(removed)
     else:
-        sequence = "062" if mutation == "extra_062" else "055"
+        sequence = (
+            "062" if mutation == "duplicate_062" else "063" if mutation == "unknown_063" else "055"
+        )
         payloads[f"finance_core/resources/migrations/{sequence}_synthetic_duplicate.sql"] = (
             b"-- test"
         )
@@ -288,11 +310,13 @@ def test_migration_resources_have_one_package_owned_source() -> None:
     package_root = REPOSITORY_ROOT / "finance_core"
     paths = migration_resource_paths()
 
-    assert len(paths) == 61
-    assert [int(path.name[:3]) for path in paths] == list(range(1, 62))
+    assert len(paths) == 62
+    assert [int(path.name[:3]) for path in paths] == list(range(1, 63))
+    assert paths[-1].name == "062_prepared_native_finalization_v1.sql"
     assert all(path.resolve().is_relative_to(package_root.resolve()) for path in paths)
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST == MIGRATION_LEDGER_DIGEST
     assert _ledger_digest(paths[:60]) == HISTORICAL_LEDGER_DIGEST_060
+    assert _ledger_digest(paths[:61]) == HISTORICAL_LEDGER_DIGEST_061
     assert _ledger_digest(paths[:58]) == EXPECTED_LEDGER_PREFIX_058
     assert not (REPOSITORY_ROOT / "database" / "migrations").exists()
 
@@ -300,7 +324,7 @@ def test_migration_resources_have_one_package_owned_source() -> None:
 def test_previous_migration_bytes_remain_unchanged_through_057() -> None:
     paths = migration_resource_paths()
 
-    assert len(paths) == 61
+    assert len(paths) == 62
     assert _ledger_digest(paths[:57]) == EXPECTED_LEDGER_PREFIX_057
 
 
@@ -313,7 +337,7 @@ def test_migration_runtime_authority_reloads_the_non_executable_contract(
 
     paths = migration_resource_paths()
 
-    assert len(paths) == 61
+    assert len(paths) == 62
     assert _ledger_digest(paths) == EXPECTED_LEDGER_DIGEST
     migration_resource_paths.cache_clear()
 
@@ -668,6 +692,114 @@ def _installed_recovery_restart_program() -> str:
     )
 
 
+def _installed_prepared_finalization_restart_program() -> str:
+    """Apply an already prepared synthetic operation under a fresh installed process."""
+    return textwrap.dedent(
+        """
+        import base64
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        installed, dependencies, helpers, checkout, state_path = (
+            Path(value).resolve() for value in sys.argv[1:6]
+        )
+        sys.path[:0] = [str(installed), str(dependencies), str(helpers)]
+        state = json.loads(state_path.read_text())
+        config_data = state['config']
+        from finance_core.profile_layout import profile_root
+        os.environ['FINANCE_RUNTIME_ROOT'] = str(
+            profile_root(Path(config_data['locator_root']), config_data['profile_id'],
+                         config_data['layout']) / 'runtime'
+        )
+        import finance_core.lifecycle_v2 as lifecycle
+        import finance_core.instance_admission as admission
+        from finance_core.instance_admission import acquire_production_owner
+        from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
+        from finance_core.lifecycle_v2.prepared_finalization_v1 import PreparedFinalizationServiceV1
+        from lifecycle_recovery_material_support_v1 import (
+            RecordingEvidencePortV1, SyntheticAuthenticatorV1,
+        )
+
+        value_types = {
+            'source': lifecycle.VerifiedSource,
+            'provider': lifecycle.VerifiedObservation,
+            'delivery': lifecycle.VerifiedDelivery,
+            'action': lifecycle.VerifiedAction,
+        }
+        authenticator = SyntheticAuthenticatorV1()
+        port = RecordingEvidencePortV1(authenticator)
+        for entry in state['evidence']:
+            key = (entry['kind'], entry['evidence_id'])
+            value = value_types[entry['kind']](**entry['value'])
+            port._records[key] = (value, entry['context'])
+            port.archives[key] = base64.b64decode(entry['archive_b64'], validate=True)
+
+        config = None
+        owner = None
+        try:
+            config = admission.TrustedInstanceConfig(
+                Path(config_data['control_root']), Path(config_data['locator_root']),
+                config_data['profile_id'], layout=config_data['layout'],
+                instance_id=config_data['instance_id'],
+                config_identity=config_data['config_identity'],
+                core_identity=config_data['core_identity'],
+                approval_verifier=lambda ref, action, binding: ref == 'approved',
+            )
+            owner = acquire_production_owner(config)
+            service = lifecycle.LedgerService(
+                owner, port, lifecycle.RuntimeBinding(**state['binding']),
+                clock=lambda: state['now'],
+            )
+            api = PreparedFinalizationServiceV1(
+                service, archive_source=port, authenticator=authenticator,
+            )
+            before = api.inspect(state['operation_id'])
+            assert before.state == 'PREPARED_OFFLINE'
+            receipt = api.apply_offline(
+                state['operation_id'], expected_intent_sha256=state['intent_sha256'],
+            )
+            after = api.inspect(state['operation_id'])
+            facts = EffectiveLedgerReaderV1(service).collect().facts
+            assert after.state == 'APPLIED_OFFLINE'
+            assert after.receipt == receipt
+            assert len(facts) == 1
+            assert facts[0].record_id == receipt.record_id
+            assert facts[0].version == receipt.version
+            assert facts[0].fact_sha256 == receipt.fact_sha256
+            assert receipt.status == 'LOCAL_POSTED'
+            module_paths = [
+                Path(module.__file__).resolve()
+                for name, module in sys.modules.items()
+                if (name == 'finance_core' or name.startswith('finance_core.'))
+                and getattr(module, '__file__', None)
+            ]
+            assert all(path.is_relative_to(installed) for path in module_paths)
+            assert not any(Path(entry or '.').resolve().is_relative_to(checkout)
+                           for entry in sys.path)
+            print(json.dumps({
+                'pid': os.getpid(),
+                'before_state': before.state,
+                'after_state': after.state,
+                'receipt_status': receipt.status,
+                'record_id': receipt.record_id,
+                'version': receipt.version,
+                'fact_sha256': receipt.fact_sha256,
+                'commit_seq': receipt.commit_seq,
+                'fact_count': len(facts),
+                'installed_only': True,
+            }, sort_keys=True))
+        finally:
+            if owner is not None and owner._lease.fd >= 0:
+                owner.close()
+            if config is not None:
+                config.close()
+            port.destroy()
+        """
+    )
+
+
 def _probe_installed_lifecycle(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
@@ -706,6 +838,10 @@ def _probe_installed_lifecycle(
         )
         from finance_core.reconciliation.native_lifecycle_v1 import NativeReconciliationAdapterV1
         from finance_core.profile_layout import product_root, profile_root
+        from finance_core.reconciliation.migrations import (
+            TEMP_DB_MIGRATION_PATHS,
+            apply_migration_paths,
+        )
         from finance_core.resources import MIGRATION_LEDGER_DIGEST, migration_resource_paths
 
         binding = lifecycle.RuntimeBinding('synthetic-instance', 'generation-1', 'actor', 'chat')
@@ -724,7 +860,13 @@ def _probe_installed_lifecycle(
         paths = migration_resource_paths()
         migration = paths[-1]
         connection = sqlite3.connect(':memory:')
-        connection.executescript(migration.read_text())
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA foreign_keys = ON')
+        apply_migration_paths(
+            connection, TEMP_DB_MIGRATION_PATHS,
+            clock=lambda: '2026-11-11T00:00:00+00:00',
+            application_version='installed-package-probe',
+        )
         tables = {row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'l2_%'")}
         connection.close()
@@ -1429,33 +1571,51 @@ def _probe_installed_lifecycle(
 def _probe_installed_native_recovery_material(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
-    """Reconstruct two material segments after deleting their synthetic source."""
-    helper_root = outside_dir / "native-recovery-fixtures"
+    """Exercise current 062 round trips, prepare/reopen/apply and historical 061."""
+    helper_root = outside_dir / "prepared-finalization-fixtures"
     helper_root.mkdir(exist_ok=True)
-    # These are acquisition fixtures, not Core implementation. All finance_core
-    # imports in the isolated process must resolve to the installed artifact.
+    # These are synthetic acquisition fixtures and a pinned historical vector;
+    # all finance_core imports must resolve to the installed artifact.
     for name in (
         "instance_admission_support_v1.py",
         "lifecycle_recovery_material_support_v1.py",
     ):
         shutil.copyfile(REPOSITORY_ROOT / "tests" / name, helper_root / name)
+    fixture = REPOSITORY_ROOT / "tests/fixtures/native_recovery_material_v1_061.json"
+    shutil.copyfile(fixture, helper_root / fixture.name)
     program = textwrap.dedent(
         """
+        import base64
         import hashlib
         import json
         import os
+        import subprocess
         import sys
         import tempfile
         from pathlib import Path
+        from dataclasses import asdict
 
-        installed, checkout, outside, dependencies, helpers = (
-            Path(value).resolve() for value in sys.argv[1:]
+        installed, checkout, outside, dependencies, helpers, fixture_path = (
+            Path(value).resolve() for value in sys.argv[1:7]
         )
+        restart_program = sys.argv[7]
         sys.path[:0] = [str(installed), str(dependencies), str(helpers)]
-        import finance_core.lifecycle_v2.recovery_material_v1 as recovery_material
+        import finance_core.lifecycle_v2.recovery_material_v2 as current_material
+        from finance_core.instance_admission.sessions import lifecycle_read_operation
+        from finance_core.lifecycle_v2.contracts import RuntimeBinding
         from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
+        from finance_core.lifecycle_v2.prepared_finalization_v1 import PreparedFinalizationServiceV1
+        import finance_core.lifecycle_v2.recovery_material_v1 as historical_material
+        from finance_core.lifecycle_v2.recovery_material_v1 import (
+            ClosureFrontierV1, ClosureIdentityV1, check_native_closure_v1,
+        )
+        from finance_core.lifecycle_v2.recovery_material_v2 import (
+            ClosureFrontierV2, ClosureIdentityV2, check_native_closure_v2,
+            decode_native_closure_v2,
+        )
+        from finance_core.resources import MIGRATION_LEDGER_DIGEST
         from lifecycle_recovery_material_support_v1 import (
-            correct_expense, make_service, stage_expense,
+            SyntheticAuthenticatorV1, correct_expense, make_service, stage_expense,
         )
 
         class Environment:
@@ -1464,56 +1624,257 @@ def _probe_installed_native_recovery_material(
 
         previous_runtime = os.environ['FINANCE_RUNTIME_ROOT']
         with tempfile.TemporaryDirectory(prefix='native-material-', dir=outside) as scratch:
-            source_root = Path(scratch)
-            service, port, config, authenticator = make_service(source_root, Environment())
+            roundtrip_source_root = Path(scratch)
+            service, roundtrip_port, config, roundtrip_authenticator = make_service(
+                roundtrip_source_root, Environment(),
+            )
             try:
-                source, _, _, first = stage_expense(service, port, 'initial')
-                first_package = recovery_material.collect_native_closure_v1(
-                    service, archive_source=port, authenticator=authenticator,
+                source, _, _, first = stage_expense(service, roundtrip_port, 'initial')
+                first_package = current_material.collect_native_closure_v2(
+                    service, archive_source=roundtrip_port,
+                    authenticator=roundtrip_authenticator,
                 )
-                _, corrected = correct_expense(service, port, source, first)
-                stage_expense(service, port, 'usd', amount='7.00', currency='USD')
-                stage_expense(service, port, 'unconfirmed', stage='delivery')
-                second_package = recovery_material.collect_native_closure_v1(
-                    service, archive_source=port, authenticator=authenticator,
+                first_decoded = decode_native_closure_v2(first_package)
+                assert first_decoded.inventory.fact_version_count == 1
+                _, corrected = correct_expense(service, roundtrip_port, source, first)
+                stage_expense(service, roundtrip_port, 'usd', amount='7.00', currency='USD')
+                _, _, unused_review, unused_fact = stage_expense(
+                    service, roundtrip_port, 'unconfirmed', stage='delivery',
+                )
+                assert unused_fact is None
+                second_package = current_material.collect_native_closure_v2(
+                    service, archive_source=roundtrip_port,
+                    authenticator=roundtrip_authenticator,
                     previous_packages=(first_package,),
                 )
-                decoded = recovery_material.decode_native_closure_v1(second_package)
-                # Pin the producer's identity and exact frontier before removing
-                # the source. The checker may not trust a package's own endpoint.
-                identity = decoded.identity
-                frontier = recovery_material.ClosureFrontierV1(
-                    package_sha256=hashlib.sha256(second_package).hexdigest(),
-                    event_seq=decoded.last_event_seq,
-                    event_sha256=decoded.last_event_sha256,
+                roundtrip_decoded = decode_native_closure_v2(second_package)
+                # Pin source-owned identity/frontier and audit before removing it.
+                roundtrip_identity = ClosureIdentityV2(
+                    source_binding=service.binding,
+                    core_identity=config.core_identity,
+                    migration_identity=config._binding['migration_identity'],
+                    migration_ledger_digest=MIGRATION_LEDGER_DIGEST,
                 )
+                roundtrip_frontier = ClosureFrontierV2(
+                    package_sha256=hashlib.sha256(second_package).hexdigest(),
+                    event_seq=roundtrip_decoded.last_event_seq,
+                    event_sha256=roundtrip_decoded.last_event_sha256,
+                )
+                source_audit = service.reader().full_audit()
+                source_inventory = roundtrip_decoded.inventory
+                assert source_inventory.event_count == source_audit['event_count']
+                assert source_inventory.event_sha256 == source_audit['audit_sha256']
+                assert source_inventory.fact_version_count == source_audit['fact_version_count']
                 expected = {
                     fact.record_id: (fact.version, fact.fact_sha256, fact.amount, fact.currency)
                     for fact in EffectiveLedgerReaderV1(service).collect().facts
                 }
                 assert expected[first.record_id][:2] == (2, corrected.fact_sha256)
-                assert decoded.previous.package_sha256 == hashlib.sha256(first_package).hexdigest()
-                assert decoded.inventory.fact_version_count == 3
+                assert sorted((item[2], item[3]) for item in expected.values()) == [
+                    ('15.00', 'SGD'), ('7.00', 'USD'),
+                ]
+                assert roundtrip_decoded.previous.package_sha256 == (
+                    hashlib.sha256(first_package).hexdigest()
+                )
+                assert source_inventory.fact_version_count == 3
+                retained = roundtrip_decoded.rows.wire()
+                assert any(row['review_id'] == unused_review.review_id
+                           for row in retained['reviews'])
+                assert any(row['review_id'] == unused_review.review_id
+                           for row in retained['deliveries'])
+                assert not any(row['review_id'] == unused_review.review_id
+                               for row in retained['facts'])
             finally:
-                service.owner.close()
+                if service.owner._lease.fd >= 0:
+                    service.owner.close()
                 config.close()
-                port.destroy()
+                roundtrip_port.destroy()
                 os.environ['FINANCE_RUNTIME_ROOT'] = previous_runtime
-        assert not source_root.exists()
-        checked = recovery_material.check_native_closure_v1(
-            (first_package, second_package), authenticator=authenticator,
-            expected_identity=identity, expected_frontier=frontier,
+        assert not roundtrip_source_root.exists() and roundtrip_port.disabled
+        roundtrip_checked = check_native_closure_v2(
+            (first_package, second_package), authenticator=roundtrip_authenticator,
+            expected_identity=roundtrip_identity, expected_frontier=roundtrip_frontier,
         )
         reconstructed = {}
-        for record_id, _, version, fact_sha256, _, _, values_json in checked.current_values:
+        for record_id, _, version, fact_sha256, _, _, values_json in (
+            roundtrip_checked.current_values
+        ):
             values = json.loads(values_json)
             reconstructed[record_id] = (
                 version, fact_sha256, values['amount'], values['currency'],
             )
         assert reconstructed == expected
+        assert roundtrip_checked.status == 'CONTENT_VERIFIED_OFFLINE'
+        assert roundtrip_checked.inventory == source_inventory
+        assert roundtrip_checked.identity == roundtrip_identity
+        assert roundtrip_checked.frontier == roundtrip_frontier
+
+        packages = None
+        expected_identity = None
+        expected_frontier = None
+        reference = None
+        reopened = None
+        source_root = None
+        port = None
+        with tempfile.TemporaryDirectory(prefix='prepared-native-', dir=outside) as scratch:
+            source_root = Path(scratch)
+            service, port, config, authenticator = make_service(source_root, Environment())
+            try:
+                _, _, review, _ = stage_expense(
+                    service, port, 'expense', stage='delivery',
+                )
+                port.register_action(service, review, 'delivery-expense', 'action-expense')
+                before = None
+                with lifecycle_read_operation(service.owner) as conn:
+                    before = {
+                        table: tuple(tuple(row) for row in conn.execute(
+                            'SELECT * FROM l2_' + table
+                        ))
+                        for table in (
+                            'sources', 'proposals', 'reviews', 'deliveries',
+                            'facts', 'decisions', 'events',
+                        )
+                    }
+                api = PreparedFinalizationServiceV1(
+                    service, archive_source=port, authenticator=authenticator,
+                )
+                reference = api.prepare(review.review_id, 'action-expense', 'finalize')
+                with lifecycle_read_operation(service.owner) as conn:
+                    after = {
+                        table: tuple(tuple(row) for row in conn.execute(
+                            'SELECT * FROM l2_' + table
+                        ))
+                        for table in (
+                            'sources', 'proposals', 'reviews', 'deliveries',
+                            'facts', 'decisions', 'events',
+                        )
+                    }
+                assert after == before
+                prepare_fact_count = len(EffectiveLedgerReaderV1(service).collect().facts)
+                assert prepare_fact_count == 0
+                assert api.inspect('finalize').state == 'PREPARED_OFFLINE'
+                packages = api.material(
+                    'finalize', expected_intent_sha256=reference.intent_sha256,
+                )
+                assert packages
+                decoded = decode_native_closure_v2(packages[-1])
+                expected_identity = ClosureIdentityV2(
+                    source_binding=service.binding,
+                    core_identity=config.core_identity,
+                    migration_identity=config._binding['migration_identity'],
+                    migration_ledger_digest=MIGRATION_LEDGER_DIGEST,
+                )
+                expected_frontier = ClosureFrontierV2(
+                    package_sha256=hashlib.sha256(packages[-1]).hexdigest(),
+                    event_seq=decoded.last_event_seq,
+                    event_sha256=decoded.last_event_sha256,
+                )
+                evidence = [
+                    {
+                        'kind': kind,
+                        'evidence_id': evidence_id,
+                        'value': asdict(value),
+                        'context': context,
+                        'archive_b64': base64.b64encode(
+                            port.archives[(kind, evidence_id)]
+                        ).decode('ascii'),
+                    }
+                    for (kind, evidence_id), (value, context) in port._records.items()
+                ]
+                config_data = {
+                    'control_root': str(config.control_root),
+                    'locator_root': str(config.locator_root),
+                    'profile_id': config.profile_id,
+                    'layout': config.layout,
+                    'instance_id': config.instance_id,
+                    'config_identity': config.config_identity,
+                    'core_identity': config.core_identity,
+                }
+                restart_state = {
+                    'config': config_data,
+                    'binding': asdict(service.binding),
+                    'now': service._now(),
+                    'operation_id': 'finalize',
+                    'intent_sha256': reference.intent_sha256,
+                    'evidence': evidence,
+                }
+                state_path = source_root / 'prepared-restart.json'
+                state_path.write_text(json.dumps(restart_state, sort_keys=True))
+                state_path.chmod(0o600)
+            finally:
+                if service.owner._lease.fd >= 0:
+                    service.owner.close()
+                config.close()
+                port.destroy()
+                os.environ['FINANCE_RUNTIME_ROOT'] = previous_runtime
+            from finance_core.profile_layout import profile_root
+            runtime_root = profile_root(
+                Path(config_data['locator_root']), config_data['profile_id'], config_data['layout'],
+            ) / 'runtime'
+            child = subprocess.run(
+                [
+                    sys.executable, '-I', '-S', '-c', restart_program,
+                    str(installed), str(dependencies), str(helpers), str(checkout),
+                    str(state_path),
+                ],
+                cwd=outside,
+                env={'PATH': os.environ.get('PATH', ''), 'FINANCE_RUNTIME_ROOT': str(runtime_root)},
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            assert child.returncode == 0, child.stdout[-32768:] + child.stderr[-32768:]
+            reopened = json.loads(child.stdout)
+            assert reopened['pid'] != os.getpid()
+            assert reopened['before_state'] == 'PREPARED_OFFLINE'
+            assert reopened['after_state'] == 'APPLIED_OFFLINE'
+            assert reopened['fact_count'] == 1
+            assert reopened['receipt_status'] == 'LOCAL_POSTED'
+            assert reopened['record_id'] == reference.record_id
+            assert reopened['fact_sha256'] == reference.fact_sha256
+        assert source_root is not None and not source_root.exists()
+        assert port is not None and port.disabled
+        checked = check_native_closure_v2(
+            packages,
+            authenticator=authenticator,
+            expected_identity=expected_identity,
+            expected_frontier=expected_frontier,
+        )
+        assert reference is not None and reopened is not None
+        projected = next(row for row in checked.current_values if row[0] == reference.record_id)
+        assert projected[1] == reference.economic_event_id
+        assert projected[2] == reference.version
+        assert projected[3] == reference.fact_sha256
+        assert projected[4] == reference.commit_seq
+        projected_values = json.loads(projected[6])
+        assert projected_values['amount'] == '12.00'
+        assert projected_values['currency'] == 'SGD'
         assert checked.status == 'CONTENT_VERIFIED_OFFLINE'
-        assert checked.inventory == decoded.inventory
-        assert checked.frontier == frontier and checked.identity == identity
+
+        fixture_bytes = fixture_path.read_bytes()
+        assert hashlib.sha256(fixture_bytes).hexdigest() == (
+            '840c8f7975e229189a5b511bd667a2ba4e571fce07a7fef5977de04290855072'
+        )
+        fixture = json.loads(fixture_bytes)
+        historical_packages = tuple(
+            base64.b64decode(item, validate=True) for item in fixture['packages_b64']
+        )
+        historical_identity_value = fixture['expected_identity']
+        historical_identity_value['source_binding'] = RuntimeBinding(
+            **historical_identity_value['source_binding']
+        )
+        historical_identity = ClosureIdentityV1(**historical_identity_value)
+        historical_frontier = ClosureFrontierV1(**fixture['expected_frontier'])
+        historical = check_native_closure_v1(
+            historical_packages,
+            authenticator=SyntheticAuthenticatorV1(),
+            expected_identity=historical_identity,
+            expected_frontier=historical_frontier,
+        )
+        assert historical.status == 'CONTENT_VERIFIED_OFFLINE'
+        assert historical.inventory.event_count == 12
+        assert historical.inventory.fact_version_count == 2
         module_paths = sorted({
             Path(module.__file__).resolve()
             for name, module in sys.modules.items()
@@ -1522,13 +1883,39 @@ def _probe_installed_native_recovery_material(
         })
         print(json.dumps({
             'status': checked.status,
-            'segments': 2,
+            'segments': len(packages),
+            'roundtrip_status': roundtrip_checked.status,
+            'roundtrip_segments': 2,
+            'roundtrip_fact_versions': roundtrip_checked.inventory.fact_version_count,
+            'roundtrip_current_records': len(roundtrip_checked.current_values),
+            'roundtrip_currencies': sorted({item[3] for item in reconstructed.values()}),
+            'roundtrip_correction_version': reconstructed[first.record_id][0],
+            'roundtrip_unused_delivered_review': unused_fact is None,
+            'roundtrip_inventory_matches_source': roundtrip_checked.inventory == source_inventory,
+            'roundtrip_matches_effective_reader': reconstructed == expected,
+            'roundtrip_source_removed': not roundtrip_source_root.exists(),
+            'roundtrip_original_port_disabled': roundtrip_port.disabled,
+            'prepare_kept_source_fact_count': prepare_fact_count,
+            'reopened_in_distinct_process': reopened['pid'] != os.getpid(),
+            'reopen_installed_only': reopened['installed_only'],
+            'apply_state': reopened['after_state'],
+            'apply_receipt_status': reopened['receipt_status'],
+            'apply_fact_count': reopened['fact_count'],
+            'detached_v2_matches_reference': (
+                projected[1] == reference.economic_event_id
+                and projected[2] == reference.version
+                and projected[3] == reference.fact_sha256
+                and projected[4] == reference.commit_seq
+            ),
+            'historical_v1_status': historical.status,
+            'historical_v1_events': historical.inventory.event_count,
+            'historical_v1_fact_versions': historical.inventory.fact_version_count,
+            'historical_v1_module_file': str(Path(historical_material.__file__).resolve()),
             'source_removed': not source_root.exists(),
             'original_port_disabled': port.disabled,
-            'fact_versions': checked.inventory.fact_version_count,
+            'current_fact_versions': checked.inventory.fact_version_count,
             'current_records': len(checked.current_values),
-            'reconstructed_matches_effective_reader': reconstructed == expected,
-            'module_file': str(Path(recovery_material.__file__).resolve()),
+            'module_file': str(Path(current_material.__file__).resolve()),
             'installed_only': all(path.is_relative_to(installed) for path in module_paths)
                 and not any(Path(path or '.').resolve().is_relative_to(checkout)
                             for path in sys.path),
@@ -1536,7 +1923,7 @@ def _probe_installed_native_recovery_material(
         """
     )
     dependency_root = _installed_runtime_dependencies(outside_dir)
-    with tempfile.TemporaryDirectory(prefix="native-material-import-", dir=outside_dir) as root:
+    with tempfile.TemporaryDirectory(prefix="prepared-material-import-", dir=outside_dir) as root:
         runtime = Path(root) / "runtime"
         runtime.mkdir(mode=0o700)
         (runtime / "database").mkdir(mode=0o700)
@@ -1552,6 +1939,8 @@ def _probe_installed_native_recovery_material(
                 str(outside_dir),
                 str(dependency_root),
                 str(helper_root),
+                str(helper_root / fixture.name),
+                _installed_prepared_finalization_restart_program(),
             ],
             cwd=outside_dir,
             env={"PATH": os.environ.get("PATH", ""), "FINANCE_RUNTIME_ROOT": str(runtime)},
@@ -1561,9 +1950,8 @@ def _probe_installed_native_recovery_material(
             check=False,
         )
     assert completed.returncode == 0, (
-        f"installed native material probe exit {completed.returncode}; "
-        f"stdout={_bounded_instance_output(completed.stdout)!r}; "
-        f"stderr={_bounded_instance_output(completed.stderr)!r}"
+        f"installed prepared material probe exit {completed.returncode}; "
+        f"stdout={completed.stdout[-32768:]!r}; stderr={completed.stderr[-32768:]!r}"
     )
     return json.loads(completed.stdout)
 
@@ -2218,21 +2606,46 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
             runtime_python, install_dir, outside_dir
         )
         assert material["status"] == "CONTENT_VERIFIED_OFFLINE"
-        assert material["segments"] == 2 and material["fact_versions"] == 3
-        assert material["current_records"] == 2
+        assert material["roundtrip_status"] == "CONTENT_VERIFIED_OFFLINE"
+        assert material["roundtrip_segments"] == 2
+        assert material["roundtrip_fact_versions"] == 3
+        assert material["roundtrip_current_records"] == 2
+        assert material["roundtrip_currencies"] == ["SGD", "USD"]
+        assert material["roundtrip_correction_version"] == 2
+        assert material["roundtrip_unused_delivered_review"]
+        assert material["roundtrip_inventory_matches_source"]
+        assert material["roundtrip_matches_effective_reader"]
+        assert material["roundtrip_source_removed"] and material["roundtrip_original_port_disabled"]
+        assert material["segments"] == 1
+        assert material["prepare_kept_source_fact_count"] == 0
+        assert material["reopened_in_distinct_process"]
+        assert material["reopen_installed_only"]
+        assert material["apply_state"] == "APPLIED_OFFLINE"
+        assert material["apply_receipt_status"] == "LOCAL_POSTED"
+        assert material["apply_fact_count"] == 1
+        assert material["detached_v2_matches_reference"]
+        assert material["historical_v1_status"] == "CONTENT_VERIFIED_OFFLINE"
+        assert material["historical_v1_events"] == 12
+        assert material["historical_v1_fact_versions"] == 2
+        assert material["current_fact_versions"] == 1
+        assert material["current_records"] == 1
         assert material["source_removed"] and material["original_port_disabled"]
-        assert material["reconstructed_matches_effective_reader"]
         assert material["installed_only"]
         assert Path(material["module_file"]).resolve().is_relative_to(install_dir.resolve())
-        print("INSTALLED_NATIVE_RECOVERY_MATERIAL_PROOF " + json.dumps(material, sort_keys=True))
+        assert (
+            Path(material["historical_v1_module_file"])
+            .resolve()
+            .is_relative_to(install_dir.resolve())
+        )
+        print("INSTALLED_PREPARED_FINALIZATION_PROOF " + json.dumps(material, sort_keys=True))
         assert lifecycle["root_api"] == "finance-core-api-v1"
         assert {"LedgerService", "LedgerReader", "RuntimeBinding", "VerifiedSource"}.issubset(
             lifecycle["lifecycle_exports"]
         )
         assert lifecycle["refused_owner"] and lifecycle["refused_runtime"]
-        assert lifecycle["migration_count"] == 61
+        assert lifecycle["migration_count"] == 62
         assert lifecycle["migration_digest"] == EXPECTED_LEDGER_DIGEST
-        assert lifecycle["migration_name"] == "061_lifecycle_v2.sql"
+        assert lifecycle["migration_name"] == "062_prepared_native_finalization_v1.sql"
         assert lifecycle["guarded_capture"]["actor_refused"] is True
         assert lifecycle["guarded_capture"]["retry_same"] is True
         assert lifecycle["guarded_capture"]["event_count"] == 5
@@ -2306,9 +2719,15 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         ]
         assert post_restore["candidate_count"] == 1
         assert post_restore["audit"] == [3, 14]
-        assert {"l2_sources", "l2_facts", "l2_events", "l2_imports"}.issubset(
-            lifecycle["lifecycle_tables"]
-        )
+        assert {
+            "l2_sources",
+            "l2_facts",
+            "l2_events",
+            "l2_imports",
+            "l2_finalization_intents",
+            "l2_finalization_materials",
+            "l2_finalization_outcomes",
+        }.issubset(lifecycle["lifecycle_tables"])
         assert lifecycle["installed_only"] is True
         print(
             "INSTALLED_LIFECYCLE_PROOF "
@@ -2463,9 +2882,9 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         assert payload["distribution_name"] == "finance-core"
         assert payload["distribution_version"] == "0.1.7"
         assert payload["money_module"] == "finance_core.money"
-        assert payload["migration_count"] == 61
-        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 62))
-        assert payload["migration_filenames"][-1] == "061_lifecycle_v2.sql"
+        assert payload["migration_count"] == 62
+        assert [int(name[:3]) for name in payload["migration_filenames"]] == list(range(1, 63))
+        assert payload["migration_filenames"][-1] == "062_prepared_native_finalization_v1.sql"
         assert payload["migration_digest"] == MIGRATION_LEDGER_DIGEST
         assert payload["preflight_sha256"] == MIGRATION_PREFLIGHT_SHA256
         assert payload["broad_modules"] is True
