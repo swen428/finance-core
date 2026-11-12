@@ -159,3 +159,50 @@ assignment remain unchanged. This repair responds to an actual admission
 failure, separate from the advisory performance-warning review above. A new
 complete candidate run, including both Bridge platforms required by this
 baseline path, must establish authoritative validation.
+
+## November 12, 2026 measured baseline refresh and interrupted-run diagnostics
+
+The refreshed manifest was built with the unchanged builder from the three
+newest eligible successful first-attempt public `main` push runs of
+`validate.yml`:
+
+| Run | Head |
+| --- | --- |
+| `42938974435` | `20176eeefb1aff6ed23914988984178336bb914f` |
+| `42976612835` | `149e587c4ac31f750afcc262d5b2f331446c3f75` |
+| `43134286804` | `730d247617a37ae8e6dd1c5add62a553cd15692b` |
+
+The run, full eleven-job, artifact identity and digest evidence was verified;
+ZIP digests matched and complete extracted timing JSON was separately hashed.
+The manifest records 277 measured files, 13,110 tests and 39,024 timing
+samples. Its P95 fallback is 271.335 seconds per file. The current candidate
+has 282 test files; five still have no eligible main timing and use the
+unchanged fallback. No failed pull-request timing was imported.
+
+The baseline review followed the existing advisory process. Two consecutive
+qualified samples emitted `refresh_unknown_weights` for different files: run
+`42976612835` measured `tests/test_lifecycle_recovery_material_v1.py` at
+590.200 seconds against the then-current 237.810-second fallback (2.481813x),
+and run `43134286804` measured
+`tests/test_prepared_native_finalization_v1.py` at 597.743 seconds (2.513532x).
+This supports manual preparation under the existing policy; it does not
+change any threshold or CI gate.
+
+Candidate run `43158199367`, attempt 1, failed after shard 0 reached the
+existing 120-minute job limit. Its partial JUnit-based timing report was
+uploaded with `junit_xml_not_found`; all four shard timing reports were
+uploaded, and the incomplete shard report remains failure evidence. The shard
+command now uses pytest's verbose case output (`-v`) in place of quiet dot
+progress so an interrupted log identifies the active test case. The exact
+Git test inventory, four single-process shards, JUnit path, exit-code
+propagation, 120-minute timeout, required jobs and acceptance minima remain
+unchanged.
+
+Historical per-test-duration replays on the three eligible sources produce
+new-plan maximum-to-mean ratios of 1.140827, 1.183618 and 1.126748. These
+known-cost replays do not show an improvement over the old assignment in the
+latest-three comparison and are not runner wall-time measurements or a
+completion guarantee. The five new candidate test files still lack eligible Linux
+main timing, so the refresh alone is not evidence that the candidate will
+finish within two hours. A complete successful exact-head run remains the
+validation authority.

@@ -111,7 +111,7 @@ jobs:
         run: |
           python -I .github/scripts/qualify_age_toolchain_v1.py \
             --output-dir "$RUNNER_TEMP/prepared-age-qualification" \
-            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"
+            --tool-directory "/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-package"
 
       - name: Require installed wheel and sdist prepared-envelope acceptance
         run: |
@@ -119,7 +119,7 @@ jobs:
             --candidate-identity "$RUNNER_TEMP/candidate-identity.json" \
             --package-dir "$RUNNER_TEMP/candidate-package" \
             --qualification-result "$RUNNER_TEMP/prepared-age-qualification/qualification-result.json" \
-            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64" \
+            --tool-directory "/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-package" \
             --output "$RUNNER_TEMP/prepared-envelope-acceptance-v1.json" \
             --run-id "${{ github.run_id }}" \
             --run-attempt "${{ github.run_attempt }}"
@@ -228,11 +228,13 @@ jobs:
         run: python .github/scripts/candidate_identity.py --output "$RUNNER_TEMP/candidate-identity.json" --github-output "$GITHUB_OUTPUT"
 
       - name: Prepare pinned Linux age tools for this shard
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
         run: |
           python -I .github/scripts/qualify_age_toolchain_v1.py \
             --output-dir "$RUNNER_TEMP/prepared-age-qualification" \
-            --tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"
-          echo "FINANCE_PREPARED_AGE_TOOL_DIR=$RUNNER_TEMP/prepared-age-tools/linux-x86_64" >> "$GITHUB_ENV"
+            --tool-directory "/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}"
+          echo "FINANCE_PREPARED_AGE_TOOL_DIR=/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}" >> "$GITHUB_ENV"
 
       - name: Install locked development dependencies
         run: "python -I -m pip install --only-binary=:all: --require-hashes -r requirements-dev.txt"
@@ -251,7 +253,7 @@ jobs:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |
           set +e
-          xargs python -I -m pytest -q \
+          xargs python -I -m pytest -v \
             --junitxml="/tmp/pytest-results-shard-${SHARD_INDEX}.xml" \
             --durations=25 --durations-min=1.0 \
             < "/tmp/finance-core-shards/shard-${SHARD_INDEX}.txt"

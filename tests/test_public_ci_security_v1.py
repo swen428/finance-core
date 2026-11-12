@@ -2004,7 +2004,10 @@ def test_prepared_envelope_acceptance_is_mandatory_before_candidate_publication(
     qualification = _step_script("Prepare pinned Linux age tools")
     assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
     assert '--output-dir "$RUNNER_TEMP/prepared-age-qualification"' in qualification
-    assert '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"' in qualification
+    package_tool_directory = (
+        '"/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-package"'
+    )
+    assert f"--tool-directory {package_tool_directory}" in qualification
     acceptance = _step_script("Require installed wheel and sdist prepared-envelope acceptance")
     assert "python -I tests/installed_prepared_envelope_probe.py" in acceptance
     for argument in (
@@ -2012,7 +2015,7 @@ def test_prepared_envelope_acceptance_is_mandatory_before_candidate_publication(
         '--package-dir "$RUNNER_TEMP/candidate-package"',
         "--qualification-result "
         '"$RUNNER_TEMP/prepared-age-qualification/qualification-result.json"',
-        '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"',
+        f"--tool-directory {package_tool_directory}",
         '--output "$RUNNER_TEMP/prepared-envelope-acceptance-v1.json"',
         '--run-id "${{ github.run_id }}"',
         '--run-attempt "${{ github.run_attempt }}"',
@@ -2043,13 +2046,37 @@ def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_exe
     qualification = _workflow_step_source("pytest", names[0])
     _require_unconditional_fail_closed_step(qualification)
     assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
-    assert '--tool-directory "$RUNNER_TEMP/prepared-age-tools/linux-x86_64"' in qualification
+    assert "SHARD_INDEX: ${{ matrix.shard }}" in qualification
+    pytest_tool_directory = (
+        '"/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}"'
+    )
+    assert f"--tool-directory {pytest_tool_directory}" in qualification
     assert (
-        'echo "FINANCE_PREPARED_AGE_TOOL_DIR=$RUNNER_TEMP/prepared-age-tools/linux-x86_64" '
+        'echo "FINANCE_PREPARED_AGE_TOOL_DIR=/tmp/finance-prepared-age-${GITHUB_RUN_ID}'
+        '-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}" '
         '>> "$GITHUB_ENV"'
     ) in qualification
+    job_header = job.split("    steps:\n", 1)[0]
+    assert "timeout-minutes: 120" in job_header
+    plan = _workflow_step_source("pytest", "Plan exact test inventory")
+    for command_fragment in (
+        "python .github/scripts/plan_pytest_shards.py plan",
+        "--baseline .github/scripts/pytest-shard-weights-v2.json",
+        "--repository-root .",
+        "--output-dir /tmp/finance-core-shards",
+        "--shard-count 4",
+    ):
+        assert command_fragment in plan
+
     run = _workflow_step_source("pytest", "Run shard")
     assert not re.search(r"^\s*(?:if|continue-on-error):", run, re.MULTILINE)
+    assert "xargs python -I -m pytest -v" in run
+    assert "xargs python -I -m pytest -q" not in run
+    assert '--junitxml="/tmp/pytest-results-shard-${SHARD_INDEX}.xml"' in run
+    assert "--durations=25 --durations-min=1.0" in run
+    assert '< "/tmp/finance-core-shards/shard-${SHARD_INDEX}.txt"' in run
+    assert "rc=$?" in run
+    assert 'echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"' in run
     assert 'exit "$rc"' in run
 
 
@@ -2275,6 +2302,7 @@ def test_installed_probe_parent_does_not_relay_forged_child_diagnostics(
     [
         "Prepare pinned Linux age tools",
         "Require installed wheel and sdist prepared-envelope acceptance",
+        "Prepare pinned Linux age tools for this shard",
     ],
 )
 @pytest.mark.parametrize("exit_code", [0, 17])
@@ -2298,12 +2326,20 @@ def test_actual_prepared_acceptance_commands_preserve_failure_exit(
         .replace("${{ github.run_id }}", "123")
         .replace("${{ github.run_attempt }}", "1")
     )
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    github_env = tmp_path / "github-env"
+    shard_step = step == "Prepare pinned Linux age tools for this shard"
     result = subprocess.run(
         ["/bin/bash", "-e", "-o", "pipefail", "-c", script],
         env={
             **os.environ,
             "PATH": str(commands),
-            "RUNNER_TEMP": str(tmp_path),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "SHARD_INDEX": "2",
+            "GITHUB_ENV": str(github_env),
             "COMMAND_TRACE": str(trace),
             "COMMAND_EXIT": str(exit_code),
         },
@@ -2316,6 +2352,74 @@ def test_actual_prepared_acceptance_commands_preserve_failure_exit(
     assert arguments[0] == "-I"
     assert arguments[1] == (
         ".github/scripts/qualify_age_toolchain_v1.py"
-        if step == "Prepare pinned Linux age tools"
+        if step != "Require installed wheel and sdist prepared-envelope acceptance"
         else "tests/installed_prepared_envelope_probe.py"
     )
+    expected_tool_directory = (
+        "/tmp/finance-prepared-age-123-1-pytest-2"
+        if shard_step
+        else "/tmp/finance-prepared-age-123-1-package"
+    )
+    assert arguments[arguments.index("--tool-directory") + 1] == expected_tool_directory
+    assert str(runner_temp) not in expected_tool_directory
+    if step != "Require installed wheel and sdist prepared-envelope acceptance":
+        assert arguments[arguments.index("--output-dir") + 1] == str(
+            runner_temp / "prepared-age-qualification"
+        )
+    if shard_step and exit_code == 0:
+        assert github_env.read_text() == (
+            "FINANCE_PREPARED_AGE_TOOL_DIR=/tmp/finance-prepared-age-123-1-pytest-2\n"
+        )
+    elif shard_step:
+        assert not github_env.exists()
+
+
+def test_actual_pytest_tool_setup_gives_each_shard_a_distinct_private_path(
+    tmp_path: Path,
+) -> None:
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    python = commands / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['COMMAND_TRACE']).write_text(json.dumps(sys.argv[1:]))\n"
+        "raise SystemExit(0)\n"
+    )
+    python.chmod(0o700)
+    script = _step_script("Prepare pinned Linux age tools for this shard")
+    paths: set[str] = set()
+
+    for shard in range(4):
+        trace = tmp_path / f"command-{shard}.json"
+        env_file = tmp_path / f"github-env-{shard}"
+        script_with_run = script.replace("${{ github.run_id }}", "123").replace(
+            "${{ github.run_attempt }}", "1"
+        )
+        result = subprocess.run(
+            ["/bin/bash", "-e", "-o", "pipefail", "-c", script_with_run],
+            env={
+                **os.environ,
+                "PATH": str(commands),
+                "RUNNER_TEMP": str(tmp_path / "different-runner-temp"),
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "SHARD_INDEX": str(shard),
+                "GITHUB_ENV": str(env_file),
+                "COMMAND_TRACE": str(trace),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        expected = f"/tmp/finance-prepared-age-123-1-pytest-{shard}"
+        paths.add(expected)
+        arguments = json.loads(trace.read_text())
+        assert arguments[arguments.index("--tool-directory") + 1] == expected
+        assert arguments[arguments.index("--output-dir") + 1] == str(
+            tmp_path / "different-runner-temp" / "prepared-age-qualification"
+        )
+        assert env_file.read_text() == f"FINANCE_PREPARED_AGE_TOOL_DIR={expected}\n"
+    assert len(paths) == 4
