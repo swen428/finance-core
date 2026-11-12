@@ -4,9 +4,11 @@ import ast
 import json
 import os
 import re
+import runpy
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -15,6 +17,24 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "validate.yml"
 FULL_SHA_ACTION = re.compile(r"^\s*uses:\s*[^@\s]+@[0-9a-f]{40}(?:\s+#.*)?$", re.MULTILINE)
+PREPARED_ENVELOPE_SCOPE_PATHS = (
+    "finance_core/_native_age_v1.py",
+    "finance_core/resources/crypto/age_toolchain_v1.json",
+    "finance_core/resources/crypto/nested/future-tool.json",
+    "finance_core/lifecycle_v2/prepared_envelope_v1.py",
+    "finance_core/lifecycle_v2/prepared_finalization_v1.py",
+    "finance_core/lifecycle_v2/_prepared_content_v1.py",
+    "finance_core/lifecycle_v2/_prepared_envelope_store_v1.py",
+    "tests/test_native_age_v1.py",
+    "tests/test_prepared_content_export_v1.py",
+    "tests/test_prepared_envelope_v1.py",
+    "tests/test_prepared_envelope_faults_v1.py",
+    "tests/test_age_toolchain_qualification_v1.py",
+    "tests/installed_prepared_envelope_probe.py",
+    "tests/prepared_envelope_test_support.py",
+    "tests/lifecycle_recovery_material_support_v1.py",
+    "tests/instance_admission_support_v1.py",
+)
 
 
 def test_public_workflow_has_read_only_top_level_permissions() -> None:
@@ -211,6 +231,7 @@ def _inline_namespace(step: str, label: str) -> dict[str, Any]:
         ("pull_request", "requirements-dev.txt", "true"),
         ("pull_request", "pyproject.toml", "true"),
         ("pull_request", ".github/workflows/validate.yml", "true"),
+        *(("pull_request", path, "true") for path in PREPARED_ENVELOPE_SCOPE_PATHS),
     ],
 )
 def test_actual_scope_script_produces_release_compatible_evidence(
@@ -322,6 +343,7 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "tests/fixtures/linux_receipt_ocr/provenance.json",
         "scripts/linux_ocr_assets_v1.json",
         "scripts/prepare_linux_ocr.py",
+        *PREPARED_ENVELOPE_SCOPE_PATHS,
         "README.md",
     ],
 )
@@ -504,15 +526,32 @@ def test_ocr_scope_regex_is_identical_in_workflow_and_independent_verifier() -> 
     workflow_pattern = re.search(r"if grep -Eq '([^']+)' ", source)
     assert workflow_pattern
     tree = ast.parse((REPOSITORY_ROOT / "scripts" / "verify_candidate_validation.py").read_text())
+    constants = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and type(node.value.value) is str
+    }
     patterns = [
-        ast.literal_eval(node.args[0])
+        (
+            constants[node.args[0].id]
+            if isinstance(node.args[0], ast.Name)
+            else ast.literal_eval(node.args[0])
+        )
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "compile"
         and node.args
-        and isinstance(node.args[0], ast.Constant)
-        and str(node.args[0].value).startswith(r"^(\.github/")
+        and (
+            isinstance(node.args[0], ast.Constant)
+            and str(node.args[0].value).startswith(r"^(\.github/")
+            or isinstance(node.args[0], ast.Name)
+            and constants.get(node.args[0].id, "").startswith(r"^(\.github/")
+        )
     ]
     assert patterns == [workflow_pattern.group(1)]
     assert 'totals["tests"] < 13' in source
@@ -1929,3 +1968,797 @@ def test_candidate_package_is_bounded_read_only_initial_graph_job():
     assert 'test "$PACKAGE_RESULT" = success' in source
     assert "artifact_id: ${{ steps.package-artifact.outputs.artifact-id }}" in header
     assert "release" not in package.lower().replace("not release approval", "")
+
+
+def _workflow_job_source(name: str) -> str:
+    source = WORKFLOW.read_text(encoding="utf-8").split(f"\n  {name}:\n", 1)[1]
+    return re.split(r"\n  [a-z][a-z-]+:\n", source, maxsplit=1)[0]
+
+
+def _workflow_step_source(job: str, name: str) -> str:
+    source = _workflow_job_source(job).split(f"      - name: {name}\n", 1)[1]
+    return source.split("\n      - name:", 1)[0]
+
+
+def _require_unconditional_fail_closed_step(step: str) -> None:
+    assert not re.search(r"^\s*(?:if|continue-on-error):", step, re.MULTILINE)
+    assert not re.search(r"\|\|\s*(?:true|:)|\bexit\s+0\b|\bset\s+\+e\b", step)
+    assert not re.search(r"--(?:allow|skip|no-native)[-\w]*", step)
+    assert "secrets." not in step
+
+
+def test_prepared_envelope_acceptance_is_mandatory_before_candidate_publication() -> None:
+    package = _workflow_job_source("candidate-package")
+    names = (
+        "Build exact tracked candidate package",
+        "Prepare pinned Linux age tools",
+        "Require installed wheel and sdist prepared-envelope acceptance",
+        "Upload prepared-envelope acceptance proof",
+        "Upload candidate build identity, not release approval",
+    )
+    positions = [package.index(f"      - name: {name}\n") for name in names]
+    assert positions == sorted(positions)
+    for name in names:
+        _require_unconditional_fail_closed_step(_workflow_step_source("candidate-package", name))
+
+    qualification = _step_script("Prepare pinned Linux age tools")
+    assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
+    assert '--output-dir "$RUNNER_TEMP/prepared-age-qualification"' in qualification
+    package_tool_directory = (
+        '"/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-package"'
+    )
+    assert f"--tool-directory {package_tool_directory}" in qualification
+    acceptance = _step_script("Require installed wheel and sdist prepared-envelope acceptance")
+    assert "python -I tests/installed_prepared_envelope_probe.py" in acceptance
+    for argument in (
+        '--candidate-identity "$RUNNER_TEMP/candidate-identity.json"',
+        '--package-dir "$RUNNER_TEMP/candidate-package"',
+        "--qualification-result "
+        '"$RUNNER_TEMP/prepared-age-qualification/qualification-result.json"',
+        f"--tool-directory {package_tool_directory}",
+        '--output "$RUNNER_TEMP/prepared-envelope-acceptance-v1.json"',
+        '--run-id "${{ github.run_id }}"',
+        '--run-attempt "${{ github.run_attempt }}"',
+    ):
+        assert argument in acceptance
+    upload = _workflow_step_source("candidate-package", "Upload prepared-envelope acceptance proof")
+    assert "uses: actions/upload-artifact@" in upload
+    assert (
+        "name: prepared-envelope-acceptance-v1-${{ github.run_id }}-${{ github.run_attempt }}"
+        in upload
+    )
+    assert "path: ${{ runner.temp }}/prepared-envelope-acceptance-v1.json" in upload
+    assert "if-no-files-found: error" in upload
+    assert "retention-days: 90" in upload
+    assert "candidate-package/" not in upload
+
+
+def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_execution() -> None:
+    job = _workflow_job_source("pytest")
+    assert "shard: [0, 1, 2, 3]" in job
+    names = (
+        "Prepare pinned Linux age tools for this shard",
+        "Plan exact test inventory",
+        "Run shard",
+    )
+    positions = [job.index(f"      - name: {name}\n") for name in names]
+    assert positions == sorted(positions)
+    qualification = _workflow_step_source("pytest", names[0])
+    _require_unconditional_fail_closed_step(qualification)
+    assert "python -I .github/scripts/qualify_age_toolchain_v1.py" in qualification
+    assert "SHARD_INDEX: ${{ matrix.shard }}" in qualification
+    pytest_tool_directory = (
+        '"/tmp/finance-prepared-age-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}"'
+    )
+    assert f"--tool-directory {pytest_tool_directory}" in qualification
+    assert (
+        'echo "FINANCE_PREPARED_AGE_TOOL_DIR=/tmp/finance-prepared-age-${GITHUB_RUN_ID}'
+        '-${GITHUB_RUN_ATTEMPT}-pytest-${SHARD_INDEX}" '
+        '>> "$GITHUB_ENV"'
+    ) in qualification
+    job_header = job.split("    steps:\n", 1)[0]
+    assert "timeout-minutes: 120" in job_header
+    plan = _workflow_step_source("pytest", "Plan exact test inventory")
+    for command_fragment in (
+        "python .github/scripts/plan_pytest_shards.py plan",
+        "--baseline .github/scripts/pytest-shard-weights-v2.json",
+        "--repository-root .",
+        "--output-dir /tmp/finance-core-shards",
+        "--shard-count 4",
+    ):
+        assert command_fragment in plan
+
+    run = _workflow_step_source("pytest", "Run shard")
+    assert not re.search(r"^\s*(?:if|continue-on-error):", run, re.MULTILINE)
+    assert "xargs python -I -m pytest -v" in run
+    assert "xargs python -I -m pytest -q" not in run
+    assert '--junitxml="/tmp/pytest-results-shard-${SHARD_INDEX}.xml"' in run
+    assert "--durations=25 --durations-min=1.0" in run
+    assert '< "/tmp/finance-core-shards/shard-${SHARD_INDEX}.txt"' in run
+    assert "rc=$?" in run
+    assert 'echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"' in run
+    assert 'exit "$rc"' in run
+
+
+def test_prepared_envelope_keeps_the_existing_eleven_job_graph() -> None:
+    source = WORKFLOW.read_text(encoding="utf-8").split("\njobs:\n", 1)[1]
+    jobs = re.findall(r"^  ([a-z][a-z-]+):$", source, re.MULTILINE)
+    assert set(jobs) == {
+        "classify",
+        "candidate-package",
+        "quality",
+        "pytest",
+        "bridge",
+        "pytest-report",
+        "validate",
+    }
+    assert len(jobs) == 7
+    assert "shard: [0, 1, 2, 3]" in _workflow_job_source("pytest")
+    assert "os: [ubuntu-latest, macos-15]" in _workflow_job_source("bridge")
+    assert len(jobs) - 2 + 4 + 2 == 11
+    package = _workflow_job_source("candidate-package")
+    assert "runs-on: ubuntu-24.04" in package
+    assert "    needs:" not in package.split("    steps:\n", 1)[0]
+    assert "    if:" not in package.split("    steps:\n", 1)[0]
+
+
+def _literal_named_constants(source: str, names: set[str]) -> dict[str, Any]:
+    """Inspect fixed module literals without executing either assignment form."""
+    tree = ast.parse(source)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        else:
+            continue
+        if not isinstance(target, ast.Name) or target.id not in names:
+            continue
+        assert target.id not in constants, "Fixed constant must have exactly one assignment"
+        assert value is not None, "Fixed constant requires a literal value"
+        try:
+            constants[target.id] = ast.literal_eval(value)
+        except (ValueError, TypeError) as exc:
+            raise AssertionError("Fixed constant requires a literal value") from exc
+    assert set(constants) == names, "Required fixed constant is missing"
+    return constants
+
+
+def test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap() -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    source = script.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    constants = _literal_named_constants(
+        source, {"RELEASE", "SOURCE_COMMIT", "SIGSUM_POLICY", "LINUX"}
+    )
+    assert constants["RELEASE"] == "v1.3.2"
+    assert constants["SOURCE_COMMIT"] == "b74dce4cdbe35b5e5f66c06d9612b72f89028758"
+    assert constants["SIGSUM_POLICY"] == "sigsum-generic-2025-1"
+    assert constants["LINUX"]["archive_sha256"] == (
+        "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10"
+    )
+    assert constants["LINUX"]["proof_sha256"] == (
+        "98402fa59b4e433426156b4a7e74a32e44902e0434c61158f7de18ffc84f1f97"
+    )
+    registry = json.loads(
+        (REPOSITORY_ROOT / "finance_core/resources/crypto/age_toolchain_v1.json").read_bytes()
+    )
+    assert constants["LINUX"]["tools"] == registry["platforms"]["linux-x86_64"]
+    assert '"status": "PREQUALIFIED_SIGSUM_PROOF_REUSED"' in source
+    assert "observed == expected_sha256" in source
+    assert 'download(\n        base + proof.name, proof, LINUX["proof_sha256"]' in source
+    arguments = {
+        ast.literal_eval(node.args[0])
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+    }
+    assert arguments == {"--output-dir", "--tool-directory"}
+    workflow_setup = _step_script("Prepare pinned Linux age tools")
+    assert not re.search(
+        r"\bgo\s+(?:build|install|run)\b|GOTOOLCHAIN|setup-go@", source + workflow_setup
+    )
+
+
+@pytest.mark.parametrize("form", ["plain", "annotated"])
+def test_fixed_source_guard_accepts_both_literal_assignment_forms(monkeypatch, form: str) -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    actual_read = Path.read_text
+    source = actual_read(script, encoding="utf-8")
+    declaration = "LINUX =" if form == "plain" else "LINUX: dict[str, Any] ="
+    amended, changes = re.subn(
+        r"^LINUX(?:\s*:\s*dict\[str, Any\])?\s*=", declaration, source, count=1, flags=re.MULTILINE
+    )
+    assert changes == 1
+
+    def adapted_read(path, *args, **kwargs):
+        return amended if path == script else actual_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", adapted_read)
+    test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap()
+
+
+@pytest.mark.parametrize("unsafe", ["missing", "nonliteral", "duplicate", "wrong_pin"])
+def test_fixed_source_guard_rejects_unproven_or_changed_constants(monkeypatch, unsafe: str) -> None:
+    script = REPOSITORY_ROOT / ".github/scripts/qualify_age_toolchain_v1.py"
+    actual_read = Path.read_text
+    source = actual_read(script, encoding="utf-8")
+    declaration = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "LINUX" for t in node.targets)
+        or isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "LINUX"
+    )
+    lines = source.splitlines(keepends=True)
+    if unsafe in {"missing", "nonliteral"}:
+        lines[declaration.lineno - 1 : declaration.end_lineno] = (
+            [] if unsafe == "missing" else ["LINUX = untrusted_runtime_lookup()\n"]
+        )
+        amended = "".join(lines)
+    elif unsafe == "duplicate":
+        amended = source + "\nLINUX = {}\n"
+    else:
+        amended = source.replace(
+            "cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10", "0" * 64, 1
+        )
+
+    def adapted_read(path, *args, **kwargs):
+        return amended if path == script else actual_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", adapted_read)
+    with pytest.raises(AssertionError):
+        test_prepared_tool_setup_reuses_fixed_source_qualification_without_go_bootstrap()
+
+
+def _probe_diagnostic_child(code: str) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import runpy, sys
+        probe = runpy.run_path(sys.argv[1])
+        code = sys.argv[2]
+        def refuse():
+            error = ValueError('synthetic-private-diagnostic-value')
+            error.code = 'synthetic-private-diagnostic-value'
+            raise error
+        def child(*args):
+            if code:
+                probe['_native_stage'](code, refuse)
+            refuse()
+        probe['main'].__globals__['child'] = child
+        sys.argv = [sys.argv[1], '--phase', 'native', '--phase-config', 'unused']
+        probe['main']()
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        code,
+    ]
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["NATIVE_PREFLIGHT_AGE_ANCESTOR", "NATIVE_GENERATE_RECOVERY", "NATIVE_DECRYPT_TEMPORARY"],
+)
+def test_installed_native_failure_preserves_only_fixed_stage(tmp_path: Path, code: str) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    command = _probe_diagnostic_child(code)
+    child = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=10)
+    assert child.returncode == 1 and child.stderr == b""
+    failure = json.loads(child.stdout)
+    assert failure["code"] == code and failure["reason"] == ""
+    assert b"synthetic-private-diagnostic-value" not in child.stdout
+    with pytest.raises(probe["NativeProbeStageError"]) as caught:
+        probe["_run"](command, cwd=tmp_path, deadline=time.monotonic() + 10, stage="native probe")
+    assert caught.value.code == code
+    assert str(caught.value) == "Native probe stage refused"
+
+
+def test_installed_native_failure_never_emits_arbitrary_exception_code(tmp_path: Path) -> None:
+    command = _probe_diagnostic_child("")
+    child = subprocess.run(command, cwd=tmp_path, capture_output=True, timeout=10)
+    assert child.returncode == 1 and child.stderr == b""
+    failure = json.loads(child.stdout)
+    assert failure["failure_type"] == "ValueError"
+    assert failure["code"] == failure["reason"] == ""
+    assert b"synthetic-private-diagnostic-value" not in child.stdout
+
+
+@pytest.mark.parametrize("failure_type", ["NativeAgeError", "synthetic-private-diagnostic-value"])
+def test_installed_probe_parent_does_not_relay_forged_child_diagnostics(
+    tmp_path: Path, failure_type: str
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    private = "synthetic-private-diagnostic-value"
+    payload = json.dumps(
+        {"failure_type": failure_type, "code": private, "reason": private}
+    ).encode()
+    program = (
+        f"import os; os.write(1,{payload!r}); os.write(2,{private.encode()!r}); raise SystemExit(1)"
+    )
+    with pytest.raises(ValueError) as caught:
+        probe["_run"](
+            [sys.executable, "-I", "-c", program],
+            cwd=tmp_path,
+            deadline=time.monotonic() + 10,
+            stage="native probe",
+        )
+    assert type(caught.value) is ValueError and not getattr(caught.value, "code", "")
+    assert private not in str(caught.value)
+
+
+def _synthetic_private_phase_child_command(
+    phase: str, config_path: Path, response_fd: int, result_field: str
+) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import runpy, sys
+        probe_path, phase, config_path, response_fd, result_field = sys.argv[1:]
+        sentinel = {
+            'native': 'SYNTHETIC_NATIVE_RESULT_SENTINEL',
+            'writer': 'SYNTHETIC_WRITER_RESULT_SENTINEL',
+        }[phase]
+        probe = runpy.run_path(probe_path)
+        namespace = probe['main'].__globals__
+        namespace['_activate'] = lambda config: (None, 'synthetic-installed-module')
+        namespace['_check_import_runtime'] = lambda config: {'empty': True}
+        namespace['_native'] = lambda config, toolchain: {result_field: sentinel}
+        namespace['_writer'] = lambda config, toolchain, module_file, secrets: {
+            result_field: sentinel
+        }
+        sys.argv = [
+            probe_path,
+            '--phase', phase,
+            '--phase-config', config_path,
+            '--response-fd', response_fd,
+        ]
+        probe['main']()
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        phase,
+        str(config_path),
+        str(response_fd),
+        result_field,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("phase", "result_field", "sentinel"),
+    [
+        ("native", "recovery_identity_hex", "SYNTHETIC_NATIVE_RESULT_SENTINEL"),
+        ("writer", "evidence_root", "SYNTHETIC_WRITER_RESULT_SENTINEL"),
+    ],
+)
+def test_installed_child_sends_native_and_writer_results_only_over_private_fd(
+    tmp_path: Path, phase: str, result_field: str, sentinel: str
+) -> None:
+    config = tmp_path / "phase-config.json"
+    config.write_text("{}\n", encoding="utf-8")
+    read_fd, response_fd = os.pipe()
+    try:
+        completed = subprocess.run(
+            _synthetic_private_phase_child_command(phase, config, response_fd, result_field),
+            cwd=tmp_path,
+            input=json.dumps({"authentication_key_hex": "SYNTHETIC_INPUT_SENTINEL"}).encode(),
+            capture_output=True,
+            pass_fds=(response_fd,),
+            timeout=10,
+        )
+    finally:
+        os.close(response_fd)
+    try:
+        response = bytearray()
+        while chunk := os.read(read_fd, 65536):
+            response.extend(chunk)
+    finally:
+        os.close(read_fd)
+
+    assert completed.returncode == 0 and completed.stderr == b""
+    assert completed.stdout == b""
+    assert json.loads(response)[result_field] == sentinel
+    assert sentinel.encode() not in completed.stdout + completed.stderr
+
+
+def _invalid_private_fd_child_command(kind: str, config_path: Path, marker: Path) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import os, runpy, sys
+        from pathlib import Path
+        probe_path, kind, config_path, marker_path = sys.argv[1:]
+        secret_input = b'SYNTHETIC_INPUT_SENTINEL'
+        probe = runpy.run_path(probe_path)
+        namespace = probe['main'].__globals__
+        def mark_and_load(path):
+            Path(marker_path).write_text('load\\n', encoding='utf-8')
+            return {}
+        def activate(config):
+            Path(marker_path).write_text('activate\\n', encoding='utf-8')
+            return None, 'synthetic-installed-module'
+        namespace['load'] = mark_and_load
+        namespace['_activate'] = activate
+        descriptor = {
+            'stdin': 0,
+            'stdout': 1,
+            'stderr': 2,
+        }.get(kind)
+        if kind == 'closed':
+            read_fd, descriptor = os.pipe()
+            os.close(descriptor)
+            os.close(read_fd)
+        elif kind == 'readonly_pipe':
+            descriptor, write_fd = os.pipe()
+        elif kind == 'file':
+            descriptor = os.open(marker_path + '.response', os.O_WRONLY | os.O_CREAT, 0o600)
+        elif kind == 'stdio_alias':
+            descriptor = os.dup(1)
+        arguments = [probe_path, '--phase', 'native', '--phase-config', config_path]
+        if descriptor is not None:
+            arguments.extend(['--response-fd', str(descriptor)])
+        sys.argv = arguments
+        try:
+            probe['main']()
+        except SystemExit as error:
+            if error.code != 1 or sys.stdin.buffer.read() != secret_input:
+                raise SystemExit(23)
+            raise
+        """
+    )
+    return [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        program,
+        str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"),
+        kind,
+        str(config_path),
+        str(marker),
+    ]
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["missing", "stdin", "stdout", "stderr", "closed", "readonly_pipe", "file", "stdio_alias"],
+)
+def test_installed_child_refuses_invalid_fd_before_config_input_or_activation(
+    tmp_path: Path, kind: str
+) -> None:
+    marker = tmp_path / "phase-activated"
+    completed = subprocess.run(
+        _invalid_private_fd_child_command(kind, tmp_path / "not-read.json", marker),
+        cwd=tmp_path,
+        input=b"SYNTHETIC_INPUT_SENTINEL",
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 1 and completed.stderr == b""
+    failure = json.loads(completed.stdout)
+    assert failure["status"] == "REFUSED"
+    assert failure["reason"] == ""
+    assert not marker.exists()
+    assert b"SYNTHETIC_INPUT_SENTINEL" not in completed.stdout + completed.stderr
+
+
+def _private_runner_child_command(mode: str) -> list[str]:
+    program = textwrap.dedent(
+        """
+        import json, os, sys, time
+        mode = sys.argv[1]
+        descriptor = int(sys.argv[sys.argv.index('--response-fd') + 1])
+        if mode == 'timeout':
+            time.sleep(5)
+            raise SystemExit(0)
+        if mode == 'eof':
+            raise SystemExit(0)
+        if mode == 'overflow':
+            payload = b'{"padding":"' + b'x' * (128 * 1024) + b'"}'
+        elif mode == 'malformed':
+            payload = b'not-json'
+        elif mode == 'nonobject':
+            payload = b'[]'
+        elif mode == 'partial':
+            payload = b'{"result":'
+        elif mode == 'large':
+            payload = json.dumps({'padding': 'x' * (100 * 1024)}, separators=(',', ':')).encode()
+        else:
+            payload = b'{"result":"SYNTHETIC_PRIVATE_RESULT_SENTINEL"}'
+        if mode == 'stdout':
+            os.write(1, b'SYNTHETIC_PUBLIC_STREAM_SENTINEL')
+        if mode == 'stderr':
+            os.write(2, b'SYNTHETIC_PUBLIC_STREAM_SENTINEL')
+        remaining = memoryview(payload)
+        while remaining:
+            remaining = remaining[os.write(descriptor, remaining):]
+        if mode == 'nonzero':
+            raise SystemExit(17)
+        """
+    )
+    return [sys.executable, "-I", "-B", "-c", program, mode]
+
+
+def _run_synthetic_private_phase(
+    probe: dict[str, Any], tmp_path: Path, mode: str, *, duration: float = 10
+) -> bytes:
+    return probe["_run_private_phase"](
+        _private_runner_child_command(mode),
+        cwd=tmp_path,
+        deadline=time.monotonic() + duration,
+        stage="synthetic phase",
+    )
+
+
+def test_private_phase_parent_concurrently_drains_response_larger_than_pipe_buffer(
+    tmp_path: Path,
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+
+    response = _run_synthetic_private_phase(probe, tmp_path, "large")
+
+    assert len(response) > 64 * 1024
+    assert len(response) <= probe["MAX_PHASE_RESPONSE_BYTES"]
+    assert len(json.loads(response)["padding"]) == 100 * 1024
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["eof", "malformed", "nonobject", "partial", "overflow", "nonzero", "stdout", "stderr"],
+)
+def test_private_phase_parent_refuses_incomplete_or_public_child_results(
+    tmp_path: Path, mode: str
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+
+    with pytest.raises(ValueError) as caught:
+        _run_synthetic_private_phase(probe, tmp_path, mode)
+
+    assert "SYNTHETIC_PRIVATE_RESULT_SENTINEL" not in str(caught.value)
+    assert "SYNTHETIC_PUBLIC_STREAM_SENTINEL" not in str(caught.value)
+
+
+def test_private_phase_parent_kills_timed_out_child_and_refuses_result(tmp_path: Path) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    started = time.monotonic()
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_synthetic_private_phase(probe, tmp_path, "timeout", duration=0.25)
+
+    assert time.monotonic() - started < 2
+
+
+def test_installed_private_response_writer_handles_partial_pipe_writes() -> None:
+    from threading import Thread
+
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    read_fd, write_fd = os.pipe()
+    payload = json.dumps({"padding": "x" * (100 * 1024)}, separators=(",", ":")).encode()
+    failures: list[BaseException] = []
+
+    def write_response() -> None:
+        try:
+            probe["_write_private_response"](write_fd, payload)
+        except Exception as error:
+            failures.append(error)
+        finally:
+            os.close(write_fd)
+
+    writer = Thread(target=write_response)
+    writer.start()
+    received = bytearray()
+    try:
+        while True:
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            received.extend(chunk)
+    finally:
+        os.close(read_fd)
+    writer.join(timeout=2)
+
+    assert not writer.is_alive() and failures == []
+    assert bytes(received) == payload
+
+
+@pytest.mark.parametrize("end", [0, 1])
+def test_private_phase_parent_refuses_response_close_failure_without_fd_leak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, end: int
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    runtime_os = probe["_run_private_phase"].__globals__["os"]
+    original_pipe = runtime_os.pipe
+    original_close = runtime_os.close
+    owned_fds: list[int] = []
+    faulted = False
+
+    def track_pipe() -> tuple[int, int]:
+        pair = original_pipe()
+        if not owned_fds:
+            owned_fds.extend(pair)
+        return pair
+
+    def close_then_fail(descriptor: int) -> None:
+        nonlocal faulted
+        if len(owned_fds) == 2 and descriptor == owned_fds[end] and not faulted:
+            faulted = True
+            original_close(descriptor)
+            raise OSError("synthetic close refusal")
+        original_close(descriptor)
+
+    monkeypatch.setattr(runtime_os, "pipe", track_pipe)
+    monkeypatch.setattr(runtime_os, "close", close_then_fail)
+    with pytest.raises(OSError) as caught:
+        _run_synthetic_private_phase(probe, tmp_path, "small")
+
+    assert faulted and "SYNTHETIC_PRIVATE_RESULT_SENTINEL" not in str(caught.value)
+    assert len(owned_fds) == 2
+    for descriptor in owned_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_private_phase_deadline_bounds_retained_writer_after_child_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    probe = runpy.run_path(str(REPOSITORY_ROOT / "tests/installed_prepared_envelope_probe.py"))
+    retained: list[int] = []
+
+    def exited_child(*args, pass_fds, **kwargs):
+        # A real extra writer keeps the read end from observing EOF, as a
+        # descendant retaining an inherited descriptor would. No crypto mock.
+        retained.append(os.dup(pass_fds[0]))
+        return b""
+
+    monkeypatch.setitem(probe["_run_private_phase"].__globals__, "_run", exited_child)
+    started = time.monotonic()
+    try:
+        with pytest.raises(ValueError, match="deadline"):
+            _run_synthetic_private_phase(probe, tmp_path, "small", duration=0.15)
+        assert time.monotonic() - started < 2
+    finally:
+        for descriptor in retained:
+            os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "Prepare pinned Linux age tools",
+        "Require installed wheel and sdist prepared-envelope acceptance",
+        "Prepare pinned Linux age tools for this shard",
+    ],
+)
+@pytest.mark.parametrize("exit_code", [0, 17])
+def test_actual_prepared_acceptance_commands_preserve_failure_exit(
+    tmp_path: Path, step: str, exit_code: int
+) -> None:
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    trace = tmp_path / "command.json"
+    python = commands / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['COMMAND_TRACE']).write_text(json.dumps(sys.argv[1:]))\n"
+        "raise SystemExit(int(os.environ['COMMAND_EXIT']))\n"
+    )
+    python.chmod(0o700)
+    script = (
+        _step_script(step)
+        .replace("${{ github.run_id }}", "123")
+        .replace("${{ github.run_attempt }}", "1")
+    )
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    github_env = tmp_path / "github-env"
+    shard_step = step == "Prepare pinned Linux age tools for this shard"
+    result = subprocess.run(
+        ["/bin/bash", "-e", "-o", "pipefail", "-c", script],
+        env={
+            **os.environ,
+            "PATH": str(commands),
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "SHARD_INDEX": "2",
+            "GITHUB_ENV": str(github_env),
+            "COMMAND_TRACE": str(trace),
+            "COMMAND_EXIT": str(exit_code),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == exit_code, result.stderr
+    arguments = json.loads(trace.read_text())
+    assert arguments[0] == "-I"
+    assert arguments[1] == (
+        ".github/scripts/qualify_age_toolchain_v1.py"
+        if step != "Require installed wheel and sdist prepared-envelope acceptance"
+        else "tests/installed_prepared_envelope_probe.py"
+    )
+    expected_tool_directory = (
+        "/tmp/finance-prepared-age-123-1-pytest-2"
+        if shard_step
+        else "/tmp/finance-prepared-age-123-1-package"
+    )
+    assert arguments[arguments.index("--tool-directory") + 1] == expected_tool_directory
+    assert str(runner_temp) not in expected_tool_directory
+    if step != "Require installed wheel and sdist prepared-envelope acceptance":
+        assert arguments[arguments.index("--output-dir") + 1] == str(
+            runner_temp / "prepared-age-qualification"
+        )
+    if shard_step and exit_code == 0:
+        assert github_env.read_text() == (
+            "FINANCE_PREPARED_AGE_TOOL_DIR=/tmp/finance-prepared-age-123-1-pytest-2\n"
+        )
+    elif shard_step:
+        assert not github_env.exists()
+
+
+def test_actual_pytest_tool_setup_gives_each_shard_a_distinct_private_path(
+    tmp_path: Path,
+) -> None:
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    python = commands / "python"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import json,os,sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['COMMAND_TRACE']).write_text(json.dumps(sys.argv[1:]))\n"
+        "raise SystemExit(0)\n"
+    )
+    python.chmod(0o700)
+    script = _step_script("Prepare pinned Linux age tools for this shard")
+    paths: set[str] = set()
+
+    for shard in range(4):
+        trace = tmp_path / f"command-{shard}.json"
+        env_file = tmp_path / f"github-env-{shard}"
+        script_with_run = script.replace("${{ github.run_id }}", "123").replace(
+            "${{ github.run_attempt }}", "1"
+        )
+        result = subprocess.run(
+            ["/bin/bash", "-e", "-o", "pipefail", "-c", script_with_run],
+            env={
+                **os.environ,
+                "PATH": str(commands),
+                "RUNNER_TEMP": str(tmp_path / "different-runner-temp"),
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_RUN_ATTEMPT": "1",
+                "SHARD_INDEX": str(shard),
+                "GITHUB_ENV": str(env_file),
+                "COMMAND_TRACE": str(trace),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        expected = f"/tmp/finance-prepared-age-123-1-pytest-{shard}"
+        paths.add(expected)
+        arguments = json.loads(trace.read_text())
+        assert arguments[arguments.index("--tool-directory") + 1] == expected
+        assert arguments[arguments.index("--output-dir") + 1] == str(
+            tmp_path / "different-runner-temp" / "prepared-age-qualification"
+        )
+        assert env_file.read_text() == f"FINANCE_PREPARED_AGE_TOOL_DIR={expected}\n"
+    assert len(paths) == 4

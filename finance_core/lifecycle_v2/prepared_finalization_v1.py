@@ -27,6 +27,11 @@ from ._finalization_plan_v1 import (
     _compile_finalization,
     _confirmed_receipt,
 )
+from ._prepared_content_v1 import (
+    PreparedContentAnchorV1,
+    PreparedContentV1,
+    PreparedPackageIdentityV1,
+)
 from ._recovery_rows_v1 import COLUMNS, ClosureLimitsV1, limits_v1, sha, text
 from .contracts import CommitReceipt, RuntimeBinding, canonical, digest
 from .reader import audit_evidence_connection
@@ -38,6 +43,7 @@ from .recovery_material_v2 import (
     ClosureFrontierV2,
     _build_prepared_native_closure_v2,
     _prepared_before_v2,
+    _prepared_service_identity,
     check_native_closure_v2,
     decode_native_closure_v2,
 )
@@ -186,6 +192,60 @@ class PreparedFinalizationServiceV1:
                     _verify_journal(conn, limits=self.limits), operation_id, expected_intent_sha256
                 )
                 result = entry.packages
+            finally:
+                conn.rollback()
+        return result
+
+    def export_content_v1(
+        self, operation_id: str, *, expected_intent_sha256: str
+    ) -> PreparedContentV1:
+        """Read exact durable content once, publishing only after actual close.
+
+        Observed state is local history; even applied content remains a prepared
+        projection and confers neither recovery nor finalization authority.
+        """
+        operation_id = self._identity(operation_id)
+        sha(expected_intent_sha256)
+        with lifecycle_read_operation(self.service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                identity = _prepared_service_identity(self.service, conn, self.limits)
+                entry = self._checked(
+                    _verify_journal(conn, limits=self.limits), operation_id, expected_intent_sha256
+                )
+                self._binding(entry)
+                if (
+                    decode_native_closure_v2(entry.packages[-1], limits=self.limits).identity
+                    != identity
+                ):
+                    _fail(
+                        "binding_mismatch", "Prepared archive differs from actual source identity"
+                    )
+                audit_evidence_connection(
+                    conn, self.service.port, self.service.binding, self.service.legacy_verifier
+                )
+                body_json = conn.execute(
+                    "SELECT body_json FROM l2_finalization_intents WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()[0]
+                # _verify_journal already validated these original canonical bytes.
+                # Never serialize its parsed body as a substitute for stored text.
+                intent_body = body_json.encode("utf-8")
+                if hashlib.sha256(intent_body).hexdigest() != entry.intent_sha256:
+                    _fail("intent_mismatch", "Original stored intent bytes changed")
+                anchor = PreparedContentAnchorV1(
+                    identity,
+                    operation_id,
+                    entry.intent_sha256,
+                    ClosureFrontierV2(**entry.body["projected_frontier"]),
+                    tuple(
+                        PreparedPackageIdentityV1(hashlib.sha256(payload).hexdigest(), len(payload))
+                        for payload in entry.packages
+                    ),
+                )
+                result = PreparedContentV1(
+                    intent_body, entry.packages, anchor, entry.outcome or "PREPARED_OFFLINE"
+                )
             finally:
                 conn.rollback()
         return result

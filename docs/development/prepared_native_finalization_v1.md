@@ -70,3 +70,9 @@ journal and unrelated application tables. A pending operation may be inspected
 as pending during held restore review, but it cannot be promoted or used to
 post. Neither format supplies encryption, independent storage, rollback
 protection, a production key policy or takeover authority.
+
+The separate opt-in [prepared encrypted envelope API](prepared_envelope_v1.md)
+uses `export_content_v1` to obtain exact intent/package bytes in one protected
+read and adds native encryption and local capsule custody. It preserves these
+projection and application boundaries; successful content verification never
+establishes source finalization or current write authority.
