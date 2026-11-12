@@ -120,6 +120,10 @@ The code checkout itself is not removed or placed behind an OS sandbox. The
 synthetic source ledger/control and capsule directories are actually removed
 before the fresh recovery reader starts; recovery keys arrive through an
 anonymous pipe, independently of the public object and saved reference.
+The existing installed-Core import contract also requires an explicit runtime
+root. The probe supplies a separate empty read-only runtime/database directory
+for imports, checks it remains empty, and never admits it as a profile or owner.
+This bootstrap directory supplies no source data or financial write authority.
 
 Local fsync/process evidence does not establish power-loss hardware behavior,
 independent storage, global latest-N rollback detection or an off-machine

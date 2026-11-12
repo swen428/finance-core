@@ -276,6 +276,11 @@ def _activate(config):
         "checkout visible",
     )
     sys.path[:0] = [str(install), str(dependencies), str(helpers)]
+    # Installed Core requires explicit runtime path authority even when imported
+    # solely for a detached content check. This separate empty/read-only locator
+    # is never admitted, never contains a DB and is not the destroyed source.
+    _check_import_runtime(config)
+    os.environ["FINANCE_RUNTIME_ROOT"] = config["import_runtime"]
     import finance_core
 
     require(
@@ -291,6 +296,30 @@ def _activate(config):
         Path(config["age"]), Path(config["age_keygen"]), config["platform"]
     )
     return toolchain, str(Path(finance_core.__file__).resolve())
+
+
+def _check_import_runtime(config):
+    root = Path(config["import_runtime"])
+    database = root / "database"
+    require(
+        root.is_absolute()
+        and root.resolve() == root
+        and not root.is_symlink()
+        and database.is_dir()
+        and not database.is_symlink()
+        and root.stat().st_mode & 0o777 == 0o500
+        and database.stat().st_mode & 0o777 == 0o500
+        and set(root.iterdir()) == {database}
+        and not list(database.iterdir()),
+        "import runtime must remain separate, empty, read-only and unadmitted",
+    )
+    return {
+        "empty": True,
+        "read_only": True,
+        "admitted": False,
+        "contains_database": False,
+        "purpose": "installed import path authority only; not source recovery state",
+    }
 
 
 def _reference(value):
@@ -492,6 +521,7 @@ def child(phase, config_path):
     else:
         require(phase == "reader", "unknown child phase")
         result = _reader(config, toolchain, secrets)
+    result["import_bootstrap"] = _check_import_runtime(config)
     print(encoded(result).decode(), end="")
 
 
@@ -574,6 +604,10 @@ def acceptance(args):
                 stage=kind + " offline installation",
                 environment=environment,
             )
+            import_runtime = artifact_root / "empty-unadmitted-import-runtime"
+            import_runtime.mkdir(mode=0o700)
+            (import_runtime / "database").mkdir(mode=0o500)
+            import_runtime.chmod(0o500)
             common = {
                 "install": str(installed),
                 "dependencies": str(dependencies),
@@ -582,6 +616,7 @@ def acceptance(args):
                 "age": qualification["tools"]["age"]["path"],
                 "age_keygen": qualification["tools"]["age_keygen"]["path"],
                 "platform": qualification["platform"],
+                "import_runtime": str(import_runtime),
             }
 
             def run_phase(phase, values, secret_values=None):
@@ -684,6 +719,10 @@ def acceptance(args):
                     "fresh per-artifact venv; -I -S; explicit locked dependency/helper roots"
                 ),
             }
+            # Only the parent, after all children have exited, restores modes
+            # for disposal of this empty synthetic locator.
+            import_runtime.chmod(0o700)
+            (import_runtime / "database").chmod(0o700)
         # Re-read immutable input objects after both installed executions.
         require(
             _package_inputs(
