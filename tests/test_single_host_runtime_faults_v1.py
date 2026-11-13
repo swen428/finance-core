@@ -555,17 +555,22 @@ def test_actual_unknown_retains_owner_handles_and_leases_until_process_exit(tmp_
         parent.send("release")
         worker.join(30)
         assert not worker.is_alive() and worker.exitcode == 0
-        config, binding = _rebuild(material)
-        try:
-            admission = _admit(config, binding)
-            assert asdict(admission) == material["admission"]
-            with acquire_production_owner(config) as owner:
-                with production_read_operation(owner) as conn:
-                    assert (
-                        conn.execute("SELECT count(*) FROM runtime_fault_probe").fetchone()[0] == 0
-                    )
-        finally:
-            config.close()
+        with pytest.MonkeyPatch.context() as runtime_environment:
+            runtime_environment.setenv(
+                "FINANCE_RUNTIME_ROOT", str(Path(material["config"]["profile_root"]) / "runtime")
+            )
+            config, binding = _rebuild(material)
+            try:
+                admission = _admit(config, binding)
+                assert asdict(admission) == material["admission"]
+                with acquire_production_owner(config) as owner:
+                    with production_read_operation(owner) as conn:
+                        assert (
+                            conn.execute("SELECT count(*) FROM runtime_fault_probe").fetchone()[0]
+                            == 0
+                        )
+            finally:
+                config.close()
     finally:
         parent.close()
         if worker.is_alive():

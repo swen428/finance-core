@@ -535,26 +535,34 @@ def test_lookup_actual_rollback_or_close_unknown_retains_owner_and_leases(tmp_pa
         parent.send("release")
         worker.join(30)
         assert worker.exitcode == 0 and not worker.is_alive()
-        config, binding = _rebuild(material)
-        try:
-            admission = readmission(config, binding)
-            with acquire_production_owner(config) as owner:
-                service = LedgerService(
-                    owner, Port(), binding, clock=lambda: 1792800601, runtime_admission=admission
-                )
-                assert (
-                    asdict(
-                        service.lookup_commit_receipt(
-                            "confirm1",
-                            review_id=material["review_id"],
-                            action_evidence_id="action1",
-                        )
+        with pytest.MonkeyPatch.context() as runtime_environment:
+            runtime_environment.setenv(
+                "FINANCE_RUNTIME_ROOT", str(Path(material["config"]["profile_root"]) / "runtime")
+            )
+            config, binding = _rebuild(material)
+            try:
+                admission = readmission(config, binding)
+                with acquire_production_owner(config) as owner:
+                    service = LedgerService(
+                        owner,
+                        Port(),
+                        binding,
+                        clock=lambda: 1792800601,
+                        runtime_admission=admission,
                     )
-                    == material["original_receipt"]
-                )
-                assert len(_rows(owner)["facts"]) == 1
-        finally:
-            config.close()
+                    assert (
+                        asdict(
+                            service.lookup_commit_receipt(
+                                "confirm1",
+                                review_id=material["review_id"],
+                                action_evidence_id="action1",
+                            )
+                        )
+                        == material["original_receipt"]
+                    )
+                    assert len(_rows(owner)["facts"]) == 1
+            finally:
+                config.close()
     finally:
         parent.close()
         if worker.is_alive():
