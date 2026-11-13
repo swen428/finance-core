@@ -380,6 +380,25 @@ def _initial_state() -> dict[str, Any]:
 
 
 _RECOVERY_ACTIONS = {"restore_prepare", "recovery_designate", "restore_admit"}
+_RUNTIME_ACTION = "single_host_runtime_admit_v1"
+
+
+def _validate_runtime_context(context: object) -> None:
+    """The additive runtime action has one exact, versioned context shape."""
+    if (
+        type(context) is not dict
+        or set(context) != {"format", "runtime_binding"}
+        or context["format"] != "single-host-runtime-admission-v1"
+    ):
+        raise InstanceAdmissionError("Invalid single-host runtime context")
+    binding = context["runtime_binding"]
+    if (
+        type(binding) is not dict
+        or set(binding) != {"instance_id", "generation", "principal_id", "client_id", "environment"}
+        or any(type(value) is not str or not 0 < len(value) <= 256 for value in binding.values())
+        or binding["environment"] not in {"single-host-synthetic", "single-host-real"}
+    ):
+        raise InstanceAdmissionError("Invalid single-host runtime binding")
 
 
 def _recovery_hash(value: object) -> bool:
@@ -589,6 +608,7 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
     previous = None
     operations: set[str] = set()
     designated: set[str] = set()
+    runtime_registered: set[str] = set()
     fields = {
         "version",
         "action",
@@ -609,7 +629,9 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
             raise InstanceAdmissionError("Authority history entry is invalid")
         action = entry.get("action")
         allowed_fields: tuple[set[str], ...]
-        if action == "recovery_designate":
+        if action == _RUNTIME_ACTION:
+            allowed_fields = (fields | {"runtime_context"},)
+        elif action == "recovery_designate":
             allowed_fields = (fields | {"recovery_context"},)
         elif action in _RECOVERY_ACTIONS:
             # The old restore_prepare/admit shape remains readable, but cannot
@@ -684,6 +706,14 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
         ):
             raise InstanceAdmissionError("Authority history instance identity is invalid")
         action = entry["action"]
+        if action == _RUNTIME_ACTION:
+            _validate_runtime_context(entry["runtime_context"])
+            if (
+                entry["context_digest"] != _digest(entry["runtime_context"])
+                or entry["runtime_context"]["runtime_binding"]["instance_id"]
+                != final["binding"]["instance_id"]
+            ):
+                raise InstanceAdmissionError("Runtime entry context binding differs")
         if action in _RECOVERY_ACTIONS and "recovery_context" in entry:
             _validate_recovery_context(action, entry["recovery_context"])
             if entry["context_digest"] != _digest(entry["recovery_context"]):
@@ -721,6 +751,12 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
             }
         elif target is None:
             raise InstanceAdmissionError("Authority history operation precedes prepare")
+        elif action == _RUNTIME_ACTION:
+            if target["state"] not in {"PREPARED", "RESTORE_HELD", "ACTIVE"} or (
+                key in runtime_registered
+            ):
+                raise InstanceAdmissionError("Runtime registration requires one unfenced config")
+            runtime_registered.add(key)
         elif action in {"admit", "restore_admit"}:
             if action == "restore_admit" and replay["current"] in designated:
                 old_designation = next(
@@ -914,6 +950,8 @@ def _transition(
 ):
     if action in _RECOVERY_ACTIONS:
         _validate_recovery_context(action, context)
+    elif action == _RUNTIME_ACTION:
+        _validate_runtime_context(context)
     _reference(operation_id)
     if any(entry["operation_id"] == operation_id for entry in before["history"]):
         raise InstanceAdmissionError("Authority operation reference was reused")
@@ -947,6 +985,8 @@ def _transition(
     }
     if action in _RECOVERY_ACTIONS:
         entry["recovery_context"] = context
+    elif action == _RUNTIME_ACTION:
+        entry["runtime_context"] = context
     entry["entry_sha256"] = _digest(entry)
     after["history"].append(entry)
     _validate_state(after)
@@ -1054,6 +1094,10 @@ def resume_authority_transition(
             or suffix["action"] != journal["action"]
             or suffix["binding"] != config.binding_sha256
             or suffix["context_digest"] != _digest(journal["context"])
+            or (
+                journal["action"] == _RUNTIME_ACTION
+                and suffix["runtime_context"] != journal["context"]
+            )
         ):
             raise InstanceAdmissionError("Pending journal does not bind exact history suffix")
         if not _exists(config, STATE_FILENAME):
@@ -1087,7 +1131,11 @@ def resume_authority_transition(
             }
         )
         actual_baseline = _verify_record_database(
-            config, _record(config, after), control, baseline_context=baseline_context
+            config,
+            _record(config, after),
+            control,
+            baseline_context=baseline_context,
+            require_no_pending_finalization=journal["action"] == _RUNTIME_ACTION,
         )
         if expected_baseline is not None and actual_baseline != expected_baseline:
             raise InstanceAdmissionError("Pending maintenance baseline changed; publication denied")
@@ -1513,6 +1561,7 @@ def _verify_record_database(
     control: _Lock,
     *,
     baseline_context: dict[str, Any] | None = None,
+    require_no_pending_finalization: bool = False,
 ) -> dict[str, Any] | None:
     """Read-only native schema/ledger proof before authority publication."""
     from finance_core.profile_paths import _MANAGED_SQLITE_LIFETIME_LOCK
@@ -1538,6 +1587,13 @@ def _verify_record_database(
             config.application_schema,
             record["ledger_sha256"],
         )
+        if require_no_pending_finalization:
+            from finance_core.lifecycle_v2._finalization_journal_v1 import _verify_journal
+
+            if any(entry.outcome is None for entry in _verify_journal(conn).values()):
+                raise InstanceAdmissionError(
+                    "Pending offline finalization blocks runtime admission"
+                )
         if baseline_context is not None:
             before_profile = _profile_baseline(profile)
             content_sha256 = _logical_database_digest(conn)

@@ -103,6 +103,51 @@ valid. A hold does not prove that an entire service has stopped or acknowledged
 shutdown. Fencing is permanent and is not reversed by maintenance abort or
 forensic reading.
 
+## Registered single-host scope
+
+The additive `single_host_runtime_admit_v1` history action records one exact
+runtime scope for a trusted configuration. Its action-specific `runtime_context`
+contains only `format="single-host-runtime-admission-v1"` and the five-field
+`runtime_binding`. The binding selects `single-host-synthetic` or
+`single-host-real` and matches the configured instance. Approval covers the
+original complete transition digest. Replay validates the context, entry hash,
+history chain and uniqueness of the configuration's registration.
+
+The original top-level state and six-field instance records retain their shapes.
+Old history entries retain their bytes. The bounded control document still has
+a 64 KiB limit. A reader that lacks the new action refuses that upgraded history.
+Deployment must preserve the complete history when considering a package change.
+
+Registration verifies the installed schema, ledger and existing prepared journal
+under the original control/profile leases and actual-close rules. Pending offline
+intent must be resolved through its original route before registration. Known
+PREPARED, RESTORE_HELD and ACTIVE records can register while keeping their current
+state, selection, admission and maintenance values. A fenced record refuses a
+first registration. Later state changes retain the exact original registration.
+
+The public registration API and its frozen reference live in
+`finance_core.lifecycle_v2.single_host_runtime_v1`. Completed exact retries check
+the original approval digest and return that original reference. Pending retries
+use `resume_authority_transition` with the original operation and approval.
+Resume checks the exact pending context and database again. Incomplete journals
+and uncertain close/publication outcomes retain the original failure evidence.
+
+`production_write_operation` and `lifecycle_write_operation` accept keyword-only
+`runtime_admission=None`. Unregistered configurations retain their original
+omitted-proof behavior. Registered configurations require their matching
+reference on every shared write path, including application-owned journal work.
+The witness checks the actual registration at operation entry and each dynamic
+write/commit check. A DTO from another configuration, altered fields, missing
+proof or an offline prepared resolver is refused. Current ACTIVE/current-owner,
+maintenance, file, schema, transaction and close rules continue to determine
+whether the operation can write.
+
+Lifecycle service entry points additionally check their exact current binding
+against the issued connection and admission while holding the existing control
+lease. Service identity remains fixed during the operation. Read-only historical
+inspection retains the existing forensic rules. See the
+[lifecycle contract](lifecycle_v2_contract.md) for service and old-format scope.
+
 ## Owner, operation, and connection lifetime
 
 Only one process may hold the production owner lease for an instance. A write
@@ -283,7 +328,7 @@ exposes maintenance-hold entry/inspection/safe abort, permanent fencing, and
 connection guards for financial read and write entry points. Callers retain
 issued witnesses and use context managers for owner and operation lifetimes.
 
-The Core boundary does not register a transport or runtime, call a provider,
-change credentials, wire private service configuration, assert full service
-quiescence, or prove a complete backup or restore. Those remain separate
+The single-host extension registers an explicitly approved runtime identity.
+Transport connections, provider calls, credentials, private service composition,
+full service quiescence and complete backup/restore proof remain separate
 integration and acceptance work.

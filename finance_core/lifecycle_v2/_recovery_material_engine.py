@@ -108,6 +108,8 @@ def _binding(value, limits):
     exact(value, RuntimeBinding.__dataclass_fields__)
     for item in value.values():
         text(item, limits, identity=True)
+    if value["environment"] != "offline-synthetic":
+        fail("unsupported_scope", "Only offline-synthetic binding supported")
     try:
         return RuntimeBinding(**value)
     except ValueError as exc:

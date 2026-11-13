@@ -1,9 +1,11 @@
-# Lifecycle v2 offline contract
+# Lifecycle v2 contract
 
-This opt-in API is an offline-synthetic feasibility candidate. It does not admit
-production bindings, publish a release, replace historical facts or activate a
-runtime. Migration 062 appends prepared-finalization control tables; migrations
-001 through 061 are unchanged.
+This opt-in API supports its original `offline-synthetic` scope and explicitly
+registered single-host scopes. The single-host extension binds every current
+operation to durable trusted instance authority. Release publication, consumer
+installation and actual runtime activation require their separate approvals.
+Migration 062 contains the prepared-finalization control tables. The single-host
+extension uses the existing authority history and the complete 001–062 ledger.
 
 The additive [native effective-ledger read contract](effective_ledger_v1.md)
 defines an explicit opt-in current-fact collection, history, export, separate
@@ -29,6 +31,104 @@ hash and actor. Reviews expire after ten minutes. Corrections create new version
 of the same economic event; unique source/event constraints prevent duplicate
 posting. Exact same-operation retries recover persisted results; a different
 operation cannot reuse confirmation rights. Successful receipts say LOCAL_POSTED.
+
+## Single-host runtime scope
+
+`finance_core.lifecycle_v2.single_host_runtime_v1` exposes
+`admit_single_host_runtime_v1(config, binding, *, operation_id, approval_ref)`
+and the frozen `SingleHostRuntimeAdmissionV1` reference. The reference contains
+`binding`, `config_binding_sha256`, `registration_operation_id`,
+`registration_version` and `registration_entry_sha256`. Each use matches all
+five values against the actual protected history for the trusted configuration.
+
+`RuntimeBinding` retains exactly five fields and the `offline-synthetic` default.
+The additional environments are `single-host-synthetic` and `single-host-real`.
+Tests of both use temporary synthetic data. Actual real-data use remains subject
+to separate operational authorization. A representable binding acquires write
+eligibility only through its exact persisted registration and the original
+current-owner, ACTIVE, maintenance, schema and transaction checks.
+
+Trusted composition approves the original transition digest, including the
+configuration, action `single_host_runtime_admit_v1`, operation ID, complete
+prior-state digest and exact versioned runtime context. Registration requires a
+known PREPARED, RESTORE_HELD or ACTIVE instance and a verified existing journal
+with no pending offline finalization. It preserves the instance state, current
+selection and maintenance hold. First registration of a fenced instance is
+refused. One configuration has one registered runtime binding. Changes of
+generation, actor/client, mode or installation follow an explicit new-instance
+configuration route.
+
+`LedgerService(..., runtime_admission=admission)` checks its current owner,
+binding and admission at capture, propose, prepare_review, record_delivery,
+confirm, prepare_correction and import_verified, including exact-result replay.
+The same check runs inside the protected reads for `expected_invocation`,
+`lookup_commit_receipt` and `seal_snapshot`. These operations hold the three
+service identity fields stable through callbacks and completion. Assignment
+while a scoped operation is active is refused. Between completed operations,
+assignment remains available and the next operation validates the new values.
+An inherited service checks its original
+process identity before acquiring its local scope lock, including identity-field
+assignment and deletion. A child process must compose its own admitted service.
+
+The shared `production_write_operation` and `lifecycle_write_operation` accept
+the same optional `runtime_admission`. A registered configuration requires its
+exact proof even for a directly opened application-journal connection. Every
+write-capable statement and commit uses the existing dynamic witness to recheck
+the persisted registration along with current authority. An unregistered
+configuration with the original offline service and omitted proof retains its
+existing behavior. A registered configuration refuses an offline downgrade and
+the private prepared-finalization write route.
+
+Interrupted registration retains the original pending publication artifacts.
+The existing `resume_authority_transition` checks the exact operation, approval,
+context, database and pending-intent condition before publication. After durable
+completion, repeating the original admission call reconstructs the original
+reference and checks its original approved digest. A completed retry can observe
+a later fenced record while write admission continues to refuse that state.
+Malformed or incomplete pending evidence remains preserved for inspection.
+
+Complete audit and snapshot sealing support registered current scopes. Pure
+historical readers retain their existing evidence-verification rules. Local
+confirmation still uses the complete original review, authenticated human
+action, expiry, version and replay rules. Successful `LOCAL_POSTED` represents
+the local commit and checked operation close. Backup availability and recovery
+verification have their own application status and acceptance.
+
+Old native closure, prepared journal, protected content and envelope formats
+remain explicitly `offline-synthetic`, including after a service is rebound.
+Their existing recovery-admission protocol keeps its original scope. A separate
+recovery extension must govern promotion of an external single-host instance.
+
+## Read-only confirmation outcome
+
+`LedgerService.lookup_commit_receipt(operation_id, *, review_id,
+action_evidence_id)` returns the original `CommitReceipt` for one exact native
+confirmation, or `None` when a complete audited read finds no operation with that
+ID. It accepts the original exact strings without trimming or normalization.
+Operation IDs retain the confirmation API's nonempty string limit of 256 UTF-8
+bytes. Review and action identifiers retain their historical exact string domain.
+
+The lookup holds the existing service runtime scope and a genuinely read-only
+SQLite operation. A single read transaction verifies the complete evidence and
+audit history before recovering the receipt with its original operation, review,
+action and runtime binding. Another event kind using the same operation ID, a
+different review or action, incomplete evidence and inconsistent history are
+refused. An exact original receipt remains observable after review expiry and
+later legitimate corrections, with its original fact version, hash and audit
+sequence.
+
+The result is returned only after read-transaction rollback, actual connection
+close and protected operation cleanup. Failures retain the existing resource and
+UNKNOWN handling. The lookup creates no fact, decision, event or confirmation
+right and never calls a fresh confirmation path.
+
+`None` describes the audited local read point. An application that durably
+recorded a confirmation attempt and then lost its result must retain UNKNOWN
+when this lookup returns `None`. Status handling must preserve the original
+operation ID and avoid starting a replacement confirmation. The application
+journal and explicit recovery procedure own subsequent resolution.
+
+## Authenticated historical reads
 
 The current reader uses indexed records, independent of completed transport
 history. It verifies referenced source/provider/publication/human-decision
@@ -89,6 +189,12 @@ decision and event once and returns the original `LOCAL_POSTED` receipt. Offline
 cancel is permanent for that review/action pair; a new proposal and action are
 required for another attempt. If protected close is uncertain, the state remains
 pending and its owner/resources stay held for exact inspection or cancellation.
+
+Each prepared operation captures its service once and holds that service's
+runtime scope through evidence callbacks, transaction completion and actual
+protected close. The owner, binding and runtime admission stay fixed throughout
+that lifetime. Replacing the prepared API's service reference affects the next
+call, which must independently pass the original offline admission checks.
 
 This path is limited to offline-synthetic personal expenses. It does not provide
 an online writer, encryption, independent durability, cross-machine takeover or

@@ -206,3 +206,77 @@ completion guarantee. The five new candidate test files still lack eligible Linu
 main timing, so the refresh alone is not evidence that the candidate will
 finish within two hours. A complete successful exact-head run remains the
 validation authority.
+
+## November 14, 2026 baseline refresh after the C1 test grouping
+
+The refreshed manifest was built once with the unchanged original builder
+from the three newest eligible complete first-attempt protected-main push
+runs of `validate.yml`. Their run and head identities appear below.
+
+| Run | Head |
+| --- | --- |
+| `42976612835` | `149e587c4ac31f750afcc262d5b2f331446c3f75` |
+| `43134286804` | `730d247617a37ae8e6dd1c5add62a553cd15692b` |
+| `43221185644` | `ae9f56079085c0a5a41c5913ae0379bba8b82a2c` |
+
+All three sources are successful first-attempt public-main pushes with the
+complete required job set and complete aggregate timing reports. Their source
+identities, downloaded artifact ZIPs and extracted JSON hashes were verified
+before building. The manifest covers 282 measured files, 13,419 test cases
+and 39,489 timing samples. Its P95 fallback remains an estimate for files
+without eligible measurements and is 319.474 seconds per file.
+
+Two successive qualified main samples meet the existing two-sample basis for
+manual review under the `refresh_unknown_weights` advisory. Run `43134286804`
+measured `tests/test_prepared_native_finalization_v1.py` at 597.743 seconds
+against the 237.810-second fallback in effect for that sample. Run
+`43221185644` measured `tests/test_prepared_envelope_faults_v1.py` at
+1,434.163 seconds against the 271.335-second fallback in effect for that
+sample. The advisory does not change the baseline thresholds or CI gate.
+
+The post-grouping tracked test inventory contains 286 files. The production
+planner assigns every file once across the unchanged four shards. The manifest
+has measured weights for 282 files. Four C1 files remain unknown, giving
+98.6014% known-file coverage. Those files are listed below.
+
+- `tests/test_lifecycle_operation_lookup_v1.py`
+- `tests/test_single_host_runtime_faults_v1.py`
+- `tests/test_single_host_runtime_v1.py`
+- `tests/test_single_host_runtime_prepared_scope_v1.py`
+
+The new prepared-scope module groups 18 existing prepared-operation
+regression cases. The runtime module retains its other 84 cases. Neither module
+has eligible protected-main timing and both receive the unchanged P95 fallback.
+No PR timing was used to assign either file a weight.
+
+The current production plan has digest
+`sha256:78be2f870a4c9cb58674cb4e30167a9de66222e13b24ec5b811fa63faabc432d`.
+Its shard file counts are 69, 70, 69 and 78. Forecasts sum per-file weights
+and are 6,085.700, 6,085.700, 6,085.701 and 6,085.700 seconds. Hosted
+wall-time remains to be measured.
+
+The complete eligible main reports were regrouped using this exact
+post-grouping plan. The table reports shard 0/1/2/3 testcase-seconds and the
+maximum-to-mean ratio.
+
+| Source run | Regrouped shard testcase-seconds | Maximum-to-mean |
+| --- | --- | ---: |
+| `43221185644` | 6,190.402 / 6,497.753 / 6,161.198 / 6,755.326 | 1.055 |
+| `43134286804` | 4,321.989 / 3,908.489 / 3,577.717 / 4,877.992 | 1.169 |
+| `42976612835` | 6,255.868 / 5,198.885 / 4,365.883 / 4,901.803 | 1.208 |
+
+These historical groupings sum complete eligible testcase durations under the
+current file inventory. The `42976612835` replay has a 1.208 maximum-to-mean
+ratio, above the existing 1.20 advisory target. This is historical assignment
+evidence. Candidate wall-time and completion remain unverified.
+
+PR 73 run `43436976339`, attempt 1, remains failure evidence. Shard 1 had one
+pytest failure and shard 3 hit the existing 120-minute job limit. Its last
+logged completed test was
+`tests/test_telegram_attachment_acquisition.py::TestByteHeaderAndTimeoutLimits::test_malformed_content_length_is_rejected[x]`
+at `2026-11-13T15:50:02.0049010Z`, followed by cancellation at
+`2026-11-13T15:50:03.1776294Z`. Shard 3 has no complete JUnit timing report
+or final case count. Failed-PR timing remains diagnostic evidence and was not
+imported. The four shards, full inventory, job timeout, required jobs and
+acceptance criteria remain unchanged. Authoritative acceptance requires a
+complete successful exact-head run.
