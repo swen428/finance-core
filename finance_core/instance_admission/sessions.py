@@ -296,6 +296,7 @@ class _Witness:
     read_only: bool
     pid: int
     immutable_migration_digest: str | None = None
+    runtime_admission: object = None
     finalization_mode: str | None = None
     finalization_operation_id: str | None = None
     active: bool = True
@@ -353,6 +354,10 @@ class _Witness:
             raise InstanceAdmissionError(
                 "Production write requires current ACTIVE writable session"
             )
+        if write:
+            from finance_core.lifecycle_v2.single_host_runtime_v1 import _require_runtime_admission
+
+            _require_runtime_admission(state, self.owner.config, self.runtime_admission)
         if not write and record["state"] not in {"ACTIVE", "FENCED"}:
             raise InstanceAdmissionError("Production read requires admitted original authority")
         if instance_id is not None and instance_id != self.owner.config.instance_id:
@@ -733,6 +738,36 @@ def require_finance_read_connection(
     _require_session(conn, write=False, instance_id=instance_id)
 
 
+def _require_runtime_scope(
+    conn: sqlite3.Connection, binding: object, runtime_admission: object
+) -> None:
+    """Bind a current service operation to the actual issued protected session.
+
+    The caller already holds the control lease and connection. Historical
+    readers do not call this current-service identity check.
+    """
+    from finance_core.lifecycle_v2.single_host_runtime_v1 import (
+        _checked_runtime_binding,
+        _require_runtime_admission,
+    )
+
+    witness = _witness_for(conn)
+    if witness is None:
+        raise InstanceAdmissionError("Runtime scope requires an issued production session")
+    witness.preflight()
+    material = _checked_runtime_binding(binding)
+    config = witness.owner.config
+    if material["instance_id"] != config.instance_id:
+        raise InstanceAdmissionError("Runtime binding belongs to another production instance")
+    state = _state(config, _proof=witness if witness.immutable_migration_digest else None)
+    entry = _require_runtime_admission(state, config, runtime_admission)
+    if entry is None:
+        if material["environment"] != "offline-synthetic":
+            raise InstanceAdmissionError("External runtime requires protected registration")
+    elif material != entry["runtime_context"]["runtime_binding"]:
+        raise InstanceAdmissionError("Service runtime binding differs from protected registration")
+
+
 @contextmanager
 def _operation(
     owner: ProductionOwner,
@@ -740,6 +775,7 @@ def _operation(
     read_only: bool,
     timeout_seconds: float,
     immutable_installation: bool = False,
+    runtime_admission: object = None,
     _finalization: tuple[str, str] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     from .schema_contract import SchemaContractError, validate_application_database
@@ -758,6 +794,12 @@ def _operation(
         control.acquire(fcntl.LOCK_SH, timeout_seconds)
         state = _state(owner.config)
         record = _record(owner.config, state)
+        if not read_only:
+            from finance_core.lifecycle_v2.single_host_runtime_v1 import _require_runtime_admission
+
+            runtime_entry = _require_runtime_admission(state, owner.config, runtime_admission)
+            if _finalization is not None and runtime_entry is not None:
+                raise InstanceAdmissionError("Prepared finalization requires offline config")
         if (
             (record["maintenance"] is not None and not (read_only and record["state"] == "FENCED"))
             or record["state"] not in {"ACTIVE", "FENCED"}
@@ -787,6 +829,7 @@ def _operation(
             read_only,
             os.getpid(),
             owner.config._binding["migration_identity"] if immutable_installation else None,
+            runtime_admission=runtime_admission,
         )
         with owner._mutex:
             _WITNESSES[id(conn)] = witness
@@ -880,9 +923,13 @@ def _operation(
                     owner._opening = False
 
 
-def production_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
+def production_write_operation(
+    owner: ProductionOwner, *, timeout_seconds: float = 5.0, runtime_admission: object = None
+):
     """Hold owner/control/profile witnesses until own connection actually closes."""
-    return _operation(owner, read_only=False, timeout_seconds=timeout_seconds)
+    return _operation(
+        owner, read_only=False, timeout_seconds=timeout_seconds, runtime_admission=runtime_admission
+    )
 
 
 def production_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
@@ -891,7 +938,13 @@ def production_read_operation(owner: ProductionOwner, *, timeout_seconds: float 
 
 
 @contextmanager
-def _lifecycle_operation(owner: ProductionOwner, *, read_only: bool, timeout_seconds: float):
+def _lifecycle_operation(
+    owner: ProductionOwner,
+    *,
+    read_only: bool,
+    timeout_seconds: float,
+    runtime_admission: object = None,
+):
     """Opt-in v2 immutable artifact proof, valid for exactly one owned operation.
 
     Dynamic authority, database/file identities, leases, write state, transaction
@@ -900,13 +953,21 @@ def _lifecycle_operation(owner: ProductionOwner, *, read_only: bool, timeout_sec
     """
     owner.assert_valid()
     with _operation(
-        owner, read_only=read_only, timeout_seconds=timeout_seconds, immutable_installation=True
+        owner,
+        read_only=read_only,
+        timeout_seconds=timeout_seconds,
+        immutable_installation=True,
+        runtime_admission=runtime_admission,
     ) as conn:
         yield conn
 
 
-def lifecycle_write_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):
-    return _lifecycle_operation(owner, read_only=False, timeout_seconds=timeout_seconds)
+def lifecycle_write_operation(
+    owner: ProductionOwner, *, timeout_seconds: float = 5.0, runtime_admission: object = None
+):
+    return _lifecycle_operation(
+        owner, read_only=False, timeout_seconds=timeout_seconds, runtime_admission=runtime_admission
+    )
 
 
 def lifecycle_read_operation(owner: ProductionOwner, *, timeout_seconds: float = 5.0):

@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from finance_core.instance_admission import ProductionOwner
 from finance_core.instance_admission.sessions import (
     _prepared_finalization_operation,
+    _require_runtime_scope,
     lifecycle_read_operation,
 )
 from finance_core.profile_paths import _migration_contract_digest
@@ -110,6 +111,20 @@ def _commit_local(conn, owner):
         raise
 
 
+def _require_offline_service(service):
+    if (
+        not isinstance(service, LedgerService)
+        or not isinstance(service.owner, ProductionOwner)
+        or type(service.binding) is not RuntimeBinding
+        or service.binding.environment != "offline-synthetic"
+        or service.owner.config.instance_id != service.binding.instance_id
+        or service.runtime_admission is not None
+    ):
+        _fail("invalid_preparation", "Actual matching offline-synthetic LedgerService required")
+    RuntimeBinding(**asdict(service.binding))
+    service.owner.assert_valid()
+
+
 class PreparedFinalizationServiceV1:
     def __init__(
         self,
@@ -119,20 +134,17 @@ class PreparedFinalizationServiceV1:
         authenticator: RecoveryEvidenceAuthenticatorV1,
         limits: ClosureLimitsV1 | None = None,
     ):
-        if (
-            not isinstance(service, LedgerService)
-            or not isinstance(service.owner, ProductionOwner)
-            or type(service.binding) is not RuntimeBinding
-            or service.owner.config.instance_id != service.binding.instance_id
-        ):
-            _fail("invalid_preparation", "Actual matching LedgerService and owner required")
-        service.owner.assert_valid()
+        _require_offline_service(service)
         if not callable(getattr(archive_source, "export", None)):
             _fail("missing_evidence", "Pre-stored archive source required")
         if not callable(getattr(authenticator, "verify", None)):
             _fail("evidence_authentication_failed", "Independent authenticator required")
         self.service, self.archive_source = service, archive_source
         self.authenticator, self.limits = authenticator, limits_v1(limits)
+
+    def _scope(self, conn):
+        _require_offline_service(self.service)
+        _require_runtime_scope(conn, self.service.binding, self.service.runtime_admission)
 
     def _identity(self, value):
         text(value, self.limits, identity=True)
@@ -170,7 +182,9 @@ class PreparedFinalizationServiceV1:
 
     def inspect(self, operation_id: str) -> FinalizationStateV1:
         operation_id = self._identity(operation_id)
+        _require_offline_service(self.service)
         with lifecycle_read_operation(self.service.owner) as conn:
+            self._scope(conn)
             conn.execute("BEGIN")
             try:
                 journal = _verify_journal(conn, limits=self.limits)
@@ -185,7 +199,9 @@ class PreparedFinalizationServiceV1:
     def material(self, operation_id: str, *, expected_intent_sha256: str) -> tuple[bytes, ...]:
         operation_id = self._identity(operation_id)
         sha(expected_intent_sha256)
+        _require_offline_service(self.service)
         with lifecycle_read_operation(self.service.owner) as conn:
+            self._scope(conn)
             conn.execute("BEGIN")
             try:
                 entry = self._checked(
@@ -206,7 +222,9 @@ class PreparedFinalizationServiceV1:
         """
         operation_id = self._identity(operation_id)
         sha(expected_intent_sha256)
+        _require_offline_service(self.service)
         with lifecycle_read_operation(self.service.owner) as conn:
+            self._scope(conn)
             conn.execute("BEGIN")
             try:
                 identity = _prepared_service_identity(self.service, conn, self.limits)
@@ -261,7 +279,9 @@ class PreparedFinalizationServiceV1:
         review_id, action_evidence_id, operation_id = (
             self._identity(value) for value in (review_id, action_evidence_id, operation_id)
         )
+        _require_offline_service(self.service)
         with _prepared_finalization_operation(self.service.owner, operation_id, "prepare") as conn:
+            self._scope(conn)
             conn.execute("BEGIN IMMEDIATE")
             journal = _verify_journal(conn, limits=self.limits)
             if operation_id in journal:
@@ -370,7 +390,9 @@ class PreparedFinalizationServiceV1:
     def apply_offline(self, operation_id: str, *, expected_intent_sha256: str) -> CommitReceipt:
         operation_id = self._identity(operation_id)
         sha(expected_intent_sha256)
+        _require_offline_service(self.service)
         with _prepared_finalization_operation(self.service.owner, operation_id, "apply") as conn:
+            self._scope(conn)
             conn.execute("BEGIN IMMEDIATE")
             entry = self._checked(
                 _verify_journal(conn, limits=self.limits), operation_id, expected_intent_sha256
@@ -429,7 +451,9 @@ class PreparedFinalizationServiceV1:
     ) -> FinalizationStateV1:
         operation_id = self._identity(operation_id)
         sha(expected_intent_sha256)
+        _require_offline_service(self.service)
         with _prepared_finalization_operation(self.service.owner, operation_id, "cancel") as conn:
+            self._scope(conn)
             conn.execute("BEGIN IMMEDIATE")
             journal = _verify_journal(conn, limits=self.limits)
             entry = self._checked(journal, operation_id, expected_intent_sha256)

@@ -179,7 +179,9 @@ def _verify_journal(conn, *, limits=None):
             ):
                 _fail("journal_mismatch", "Unsupported preparation journal format or scope")
             exact(body["binding"], RuntimeBinding.__dataclass_fields__)
-            RuntimeBinding(**body["binding"])
+            binding = RuntimeBinding(**body["binding"])
+            if binding.environment != "offline-synthetic":
+                _fail("journal_mismatch", "Only offline-synthetic preparation binding supported")
             for key in ("operation_id", "review_id", "action_evidence_id", "core_identity"):
                 text(body[key], limits, identity=True)
             for key in ("migration_identity", "migration_ledger_digest"):

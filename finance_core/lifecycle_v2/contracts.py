@@ -1,4 +1,4 @@
-"""Versioned offline lifecycle evidence contracts; no public boolean authorizations."""
+"""Versioned lifecycle evidence contracts; no public boolean authorizations."""
 
 from __future__ import annotations
 
@@ -32,11 +32,16 @@ class RuntimeBinding:
     environment: str = "offline-synthetic"
 
     def __post_init__(self):
-        if self.environment != "offline-synthetic" or any(
-            not isinstance(v, str) or not v or len(v) > 256
-            for v in (self.instance_id, self.generation, self.principal_id, self.client_id)
+        if (
+            type(self.environment) is not str
+            or self.environment
+            not in {"offline-synthetic", "single-host-synthetic", "single-host-real"}
+            or any(
+                type(v) is not str or not v or len(v) > 256
+                for v in (self.instance_id, self.generation, self.principal_id, self.client_id)
+            )
         ):
-            raise LifecycleError("Only exact offline-synthetic bindings are admitted")
+            raise LifecycleError("Exact supported runtime binding fields required")
 
 
 @dataclass(frozen=True)

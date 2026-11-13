@@ -1,4 +1,4 @@
-"""Opt-in, offline-synthetic lifecycle generation with exact evidence ports."""
+"""Opt-in lifecycle generation with exact evidence ports and protected runtime scope."""
 
 from .contracts import (
     CommitReceipt,
