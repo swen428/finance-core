@@ -61,11 +61,14 @@ configuration route.
 `LedgerService(..., runtime_admission=admission)` checks its current owner,
 binding and admission at capture, propose, prepare_review, record_delivery,
 confirm, prepare_correction and import_verified, including exact-result replay.
-The same check runs inside the protected reads for `expected_invocation` and
-`seal_snapshot`. These operations hold the three service identity fields stable
-through callbacks and completion. Assignment while a scoped operation is active
-is refused. Between completed operations, assignment remains available and the
-next operation validates the new values.
+The same check runs inside the protected reads for `expected_invocation`,
+`lookup_commit_receipt` and `seal_snapshot`. These operations hold the three
+service identity fields stable through callbacks and completion. Assignment
+while a scoped operation is active is refused. Between completed operations,
+assignment remains available and the next operation validates the new values.
+An inherited service checks its original
+process identity before acquiring its local scope lock, including identity-field
+assignment and deletion. A child process must compose its own admitted service.
 
 The shared `production_write_operation` and `lifecycle_write_operation` accept
 the same optional `runtime_admission`. A registered configuration requires its
@@ -95,6 +98,37 @@ Old native closure, prepared journal, protected content and envelope formats
 remain explicitly `offline-synthetic`, including after a service is rebound.
 Their existing recovery-admission protocol keeps its original scope. A separate
 recovery extension must govern promotion of an external single-host instance.
+
+## Read-only confirmation outcome
+
+`LedgerService.lookup_commit_receipt(operation_id, *, review_id,
+action_evidence_id)` returns the original `CommitReceipt` for one exact native
+confirmation, or `None` when a complete audited read finds no operation with that
+ID. It accepts the original exact strings without trimming or normalization.
+Operation IDs retain the confirmation API's nonempty string limit of 256 UTF-8
+bytes. Review and action identifiers retain their historical exact string domain.
+
+The lookup holds the existing service runtime scope and a genuinely read-only
+SQLite operation. A single read transaction verifies the complete evidence and
+audit history before recovering the receipt with its original operation, review,
+action and runtime binding. Another event kind using the same operation ID, a
+different review or action, incomplete evidence and inconsistent history are
+refused. An exact original receipt remains observable after review expiry and
+later legitimate corrections, with its original fact version, hash and audit
+sequence.
+
+The result is returned only after read-transaction rollback, actual connection
+close and protected operation cleanup. Failures retain the existing resource and
+UNKNOWN handling. The lookup creates no fact, decision, event or confirmation
+right and never calls a fresh confirmation path.
+
+`None` describes the audited local read point. An application that durably
+recorded a confirmation attempt and then lost its result must retain UNKNOWN
+when this lookup returns `None`. Status handling must preserve the original
+operation ID and avoid starting a replacement confirmation. The application
+journal and explicit recovery procedure own subsequent resolution.
+
+## Authenticated historical reads
 
 The current reader uses indexed records, independent of completed transport
 history. It verifies referenced source/provider/publication/human-decision
@@ -155,6 +189,12 @@ decision and event once and returns the original `LOCAL_POSTED` receipt. Offline
 cancel is permanent for that review/action pair; a new proposal and action are
 required for another attempt. If protected close is uncertain, the state remains
 pending and its owner/resources stay held for exact inspection or cancellation.
+
+Each prepared operation captures its service once and holds that service's
+runtime scope through evidence callbacks, transaction completion and actual
+protected close. The owner, binding and runtime admission stay fixed throughout
+that lifetime. Replacing the prepared API's service reference affects the next
+call, which must independently pass the original offline admission checks.
 
 This path is limited to offline-synthetic personal expenses. It does not provide
 an online writer, encryption, independent durability, cross-machine takeover or

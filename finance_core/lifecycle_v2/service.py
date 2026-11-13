@@ -25,6 +25,7 @@ from finance_core.money import Money, canonical_money_str
 from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
 from .contracts import (
+    CommitReceipt,
     EvidencePort,
     ExpectedDisplay,
     ExpectedInvocation,
@@ -709,6 +710,40 @@ class LedgerService:
                 )
                 result = _append_finalization(conn, plan)
                 conn.commit()
+        return result
+
+    def lookup_commit_receipt(
+        self, operation_id: str, *, review_id: str, action_evidence_id: str
+    ) -> CommitReceipt | None:
+        """Observe an exact original outcome at one fully audited read point."""
+        from ._finalization_plan_v1 import _confirmed_receipt
+        from .reader import audit_evidence_connection
+
+        if type(operation_id) is not str or not operation_id:
+            raise LifecycleError("Exact nonempty operation identity required")
+        try:
+            operation_size = len(operation_id.encode("utf-8"))
+        except UnicodeError as exc:
+            raise LifecycleError("Operation identity must encode as UTF-8") from exc
+        if operation_size > 256:
+            raise LifecycleError("Operation identity exceeds 256 UTF-8 bytes")
+        if type(review_id) is not str or type(action_evidence_id) is not str:
+            raise LifecycleError("Exact review and action identity strings required")
+        with self._runtime_scope(), lifecycle_read_operation(self.owner) as conn:
+            _require_runtime_scope(conn, self.binding, self.runtime_admission)
+            conn.execute("BEGIN")
+            try:
+                audit_evidence_connection(conn, self.port, self.binding, self.legacy_verifier)
+                event = conn.execute(
+                    "SELECT kind FROM l2_events WHERE operation_id=?", (operation_id,)
+                ).fetchone()
+                if event is not None and event["kind"] != "confirm":
+                    raise LifecycleError("Operation belongs to another lifecycle event kind")
+                result = _confirmed_receipt(self, conn, review_id, action_evidence_id, operation_id)
+                if event is not None and result is None:
+                    raise LifecycleError("Commit operation lacks its verified receipt")
+            finally:
+                conn.rollback()
         return result
 
     def prepare_correction(
