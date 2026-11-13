@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from finance_core.instance_admission import ProductionOwner
+from finance_core.instance_admission import InstanceAdmissionError, ProductionOwner
 from finance_core.instance_admission.sessions import (
     _require_runtime_scope,
     lifecycle_read_operation,
@@ -140,7 +141,16 @@ def _capture_generation(row, payload_json):
 
 
 class LedgerService:
+    def _assert_runtime_process(self):
+        pid = self.__dict__.get("_runtime_scope_pid")
+        if pid is not None and pid != os.getpid():
+            raise InstanceAdmissionError(
+                "Service runtime identity cannot cross process/fork boundary"
+            )
+
     def __setattr__(self, name, value):
+        if name in {"owner", "binding", "runtime_admission"}:
+            self._assert_runtime_process()
         lock = self.__dict__.get("_runtime_scope_lock")
         if lock is not None and name in {"owner", "binding", "runtime_admission"}:
             with lock:
@@ -151,6 +161,8 @@ class LedgerService:
             object.__setattr__(self, name, value)
 
     def __delattr__(self, name):
+        if name in {"owner", "binding", "runtime_admission"}:
+            self._assert_runtime_process()
         lock = self.__dict__.get("_runtime_scope_lock")
         if lock is not None and name in {"owner", "binding", "runtime_admission"}:
             with lock:
@@ -177,6 +189,7 @@ class LedgerService:
         ):
             raise LifecycleError("Actual matching production owner required")
         owner.assert_valid()
+        self._runtime_scope_pid = os.getpid()
         self._runtime_scope_lock = threading.Lock()
         self._active_runtime_scopes = 0
         self.owner, self.port, self.binding, self.clock = owner, port, binding, clock
@@ -186,11 +199,13 @@ class LedgerService:
     @contextmanager
     def _runtime_scope(self):
         """Keep the call's runtime identity stable through callbacks and actual close."""
+        self._assert_runtime_process()
         with self._runtime_scope_lock:
             self._active_runtime_scopes += 1
         try:
             yield
         finally:
+            self._assert_runtime_process()
             with self._runtime_scope_lock:
                 self._active_runtime_scopes -= 1
 
