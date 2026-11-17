@@ -104,10 +104,16 @@ def audit_connection(conn, *, _rows=None):
         else conn.execute("SELECT * FROM l2_reviews")
     ):
         material = json.loads(row["material_json"])
-        if "format" in material and material["format"] != "finance-daily-review-v1":
+        if "format" in material and material["format"] not in {
+            "finance-daily-review-v1",
+            "finance-daily-movement-review-v1",
+        }:
             raise LifecycleError("Unsupported review format")
         values_key = (
-            "after_values" if material.get("format") == "finance-daily-review-v1" else "values"
+            "after_values"
+            if material.get("format")
+            in {"finance-daily-review-v1", "finance-daily-movement-review-v1"}
+            else "values"
         )
         if (
             digest(material) != row["review_sha256"]
@@ -241,6 +247,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     from .contracts import ExpectedInvocation, RuntimeBinding
 
     sealed = json.loads(proposal["observation_json"])
+    if sealed.get("format") == "finance-daily-movement-observation-v1":
+        from .daily_v1.movements import verify_proposal as verify_movement_proposal
+
+        return verify_movement_proposal(service, conn, proposal)
     if "format" in sealed:
         if sealed["format"] != "finance-daily-proposal-observation-v1":
             raise LifecycleError("Unsupported proposal observation format")
@@ -375,6 +385,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
+    if material.get("format") == "finance-daily-movement-review-v1":
+        from .daily_v1.movements import verify_review as verify_movement_review
+
+        return verify_movement_review(service, conn, review)
     if "format" in material:
         if material["format"] != "finance-daily-review-v1":
             raise LifecycleError("Unsupported review format")
@@ -466,6 +480,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
             from .daily_v1.accounts import verify_fact
 
             verify_fact(service, conn, fact, _rows=_rows)
+        elif values.get("format") == "finance-daily-movement-v1":
+            from .daily_v1.movements import verify_fact as verify_movement_fact
+
+            verify_movement_fact(service, conn, fact)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous
@@ -599,7 +617,13 @@ def _has_daily_values(conn):
     from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
 
     return any(
-        json.loads(row[0]).get("format") in {BUNDLE_FORMAT, INCOMPLETE_FORMAT}
+        json.loads(row[0]).get("format")
+        in {
+            BUNDLE_FORMAT,
+            INCOMPLETE_FORMAT,
+            "finance-daily-movement-v1",
+            "finance-daily-movement-incomplete-v1",
+        }
         for row in conn.execute("SELECT values_json FROM l2_proposals")
     )
 

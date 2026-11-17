@@ -10,9 +10,10 @@ together by a consumer's separate admission procedure.
 
 This contract covers account creation and renaming, setting an opening balance,
 and correcting or voiding an opening with a provably empty dependency closure.
-Account-associated income/expense, current balances after financial movements,
-nonempty opening dependencies, transfers and refunds require their respective
-later contracts. An opening is a balance baseline, never income.
+Account-associated ordinary income/expense and current balances use the separate
+[ordinary movement contract](daily_movements_v1.md). Nonempty opening replacement,
+transfers and refunds still require their respective later contracts. An opening
+is a balance baseline, never income.
 
 ## Explicit API
 
@@ -203,16 +204,19 @@ operation. A caller-supplied empty collection cannot prove emptiness.
 The review binds the exact target and derived closure. Confirmation recomputes
 both under the same protected transaction and rejects changes. Historical audit
 reconstructs the confirmed event prefix, so later valid data cannot rewrite the
-meaning of an earlier correct decision. Introducing an account-impact writer
-requires extending both the inventory and this shared dependency protocol
-before its first write.
+meaning of an earlier correct decision. Registered ordinary movements now
+participate in this inventory; any current effective movement impact refuses
+these empty-closure opening operations. Introducing another account-impact type
+requires extending both inventory and dependency verification before its first write.
 
 ## Complete reads and audit
 
 The daily account reader returns one audited read identity, stable account and
 component references, opening history, explicit unknown state and completeness
-information. The supported scope is registered account/opening data together
-with original native personal-expense history. Legacy unassigned expenses
+information. This reader projects account/opening data after auditing registered
+ordinary movements and original native personal-expense history. Use
+`DailyLedgerReaderV1` for movements, totals and balances sharing one read identity.
+Legacy unassigned expenses
 remain visible as an account-completeness gap; they are not deducted from an
 arbitrary balance. Unsupported nonempty imported/archive domains are refused.
 

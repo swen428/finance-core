@@ -47,6 +47,7 @@ DAILY_ACCOUNTS_SCOPE_PATHS = (
     "tests/test_finance_core_package_v1.py",
     "tests/test_daily_accounts_contracts_v1.py",
     "tests/test_daily_accounts_lifecycle_v1.py",
+    "tests/test_daily_movements_lifecycle_v1.py",
     "tests/daily_account_support_v1.py",
     "tests/installed_daily_accounts_probe_v1.py",
 )

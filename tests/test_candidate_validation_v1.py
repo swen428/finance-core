@@ -804,6 +804,7 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         "tests/test_daily_evidence_callback_scope_v1.py",
         "tests/test_daily_accounts_contracts_v1.py",
         "tests/test_daily_accounts_lifecycle_v1.py",
+        "tests/test_daily_movements_lifecycle_v1.py",
         "tests/daily_account_support_v1.py",
         "tests/installed_daily_accounts_probe_v1.py",
         "finance_core/openclaw_staging_bridge/commands.py",

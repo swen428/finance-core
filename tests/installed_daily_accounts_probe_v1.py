@@ -38,7 +38,10 @@ def main():
         DAILY_CONTRACT_VERSION,
         DailyAccountReaderV1,
         DailyAccountServiceV1,
+        DailyLedgerReaderV1,
+        DailyMovementServiceV1,
         VerifiedDailyProposalV1,
+        VerifiedMovementProposalV1,
     )
     from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1, EffectiveReadError
     from finance_core.profile_layout import product_root, profile_root
@@ -101,11 +104,22 @@ def main():
             for key, cls in (
                 ("sources", VerifiedSource),
                 ("observations", VerifiedDailyProposalV1),
+                ("movement_observations", VerifiedMovementProposalV1),
                 ("deliveries", VerifiedDelivery),
                 ("actions", VerifiedAction),
             ):
                 setattr(port, key, {k: cls(**v) for k, v in state[key].items()})
             port.commands = state["commands"]
+            for key in (
+                "movement_sources",
+                "movement_latest",
+                "movement_links",
+                "movement_link_origins",
+                "movement_questions",
+                "movement_delivered_questions",
+                "movement_latest_question",
+            ):
+                setattr(port, key, state[key])
         binding = RuntimeBinding(cfg.instance_id, "daily-generation-1", "user", "chat")
         ledger = LedgerService(owner, port, binding, clock=lambda: NOW)
         daily = DailyAccountServiceV1(ledger)
@@ -115,6 +129,36 @@ def main():
                 "source1", "Create my MYR credit card account; opening not yet specified"
             )
             source = ledger.capture("source1", "capture1")
+            source_reader = DailyLedgerReaderV1(ledger)
+            assert source_reader.source(source.source_id) == port.sources["source1"]
+            actual_source_callback = port.source
+            for control in ("commit", "rollback", "close"):
+                source_calls = []
+
+                def guarded_source(conn, identity):
+                    source_calls.append((id(conn), conn.in_transaction))
+                    if len(source_calls) == 2:
+                        try:
+                            getattr(conn, control)()
+                        except (InstanceAdmissionError, sqlite3.DatabaseError):
+                            pass
+                    return actual_source_callback(conn, identity)
+
+                port.source = guarded_source
+                try:
+                    source_reader.source(source.source_id)
+                except InstanceAdmissionError as exc:
+                    assert "read-only scope" in str(exc)
+                else:
+                    raise AssertionError(
+                        "Daily source callback controlled its transaction/connection"
+                    )
+                finally:
+                    port.source = actual_source_callback
+                assert len(source_calls) == 2
+                assert len({identity for identity, _ in source_calls}) == 1
+                assert all(in_transaction for _, in_transaction in source_calls)
+            assert source_reader.source(source.source_id) == port.sources["source1"]
             port.commands["draft"] = command(fields={"name": "Daily Card", "currency": "MYR"})
             draft = daily.propose_account_create(source.source_id, "draft", 0, "draft-propose")
             assert daily.pending()[0]["values"]["missing_fields"] == ["account_type", "opening"]
@@ -218,12 +262,189 @@ def main():
                 raise AssertionError("Old complete reader admitted daily")
             audit = ledger.reader().full_audit()
             assert audit["fact_version_count"] == 4
+            movements = DailyMovementServiceV1(ledger)
+            unified = DailyLedgerReaderV1(ledger)
+
+            movement_reviews = {}
+
+            def movement(identity, kind="movement_create", target=None, amount="9", income=False):
+                raw = "excluded; incorrect amount"
+                port.add_source(identity, raw)
+                fields = (
+                    {}
+                    if kind == "movement_void"
+                    else {
+                        "kind": "income" if income else "expense",
+                        "business_date": "2026-11-17",
+                        "description": "Synthetic salary" if income else "Synthetic coffee",
+                        "category": "salary" if income else "food",
+                        "account_id": account,
+                        "account_amount": amount,
+                        "original_amount": amount if income else "1000",
+                        "original_currency": "MYR" if income else "JPY",
+                        "funds_time": unknown_time(),
+                        "coverage": {"answer": "excluded", "span": [0, 8]},
+                    }
+                )
+                port.commands[identity] = {
+                    "format": "finance-daily-movement-command-v1",
+                    "command_kind": kind,
+                    "fields": fields,
+                    "reason_span": [10, len(raw)] if target else None,
+                }
+                if target is None:
+                    captured = ledger.capture(identity, "capture-" + identity)
+                    port.remember_movement_source(captured, identity)
+                    port.register_movement_instruction(binding, captured.source_id, identity)
+                    proposal = movements.propose_movement_create(
+                        captured.source_id, identity, 0, "propose-" + identity
+                    )
+                else:
+                    port.register_movement_instruction(
+                        binding, target.source_id, identity, kind, target.fact_ref
+                    )
+                    proposal = movements.propose_movement_change(
+                        target.record_id,
+                        identity,
+                        target.fact_ref,
+                        "propose-" + identity,
+                        reply_evidence_id=identity,
+                        command_kind=kind,
+                    )
+                port.remember_movement_proposal(proposal)
+                review = movements.prepare_review(proposal.proposal_id, proposal.version)
+                movement_reviews[identity] = review
+                movements.record_delivery(review.review_id, "delivery-" + identity)
+                return movements.confirm(
+                    review.review_id, "action-" + identity, "confirm-" + identity
+                )
+
+            original_expense = movement("expense")
+            assert unified.collect().balances[0].credit_card_debt == "9.00"
+            assert unified.collect().expense_by_currency == (("JPY", "1000"),)
+            movement("income", amount="200", income=True)
+            assert unified.collect().balances[0].balance_amount == "191.00"
+            target = unified.detail(original_expense.receipt.record_id)
+            movement("correct-expense", "movement_correct", target, "10")
+            assert unified.collect().balances[0].balance_amount == "190.00"
+            movement("void-expense", "movement_void", unified.detail(target.record_id))
+            assert unified.collect().balances[0].credit_card_overpayment == "200.00"
+            assert (
+                movements.lookup_commit_receipt(
+                    "confirm-expense",
+                    review_id=movement_reviews["expense"].review_id,
+                    action_evidence_id="action-expense",
+                )
+                == original_expense
+            )
+            # Original movement receipt remains a separate immutable version.
+            assert len(unified.history(target.record_id)) == 3
+            # A genuine delivered opening-coverage question is registered
+            # before the actual bare reply; callbacks only read these records.
+
+            port.add_source("question-expense", "Record MYR 9; opening coverage unknown")
+            captured = ledger.capture("question-expense", "capture-question-expense")
+            port.remember_movement_source(captured, "question-expense")
+            port.register_movement_instruction(binding, captured.source_id, "question-expense")
+            question_fields = {
+                "kind": "expense",
+                "business_date": "2026-11-17",
+                "description": "Synthetic coffee",
+                "category": "food",
+                "account_id": account,
+                "account_amount": "9.00",
+                "original_amount": "9.00",
+                "original_currency": "MYR",
+                "funds_time": unknown_time(),
+                "coverage": {"answer": "unknown", "span": None},
+            }
+            port.commands["question-draft"] = {
+                "format": "finance-daily-movement-command-v1",
+                "command_kind": "movement_create",
+                "fields": question_fields,
+                "reason_span": None,
+            }
+            draft = movements.propose_movement_create(
+                captured.source_id, "question-draft", 0, "propose-question-draft"
+            )
+            port.remember_movement_proposal(draft)
+            question_account = reader.get_account(account)
+            subject = {
+                "account_ref": asdict(question_account.account_ref),
+                "opening_ref": asdict(question_account.opening_ref),
+                "kind": "expense",
+                "original_amount": "9.00",
+                "original_currency": "MYR",
+                "account_amount": "9.00",
+                "account_currency": "MYR",
+                "business_date": "2026-11-17",
+                "funds_time": unknown_time(),
+            }
+            question = port.register_opening_question(
+                binding, captured.source_id, "installed-opening-question", subject
+            )
+            port.add_source("question-answer", "not included")
+            port.register_opening_reply(question, "question-answer")
+            port.commands["question-wrong-positive"] = {
+                "format": "finance-daily-movement-command-v1",
+                "command_kind": "movement_create",
+                "fields": {**question_fields, "coverage": {"answer": "included", "span": [4, 12]}},
+                "reason_span": None,
+            }
+            try:
+                movements.propose_movement_create(
+                    captured.source_id,
+                    "question-wrong-positive",
+                    1,
+                    "propose-question-wrong-positive",
+                    reply_evidence_id="question-answer",
+                )
+            except LifecycleError as exc:
+                assert "complete genuine choice" in str(exc)
+            else:
+                raise AssertionError("Negative actual answer was compiled as included")
+            port.commands["question-complete"] = {
+                "format": "finance-daily-movement-command-v1",
+                "command_kind": "movement_create",
+                "fields": {**question_fields, "coverage": {"answer": "excluded", "span": [0, 12]}},
+                "reason_span": None,
+            }
+            proposal = movements.propose_movement_create(
+                captured.source_id,
+                "question-complete",
+                1,
+                "propose-question-complete",
+                reply_evidence_id="question-answer",
+            )
+            port.remember_movement_proposal(proposal)
+            question_card = movements.prepare_review(proposal.proposal_id, proposal.version)
+            movements.record_delivery(question_card.review_id, "delivery-question-card")
+            movements.confirm(
+                question_card.review_id, "independent-question-confirm", "confirm-question-expense"
+            )
+            assert unified.collect().balances[0].balance_amount == "191.00"
             cut = ledger.seal_snapshot(scratch / "snapshot.sqlite")
             state = {
                 key: {k: asdict(v) for k, v in getattr(port, key).items()}
-                for key in ("sources", "observations", "deliveries", "actions")
+                for key in (
+                    "sources",
+                    "observations",
+                    "movement_observations",
+                    "deliveries",
+                    "actions",
+                )
             }
             state["commands"] = port.commands
+            for key in (
+                "movement_sources",
+                "movement_latest",
+                "movement_links",
+                "movement_link_origins",
+                "movement_questions",
+                "movement_delivered_questions",
+                "movement_latest_question",
+            ):
+                state[key] = getattr(port, key)
             state_path.write_text(json.dumps(state))
             state_path.chmod(0o600)
             before = asdict(reader.collect_accounts().read_identity)
@@ -250,7 +471,7 @@ def main():
                 check=True,
             )
             reopened = json.loads(child.stdout)
-            assert reopened["fact_versions"] == 4 and reopened["snapshot_fact_versions"] == 4
+            assert reopened["fact_versions"] == 9 and reopened["snapshot_fact_versions"] == 9
             assert (
                 reopened["logical_database_sha256"]
                 == before["logical_database_sha256"]
@@ -261,8 +482,12 @@ def main():
                 json.dumps(
                     {
                         "contract": DAILY_CONTRACT_VERSION,
-                        "fact_versions": 4,
-                        "proposal_count": 5,
+                        "fact_versions": 9,
+                        "proposal_count": 11,
+                        "independent_instruction_question_link": True,
+                        "negative_coverage_preserved": True,
+                        "daily_source_guarded": True,
+                        "movement_balance_correction_void": True,
                         "incomplete_preserved": True,
                         "single_confirm_bundle": True,
                         "callback_persistent_write_refused": True,
@@ -281,6 +506,7 @@ def main():
         else:
             result = reader.collect_accounts()
             assert len(result.accounts) == 1
+            assert DailyLedgerReaderV1(ledger).collect().balances[0].balance_amount == "191.00"
             audit = ledger.reader().full_audit()
             from finance_core.instance_admission.authority import _logical_database_digest
             from finance_core.lifecycle_v2.reader import audit_evidence_connection
