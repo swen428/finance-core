@@ -81,6 +81,14 @@ Independent AI parser/lineage/validation modules and their packaged
 modification, deletion and rename. The workflow and independent candidate
 verifier classify the same paths; a policy-only edit cannot skip that matrix.
 
+The opt-in `lifecycle_v2/daily_v1/` subtree and its account contract/lifecycle
+tests, support module and installed probe also require both Bridge systems.
+The shared `instance_admission/sessions.py` guard and dedicated daily evidence
+callback-scope acceptance test require the same matrix.
+Workflow classification and independent verification cover modification,
+deletion and rename in either direction. A test-only change to this acceptance
+cannot omit the corresponding Bridge proof.
+
 One successful attempt-1 complete PR run for that frozen candidate is the
 normal authoritative V2. Immediately before protected merge, use the reviewed
 verification tool with the reviewed identities, for example:

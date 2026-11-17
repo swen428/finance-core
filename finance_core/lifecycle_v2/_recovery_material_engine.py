@@ -460,6 +460,17 @@ def _required_evidence(rows):
 
 
 def _scope(conn, rows):
+    for table, column in (
+        ("l2_proposals", "observation_json"),
+        ("l2_reviews", "material_json"),
+        ("l2_facts", "values_json"),
+    ):
+        for row in conn.execute(f"SELECT {column} FROM {table}"):
+            if "format" in json.loads(row[0]):
+                fail(
+                    "unsupported_scope",
+                    "Daily formats are outside the retained native expense closure",
+                )
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()

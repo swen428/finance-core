@@ -8,7 +8,18 @@ import json
 from finance_core.instance_admission.sessions import lifecycle_read_operation
 
 from .contracts import LifecycleError, VerifiedSource, canonical, digest
-from .service import _capture_generation, _fact_material, _money
+from .service import _capture_generation, _fact_material
+
+
+def _registered_values(value):
+    from .daily_v1.accounts import registered_values
+
+    return registered_values(value)
+
+
+def _old_record(values):
+    if "format" in values:
+        raise LifecycleError("unsupported_record_format: use the explicit daily reader")
 
 
 def audit_connection(conn):
@@ -30,7 +41,7 @@ def audit_connection(conn):
     audit_owned_inventory(conn)
     count = 0
     for row in conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version"):
-        values = _money(json.loads(row["values_json"]))
+        values = _registered_values(json.loads(row["values_json"]))
         expected = digest(
             _fact_material(
                 row["record_id"],
@@ -67,9 +78,14 @@ def audit_connection(conn):
         count += 1
     for row in conn.execute("SELECT * FROM l2_reviews"):
         material = json.loads(row["material_json"])
+        if "format" in material and material["format"] != "finance-daily-review-v1":
+            raise LifecycleError("Unsupported review format")
+        values_key = (
+            "after_values" if material.get("format") == "finance-daily-review-v1" else "values"
+        )
         if (
             digest(material) != row["review_sha256"]
-            or canonical(material["values"]) != row["values_json"]
+            or canonical(material[values_key]) != row["values_json"]
         ):
             raise LifecycleError("Review hash invalid")
     return {"event_count": expected_seq - 1, "fact_version_count": count, "audit_sha256": previous}
@@ -101,6 +117,7 @@ class LedgerReader:
                 (record_id,),
             ).fetchone()
             if row:
+                _old_record(json.loads(row["values_json"]))
                 verify_record(self.service, conn, row["record_id"])
             else:
                 audit_record_inventory(conn, record_id)
@@ -135,6 +152,7 @@ class LedgerReader:
                 (limit,),
             ).fetchall()
             for row in rows:
+                _old_record(json.loads(row["values_json"]))
                 verify_record(self.service, conn, row["record_id"])
             return [self._record(row) for row in rows]
 
@@ -150,11 +168,22 @@ class LedgerReader:
                 (limit,),
             ).fetchall()
             for row in rows:
+                _old_record(json.loads(row["values_json"]))
                 verify_review(self.service, conn, row)
             return [self.service._review_dto(conn, row) for row in rows]
 
     def full_audit(self):
         with lifecycle_read_operation(self.service.owner) as conn:
+            if _has_daily_values(conn):
+                # New opt-in formats require an operation-local evidence port.
+                # The historical expense-only read path keeps its contract.
+                conn.execute("BEGIN")
+                try:
+                    return audit_evidence_connection(
+                        conn, self.service.port, self.service.binding, self.service.legacy_verifier
+                    )
+                finally:
+                    conn.rollback()
             result = audit_connection(conn)
             if (
                 conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
@@ -185,8 +214,14 @@ def verify_proposal(service, conn, proposal):
 
     from .contracts import ExpectedInvocation, RuntimeBinding
 
-    source = service._source(conn, proposal["source_id"], allow_archived=True)
     sealed = json.loads(proposal["observation_json"])
+    if "format" in sealed:
+        if sealed["format"] != "finance-daily-proposal-observation-v1":
+            raise LifecycleError("Unsupported proposal observation format")
+        from .daily_v1.accounts import verify_proposal as verify_daily_proposal
+
+        return verify_daily_proposal(service, conn, proposal)
+    source = service._source(conn, proposal["source_id"], allow_archived=True)
     raw_expected = dict(sealed["expected"])
     raw_expected["binding"] = RuntimeBinding(**raw_expected["binding"])
     expected = ExpectedInvocation(**raw_expected)
@@ -289,6 +324,13 @@ def verify_proposal(service, conn, proposal):
 
 
 def verify_review(service, conn, review):
+    material = json.loads(review["material_json"])
+    if "format" in material:
+        if material["format"] != "finance-daily-review-v1":
+            raise LifecycleError("Unsupported review format")
+        from .daily_v1.accounts import verify_review as verify_daily_review
+
+        return verify_daily_review(service, conn, review)
     from dataclasses import asdict
 
     from .contracts import ExpectedDisplay
@@ -355,7 +397,11 @@ def verify_record(service, conn, record_id):
         "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version", (record_id,)
     ):
         version += 1
-        values = _money(json.loads(fact["values_json"]))
+        values = _registered_values(json.loads(fact["values_json"]))
+        if values.get("format") == "finance-daily-account-bundle-v1":
+            from .daily_v1.accounts import verify_fact
+
+            verify_fact(service, conn, fact)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous
@@ -473,10 +519,28 @@ class SnapshotEvidenceVerifier:
         return LedgerService._source(self, conn, source_id, allow_archived=allow_archived)
 
 
+def _has_daily_values(conn):
+    from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
+
+    return any(
+        json.loads(row[0]).get("format") in {BUNDLE_FORMAT, INCOMPLETE_FORMAT}
+        for row in conn.execute("SELECT values_json FROM l2_proposals")
+    )
+
+
 def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
     """Authenticate every signed source/provider/display/action and dormant archive."""
-    verifier = SnapshotEvidenceVerifier(port, binding, legacy_verifier)
     result = audit_connection(conn)
+    from finance_core.instance_admission.sessions import _witness_for
+
+    if _witness_for(conn) is not None and _has_daily_values(conn):
+        from .daily_v1.accounts import _EvidenceReadPort
+
+        if type(port) is not _EvidenceReadPort:
+            port = _EvidenceReadPort(port)
+    # Raw immutable snapshot readback has an independent read-only boundary;
+    # it never borrows a production callback token or successful admission.
+    verifier = SnapshotEvidenceVerifier(port, binding, legacy_verifier)
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()

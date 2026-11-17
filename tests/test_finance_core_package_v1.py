@@ -873,6 +873,48 @@ def _installed_prepared_finalization_restart_program() -> str:
     )
 
 
+def _probe_installed_daily(runtime_python, install_dir, outside_dir):
+    helpers = outside_dir / "daily-account-probe-fixtures"
+    helpers.mkdir(exist_ok=True)
+    for name in ("daily_account_support_v1.py", "installed_daily_accounts_probe_v1.py"):
+        shutil.copyfile(REPOSITORY_ROOT / "tests" / name, helpers / name)
+    dependencies = _installed_runtime_dependencies(outside_dir)
+    target = helpers / "runtime-dependencies"
+    if not target.exists():
+        shutil.copytree(dependencies, target)
+    completed = subprocess.run(
+        [
+            str(runtime_python),
+            "-I",
+            "-S",
+            str(helpers / "installed_daily_accounts_probe_v1.py"),
+            str(install_dir),
+            str(helpers),
+            str(outside_dir),
+            str(REPOSITORY_ROOT),
+        ],
+        check=True,
+        cwd=outside_dir,
+        env={"PATH": os.environ.get("PATH", "")},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    payload = json.loads(completed.stdout)
+    assert payload["contract"] == "finance-daily-v1"
+    assert payload["fact_versions"] == 4 and payload["proposal_count"] == 5
+    assert payload["incomplete_preserved"] and payload["fresh_opening_id"]
+    assert payload["callback_persistent_write_refused"]
+    assert payload["original_receipt_unchanged"] and payload["old_complete_reader_refused"]
+    assert payload["installed_only"] and payload["fresh_process"]["installed_only"]
+    assert Path(payload["module_file"]).resolve().is_relative_to(install_dir.resolve())
+    print(
+        "INSTALLED_DAILY_ACCOUNTS_PROOF "
+        + json.dumps({"artifact": install_dir.name, **payload}, sort_keys=True)
+    )
+    return payload
+
+
 def _probe_installed_lifecycle(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
@@ -2703,6 +2745,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
 
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
+        _probe_installed_daily(runtime_python, install_dir, outside_dir)
         lifecycle = _probe_installed_lifecycle(runtime_python, install_dir, outside_dir)
         material = _probe_installed_native_recovery_material(
             runtime_python, install_dir, outside_dir

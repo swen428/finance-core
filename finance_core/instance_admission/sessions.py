@@ -105,6 +105,32 @@ def _install_write_protocol(witness: "_Witness") -> None:
     """Private compile boundary; no SQL/admission or caller code in this hook."""
 
     def authorize(action, first, second, database, source):
+        if witness.evidence_callback_token is not None:
+            # This restriction precedes the ordinary cleanup ROLLBACK grant.
+            # It is opt-in and never replaces the owning authorizer.
+            allowed = False
+            valid = (
+                witness.pid == os.getpid()
+                and witness.active
+                and not witness.closed
+                and not witness.closing
+                and not witness.owner._uncertain
+            )
+            if valid and action in _SQL_READ_ACTIONS:
+                allowed = True
+            elif valid and action == sqlite3.SQLITE_FUNCTION:
+                allowed = second in _SQL_FUNCTIONS
+            elif valid and action == sqlite3.SQLITE_PRAGMA:
+                name = first.lower() if type(first) is str else ""
+                allowed = (
+                    name in _SQL_METADATA_PRAGMAS and (second is None or type(second) is str)
+                ) or (
+                    name in {"database_list", "foreign_keys", "busy_timeout", "defer_foreign_keys"}
+                    and second is None
+                )
+            if not allowed:
+                witness.evidence_callback_violated = True
+            return sqlite3.SQLITE_OK if allowed else sqlite3.SQLITE_DENY
         # Cleanup may safely roll back after admission or lifecycle is lost.
         if action == sqlite3.SQLITE_TRANSACTION and first == "ROLLBACK":
             return sqlite3.SQLITE_OK
@@ -304,6 +330,10 @@ class _Witness:
     closed: bool = False
     cursors: dict[int, _ProductionCursor] = field(default_factory=dict)
     retained_cursors: tuple[_ProductionCursor, ...] = ()
+    evidence_callback_token: object | None = None
+    evidence_callback_depth: int = 0
+    evidence_callback_violated: bool = False
+    evidence_cursors: dict[int, tuple[_ProductionCursor, object]] = field(default_factory=dict)
 
     def preflight(
         self, *, write: bool = False, instance_id: str | None = None, full: bool = True
@@ -408,7 +438,93 @@ def _preflight(conn: sqlite3.Connection, *, write: bool = False) -> _Witness:
     return witness
 
 
+_EXPIRED_EVIDENCE_CURSOR = object()
+
+
+def _evidence_refuse(witness: _Witness, operation: str) -> None:
+    witness.evidence_callback_violated = True
+    raise InstanceAdmissionError("Evidence callback is read-only: " + operation)
+
+
+def _evidence_forbid(witness: _Witness, operation: str) -> None:
+    if witness.evidence_callback_token is not None:
+        _evidence_refuse(witness, operation)
+
+
+def _evidence_cursor_check(witness: _Witness, cursor) -> None:
+    entry = witness.evidence_cursors.get(id(cursor))
+    if entry is not None and entry[0] is cursor and entry[1] is _EXPIRED_EVIDENCE_CURSOR:
+        if witness.evidence_callback_token is not None:
+            _evidence_refuse(witness, "expired callback cursor")
+        raise InstanceAdmissionError("Expired evidence callback cursor")
+    if witness.evidence_callback_token is not None and (
+        entry is None
+        or entry[0] is not cursor
+        or entry[1] is not witness.evidence_callback_token
+        or witness.cursors.get(id(cursor)) is not cursor
+    ):
+        _evidence_refuse(witness, "cursor belongs to another callback scope")
+
+
+@contextmanager
+def _evidence_read_callback(conn):
+    """Temporarily restrict the actual issued connection, without a proxy.
+
+    No authority success is cached. Every original execute/fetch/close admission
+    remains active, and rejected capabilities are sticky until the outer exit.
+    """
+    witness = _witness_for(conn)
+    if witness is None or type(conn) is not _ProductionConnection:
+        raise InstanceAdmissionError("Evidence callback requires the actual issued connection")
+    _require_session(conn, write=not witness.read_only, instance_id=None)
+    outer = witness.evidence_callback_token is None
+    if outer:
+        witness.evidence_callback_token = object()
+        witness.evidence_callback_violated = False
+    token = witness.evidence_callback_token
+    transaction = conn.in_transaction
+    changes = conn.total_changes
+    witness.evidence_callback_depth += 1
+    try:
+        yield conn
+    finally:
+        witness.evidence_callback_depth -= 1
+        if outer:
+            try:
+                if witness.owner._uncertain:
+                    raise ProductionCloseUncertain(witness)
+                # Close actual read cursors while restrictions still apply.
+                # A failed real close retains the original UNKNOWN witness.
+                for cursor, cursor_token in tuple(witness.evidence_cursors.values()):
+                    if cursor_token is token and witness.cursors.get(id(cursor)) is cursor:
+                        cursor.close()
+                _require_session(conn, write=not witness.read_only, instance_id=None)
+                if (
+                    witness.connection is not conn
+                    or conn.in_transaction != transaction
+                    or conn.total_changes != changes
+                ):
+                    witness.evidence_callback_violated = True
+                if witness.evidence_callback_violated:
+                    raise InstanceAdmissionError("Evidence callback violated read-only scope")
+            finally:
+                witness.evidence_callback_token = None
+                witness.evidence_callback_depth = 0
+                witness.evidence_callback_violated = False
+        elif witness.evidence_callback_violated:
+            raise InstanceAdmissionError("Nested evidence callback violated read-only scope")
+
+
 class _ProductionCursor(sqlite3.Cursor):
+    @property
+    def arraysize(self):
+        return sqlite3.Cursor.arraysize.__get__(self)
+
+    @arraysize.setter
+    def arraysize(self, value):
+        _evidence_forbid(_preflight(self.connection), "cursor arraysize configuration")
+        sqlite3.Cursor.arraysize.__set__(self, value)
+
     @property
     def row_factory(self):
         _preflight(self.connection)
@@ -416,7 +532,8 @@ class _ProductionCursor(sqlite3.Cursor):
 
     @row_factory.setter
     def row_factory(self, value):
-        _preflight(self.connection)
+        witness = _preflight(self.connection)
+        _evidence_forbid(witness, "cursor row_factory configuration")
         if value is not None and value is not sqlite3.Row:
             raise InstanceAdmissionError(
                 "Production cursor factories require configured None/sqlite3.Row"
@@ -424,6 +541,7 @@ class _ProductionCursor(sqlite3.Cursor):
         sqlite3.Cursor.row_factory.__set__(self, value)
 
     def _factory_preflight(self) -> None:
+        _evidence_cursor_check(_preflight(self.connection), self)
         factory = self.row_factory
         if factory is not None and factory is not sqlite3.Row:
             raise InstanceAdmissionError(
@@ -450,6 +568,9 @@ class _ProductionCursor(sqlite3.Cursor):
             _retain_unknown_close(witness)
             raise ProductionCloseUncertain(witness) from exc
         witness.cursors.pop(id(self), None)
+        entry = witness.evidence_cursors.get(id(self))
+        if entry is not None and entry[0] is self:
+            witness.evidence_cursors[id(self)] = (self, _EXPIRED_EVIDENCE_CURSOR)
 
     def execute(self, sql, parameters=(), /):
         self._factory_preflight()
@@ -461,6 +582,7 @@ class _ProductionCursor(sqlite3.Cursor):
 
     def executemany(self, sql, seq_of_parameters, /):
         self._factory_preflight()
+        _evidence_forbid(_preflight(self.connection), "executemany")
         if type(sql) is not str:
             raise InstanceAdmissionError("Production SQL requires a plain statement string")
 
@@ -479,7 +601,7 @@ class _ProductionCursor(sqlite3.Cursor):
         return super().executemany(sql, guarded_rows())
 
     def _refuse_script_execution(self, sql_script, /):
-        _preflight(self.connection)
+        _evidence_forbid(_preflight(self.connection), "executescript")
         raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
 
     # Bind the public script API to an explicit refusal, never native execution.
@@ -508,11 +630,15 @@ class _ProductionCursor(sqlite3.Cursor):
         return super().__next__()
 
     def setinputsizes(self, sizes, /):
-        _preflight(self.connection)
+        witness = _preflight(self.connection)
+        _evidence_cursor_check(witness, self)
+        _evidence_forbid(witness, "setinputsizes")
         return super().setinputsizes(sizes)
 
     def setoutputsize(self, size, column=None, /):
-        _preflight(self.connection)
+        witness = _preflight(self.connection)
+        _evidence_cursor_check(witness, self)
+        _evidence_forbid(witness, "setoutputsize")
         if column is None:
             return super().setoutputsize(size)
         return super().setoutputsize(size, column)
@@ -525,7 +651,7 @@ class _ProductionConnection(sqlite3.Connection):
     # Direct caller borrowing of native Statement objects is outside this API.
 
     def _unsupported(self, name: str) -> None:
-        _preflight(self)
+        _evidence_forbid(_preflight(self), name)
         raise InstanceAdmissionError(f"Production {name} is unsupported")
 
     def blobopen(self, *args, **kwargs):
@@ -585,8 +711,26 @@ class _ProductionConnection(sqlite3.Connection):
         return super().getlimit(category)
 
     def interrupt(self) -> None:
-        _preflight(self)
+        _evidence_forbid(_preflight(self), "interrupt")
         super().interrupt()
+
+    @property
+    def row_factory(self):
+        return sqlite3.Connection.row_factory.__get__(self)
+
+    @row_factory.setter
+    def row_factory(self, value):
+        _evidence_forbid(_preflight(self), "row_factory configuration")
+        sqlite3.Connection.row_factory.__set__(self, value)
+
+    @property
+    def text_factory(self):
+        return sqlite3.Connection.text_factory.__get__(self)
+
+    @text_factory.setter
+    def text_factory(self, value):
+        _evidence_forbid(_preflight(self), "text_factory configuration")
+        sqlite3.Connection.text_factory.__set__(self, value)
 
     @property
     def isolation_level(self):
@@ -594,6 +738,7 @@ class _ProductionConnection(sqlite3.Connection):
 
     @isolation_level.setter
     def isolation_level(self, value):
+        _evidence_forbid(_preflight(self), "isolation_level configuration")
         _submit_admission(self)
         if type(value) is not str or value != "":
             raise InstanceAdmissionError(
@@ -607,6 +752,7 @@ class _ProductionConnection(sqlite3.Connection):
 
     @autocommit.setter
     def autocommit(self, value):
+        _evidence_forbid(_preflight(self), "autocommit configuration")
         _submit_admission(self)
         if type(value) is not int or value != sqlite3.LEGACY_TRANSACTION_CONTROL:
             raise InstanceAdmissionError(
@@ -621,7 +767,7 @@ class _ProductionConnection(sqlite3.Connection):
         return self.cursor().executemany(sql, seq_of_parameters)
 
     def _refuse_script_execution(self, sql_script, /):
-        _preflight(self)
+        _evidence_forbid(_preflight(self), "executescript")
         raise InstanceAdmissionError("Production executescript implicit commits are unsupported")
 
     # Refuse directly: no cursor allocation or native script delegation.
@@ -630,22 +776,27 @@ class _ProductionConnection(sqlite3.Connection):
     def cursor(self, factory=None):
         witness = _preflight(self)
         if factory is not None and factory is not _ProductionCursor:
+            _evidence_forbid(witness, "cursor factory")
             raise InstanceAdmissionError("Production cursor factory cannot replace session witness")
         cursor = super().cursor(_ProductionCursor)
         witness.cursors[id(cursor)] = cursor
+        if witness.evidence_callback_token is not None:
+            witness.evidence_cursors[id(cursor)] = (cursor, witness.evidence_callback_token)
         return cursor
 
     def commit(self) -> None:
         witness = _preflight(self)
+        _evidence_forbid(witness, "commit")
         _require_session(self, write=not witness.read_only, instance_id=None)
         super().commit()
 
     def rollback(self) -> None:
-        _preflight(self)
+        _evidence_forbid(_preflight(self), "rollback")
         super().rollback()
 
     def close(self) -> None:
         witness = _preflight(self)
+        _evidence_forbid(witness, "close")
         try:
             _close_issued_connection(witness)
         except BaseException as exc:
@@ -653,11 +804,12 @@ class _ProductionConnection(sqlite3.Connection):
             raise ProductionCloseUncertain(witness) from exc
 
     def __enter__(self) -> Self:
-        _preflight(self)
+        _evidence_forbid(_preflight(self), "connection context entry")
         return super().__enter__()
 
     def __exit__(self, *args: Any) -> Any:
         witness = _preflight(self)
+        _evidence_forbid(witness, "connection context exit")
         _require_session(self, write=not witness.read_only, instance_id=None)
         return super().__exit__(*args)
 

@@ -20,7 +20,14 @@ class _FinalizationPlanV1:
         return CommitReceipt(self.fact[0], self.fact[1], self.fact[7], self.fact[8])
 
 
+def _old_review(conn, review_id):
+    row = conn.execute("SELECT * FROM l2_reviews WHERE review_id=?", (review_id,)).fetchone()
+    if row is not None and "format" in json.loads(row["values_json"]):
+        raise LifecycleError("unsupported_record_format: use the explicit daily API")
+
+
 def _confirmed_receipt(service, conn, review_id, action_evidence_id, operation_id):
+    _old_review(conn, review_id)
     existing = conn.execute(
         "SELECT * FROM l2_decisions WHERE operation_id=?", (operation_id,)
     ).fetchone()
@@ -64,6 +71,7 @@ def _compile_finalization(
 ):
     from ._finalization_journal_v1 import _assert_unreserved
 
+    _old_review(conn, review_id)
     _assert_unreserved(conn, review_id, action_evidence_id, operation_id, reservation=reservation)
     row = _row(conn, "l2_reviews", "review_id", review_id)
     from .reader import verify_review

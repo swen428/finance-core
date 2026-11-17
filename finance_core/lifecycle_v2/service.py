@@ -413,6 +413,8 @@ class LedgerService:
             current = json.loads(prior["values_json"]) if prior else {}
             if conn.execute("SELECT 1 FROM l2_facts WHERE source_id=?", (source_id,)).fetchone():
                 raise LifecycleError("Posted source requires correction")
+        if "format" in current:
+            raise LifecycleError("unsupported_record_format: use the explicit daily API")
         prior_proposal = conn.execute(
             "SELECT proposal_id FROM l2_proposals WHERE source_id=? ORDER BY version DESC LIMIT 1",
             (source_id,),
@@ -578,6 +580,8 @@ class LedgerService:
 
     def _review(self, conn, proposal_id, expected_version):
         proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
+        if "format" in json.loads(proposal["observation_json"]):
+            raise LifecycleError("unsupported_record_format: use the explicit daily API")
         from .reader import verify_proposal
 
         verify_proposal(self, conn, proposal)
@@ -669,6 +673,8 @@ class LedgerService:
     def record_delivery(self, review_id, delivery_evidence_id):
         with self._write_operation() as conn:
             row = _row(conn, "l2_reviews", "review_id", review_id)
+            if "format" in json.loads(row["material_json"]):
+                raise LifecycleError("unsupported_record_format: use the explicit daily API")
             expected = ExpectedDisplay(self.binding, review_id, row["review_sha256"])
             delivery = self.port.delivery(conn, delivery_evidence_id, expected)
             self._actor(delivery)
@@ -806,6 +812,7 @@ class LedgerService:
         from .snapshot_io import _secure_snapshot_destination
 
         with self._runtime_scope():
+            port = self.port
             destination = Path(destination)
             with _secure_snapshot_destination(destination) as target:
                 with lifecycle_read_operation(self.owner) as conn:
@@ -816,7 +823,7 @@ class LedgerService:
                     core_identity = config.core_identity
                     source_binding_sha256 = config.binding_sha256
                     conn.execute("BEGIN")
-                    audit_evidence_connection(conn, self.port, binding, self.legacy_verifier)
+                    audit_evidence_connection(conn, port, binding, self.legacy_verifier)
                     sealed_ledger = ledger_sha256(conn)
                     validate_application_database(conn, migration, schema, sealed_ledger)
                     source_logical = _logical_database_digest(conn)
@@ -831,6 +838,8 @@ class LedgerService:
                     readback.execute("PRAGMA query_only=ON")
                     validate_application_database(readback, migration, schema, sealed_ledger)
                     _snapshot_integrity(readback)
+                    readback.row_factory = sqlite3.Row
+                    audit_evidence_connection(readback, port, binding, self.legacy_verifier)
                     if _logical_database_digest(readback) != source_logical or _snapshot_inventory(
                         readback
                     ) != (facts, seq):
