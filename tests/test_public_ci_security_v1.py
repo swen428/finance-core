@@ -322,6 +322,7 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "finance_core/parser_proposals/ai_example.py",
         "finance_core/parser_proposals/independent_ai_lineage.py",
         "finance_core/parser_proposals/independent_ai_validation.py",
+        "finance_core/parser_proposals/currency_policy_v1.py",
         "finance_core/resources/independent_ai/policy_v1.json",
         "finance_core/resources/independent_ai/prompt_v1.txt",
         "finance_core/intake/receipt_ocr_evidence.py",
