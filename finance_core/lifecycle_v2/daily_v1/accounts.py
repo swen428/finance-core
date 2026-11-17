@@ -102,6 +102,10 @@ def registered_values(value):
     if type(value) is not dict:
         raise LifecycleError("unsupported_record_format")
     if "format" in value:
+        from .movement_contracts import MOVEMENT_FORMAT, validate_movement
+
+        if value["format"] == MOVEMENT_FORMAT:
+            return validate_movement(value)
         if value["format"] != BUNDLE_FORMAT:
             raise LifecycleError("unsupported_record_format")
         return validate_bundle(value)
@@ -150,14 +154,20 @@ def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None
                 owner = opening_owners.setdefault(identity, fact["record_id"])
                 if owner != fact["record_id"]:
                     raise LifecycleError("Opening identity has multiple owners")
+        elif values.get("format") == "finance-daily-movement-v1":
+            pass  # Exact movement already validated by registered_values.
         else:
             # This is the exact old native expense domain, with unknown account.
             from ..effective_v1 import _business_fields
 
             _business_fields(fact["values_json"])
         current[fact["record_id"]] = values
-    # There are no registered account-impact writers in this version. Every
-    # supported type has been explicitly interpreted above; unknown types fail.
+    from ._impacts_v1 import current_impacts
+
+    if current_impacts(conn, account_id, before_seq):
+        raise LifecycleError("unsupported_nonempty_opening_dependencies")
+    # Historical empty-closure bytes remain unchanged. Current effective
+    # movement dependencies are explicitly refused by this account format.
     material = {
         "format": "finance-daily-opening-dependency-closure-v1",
         "registry": REGISTRY_ID,
@@ -565,6 +575,18 @@ class _EvidenceReadPort:
 
     def daily_proposal(self, conn, identity, expected):
         return self._call("daily_proposal", VerifiedDailyProposalV1, conn, identity, expected)
+
+    def movement_instruction_link(self, conn, identity, expected):
+        from .movement_contracts import VerifiedMovementInstructionLinkV1
+
+        return self._call(
+            "movement_instruction_link", VerifiedMovementInstructionLinkV1, conn, identity, expected
+        )
+
+    def movement_proposal(self, conn, identity, expected):
+        from .movement_contracts import VerifiedMovementProposalV1
+
+        return self._call("movement_proposal", VerifiedMovementProposalV1, conn, identity, expected)
 
     def delivery(self, conn, identity, expected):
         return self._call("delivery", VerifiedDelivery, conn, identity, expected)

@@ -1,0 +1,720 @@
+"""Exact opt-in income/expense values; original and account money stay distinct."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import asdict, dataclass
+from datetime import date
+from decimal import Decimal
+
+from finance_core.money import normalize_currency
+
+from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, digest
+from .contracts import (
+    BundleFactRefV1,
+    _money,
+    _reason,
+    _reference,
+    account_ref,
+    exact,
+    instruction_ref,
+    opening_ref,
+    sha,
+    strict_json,
+    text,
+    validate_as_of,
+    validate_bundle,
+)
+
+MOVEMENT_FORMAT = "finance-daily-movement-v1"
+OBSERVATION_FORMAT = "finance-daily-movement-observation-v1"
+REVIEW_FORMAT = "finance-daily-movement-review-v1"
+COMMAND_FORMAT = "finance-daily-movement-command-v1"
+INCOMPLETE_FORMAT = "finance-daily-movement-incomplete-v1"
+COMMANDS = frozenset({"movement_create", "movement_correct", "movement_void"})
+FIELDS = frozenset(
+    {
+        "kind",
+        "business_date",
+        "description",
+        "category",
+        "original_amount",
+        "original_currency",
+        "account_id",
+        "account_amount",
+        "funds_time",
+        "coverage",
+    }
+)
+
+
+def movement_record_id_v1(source_id):
+    """Pure initial identity, available before independent link registration."""
+    text(source_id, "captured movement source id")
+    return "movement-" + digest(["finance-daily-movement-id-v1", source_id])
+
+
+@dataclass(frozen=True)
+class ExpectedMovementInvocationV1:
+    binding: RuntimeBinding
+    source_id: str
+    source_sha256: str
+    expected_version: int
+    record_id: str
+    command_kind: str
+    before_values: dict | None
+    target_bundle_ref: dict | None
+    instruction: dict
+    accounts: list
+    instruction_link: dict
+    current_proposal_id: str | None = None
+    reply_evidence_id: str | None = None
+    expected_proposal_version: int = 0
+    format: str = "finance-daily-movement-expected-v1"
+
+
+@dataclass(frozen=True)
+class MovementInstructionTargetV1:
+    binding: RuntimeBinding
+    source_id: str
+    source_sha256: str
+    source_instruction_ref: dict
+    instruction_ref: dict
+    record_id: str
+    command_kind: str
+    current_proposal: dict | None
+    target_fact_ref: dict | None
+
+
+@dataclass(frozen=True)
+class VerifiedMovementInstructionLinkV1:
+    evidence_id: str
+    link_json: str
+
+
+def _evidence_ref(value):
+    exact(value, {"evidence_id", "sha256"}, "association evidence reference")
+    text(value["evidence_id"], "association evidence id")
+    sha(value["sha256"])
+
+
+def question_target(target):
+    return {key: value for key, value in target.items() if key != "instruction_ref"}
+
+
+def coverage_subject(values, account):
+    opening = account["opening"]
+    return {
+        "account_ref": asdict(account_ref(account)),
+        "opening_ref": asdict(opening_ref(account))
+        if opening and opening["status"] == "ACTIVE"
+        else None,
+        **{
+            key: values[key]
+            for key in (
+                "kind",
+                "original_amount",
+                "original_currency",
+                "account_amount",
+                "account_currency",
+                "business_date",
+                "funds_time",
+            )
+        },
+    }
+
+
+def decode_instruction_link(value, target=None):
+    exact(value, {"evidence_id", "link_json"}, "verified movement instruction link")
+    text(value["evidence_id"], "instruction link id")
+    material = strict_json(value["link_json"])
+    from ..contracts import canonical
+
+    if canonical(material) != value["link_json"]:
+        raise LifecycleError("Canonical movement instruction link required")
+    exact(material, {"format", "mode", "target", "association_ref", "question"}, "instruction link")
+    if (
+        material["format"] != "finance-daily-movement-instruction-link-v1"
+        or type(material["mode"]) is not str
+        or material["mode"]
+        not in {"initial_instruction", "direct_targeted_instruction", "question_reply"}
+    ):
+        raise LifecycleError("Unsupported movement instruction association")
+    actual_target = material["target"]
+    exact(actual_target, MovementInstructionTargetV1.__dataclass_fields__, "instruction target")
+    RuntimeBinding(**actual_target["binding"])
+    text(actual_target["source_id"], "linked source id")
+    sha(actual_target["source_sha256"])
+    _reference(actual_target["source_instruction_ref"])
+    _reference(actual_target["instruction_ref"])
+    text(actual_target["record_id"], "linked record id")
+    if (
+        type(actual_target["command_kind"]) is not str
+        or actual_target["command_kind"] not in COMMANDS
+    ):
+        raise LifecycleError("Unsupported linked movement command")
+    previous = actual_target["current_proposal"]
+    if previous is not None:
+        exact(previous, {"proposal_id", "version", "proposal_sha256"}, "linked proposal")
+        text(previous["proposal_id"], "linked proposal id")
+        from .contracts import positive
+
+        positive(previous["version"])
+        sha(previous["proposal_sha256"])
+    if actual_target["target_fact_ref"] is not None:
+        BundleFactRefV1(**actual_target["target_fact_ref"])
+    if target is not None and actual_target != asdict(target):
+        raise LifecycleError("movement_instruction_target_mismatch")
+    _evidence_ref(material["association_ref"])
+    initial = actual_target["instruction_ref"] == actual_target["source_instruction_ref"]
+    if material["mode"] == "initial_instruction":
+        if not initial or previous is not None or actual_target["target_fact_ref"] is not None:
+            raise LifecycleError("Initial instruction cannot borrow a question or prior target")
+        if material["association_ref"] != {
+            "evidence_id": actual_target["instruction_ref"]["evidence_id"],
+            "sha256": actual_target["instruction_ref"]["original_sha256"],
+        }:
+            raise LifecycleError("Initial association must be the actual captured source")
+    elif initial:
+        raise LifecycleError("Supplement/change requires independently linked instruction")
+    question = material["question"]
+    if material["mode"] == "question_reply":
+        if actual_target["command_kind"] == "movement_void":
+            raise LifecycleError("opening_coverage question cannot instruct whole-event VOID")
+        exact(
+            question,
+            {"question_id", "question_version", "delivery_ref", "purpose", "target", "subject"},
+            "opening coverage question",
+        )
+        text(question["question_id"], "question id")
+        from .contracts import positive
+
+        positive(question["question_version"])
+        _evidence_ref(question["delivery_ref"])
+        if question["purpose"] != "opening_coverage":
+            raise LifecycleError("unsupported_movement_question_purpose")
+        if question["target"] != question_target(actual_target):
+            raise LifecycleError("movement_question_target_mismatch")
+        subject = question["subject"]
+        exact(
+            subject,
+            {
+                "account_ref",
+                "opening_ref",
+                "kind",
+                "original_amount",
+                "original_currency",
+                "account_amount",
+                "account_currency",
+                "business_date",
+                "funds_time",
+            },
+            "opening coverage subject",
+        )
+        from .contracts import AccountDefinitionRefV1, OpeningRefV1
+
+        account = AccountDefinitionRefV1(**subject["account_ref"])
+        if (
+            subject["opening_ref"] is not None
+            and OpeningRefV1(**subject["opening_ref"]).account_id != account.account_id
+        ):
+            raise LifecycleError("Question account/opening mismatch")
+        if type(subject["kind"]) is not str or subject["kind"] not in {"income", "expense"}:
+            raise LifecycleError("Unsupported question financial kind")
+        for amount, currency in (
+            ("original_amount", "original_currency"),
+            ("account_amount", "account_currency"),
+        ):
+            if (
+                normalize_currency(subject[currency]) != subject[currency]
+                or _positive_money(subject[amount], subject[currency]) != subject[amount]
+            ):
+                raise LifecycleError("Noncanonical question subject money")
+        _day(subject["business_date"])
+        validate_as_of(subject["funds_time"])
+    elif question is not None:
+        raise LifecycleError("Direct/initial instruction cannot invent a question")
+    return material
+
+
+@dataclass(frozen=True)
+class VerifiedMovementProposalV1:
+    evidence_id: str
+    source_id: str
+    principal_id: str
+    client_id: str
+    request_sha256: str
+    raw_proposal: str
+    format: str = OBSERVATION_FORMAT
+
+
+@dataclass(frozen=True)
+class DailyMovementReceiptV1:
+    receipt: CommitReceipt
+    command_kind: str
+    status: str
+
+
+def decode_command(raw):
+    value = strict_json(raw)
+    exact(value, {"format", "command_kind", "fields", "reason_span"}, "movement command")
+    if (
+        value["format"] != COMMAND_FORMAT
+        or type(value["command_kind"]) is not str
+        or value["command_kind"] not in COMMANDS
+    ):
+        raise LifecycleError("Unsupported movement command")
+    if type(value["fields"]) is not dict or set(value["fields"]) - FIELDS:
+        raise LifecycleError(
+            "Unsupported movement fields (transfer/refund/fee/repayment unsupported)"
+        )
+    return value
+
+
+def validate_before(value):
+    if value.get("format") == MOVEMENT_FORMAT:
+        return validate_movement(value)
+    from ..effective_v1 import _business_fields
+    from ..service import _money as legacy_money
+
+    legacy_money(value)
+    from ..contracts import canonical
+
+    _business_fields(canonical(value))
+    return value
+
+
+def decode_expected(value):
+    exact(value, ExpectedMovementInvocationV1.__dataclass_fields__, "movement expected")
+    raw = dict(value)
+    raw["binding"] = RuntimeBinding(**raw["binding"])
+    expected = ExpectedMovementInvocationV1(**raw)
+    if (
+        expected.format != "finance-daily-movement-expected-v1"
+        or type(expected.command_kind) is not str
+        or expected.command_kind not in COMMANDS
+    ):
+        raise LifecycleError("Unsupported movement expected")
+    text(expected.record_id, "record id")
+    text(expected.source_id, "source id")
+    sha(expected.source_sha256)
+    instruction_ref(expected.instruction, expected.binding)
+    link = decode_instruction_link(expected.instruction_link)
+    target = link["target"]
+    if (
+        target["binding"] != asdict(expected.binding)
+        or target["source_id"] != expected.source_id
+        or target["source_sha256"] != expected.source_sha256
+        or target["record_id"] != expected.record_id
+        or target["command_kind"] != expected.command_kind
+        or target["instruction_ref"] != instruction_ref(expected.instruction)
+        or target["target_fact_ref"] != expected.target_bundle_ref
+        or (target["current_proposal"]["proposal_id"] if target["current_proposal"] else None)
+        != expected.current_proposal_id
+        or (target["current_proposal"]["version"] if target["current_proposal"] else 0)
+        != expected.expected_proposal_version
+    ):
+        raise LifecycleError("Stored movement instruction link differs from expected context")
+    if any(
+        type(v) is not int or v < 0
+        for v in (expected.expected_version, expected.expected_proposal_version)
+    ):
+        raise LifecycleError("Exact nonnegative versions required")
+    if type(expected.accounts) is not list:
+        raise LifecycleError("Exact account inventory required")
+    ids = []
+    for item in expected.accounts:
+        exact(item, {"fact_ref", "values"}, "account inventory item")
+        ref = BundleFactRefV1(**item["fact_ref"])
+        validate_bundle(item["values"])
+        if ref.record_id != item["values"]["account"]["account_id"]:
+            raise LifecycleError("Account inventory identity mismatch")
+        ids.append(ref.record_id)
+    if ids != sorted(set(ids)):
+        raise LifecycleError("Account inventory must be unique and ordered")
+    if expected.before_values is not None:
+        validate_before(expected.before_values)
+        ref = BundleFactRefV1(**expected.target_bundle_ref)
+        if ref.record_id != expected.record_id or ref.version != expected.expected_version:
+            raise LifecycleError("Movement target mismatch")
+    elif expected.expected_version != 0 or expected.target_bundle_ref is not None:
+        raise LifecycleError("Initial movement cannot claim predecessor")
+    return expected
+
+
+def _positive_money(raw, currency):
+    result = _money(raw, currency)
+    if Decimal(result) <= 0:
+        raise LifecycleError("Movement amounts must be strictly positive")
+    return result
+
+
+def _day(value):
+    if type(value) is not str:
+        raise LifecycleError("Exact business date required")
+    try:
+        if date.fromisoformat(value).isoformat() != value:
+            raise ValueError()
+    except ValueError as exc:
+        raise LifecycleError("Exact business date required") from exc
+    return value
+
+
+def _later(funds, boundary):
+    if funds["precision"] == "instant" and boundary["precision"] == "instant":
+        return funds["timestamp"] > boundary["timestamp"]
+    if funds["precision"] != "unknown" and boundary["precision"] != "unknown":
+        return funds["local_date"] > boundary["local_date"]
+    return False
+
+
+def _coverage(command, expected, values, account):
+    opening = account["opening"]
+    active = opening is not None and opening["status"] == "ACTIVE"
+    supplied = command["fields"].get("coverage")
+    if supplied is not None:
+        exact(supplied, {"answer", "span"}, "opening coverage reply")
+        if type(supplied["answer"]) is not str or supplied["answer"] not in {
+            "included",
+            "excluded",
+            "unknown",
+        }:
+            raise LifecycleError("Unsupported opening coverage answer")
+    answer = supplied["answer"] if supplied else "unknown"
+    link = decode_instruction_link(expected.instruction_link)
+    bare = expected.instruction["raw_input"].strip().casefold() in {
+        "included",
+        "already included",
+        "已包含",
+        "已经包含",
+        "excluded",
+        "not included",
+        "尚未包含",
+        "未包含",
+    }
+    if bare and link["mode"] != "question_reply":
+        raise LifecycleError("Bare opening coverage reply requires actual linked question")
+    if link["mode"] == "question_reply" and link["question"]["subject"] != coverage_subject(
+        values, account
+    ):
+        return None
+    reason = None
+    if supplied and answer != "unknown":
+        reason = _reason(supplied["span"], expected, True)
+        accepted = {
+            "included": {"included", "already included", "已包含", "已经包含"},
+            "excluded": {"excluded", "not included", "尚未包含", "未包含"},
+        }
+        if reason["quote"].casefold() not in accepted[answer]:
+            raise LifecycleError("Coverage answer must match genuine exact reply selection")
+    if not active:
+        treatment, basis = "no_baseline", "no_active_opening"
+    elif _later(values["funds_time"], opening["as_of"]):
+        if answer == "included":
+            raise LifecycleError("Coverage answer contradicts strictly later funds time")
+        treatment, basis = "excluded", "strictly_later"
+    elif answer in {"included", "excluded"}:
+        treatment, basis = answer, "authenticated_reply"
+    else:
+        return None
+    material = {
+        "account_ref": asdict(account_ref(account)),
+        "opening_ref": asdict(opening_ref(account)) if active else None,
+        "kind": values["kind"],
+        "business_date": values["business_date"],
+        "original_amount": values["original_amount"],
+        "original_currency": values["original_currency"],
+        "account_amount": values["account_amount"],
+        "funds_time": values["funds_time"],
+        "instruction_ref": instruction_ref(expected.instruction),
+    }
+    return {
+        "treatment": treatment,
+        "basis": basis,
+        "reply_ref": reason,
+        "binding": material,
+        "binding_sha256": digest(material),
+    }
+
+
+def compile_proposal(command, expected):
+    if command["command_kind"] != expected.command_kind:
+        raise LifecycleError("Movement command differs from request")
+    before = expected.before_values
+    if command["reason_span"] is None and expected.command_kind != "movement_create":
+        return {
+            "format": INCOMPLETE_FORMAT,
+            "missing_fields": ["reason_span"],
+            "command": command,
+            "instruction_ref": instruction_ref(expected.instruction),
+        }
+    reason = _reason(command["reason_span"], expected, expected.command_kind != "movement_create")
+    if before and before.get("format") == MOVEMENT_FORMAT and before["status"] == "VOID":
+        raise LifecycleError("movement_already_void")
+    if expected.command_kind == "movement_void":
+        if not before:
+            raise LifecycleError("VOID requires current event")
+        if command["fields"]:
+            raise LifecycleError("Whole-event VOID cannot modify business values")
+        if before.get("format") != MOVEMENT_FORMAT:
+            # A legacy unknown-account event has no account impact to undo.
+            from ..contracts import canonical
+            from ..effective_v1 import _business_fields
+
+            old = _business_fields(canonical(before))
+            return validate_movement(
+                {
+                    "format": MOVEMENT_FORMAT,
+                    "status": "VOID",
+                    "transition": expected.command_kind,
+                    "kind": "expense",
+                    "business_date": old["transaction_date"],
+                    "description": old["merchant"],
+                    "category": old["category"] or "uncategorized",
+                    "original_amount": old["amount"],
+                    "original_currency": old["currency"],
+                    "account_id": None,
+                    "account_amount": None,
+                    "account_currency": None,
+                    "funds_time": None,
+                    "account_ref": None,
+                    "opening_ref": None,
+                    "coverage": None,
+                    "instruction_ref": instruction_ref(expected.instruction),
+                    "reason_ref": reason,
+                }
+            )
+        return validate_movement(
+            {
+                **before,
+                "status": "VOID",
+                "transition": expected.command_kind,
+                "instruction_ref": instruction_ref(expected.instruction),
+                "reason_ref": reason,
+            }
+        )
+    f = command["fields"]
+    required = FIELDS - {"coverage", "original_amount", "original_currency"}
+    missing = [k for k in sorted(required) if f.get(k) is None]
+    if f.get("kind") is not None and (
+        type(f["kind"]) is not str or f["kind"] not in {"income", "expense"}
+    ):
+        raise LifecycleError(
+            "Only ordinary income/expense supported; transfer/refund/fee/repayment refused"
+        )
+    if f.get("kind") == "expense":
+        missing += [k for k in ("original_amount", "original_currency") if f.get(k) is None]
+    if missing:
+        return {
+            "format": INCOMPLETE_FORMAT,
+            "missing_fields": sorted(set(missing)),
+            "command": command,
+            "instruction_ref": instruction_ref(expected.instruction),
+        }
+    account = next(
+        (
+            a["values"]
+            for a in expected.accounts
+            if a["values"]["account"]["account_id"] == f["account_id"]
+        ),
+        None,
+    )
+    if account is None:
+        raise LifecycleError("Exact current account selection required")
+    currency = account["account"]["currency"]
+    original_currency = f.get("original_currency") if f["kind"] == "expense" else currency
+    if normalize_currency(original_currency) != original_currency:
+        raise LifecycleError("Exact uppercase currency required")
+    amount = _positive_money(f["account_amount"], currency)
+    if f["kind"] == "income" and (
+        (f.get("original_currency") is not None and f["original_currency"] != currency)
+        or (
+            f.get("original_amount") is not None
+            and _positive_money(f["original_amount"], currency) != amount
+        )
+    ):
+        raise LifecycleError(
+            "Income has only actual credited money; conflicting original amount refused"
+        )
+    values = {
+        "format": MOVEMENT_FORMAT,
+        "status": "ACTIVE",
+        "transition": expected.command_kind,
+        "kind": f["kind"],
+        "business_date": _day(f["business_date"]),
+        "description": text(f["description"], "description", 1024),
+        "category": text(f["category"], "category"),
+        "original_amount": _positive_money(f["original_amount"], original_currency)
+        if f["kind"] == "expense"
+        else amount,
+        "original_currency": original_currency,
+        "account_id": f["account_id"],
+        "account_amount": amount,
+        "account_currency": currency,
+        "funds_time": validate_as_of(f["funds_time"]),
+        "account_ref": asdict(account_ref(account)),
+        "opening_ref": asdict(opening_ref(account))
+        if account["opening"] and account["opening"]["status"] == "ACTIVE"
+        else None,
+        "instruction_ref": instruction_ref(expected.instruction),
+        "reason_ref": reason,
+    }
+    coverage = _coverage(command, expected, values, account)
+    if coverage is None:
+        return {
+            "format": INCOMPLETE_FORMAT,
+            "missing_fields": ["opening_coverage"],
+            "command": command,
+            "instruction_ref": instruction_ref(expected.instruction),
+        }
+    return validate_movement({**values, "coverage": coverage})
+
+
+def _validate_reason_ref(reason):
+    if reason is None:
+        return
+    exact(reason, {"format", "instruction_ref", "span", "quote", "quote_sha256"}, "reason ref")
+    _reference(reason["instruction_ref"])
+    text(reason["quote"], "reason", 1024)
+    span = reason["span"]
+    if (
+        reason["format"] != "finance-daily-reason-ref-v1"
+        or type(span) is not list
+        or len(span) != 2
+        or any(type(n) is not int for n in span)
+        or not 0 <= span[0] < span[1]
+        or span[1] - span[0] != len(reason["quote"])
+        or hashlib.sha256(reason["quote"].encode()).hexdigest() != reason["quote_sha256"]
+    ):
+        raise LifecycleError("Invalid genuine reason reference")
+
+
+def validate_movement(value):
+    exact(
+        value,
+        {
+            "format",
+            "status",
+            "transition",
+            "kind",
+            "business_date",
+            "description",
+            "category",
+            "original_amount",
+            "original_currency",
+            "account_id",
+            "account_amount",
+            "account_currency",
+            "funds_time",
+            "account_ref",
+            "opening_ref",
+            "coverage",
+            "instruction_ref",
+            "reason_ref",
+        },
+        "movement fact",
+    )
+    if (
+        value["format"] != MOVEMENT_FORMAT
+        or any(type(value[k]) is not str for k in ("status", "transition", "kind"))
+        or value["status"] not in {"ACTIVE", "VOID"}
+        or value["transition"] not in COMMANDS
+        or value["kind"] not in {"expense", "income"}
+        or (value["status"] == "VOID") != (value["transition"] == "movement_void")
+    ):
+        raise LifecycleError("Invalid movement domain/status")
+    _day(value["business_date"])
+    text(value["description"], "description", 1024)
+    text(value["category"], "category")
+    if (
+        _positive_money(value["original_amount"], value["original_currency"])
+        != value["original_amount"]
+    ):
+        raise LifecycleError("Noncanonical original money")
+    _reference(value["instruction_ref"])
+    _validate_reason_ref(value["reason_ref"])
+    if (
+        value["reason_ref"] is not None
+        and value["reason_ref"]["instruction_ref"] != value["instruction_ref"]
+    ):
+        raise LifecycleError("Reason belongs to another instruction")
+    if normalize_currency(value["original_currency"]) != value["original_currency"]:
+        raise LifecycleError("Noncanonical original currency")
+    if value["account_id"] is None:
+        if value["status"] != "VOID" or any(
+            value[k] is not None
+            for k in (
+                "account_amount",
+                "account_currency",
+                "funds_time",
+                "account_ref",
+                "opening_ref",
+                "coverage",
+            )
+        ):
+            raise LifecycleError("Only legacy VOID may retain unknown account")
+    else:
+        from .contracts import AccountDefinitionRefV1, OpeningRefV1
+
+        ref = AccountDefinitionRefV1(**value["account_ref"])
+        if ref.account_id != value["account_id"]:
+            raise LifecycleError("Movement account mismatch")
+        if (
+            value["opening_ref"] is not None
+            and OpeningRefV1(**value["opening_ref"]).account_id != ref.account_id
+        ):
+            raise LifecycleError("Movement opening mismatch")
+        if (
+            _positive_money(value["account_amount"], value["account_currency"])
+            != value["account_amount"]
+        ):
+            raise LifecycleError("Noncanonical actual account money")
+        if value["kind"] == "income" and (value["account_amount"], value["account_currency"]) != (
+            value["original_amount"],
+            value["original_currency"],
+        ):
+            raise LifecycleError("Income must retain actual credited money")
+        validate_as_of(value["funds_time"])
+        c = value["coverage"]
+        exact(c, {"treatment", "basis", "reply_ref", "binding", "binding_sha256"}, "coverage")
+        binding = c["binding"]
+        exact(
+            binding,
+            {
+                "account_ref",
+                "opening_ref",
+                "kind",
+                "business_date",
+                "original_amount",
+                "original_currency",
+                "account_amount",
+                "funds_time",
+                "instruction_ref",
+            },
+            "coverage binding",
+        )
+        if (
+            c["treatment"] not in {"included", "excluded", "no_baseline"}
+            or c["basis"] not in {"no_active_opening", "strictly_later", "authenticated_reply"}
+            or digest(binding) != c["binding_sha256"]
+            or any(binding[k] != value[k] for k in binding if k != "instruction_ref")
+            or (
+                value["status"] == "ACTIVE"
+                and binding["instruction_ref"] != value["instruction_ref"]
+            )
+            or (c["treatment"] == "no_baseline") != (value["opening_ref"] is None)
+            or (c["basis"] == "no_active_opening") != (c["treatment"] == "no_baseline")
+            or (c["basis"] == "strictly_later" and c["treatment"] != "excluded")
+            or (c["treatment"] == "included" and c["basis"] != "authenticated_reply")
+        ):
+            raise LifecycleError("Invalid coverage binding")
+        _reference(binding["instruction_ref"])
+        _validate_reason_ref(c["reply_ref"])
+        if c["basis"] == "authenticated_reply" and (
+            c["reply_ref"] is None
+            or c["reply_ref"]["instruction_ref"] != binding["instruction_ref"]
+        ):
+            raise LifecycleError("Coverage lacks exact reply identity")
+    if value["transition"] != "movement_create" and value["reason_ref"] is None:
+        raise LifecycleError("Genuine reason required")
+    return value

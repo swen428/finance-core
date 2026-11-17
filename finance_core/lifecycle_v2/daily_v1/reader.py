@@ -172,6 +172,8 @@ class DailyAccountReaderV1:
                             old = openings.setdefault(key, item)
                             if old.component_json != item.component_json:
                                 raise LifecycleError("Opening version has contradictory owners")
+                    elif values.get("format") == "finance-daily-movement-v1":
+                        unknown.discard(fact["record_id"])
                     else:
                         unknown.add(fact["record_id"])
                 identity = DailyReadIdentityV1(
