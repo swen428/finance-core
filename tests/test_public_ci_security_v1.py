@@ -36,6 +36,9 @@ PREPARED_ENVELOPE_SCOPE_PATHS = (
     "tests/instance_admission_support_v1.py",
 )
 DAILY_ACCOUNTS_SCOPE_PATHS = (
+    "finance_core/lifecycle_v2/_audit_rows_v1.py",
+    "finance_core/lifecycle_v2/reader.py",
+    "tests/test_lifecycle_audit_rows_v1.py",
     "finance_core/lifecycle_v2/daily_v1/__init__.py",
     "finance_core/lifecycle_v2/daily_v1/accounts.py",
     "finance_core/lifecycle_v2/daily_v1/contracts.py",

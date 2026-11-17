@@ -85,6 +85,9 @@ The opt-in `lifecycle_v2/daily_v1/` subtree and its account contract/lifecycle
 tests, support module and installed probe also require both Bridge systems.
 The shared `instance_admission/sessions.py` guard and dedicated daily evidence
 callback-scope acceptance test require the same matrix.
+The shared `lifecycle_v2/reader.py` selector, its private `_audit_rows_v1.py`
+helper and `test_lifecycle_audit_rows_v1.py` acceptance tests require that matrix
+also when changed in isolation.
 Workflow classification and independent verification cover modification,
 deletion and rename in either direction. A test-only change to this acceptance
 cannot omit the corresponding Bridge proof.
