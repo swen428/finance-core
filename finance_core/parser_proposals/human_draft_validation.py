@@ -15,8 +15,11 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import NoReturn
 
-from finance_core.money import MoneyValidationError, canonical_decimal_str, normalize_currency
+from finance_core.money import MoneyValidationError, canonical_decimal_str
 from finance_core.parser_proposals.content_hash import canonicalize_proposal_money
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
+)
 from finance_core.parser_proposals.human_drafts import HumanReasonContributor
 
 _FIELDS = ("amount", "currency", "transaction_date", "merchant", "description", "category")

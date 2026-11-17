@@ -12,8 +12,10 @@ from finance_core.money import (
     SignPolicy,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 

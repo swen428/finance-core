@@ -427,6 +427,9 @@ def test_finance_core_exposes_the_authoritative_money_contract() -> None:
         Decimal("12.30"), "SGD"
     )
     assert finance_core.canonical_money_str(Decimal("12.3"), "SGD") == "12.30"
+    assert finance_core.Money.from_string("12.3", "myr").currency == "MYR"
+    assert finance_core.canonical_money_str(Decimal("12.3"), "MYR") == "12.30"
+    assert finance_core.minor_units("MYR") == 2
     assert finance_core.quantum_for_currency("JPY") == Decimal("1")
 
     with pytest.raises(finance_core.CurrencyMismatchError):
@@ -446,7 +449,7 @@ def _probe_installed_package(
             "-S",
             "-c",
             (
-                "import hashlib, importlib.util, json, sys; "
+                "import hashlib, importlib.util, json, sqlite3, sys; "
                 f"sys.path.insert(0, {str(install_dir)!r}); "
                 "import finance_core; "
                 "import finance_core.instance_admission as instance_admission; "
@@ -458,6 +461,12 @@ def _probe_installed_package(
                 "VerifiedInterpretationInputV2); "
                 "from finance_core.application.ai_invocation_v2 import CLARIFICATION_SCHEMA; "
                 "from finance_core.parser_proposals.independent_ai_validation import assets; "
+                "from finance_core.parser_proposals.independent_ai_source_grammar "
+                "import assess_source_money; "
+                "from finance_core.parser_proposals.receipt_total_parser "
+                "import ParserOcrBlock, parse_receipt_total; "
+                "from finance_core.parser_proposals.content_hash "
+                "import compute_proposal_content_hash; "
                 "from finance_core.resources import ("
                 "MIGRATION_LEDGER_DIGEST, MIGRATION_PREFLIGHT_SHA256, "
                 "migration_preflight_path, migration_resource_paths); "
@@ -475,6 +484,23 @@ def _probe_installed_package(
                 "v2_feature = json.loads(ai_root.joinpath('feature_v2.json').read_text()); "
                 "v2_types = (ClarificationReview, ClarificationStatus, "
                 "ExpectedInterpretationInputV2, VerifiedInterpretationInputV2); "
+                "myr_receipt_blocks = tuple(ParserOcrBlock(i, 0, text, 0, i * 30, "
+                "engine_line_index=i, engine_block_index=0, engine_paragraph_index=0, height=10) "
+                "for i, text in enumerate(('SYNTHETIC CAFE', '2026-01-02', 'TOTAL RM 12.30'))); "
+                "myr_receipt_hashes = {version: hashlib.sha256(json.dumps(dataclasses.asdict("
+                "parse_receipt_total(myr_receipt_blocks, extraction_status='succeeded', "
+                "parser_version=version)), sort_keys=True, separators=(',', ':')).encode())"
+                ".hexdigest() for version in ('v1', 'v2')}; "
+                "hash_conn = sqlite3.connect(':memory:'); "
+                "hash_conn.execute('CREATE TABLE attachments(public_id TEXT, file_path TEXT, '"
+                "'file_hash TEXT, parser_output_id INTEGER, id INTEGER)'); "
+                "legacy_myr_hash = compute_proposal_content_hash(hash_conn, {"
+                "'id': 1, 'public_id': 'proposal-synthetic', 'source_type': 'telegram_text', "
+                "'source_public_id': 'source-synthetic', 'statement_batch_id': None, "
+                "'raw_text': 'Coffee MYR 12.3', 'parser_name': 'text-expense-parser', "
+                "'parser_version': 'v1', 'attachment_id': None, "
+                "'parsed_payload': json.dumps({'amount': '12.3', 'currency': 'MYR'})}); "
+                "hash_conn.close(); "
                 "print(json.dumps({"
                 "'api': finance_core.API_CONTRACT_VERSION, "
                 "'instance_admission_api': {name: "
@@ -488,6 +514,14 @@ def _probe_installed_package(
                 "'fence_production_instance', 'require_finance_write_connection', "
                 "'require_finance_read_connection')}, "
                 "'canonical': finance_core.canonical_money_str(Decimal('12.3'), 'SGD'), "
+                "'myr_canonical': finance_core.canonical_money_str(Decimal('12.3'), 'MYR'), "
+                "'myr_minor_units': finance_core.minor_units('MYR'), "
+                "'myr_signed': finance_core.canonical_money_str("
+                "finance_core.Money.from_string('-12.3', 'myr').amount, 'MYR'), "
+                "'myr_zero': finance_core.Money.zero('MYR').is_zero(), "
+                "'legacy_myr_receipt_hashes': myr_receipt_hashes, "
+                "'legacy_myr_content_hash': legacy_myr_hash, "
+                "'legacy_myr_ai_state': assess_source_money('MYR 12.30').currency_state, "
                 "'ai_service_module': AiInvocationService.__module__, "
                 "'ai_contract_module': ai_contract.__name__, "
                 "'ai_feature_constants': {name: getattr(ai_contract, name + '_V1') for name in ("
@@ -1522,6 +1556,34 @@ def _probe_installed_lifecycle(
                         restored_audit['fact_version_count'], restored_audit['event_count'],
                     ],
                 }
+                # Current Money admits MYR; the retained native AI format must
+                # still reject it before creating proposal or financial state.
+                from finance_core.instance_admission.sessions import lifecycle_read_operation
+                myr_raw = raw.replace('SGD', 'MYR')
+                port.sources['source-myr-policy'] = lifecycle.VerifiedSource(
+                    'source-myr-policy', 'actor', 'chat', 'message-myr-policy', myr_raw,
+                    hashlib.sha256(myr_raw.encode()).hexdigest(), 1792800000,
+                )
+                port.responses['observation-myr-policy'] = response.replace('SGD', 'MYR')
+                myr_source = restored_service.capture('source-myr-policy', 'capture-myr-policy')
+                myr_tables = ('l2_proposals', 'l2_reviews', 'l2_decisions', 'l2_facts', 'l2_events')
+                with lifecycle_read_operation(new_owner) as conn:
+                    myr_before = tuple(conn.execute(
+                        f'SELECT count(*) FROM {name}').fetchone()[0] for name in myr_tables)
+                myr_refused = False
+                try:
+                    restored_service.propose(
+                        myr_source.source_id, 'observation-myr-policy', 0, 'propose-myr-policy')
+                except lifecycle.LifecycleError as exc:
+                    assert 'Provider proposal is not complete' in str(exc)
+                    myr_refused = True
+                with lifecycle_read_operation(new_owner) as conn:
+                    myr_after = tuple(conn.execute(
+                        f'SELECT count(*) FROM {name}').fetchone()[0] for name in myr_tables)
+                assert myr_refused and myr_after == myr_before
+                legacy_myr_proof = {
+                    'refused': myr_refused, 'no_financial_write': myr_after == myr_before,
+                }
             finally:
                 if new_owner is not None:
                     new_owner.close()
@@ -1551,6 +1613,7 @@ def _probe_installed_lifecycle(
             'effective_v2': effective_proof,
             'recovery': recovery_proof,
             'post_restore_v3': post_restore_proof,
+            'legacy_myr_policy': legacy_myr_proof,
             'effective_module_file': str(Path(effective.__file__).resolve()),
             'native_reconciliation_module_file': str(
                 Path(native_reconciliation.__file__).resolve()
@@ -2678,6 +2741,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         )
         print("INSTALLED_PREPARED_FINALIZATION_PROOF " + json.dumps(material, sort_keys=True))
         assert lifecycle["root_api"] == "finance-core-api-v1"
+        assert lifecycle["legacy_myr_policy"] == {"refused": True, "no_financial_write": True}
         assert {"LedgerService", "LedgerReader", "RuntimeBinding", "VerifiedSource"}.issubset(
             lifecycle["lifecycle_exports"]
         )
@@ -2843,6 +2907,18 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
         }
         assert payload["api"] == "finance-core-api-v1"
         assert payload["canonical"] == "12.30"
+        assert payload["myr_canonical"] == "12.30"
+        assert payload["myr_minor_units"] == 2
+        assert payload["myr_signed"] == "-12.30"
+        assert payload["myr_zero"] is True
+        assert payload["legacy_myr_receipt_hashes"] == {
+            version: "a42221a911be81c2f3804dee700dae826e724ac165a121560f8b663042921a6e"
+            for version in ("v1", "v2")
+        }
+        assert payload["legacy_myr_ai_state"] == "PRESENT_UNSUPPORTED_OR_AMBIGUOUS"
+        assert payload["legacy_myr_content_hash"] == (
+            "41d001cf31e11f61e16b31709f0cceef0440b997f106508e84cf474c67949215"
+        )
         assert payload["ai_service_module"] == "finance_core.application.ai_invocation"
         assert payload["ai_contract_module"] == "finance_core.application.ai_invocation_contract"
         assert payload["ai_feature_constants"] == EXPECTED_AI_FEATURE_CONSTANTS

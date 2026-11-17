@@ -22,6 +22,7 @@ from finance_core.instance_admission.sessions import (
     lifecycle_write_operation,
 )
 from finance_core.money import Money, canonical_money_str
+from finance_core.parser_proposals.currency_policy_v1 import normalize_currency_v1
 from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
 from .contracts import (
@@ -82,6 +83,9 @@ def _money(values):
     currency = values.get("currency")
     if not isinstance(amount, str) or not isinstance(currency, str):
         raise LifecycleError("Canonical monetary strings required")
+    # This retained personal-expense format, including issued legacy imports
+    # and historical audit reconstruction, keeps its original currency domain.
+    normalize_currency_v1(currency)
     money = Money.from_string(amount, currency)
     if money.amount <= 0 or canonical_money_str(money.amount, currency) != amount:
         raise LifecycleError("Canonical positive expense required")

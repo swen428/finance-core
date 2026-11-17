@@ -30,7 +30,6 @@ from finance_core.money import (
     SignPolicy,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
 )
 from finance_core.parser_proposals.ai_fallback import (
@@ -50,6 +49,9 @@ from finance_core.parser_proposals.content_hash import (
 from finance_core.parser_proposals.conversion_state import (
     has_receipt_ocr_proposal_link,
     has_receipt_registry_conversion,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.lifecycle import (

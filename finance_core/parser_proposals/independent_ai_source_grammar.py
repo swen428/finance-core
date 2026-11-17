@@ -13,7 +13,9 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
-from finance_core.money import SUPPORTED_CURRENCIES
+from finance_core.parser_proposals.currency_policy_v1 import (
+    SUPPORTED_CURRENCIES_V1 as SUPPORTED_CURRENCIES,
+)
 
 SEPARATORS = " \t\r\n"
 _WRAPPERS = ":;,!?，、；：！？。"

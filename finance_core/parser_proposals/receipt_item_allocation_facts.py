@@ -59,8 +59,10 @@ from finance_core.money import (
     MoneyValidationError,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.receipt_facts_conversion import (
     NEVER_WRITTEN_RECEIPT_COLUMNS,
