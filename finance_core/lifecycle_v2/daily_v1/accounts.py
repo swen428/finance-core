@@ -110,7 +110,7 @@ def registered_values(value):
     return _money(value)
 
 
-def closure(conn, account_id, *, before_seq=None, before_values=None):
+def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None):
     """Scan every registered domain by account, never by an old opening ID.
 
     Caller supplies a commit/review prefix only for authenticated historical
@@ -119,15 +119,26 @@ def closure(conn, account_id, *, before_seq=None, before_values=None):
     _limits(conn)
     if before_seq is None:
         before_seq = conn.execute("SELECT coalesce(max(seq),0)+1 FROM l2_events").fetchone()[0]
-    if conn.execute(
-        "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') AND seq<? LIMIT 1",
-        (before_seq,),
-    ).fetchone():
+    if (
+        any(
+            event["kind"] in {"import", "legacy_archive"} and event["seq"] < before_seq
+            for event in _rows.table(conn, "events")
+        )
+        if _rows is not None
+        else conn.execute(
+            "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') AND seq<? LIMIT 1",
+            (before_seq,),
+        ).fetchone()
+    ):
         raise LifecycleError("unsupported_ledger_scope: imported daily dependency scope")
     current = {}
     opening_owners = {}
-    for fact in conn.execute(
-        "SELECT * FROM l2_facts WHERE commit_seq<? ORDER BY record_id,version", (before_seq,)
+    for fact in (
+        _rows.facts_before(conn, before_seq)
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_facts WHERE commit_seq<? ORDER BY record_id,version", (before_seq,)
+        )
     ):
         values = registered_values(strict_json(fact["values_json"]))
         if values.get("format") == BUNDLE_FORMAT:
@@ -168,7 +179,7 @@ def needs_closure(values):
     )
 
 
-def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq):
+def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq, _rows=None):
     """Rebuild the complete retained request from actual source/predecessors."""
     expected = decode_expected(asdict(expected))
     source = service._source(conn, expected.source_id, allow_archived=True)
@@ -194,9 +205,17 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq)
         instruction = asdict(reply)
     instruction_ref(instruction, expected.binding)
     if expected.reply_evidence_id is not None:
-        for prior_request in conn.execute(
-            "SELECT observation_json FROM l2_proposals WHERE source_id=? AND version<?",
-            (expected.source_id, proposal_version),
+        for prior_request in (
+            tuple(
+                (row["observation_json"],)
+                for row in _rows.many(conn, "source_proposals", expected.source_id)
+                if row["version"] < proposal_version
+            )
+            if _rows is not None
+            else conn.execute(
+                "SELECT observation_json FROM l2_proposals WHERE source_id=? AND version<?",
+                (expected.source_id, proposal_version),
+            )
         ):
             if (
                 strict_json(prior_request[0]).get("expected", {}).get("reply_evidence_id")
@@ -205,20 +224,28 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq)
                 raise LifecycleError("reply_evidence_already_used")
     if instruction != expected.instruction:
         raise LifecycleError("Daily instruction differs from authenticated source")
-    previous = conn.execute(
-        "SELECT * FROM l2_proposals WHERE source_id=? AND version=?",
-        (expected.source_id, proposal_version - 1),
-    ).fetchone()
+    previous = (
+        _rows.one(conn, "proposal_version", expected.source_id, proposal_version - 1)
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_proposals WHERE source_id=? AND version=?",
+            (expected.source_id, proposal_version - 1),
+        ).fetchone()
+    )
     if (
         expected.current_proposal_id != (previous["proposal_id"] if previous else None)
         or expected.expected_proposal_version != proposal_version - 1
     ):
         raise LifecycleError("Daily request has different predecessor proposal")
     if expected.expected_version:
-        prior = conn.execute(
-            "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
-            (expected.record_id, expected.expected_version),
-        ).fetchone()
+        prior = (
+            _rows.one(conn, "fact_version", expected.record_id, expected.expected_version)
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
+                (expected.record_id, expected.expected_version),
+            ).fetchone()
+        )
         if (
             prior is None
             or prior["source_id"] != source["source_id"]
@@ -235,10 +262,17 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq)
         or expected.record_id != _account_id(source["source_id"])
         or (proposal_version == 1 and expected.reply_evidence_id is not None)
         or (proposal_version > 1 and expected.reply_evidence_id is None)
-        or conn.execute(
-            "SELECT 1 FROM l2_facts WHERE source_id=? AND commit_seq<? LIMIT 1",
-            (expected.source_id, proposal_seq),
-        ).fetchone()
+        or (
+            any(
+                row["commit_seq"] < proposal_seq
+                for row in _rows.many(conn, "source_facts", expected.source_id)
+            )
+            if _rows is not None
+            else conn.execute(
+                "SELECT 1 FROM l2_facts WHERE source_id=? AND commit_seq<? LIMIT 1",
+                (expected.source_id, proposal_seq),
+            ).fetchone()
+        )
     ):
         raise LifecycleError("Invalid initial account identity or supplemental reply")
     allocated = _allocated(
@@ -249,15 +283,20 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq)
     return expected
 
 
-def verify_proposal(service, conn, proposal):
+def verify_proposal(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
     exact(sealed, {"format", "expected", "observation"}, "daily observation envelope")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported daily observation")
-    events = conn.execute(
-        "SELECT * FROM l2_events WHERE kind='propose' AND entity_id=?", (proposal["proposal_id"],)
-    ).fetchall()
+    events = (
+        _rows.many(conn, "entity_events", "propose", proposal["proposal_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_events WHERE kind='propose' AND entity_id=?",
+            (proposal["proposal_id"],),
+        ).fetchall()
+    )
     if len(events) != 1:
         raise LifecycleError("Daily proposal lacks exact event")
     expected = _actual_expected(
@@ -266,8 +305,9 @@ def verify_proposal(service, conn, proposal):
         decode_expected(sealed["expected"]),
         proposal_version=proposal["version"],
         proposal_seq=events[0]["seq"],
+        _rows=_rows,
     )
-    _require_prefix(conn, expected, proposal, "proposal")
+    _require_prefix(conn, expected, proposal, "proposal", _rows=_rows)
     if (
         expected.source_id != proposal["source_id"]
         or expected.record_id != proposal["record_id"]
@@ -311,14 +351,18 @@ def verify_proposal(service, conn, proposal):
     return expected
 
 
-def verify_review(service, conn, review):
+def verify_review(service, conn, review, *, _rows=None):
     fingerprint = _fingerprint(conn)
-    proposal = conn.execute(
-        "SELECT * FROM l2_proposals WHERE proposal_id=?", (review["proposal_id"],)
-    ).fetchone()
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_proposals WHERE proposal_id=?", (review["proposal_id"],)
+        ).fetchone()
+    )
     if proposal is None:
         raise LifecycleError("Daily review lacks proposal")
-    expected = verify_proposal(service, conn, proposal)
+    expected = verify_proposal(service, conn, proposal, _rows=_rows)
     material = strict_json(review["material_json"])
     exact(
         material,
@@ -340,10 +384,14 @@ def verify_review(service, conn, review):
         },
         "daily review",
     )
-    events = conn.execute(
-        "SELECT * FROM l2_events WHERE kind='review' AND entity_id=?", (review["review_id"],)
-    ).fetchall()
-    _require_prefix(conn, expected, proposal, "review", review_id=review["review_id"])
+    events = (
+        _rows.many(conn, "entity_events", "review", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_events WHERE kind='review' AND entity_id=?", (review["review_id"],)
+        ).fetchall()
+    )
+    _require_prefix(conn, expected, proposal, "review", review_id=review["review_id"], _rows=_rows)
     values = validate_bundle(strict_json(proposal["values_json"]))
     expected_closure = (
         closure(
@@ -351,6 +399,7 @@ def verify_review(service, conn, review):
             expected.record_id,
             before_seq=events[0]["seq"],
             before_values=expected.before_values,
+            _rows=_rows,
         )
         if len(events) == 1 and needs_closure(values)
         else None
@@ -390,11 +439,17 @@ def verify_review(service, conn, review):
         or canonical(material) != events[0]["payload_json"]
     ):
         raise LifecycleError("Daily complete review differs from proposal/closure")
-    delivery = conn.execute(
-        "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
-    ).fetchone()
+    delivery = (
+        _rows.one(conn, "delivery", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
+        ).fetchone()
+    )
     if delivery:
-        _require_prefix(conn, expected, proposal, "delivery", review_id=review["review_id"])
+        _require_prefix(
+            conn, expected, proposal, "delivery", review_id=review["review_id"], _rows=_rows
+        )
         actual = service.port.delivery(
             conn,
             delivery["evidence_id"],
@@ -414,17 +469,27 @@ def verify_review(service, conn, review):
     return expected, delivery
 
 
-def verify_fact(service, conn, fact):
+def verify_fact(service, conn, fact, *, _rows=None):
     values = validate_bundle(strict_json(fact["values_json"]))
     account = values["account"]
     if account["account_id"] != fact["record_id"]:
         raise LifecycleError("Daily fact account identity mismatch")
-    review = conn.execute(
-        "SELECT * FROM l2_reviews WHERE review_id=?", (fact["review_id"],)
-    ).fetchone()
+    review = (
+        _rows.one(conn, "review", fact["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_reviews WHERE review_id=?", (fact["review_id"],)
+        ).fetchone()
+    )
     if review is None:
         raise LifecycleError("Daily fact lacks review")
-    proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    )
+    if proposal is None:
+        raise LifecycleError("Missing l2_proposals identity")
     expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
     _require_prefix(
         conn,
@@ -433,6 +498,7 @@ def verify_fact(service, conn, fact):
         "confirm",
         review_id=review["review_id"],
         commit_seq=fact["commit_seq"],
+        _rows=_rows,
     )
     material = strict_json(review["material_json"])
     if needs_closure(values) and material["opening_dependency_closure"] != closure(
@@ -440,13 +506,22 @@ def verify_fact(service, conn, fact):
         fact["record_id"],
         before_seq=fact["commit_seq"],
         before_values=material["before_values"],
+        _rows=_rows,
     ):
         raise LifecycleError("Daily commit-prefix dependency closure changed")
     if values["transition"] in {"account_create", "opening_set"} and values["opening"]:
         oid = values["opening"]["opening_event_id"]
-        for old in conn.execute(
-            "SELECT values_json FROM l2_facts WHERE record_id=? AND version<?",
-            (fact["record_id"], fact["version"]),
+        for old in (
+            tuple(
+                (row["values_json"],)
+                for row in _rows.many(conn, "record_facts", fact["record_id"])
+                if row["version"] < fact["version"]
+            )
+            if _rows is not None
+            else conn.execute(
+                "SELECT values_json FROM l2_facts WHERE record_id=? AND version<?",
+                (fact["record_id"], fact["version"]),
+            )
         ):
             opening = validate_bundle(strict_json(old[0]))["opening"]
             if opening and opening["opening_event_id"] == oid:
@@ -527,7 +602,11 @@ def _audit(service, conn):
     return result
 
 
-def _state_at(conn, expected, before_seq=None):
+def _state_at(conn, expected, before_seq=None, *, _rows=None):
+    if _rows is not None:
+        current, latest = _rows.state_at(conn, expected.record_id, expected.source_id, before_seq)
+        ref = asdict(bundle_ref(current)) if current else None
+        return ref, (latest["proposal_id"], latest["version"]) if latest else None
     current = conn.execute(
         "SELECT * FROM l2_facts WHERE record_id=? AND (? IS NULL OR commit_seq<?) "
         "ORDER BY version DESC LIMIT 1",
@@ -555,30 +634,36 @@ def _require_current(conn, expected, *, proposal=None):
     validate_eligibility(target, expected.target_bundle_ref, latest, required)
 
 
-def _event_seq(conn, kind, identity):
+def _event_seq(conn, kind, identity, *, _rows=None):
     if kind not in {"capture", "propose", "review", "delivery"}:
         raise LifecycleError("Unsupported daily prefix event")
-    rows = conn.execute(
-        "SELECT seq FROM l2_events WHERE kind=? AND entity_id=?", (kind, identity)
-    ).fetchall()
+    rows = (
+        _rows.project_many(conn, "entity_events", ("seq",), kind, identity)
+        if _rows is not None
+        else conn.execute(
+            "SELECT seq FROM l2_events WHERE kind=? AND entity_id=?", (kind, identity)
+        ).fetchall()
+    )
     if len(rows) != 1:
         raise LifecycleError("Daily prefix requires one exact event")
     return rows[0][0]
 
 
-def _require_prefix(conn, expected, proposal, stage, *, review_id=None, commit_seq=None):
+def _require_prefix(
+    conn, expected, proposal, stage, *, review_id=None, commit_seq=None, _rows=None
+):
     sequences = (
-        _event_seq(conn, "capture", expected.source_id),
-        _event_seq(conn, "propose", proposal["proposal_id"]),
+        _event_seq(conn, "capture", expected.source_id, _rows=_rows),
+        _event_seq(conn, "propose", proposal["proposal_id"], _rows=_rows),
     )
     if stage in {"review", "delivery", "confirm"}:
-        sequences += (_event_seq(conn, "review", review_id),)
+        sequences += (_event_seq(conn, "review", review_id, _rows=_rows),)
     if stage in {"delivery", "confirm"}:
-        sequences += (_event_seq(conn, "delivery", review_id),)
+        sequences += (_event_seq(conn, "delivery", review_id, _rows=_rows),)
     if stage == "confirm":
         sequences += (commit_seq,)
     validate_order(stage, sequences)
-    target, latest = _state_at(conn, expected, sequences[-1])
+    target, latest = _state_at(conn, expected, sequences[-1], _rows=_rows)
     required = (
         (
             (expected.current_proposal_id, expected.expected_proposal_version)

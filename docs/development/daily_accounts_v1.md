@@ -237,6 +237,17 @@ dependencies. Both source and independently opened snapshot copies perform the
 registered semantic audit. The existing SnapshotCut binds bundle watermarks,
 all history and the complete logical database digest.
 
+An eligible source audit may load complete immutable raw rows and private
+indexes within its existing protected transaction. All original semantic
+validators, repeated evidence callbacks on the actual connection, callback
+cursor lifetimes, fingerprints and full current admission checks remain in
+force. The view expires before audit return; subsequent current-state checks,
+projection, backup and writes keep their original SQL reads. Independent raw
+snapshot copies and default old/legacy contexts retain independent SQL audits.
+A private row/byte optimization budget chooses the original SQL path before
+callbacks when complete loading would exceed it; it never lowers the financial
+bounds, skips rows or retries failed validation.
+
 Current review and delivery creation require the exact currently eligible
 proposal and runtime binding before appending anything. Historical audit checks
 the same eligibility rules at each original event point, including causal

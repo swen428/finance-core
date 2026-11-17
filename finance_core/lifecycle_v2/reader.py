@@ -22,10 +22,14 @@ def _old_record(values):
         raise LifecycleError("unsupported_record_format: use the explicit daily reader")
 
 
-def audit_connection(conn):
+def audit_connection(conn, *, _rows=None):
     previous = None
     expected_seq = 1
-    for row in conn.execute("SELECT * FROM l2_events ORDER BY seq"):
+    for row in (
+        _rows.table(conn, "events")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_events ORDER BY seq")
+    ):
         payload = json.loads(row["payload_json"])
         if (
             row["seq"] != expected_seq
@@ -38,9 +42,13 @@ def audit_connection(conn):
             raise LifecycleError("Audit event chain invalid")
         previous = row["event_sha256"]
         expected_seq += 1
-    audit_owned_inventory(conn)
+    audit_owned_inventory(conn, _rows=_rows)
     count = 0
-    for row in conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version"):
+    for row in (
+        _rows.table(conn, "facts")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version")
+    ):
         values = _registered_values(json.loads(row["values_json"]))
         expected = digest(
             _fact_material(
@@ -55,28 +63,46 @@ def audit_connection(conn):
         if expected != row["fact_sha256"]:
             raise LifecycleError("Fact material hash invalid")
         if row["version"] > 1:
-            prior = conn.execute(
-                "SELECT fact_sha256 FROM l2_facts WHERE record_id=? AND version=?",
-                (row["record_id"], row["version"] - 1),
-            ).fetchone()
+            prior = (
+                _rows.project(
+                    conn, "fact_version", ("fact_sha256",), row["record_id"], row["version"] - 1
+                )
+                if _rows is not None
+                else conn.execute(
+                    "SELECT fact_sha256 FROM l2_facts WHERE record_id=? AND version=?",
+                    (row["record_id"], row["version"] - 1),
+                ).fetchone()
+            )
             if prior is None or prior[0] != row["predecessor_sha256"]:
                 raise LifecycleError("Fact predecessor invalid")
-        event = conn.execute(
-            "SELECT kind,payload_json FROM l2_events WHERE seq=?", (row["commit_seq"],)
-        ).fetchone()
+        event = (
+            _rows.project(conn, "event", ("kind", "payload_json"), row["commit_seq"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT kind,payload_json FROM l2_events WHERE seq=?", (row["commit_seq"],)
+            ).fetchone()
+        )
         if event is None or event[0] not in {"confirm", "import"}:
             raise LifecycleError("Fact lacks audit commit")
         if event[0] == "confirm":
             if json.loads(event[1])["fact_sha256"] != expected:
                 raise LifecycleError("Fact audit binding mismatch")
-            decision = conn.execute(
-                "SELECT * FROM l2_decisions WHERE record_id=? AND version=?",
-                (row["record_id"], row["version"]),
-            ).fetchone()
+            decision = (
+                _rows.one(conn, "decision_version", row["record_id"], row["version"])
+                if _rows is not None
+                else conn.execute(
+                    "SELECT * FROM l2_decisions WHERE record_id=? AND version=?",
+                    (row["record_id"], row["version"]),
+                ).fetchone()
+            )
             if decision is None or decision["review_id"] != row["review_id"]:
                 raise LifecycleError("Fact lacks exact decision")
         count += 1
-    for row in conn.execute("SELECT * FROM l2_reviews"):
+    for row in (
+        _rows.table(conn, "reviews")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_reviews")
+    ):
         material = json.loads(row["material_json"])
         if "format" in material and material["format"] != "finance-daily-review-v1":
             raise LifecycleError("Unsupported review format")
@@ -206,7 +232,7 @@ class LedgerReader:
             return result
 
 
-def verify_proposal(service, conn, proposal):
+def verify_proposal(service, conn, proposal, *, _rows=None):
     """Verify the actual retained provider request/output, not its DB self-hash."""
     from dataclasses import asdict
 
@@ -220,7 +246,7 @@ def verify_proposal(service, conn, proposal):
             raise LifecycleError("Unsupported proposal observation format")
         from .daily_v1.accounts import verify_proposal as verify_daily_proposal
 
-        return verify_daily_proposal(service, conn, proposal)
+        return verify_daily_proposal(service, conn, proposal, _rows=_rows)
     source = service._source(conn, proposal["source_id"], allow_archived=True)
     raw_expected = dict(sealed["expected"])
     raw_expected["binding"] = RuntimeBinding(**raw_expected["binding"])
@@ -272,15 +298,23 @@ def verify_proposal(service, conn, proposal):
         raise LifecycleError("Proposal differs from authenticated provider observation")
     # Reconstruct the predecessor values; stored request context cannot invent them.
     if proposal["record_id"]:
-        prior = conn.execute(
-            "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
-            (proposal["record_id"], proposal["expected_version"]),
-        ).fetchone()
+        prior = (
+            _rows.one(conn, "fact_version", proposal["record_id"], proposal["expected_version"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
+                (proposal["record_id"], proposal["expected_version"]),
+            ).fetchone()
+        )
     elif proposal["expected_version"]:
-        prior = conn.execute(
-            "SELECT * FROM l2_proposals WHERE source_id=? AND version=?",
-            (proposal["source_id"], proposal["expected_version"]),
-        ).fetchone()
+        prior = (
+            _rows.one(conn, "proposal_version", proposal["source_id"], proposal["expected_version"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_proposals WHERE source_id=? AND version=?",
+                (proposal["source_id"], proposal["expected_version"]),
+            ).fetchone()
+        )
     else:
         prior = None
     if expected.projection["current_values"] != (json.loads(prior["values_json"]) if prior else {}):
@@ -306,16 +340,32 @@ def verify_proposal(service, conn, proposal):
         proposal["expected_version"],
         proposal["record_id"],
     ]
-    events = conn.execute(
-        "SELECT payload_json FROM l2_events WHERE kind='propose' AND entity_id=?",
-        (proposal["proposal_id"],),
-    ).fetchall()
+    events = (
+        _rows.project_many(
+            conn, "entity_events", ("payload_json",), "propose", proposal["proposal_id"]
+        )
+        if _rows is not None
+        else conn.execute(
+            "SELECT payload_json FROM l2_events WHERE kind='propose' AND entity_id=?",
+            (proposal["proposal_id"],),
+        ).fetchall()
+    )
     if len(events) != 1 or events[0][0] != canonical(material):
         raise LifecycleError("Proposal lacks its exact original audit event")
-    prior_proposal = conn.execute(
-        "SELECT proposal_id FROM l2_proposals WHERE source_id=? AND version=?",
-        (proposal["source_id"], proposal["version"] - 1),
-    ).fetchone()
+    prior_proposal = (
+        _rows.project(
+            conn,
+            "proposal_version",
+            ("proposal_id",),
+            proposal["source_id"],
+            proposal["version"] - 1,
+        )
+        if _rows is not None
+        else conn.execute(
+            "SELECT proposal_id FROM l2_proposals WHERE source_id=? AND version=?",
+            (proposal["source_id"], proposal["version"] - 1),
+        ).fetchone()
+    )
     if expected.current_proposal_id != (prior_proposal[0] if prior_proposal else None):
         raise LifecycleError("Proposal request has a different predecessor identity")
     if digest(material) != proposal["proposal_sha256"]:
@@ -323,24 +373,28 @@ def verify_proposal(service, conn, proposal):
     return expected
 
 
-def verify_review(service, conn, review):
+def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
     if "format" in material:
         if material["format"] != "finance-daily-review-v1":
             raise LifecycleError("Unsupported review format")
         from .daily_v1.accounts import verify_review as verify_daily_review
 
-        return verify_daily_review(service, conn, review)
+        return verify_daily_review(service, conn, review, _rows=_rows)
     from dataclasses import asdict
 
     from .contracts import ExpectedDisplay
 
-    proposal = conn.execute(
-        "SELECT * FROM l2_proposals WHERE proposal_id=?", (review["proposal_id"],)
-    ).fetchone()
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_proposals WHERE proposal_id=?", (review["proposal_id"],)
+        ).fetchone()
+    )
     if proposal is None:
         raise LifecycleError("Review lacks proposal")
-    expected = verify_proposal(service, conn, proposal)
+    expected = verify_proposal(service, conn, proposal, _rows=_rows)
     material = json.loads(review["material_json"])
     if (
         material["binding"] != asdict(expected.binding)
@@ -358,15 +412,23 @@ def verify_review(service, conn, review):
         or not 0 < material["expires_at"] - material["created_at"] <= 600
     ):
         raise LifecycleError("Review material differs from exact provider proposal")
-    events = conn.execute(
-        "SELECT payload_json FROM l2_events WHERE kind='review' AND entity_id=?",
-        (review["review_id"],),
-    ).fetchall()
+    events = (
+        _rows.project_many(conn, "entity_events", ("payload_json",), "review", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT payload_json FROM l2_events WHERE kind='review' AND entity_id=?",
+            (review["review_id"],),
+        ).fetchall()
+    )
     if len(events) != 1 or events[0][0] != canonical(material):
         raise LifecycleError("Review lacks its exact original audit event")
-    delivery = conn.execute(
-        "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
-    ).fetchone()
+    delivery = (
+        _rows.one(conn, "delivery", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
+        ).fetchone()
+    )
     if delivery:
         actual = service.port.delivery(
             conn,
@@ -384,24 +446,26 @@ def verify_review(service, conn, review):
     return expected, delivery
 
 
-def verify_record(service, conn, record_id):
+def verify_record(service, conn, record_id, *, _rows=None):
     from dataclasses import asdict
 
     from .contracts import ExpectedAction
 
-    audit_record_inventory(conn, record_id)
+    audit_record_inventory(conn, record_id, _rows=_rows)
     previous = None
     version = 0
     economic = None
-    for fact in conn.execute(
-        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version", (record_id,)
+    for fact in (
+        _rows.many(conn, "record_facts", record_id)
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_facts WHERE record_id=? ORDER BY version", (record_id,))
     ):
         version += 1
         values = _registered_values(json.loads(fact["values_json"]))
         if values.get("format") == "finance-daily-account-bundle-v1":
             from .daily_v1.accounts import verify_fact
 
-            verify_fact(service, conn, fact)
+            verify_fact(service, conn, fact, _rows=_rows)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous
@@ -421,9 +485,13 @@ def verify_record(service, conn, record_id):
             raise LifecycleError("Current record/version predecessor hash mismatch")
         economic = fact["economic_event_id"]
         previous = fact["fact_sha256"]
-        event = conn.execute(
-            "SELECT * FROM l2_events WHERE seq=?", (fact["commit_seq"],)
-        ).fetchone()
+        event = (
+            _rows.one(conn, "event", fact["commit_seq"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_events WHERE seq=?", (fact["commit_seq"],)
+            ).fetchone()
+        )
         if event is None:
             raise LifecycleError("Record lacks commit audit")
         if event["kind"] == "import":
@@ -431,20 +499,28 @@ def verify_record(service, conn, record_id):
 
             verify_imported_fact(conn, fact, service.legacy_verifier)
             continue
-        review = conn.execute(
-            "SELECT * FROM l2_reviews WHERE review_id=?", (fact["review_id"],)
-        ).fetchone()
+        review = (
+            _rows.one(conn, "review", fact["review_id"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_reviews WHERE review_id=?", (fact["review_id"],)
+            ).fetchone()
+        )
         if review is None:
             raise LifecycleError("Record lacks original review")
-        expected, delivery = verify_review(service, conn, review)
+        expected, delivery = verify_review(service, conn, review, _rows=_rows)
         source = service._source(conn, expected.source_id, allow_archived=True)
         if fact["source_id"] != expected.source_id or (
             version == 1 and fact["economic_event_id"] != source["source_key"]
         ):
             raise LifecycleError("Economic event differs from authenticated source identity")
-        decision = conn.execute(
-            "SELECT * FROM l2_decisions WHERE record_id=? AND version=?", (record_id, version)
-        ).fetchone()
+        decision = (
+            _rows.one(conn, "decision_version", record_id, version)
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_decisions WHERE record_id=? AND version=?", (record_id, version)
+            ).fetchone()
+        )
         if (
             delivery is None
             or decision is None
@@ -530,16 +606,24 @@ def _has_daily_values(conn):
 
 def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
     """Authenticate every signed source/provider/display/action and dormant archive."""
-    result = audit_connection(conn)
     from finance_core.instance_admission.sessions import _witness_for
+
+    from ._audit_rows_v1 import audit_rows
 
     if _witness_for(conn) is not None and _has_daily_values(conn):
         from .daily_v1.accounts import _EvidenceReadPort
 
         if type(port) is not _EvidenceReadPort:
             port = _EvidenceReadPort(port)
-    # Raw immutable snapshot readback has an independent read-only boundary;
-    # it never borrows a production callback token or successful admission.
+    # Raw immutable snapshot readback retains its independent SQL boundary.
+    # An exact adapter alone is not admission; the selector proves its context.
+    with audit_rows(conn, port) as rows:
+        return _audit_evidence_connection(conn, port, binding, legacy_verifier, _rows=rows)
+
+
+def _audit_evidence_connection(conn, port, binding, legacy_verifier=None, *, _rows=None):
+    """Original SQL reference with optional private, audit-local raw lookups."""
+    result = audit_connection(conn, _rows=_rows)
     verifier = SnapshotEvidenceVerifier(port, binding, legacy_verifier)
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
@@ -551,18 +635,38 @@ def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
         from .legacy import verify_import_archives
 
         verify_import_archives(conn, legacy_verifier)
-    for source in conn.execute("SELECT source_id FROM l2_sources"):
+    sources = (
+        ((identity,) for identity in _rows.vector(conn, "sources"))
+        if _rows is not None
+        else conn.execute("SELECT source_id FROM l2_sources")
+    )
+    for source in sources:
         verifier._source(conn, source[0], allow_archived=True)
-    for proposal in conn.execute("SELECT * FROM l2_proposals"):
-        verify_proposal(verifier, conn, proposal)
-    for review in conn.execute("SELECT * FROM l2_reviews"):
-        verify_review(verifier, conn, review)
-    for record in conn.execute("SELECT DISTINCT record_id FROM l2_facts"):
-        verify_record(verifier, conn, record[0])
+    proposals = (
+        _rows.table(conn, "proposals")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_proposals")
+    )
+    for proposal in proposals:
+        verify_proposal(verifier, conn, proposal, _rows=_rows)
+    reviews = (
+        _rows.table(conn, "reviews")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_reviews")
+    )
+    for review in reviews:
+        verify_review(verifier, conn, review, _rows=_rows)
+    records = (
+        ((identity,) for identity in _rows.vector(conn, "records"))
+        if _rows is not None
+        else conn.execute("SELECT DISTINCT record_id FROM l2_facts")
+    )
+    for record in records:
+        verify_record(verifier, conn, record[0], _rows=_rows)
     return result
 
 
-def _exact_confirm_inventory(conn, event):
+def _exact_confirm_inventory(conn, event, *, _rows=None):
     """Resolve a retained commit in both directions without assuming fact existence."""
     payload = json.loads(event["payload_json"])
     if (
@@ -572,10 +676,18 @@ def _exact_confirm_inventory(conn, event):
         or type(payload["accepted_at"]) is not int
     ):
         raise LifecycleError("Confirm event inventory payload invalid")
-    facts = conn.execute("SELECT * FROM l2_facts WHERE commit_seq=?", (event["seq"],)).fetchall()
-    decisions = conn.execute(
-        "SELECT * FROM l2_decisions WHERE operation_id=?", (event["operation_id"],)
-    ).fetchall()
+    facts = (
+        _rows.many(conn, "commit_facts", event["seq"])
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_facts WHERE commit_seq=?", (event["seq"],)).fetchall()
+    )
+    decisions = (
+        _rows.many(conn, "operation_decisions", event["operation_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_decisions WHERE operation_id=?", (event["operation_id"],)
+        ).fetchall()
+    )
     if len(facts) != 1 or len(decisions) != 1:
         raise LifecycleError("Confirm event inventory lacks its exact fact/decision")
     fact, decision = facts[0], decisions[0]
@@ -597,31 +709,48 @@ def _exact_confirm_inventory(conn, event):
     return fact, decision
 
 
-def audit_record_inventory(conn, record_id):
+def audit_record_inventory(conn, record_id, *, _rows=None):
     """Bounded reverse inventory for one record's commit versions."""
-    events = conn.execute(
-        "SELECT * FROM l2_events WHERE entity_id=? AND kind IN ('confirm','import')", (record_id,)
-    ).fetchall()
+    events = (
+        _rows.many(conn, "entity_events", "confirm", record_id)
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_events WHERE entity_id=? AND kind IN ('confirm','import')",
+            (record_id,),
+        ).fetchall()
+    )
     seen = set()
     for event in events:
         if event["kind"] == "confirm":
-            fact, _ = _exact_confirm_inventory(conn, event)
+            fact, _ = _exact_confirm_inventory(conn, event, _rows=_rows)
         else:
             fact = _exact_import_inventory(conn, event)
         if fact["version"] in seen:
             raise LifecycleError("Duplicate record commit event inventory")
         seen.add(fact["version"])
-    facts = conn.execute("SELECT * FROM l2_facts WHERE record_id=?", (record_id,)).fetchall()
+    facts = (
+        _rows.many(conn, "record_facts", record_id)
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_facts WHERE record_id=?", (record_id,)).fetchall()
+    )
     if {row["version"] for row in facts} != seen:
         raise LifecycleError("Record fact inventory differs from retained commit events")
-    for decision in conn.execute("SELECT * FROM l2_decisions WHERE record_id=?", (record_id,)):
-        matches = conn.execute(
-            "SELECT * FROM l2_events WHERE kind='confirm' AND operation_id=?",
-            (decision["operation_id"],),
-        ).fetchall()
+    for decision in (
+        _rows.many(conn, "record_decisions", record_id)
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_decisions WHERE record_id=?", (record_id,))
+    ):
+        matches = (
+            _rows.many(conn, "operation_events", "confirm", decision["operation_id"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT * FROM l2_events WHERE kind='confirm' AND operation_id=?",
+                (decision["operation_id"],),
+            ).fetchall()
+        )
         if len(matches) != 1:
             raise LifecycleError("Decision inventory lacks its exact confirm event")
-        fact, actual = _exact_confirm_inventory(conn, matches[0])
+        fact, actual = _exact_confirm_inventory(conn, matches[0], _rows=_rows)
         if dict(actual) != dict(decision) or fact["record_id"] != record_id:
             raise LifecycleError("Decision reverse inventory differs")
 
@@ -645,14 +774,18 @@ def _exact_import_inventory(conn, event):
     return facts[0]
 
 
-def audit_owned_inventory(conn):
+def audit_owned_inventory(conn, *, _rows=None):
     """Complete row/event bijection for retained owned state, including dormant rows."""
     counts = {kind: {} for kind in ("capture", "propose", "review", "delivery")}
-    for event in conn.execute("SELECT * FROM l2_events ORDER BY seq"):
+    for event in (
+        _rows.table(conn, "events")
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_events ORDER BY seq")
+    ):
         kind, identity = event["kind"], event["entity_id"]
         payload = json.loads(event["payload_json"])
         if kind == "confirm":
-            _exact_confirm_inventory(conn, event)
+            _exact_confirm_inventory(conn, event, _rows=_rows)
         elif kind == "import":
             _exact_import_inventory(conn, event)
         elif kind == "legacy_archive":
@@ -670,16 +803,24 @@ def audit_owned_inventory(conn):
                 raise LifecycleError("Duplicate owned event inventory")
             counts[kind][identity] = event
             if kind == "capture":
-                row = conn.execute(
-                    "SELECT * FROM l2_sources WHERE source_id=?", (identity,)
-                ).fetchone()
+                row = (
+                    _rows.one(conn, "source", identity)
+                    if _rows is not None
+                    else conn.execute(
+                        "SELECT * FROM l2_sources WHERE source_id=?", (identity,)
+                    ).fetchone()
+                )
                 if row is None or row["source_key"].startswith("legacy:"):
                     raise LifecycleError("Capture event inventory lacks its exact source")
                 _capture_generation(row, event["payload_json"])
             elif kind == "propose":
-                row = conn.execute(
-                    "SELECT * FROM l2_proposals WHERE proposal_id=?", (identity,)
-                ).fetchone()
+                row = (
+                    _rows.one(conn, "proposal", identity)
+                    if _rows is not None
+                    else conn.execute(
+                        "SELECT * FROM l2_proposals WHERE proposal_id=?", (identity,)
+                    ).fetchone()
+                )
                 if row is None:
                     raise LifecycleError("Proposal event inventory lacks owned row")
                 observation = json.loads(row["observation_json"])["observation"]
@@ -694,15 +835,23 @@ def audit_owned_inventory(conn):
                 if payload != expected or digest(payload) != row["proposal_sha256"]:
                     raise LifecycleError("Proposal event inventory differs from owned row")
             elif kind == "review":
-                row = conn.execute(
-                    "SELECT * FROM l2_reviews WHERE review_id=?", (identity,)
-                ).fetchone()
+                row = (
+                    _rows.one(conn, "review", identity)
+                    if _rows is not None
+                    else conn.execute(
+                        "SELECT * FROM l2_reviews WHERE review_id=?", (identity,)
+                    ).fetchone()
+                )
                 if row is None or event["payload_json"] != row["material_json"]:
                     raise LifecycleError("Review event inventory lacks its exact owned row")
             else:
-                row = conn.execute(
-                    "SELECT * FROM l2_deliveries WHERE review_id=?", (identity,)
-                ).fetchone()
+                row = (
+                    _rows.one(conn, "delivery", identity)
+                    if _rows is not None
+                    else conn.execute(
+                        "SELECT * FROM l2_deliveries WHERE review_id=?", (identity,)
+                    ).fetchone()
+                )
                 if (
                     row is None
                     or event["payload_json"] != row["material_json"]
@@ -720,12 +869,18 @@ def audit_owned_inventory(conn):
     ):
         expected = {
             row[key]
-            for row in conn.execute(f"SELECT * FROM {table}")
+            for row in (
+                _rows.table(conn, table.removeprefix("l2_"))
+                if _rows is not None
+                else conn.execute(f"SELECT * FROM {table}")
+            )
             if kind != "capture" or not row["source_key"].startswith("legacy:")
         }
         if expected != set(counts[kind]):
             raise LifecycleError("Owned row inventory lacks its exact " + kind + " event")
-    for record in conn.execute(
-        "SELECT record_id FROM l2_facts UNION SELECT record_id FROM l2_decisions"
+    for record in (
+        tuple((identity,) for identity in _rows.vector(conn, "owned_records"))
+        if _rows is not None
+        else conn.execute("SELECT record_id FROM l2_facts UNION SELECT record_id FROM l2_decisions")
     ):
-        audit_record_inventory(conn, record[0])
+        audit_record_inventory(conn, record[0], _rows=_rows)
