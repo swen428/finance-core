@@ -26,6 +26,7 @@ from ..contracts import (
 )
 from ..reader import SnapshotEvidenceVerifier
 from ..service import LedgerService, _event, _fact_material, _id, _row
+from ._prefix_v1 import validate_eligibility, validate_order
 from .contracts import (
     BUNDLE_FORMAT,
     COMMANDS,
@@ -266,6 +267,7 @@ def verify_proposal(service, conn, proposal):
         proposal_version=proposal["version"],
         proposal_seq=events[0]["seq"],
     )
+    _require_prefix(conn, expected, proposal, "proposal")
     if (
         expected.source_id != proposal["source_id"]
         or expected.record_id != proposal["record_id"]
@@ -341,6 +343,7 @@ def verify_review(service, conn, review):
     events = conn.execute(
         "SELECT * FROM l2_events WHERE kind='review' AND entity_id=?", (review["review_id"],)
     ).fetchall()
+    _require_prefix(conn, expected, proposal, "review", review_id=review["review_id"])
     values = validate_bundle(strict_json(proposal["values_json"]))
     expected_closure = (
         closure(
@@ -391,6 +394,7 @@ def verify_review(service, conn, review):
         "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
     ).fetchone()
     if delivery:
+        _require_prefix(conn, expected, proposal, "delivery", review_id=review["review_id"])
         actual = service.port.delivery(
             conn,
             delivery["evidence_id"],
@@ -420,6 +424,16 @@ def verify_fact(service, conn, fact):
     ).fetchone()
     if review is None:
         raise LifecycleError("Daily fact lacks review")
+    proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
+    _require_prefix(
+        conn,
+        expected,
+        proposal,
+        "confirm",
+        review_id=review["review_id"],
+        commit_seq=fact["commit_seq"],
+    )
     material = strict_json(review["material_json"])
     if needs_closure(values) and material["opening_dependency_closure"] != closure(
         conn,
@@ -513,23 +527,76 @@ def _audit(service, conn):
     return result
 
 
-def _require_current(conn, expected, *, proposal=None):
+def _state_at(conn, expected, before_seq=None):
     current = conn.execute(
-        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-        (expected.record_id,),
+        "SELECT * FROM l2_facts WHERE record_id=? AND (? IS NULL OR commit_seq<?) "
+        "ORDER BY version DESC LIMIT 1",
+        (expected.record_id, before_seq, before_seq),
     ).fetchone()
     ref = asdict(bundle_ref(current)) if current else None
-    if ref != expected.target_bundle_ref:
-        raise LifecycleError("stale_bundle_ref")
     latest = conn.execute(
-        "SELECT * FROM l2_proposals WHERE source_id=? ORDER BY version DESC LIMIT 1",
-        (expected.source_id,),
+        "SELECT p.proposal_id,p.version FROM l2_proposals p JOIN l2_events e "
+        "ON e.kind='propose' AND e.entity_id=p.proposal_id "
+        "WHERE p.source_id=? AND (? IS NULL OR e.seq<?) ORDER BY p.version DESC LIMIT 1",
+        (expected.source_id, before_seq, before_seq),
     ).fetchone()
-    if proposal is not None:
-        if latest is None or latest["proposal_id"] != proposal["proposal_id"]:
-            raise LifecycleError("stale_proposal")
-    elif (latest["proposal_id"] if latest else None) != expected.current_proposal_id:
-        raise LifecycleError("Proposal context changed during evidence callbacks")
+    return ref, (latest["proposal_id"], latest["version"]) if latest else None
+
+
+def _require_current(conn, expected, *, proposal=None):
+    target, latest = _state_at(conn, expected)
+    required = (
+        (proposal["proposal_id"], proposal["version"])
+        if proposal is not None
+        else (expected.current_proposal_id, expected.expected_proposal_version)
+        if expected.current_proposal_id is not None
+        else None
+    )
+    validate_eligibility(target, expected.target_bundle_ref, latest, required)
+
+
+def _event_seq(conn, kind, identity):
+    if kind not in {"capture", "propose", "review", "delivery"}:
+        raise LifecycleError("Unsupported daily prefix event")
+    rows = conn.execute(
+        "SELECT seq FROM l2_events WHERE kind=? AND entity_id=?", (kind, identity)
+    ).fetchall()
+    if len(rows) != 1:
+        raise LifecycleError("Daily prefix requires one exact event")
+    return rows[0][0]
+
+
+def _require_prefix(conn, expected, proposal, stage, *, review_id=None, commit_seq=None):
+    sequences = (
+        _event_seq(conn, "capture", expected.source_id),
+        _event_seq(conn, "propose", proposal["proposal_id"]),
+    )
+    if stage in {"review", "delivery", "confirm"}:
+        sequences += (_event_seq(conn, "review", review_id),)
+    if stage in {"delivery", "confirm"}:
+        sequences += (_event_seq(conn, "delivery", review_id),)
+    if stage == "confirm":
+        sequences += (commit_seq,)
+    validate_order(stage, sequences)
+    target, latest = _state_at(conn, expected, sequences[-1])
+    required = (
+        (
+            (expected.current_proposal_id, expected.expected_proposal_version)
+            if expected.current_proposal_id is not None
+            else None
+        )
+        if stage == "proposal"
+        else (proposal["proposal_id"], proposal["version"])
+    )
+    validate_eligibility(target, expected.target_bundle_ref, latest, required)
+
+
+def _require_current_authority(service, conn, expected):
+    if expected.binding != service.binding:
+        raise LifecycleError("stale_proposal_binding")
+    service._source(
+        conn, expected.source_id, allow_archived=expected.command_kind != "account_create"
+    )
 
 
 def _tail(conn):
@@ -945,6 +1012,7 @@ class DailyAccountServiceV1:
                 verify_review(service, conn, existing)
                 result = _review_dto(conn, existing)
             else:
+                _require_current_authority(service, conn, expected)
                 _require_current(conn, expected, proposal=proposal)
                 review_id = _id("daily-review")
                 now = service._now()
@@ -1000,12 +1068,14 @@ class DailyAccountServiceV1:
         with self._write() as (service, conn):
             _audit(service, conn)
             row = _row(conn, "l2_reviews", "review_id", review_id)
-            expected, _ = verify_review(service, conn, row)
+            expected, retained_delivery = verify_review(service, conn, row)
+            if retained_delivery is None:
+                _require_current_authority(service, conn, expected)
             fingerprint = _fingerprint(conn)
             actual = service.port.delivery(
                 conn,
                 delivery_evidence_id,
-                ExpectedDisplay(service.binding, review_id, row["review_sha256"]),
+                ExpectedDisplay(expected.binding, review_id, row["review_sha256"]),
             )
             service._actor(actual)
             if (
@@ -1037,6 +1107,9 @@ class DailyAccountServiceV1:
         return result
 
     def confirm(self, review_id, action_evidence_id, operation_id):
+        text(review_id, "review id")
+        text(action_evidence_id, "action evidence id")
+        text(operation_id, "operation id")
         from .._finalization_journal_v1 import _assert_unreserved
         from .._finalization_plan_v1 import _append_finalization, _FinalizationPlanV1
 
@@ -1045,7 +1118,6 @@ class DailyAccountServiceV1:
             result = _existing_receipt(service, conn, review_id, action_evidence_id, operation_id)
             if result is None:
                 _assert_unreserved(conn, review_id, action_evidence_id, operation_id)
-                text(operation_id, "operation id")
                 row = _row(conn, "l2_reviews", "review_id", review_id)
                 expected, delivery = verify_review(service, conn, row)
                 material = strict_json(row["material_json"])
@@ -1151,6 +1223,9 @@ class DailyAccountServiceV1:
         return result
 
     def lookup_commit_receipt(self, operation_id, *, review_id, action_evidence_id):
+        text(review_id, "review id")
+        text(action_evidence_id, "action evidence id")
+        text(operation_id, "operation id")
         with self._read() as (service, conn):
             _audit(service, conn)
             return _existing_receipt(service, conn, review_id, action_evidence_id, operation_id)

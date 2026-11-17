@@ -165,6 +165,9 @@ after subsequent legitimate changes. They do not add another decision or
 financial effect. A different operation cannot borrow the original review or
 human action. An uncertain outcome retains its original operation identity and
 must be resolved through read-only outcome lookup.
+Operation, review and action identifiers are validated before outcome lookup,
+including retries and absent outcomes. Non-string identifiers cannot borrow a
+stored string identity through database conversion.
 
 ## Amount and time meaning
 
@@ -233,6 +236,13 @@ permitted changes, permanent opening closure and original confirmation-prefix
 dependencies. Both source and independently opened snapshot copies perform the
 registered semantic audit. The existing SnapshotCut binds bundle watermarks,
 all history and the complete logical database digest.
+
+Current review and delivery creation require the exact currently eligible
+proposal and runtime binding before appending anything. Historical audit checks
+the same eligibility rules at each original event point, including causal
+source/proposal/review/delivery/confirmation order and the latest applicable
+proposal and target at that point. Later legitimate changes do not invalidate
+an earlier valid decision or its original receipt.
 
 | Existing entry point | Behavior with daily data |
 | --- | --- |

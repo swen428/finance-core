@@ -623,3 +623,198 @@ def test_unknown_opening_is_set_later_and_duplicate_names_never_merge(live):
 
     with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
         reader.get_account(first.account_ref.account_id, limits=DailyReadLimitsV1(max_records=1))
+
+
+def inventory(ledger):
+    with lifecycle_read_operation(ledger.owner) as conn:
+        return tuple(
+            conn.execute(
+                "SELECT (SELECT count(*) FROM l2_events),(SELECT count(*) FROM l2_reviews),"
+                "(SELECT count(*) FROM l2_deliveries),(SELECT count(*) FROM l2_facts),"
+                "(SELECT count(*) FROM l2_decisions)"
+            ).fetchone()
+        )
+
+
+@pytest.mark.parametrize("kind", ["account_create", "account_rename"])
+def test_current_review_binding_mismatch_refuses_without_append(live, kind):
+    from dataclasses import replace
+
+    ledger, port, daily, reader, _ = setup(live)
+    if kind == "account_create":
+        source = ledger.capture("source1", "capture1")
+        port.commands["obs"] = command()
+        proposal = daily.propose_account_create(source.source_id, "obs", 0, "propose")
+    else:
+        _, _, _, first = create(ledger, port, daily)
+        view = reader.get_account(first.account_ref.account_id)
+        port.add_source("rename", "Rename account")
+        port.commands["rename"] = command("account_rename", {"name": "Other"})
+        proposal = daily.propose_account_change(
+            view.account_id,
+            "rename",
+            view.bundle_ref,
+            "rename-propose",
+            reply_evidence_id="rename",
+            command_kind="account_rename",
+        )
+    original = ledger.binding
+    before = inventory(ledger)
+    ledger.binding = replace(original, generation="gen2")
+    with pytest.raises(LifecycleError, match="binding"):
+        daily.prepare_review(proposal.proposal_id, proposal.version)
+    assert inventory(ledger) == before
+    assert daily.pending()
+    ledger.binding = original
+    review = daily.prepare_review(proposal.proposal_id, proposal.version)
+    assert review.material["binding"]["generation"] == original.generation
+    ledger.reader().full_audit()
+
+
+def test_current_delivery_binding_mismatch_refuses_without_append(live):
+    from dataclasses import replace
+
+    ledger, port, daily, _, _ = setup(live)
+    source = ledger.capture("source1", "capture1")
+    port.commands["obs"] = command()
+    proposal = daily.propose_account_create(source.source_id, "obs", 0, "propose")
+    card = daily.prepare_review(proposal.proposal_id, proposal.version)
+    before = inventory(ledger)
+    original = ledger.binding
+    ledger.binding = replace(original, generation="gen2")
+    with pytest.raises(LifecycleError, match="binding"):
+        daily.record_delivery(card.review_id, "delivery")
+    assert inventory(ledger) == before
+    assert daily.prepare_review(proposal.proposal_id, proposal.version) == card
+    ledger.binding = original
+    daily.record_delivery(card.review_id, "delivery")
+    ledger.reader().full_audit()
+
+
+def test_receipt_identifiers_are_checked_before_any_outcome_lookup(live):
+    ledger, port, daily, _, _ = setup(live)
+    source = ledger.capture("source1", "capture1")
+    port.commands["obs"] = command()
+    proposal = daily.propose_account_create(source.source_id, "obs", 0, "propose")
+    card = daily.prepare_review(proposal.proposal_id, proposal.version)
+    daily.record_delivery(card.review_id, "delivery")
+    receipt = daily.confirm(card.review_id, "action", "1")
+    before = inventory(ledger)
+    for bad in (1, True, None, b"1", [], "", " 1", "1 ", "x" * 257):
+        for operation in (
+            lambda: daily.lookup_commit_receipt(
+                bad, review_id=card.review_id, action_evidence_id="action"
+            ),
+            lambda: daily.confirm(card.review_id, "action", bad),
+            lambda: daily.lookup_commit_receipt(
+                "absent", review_id=bad, action_evidence_id="action"
+            ),
+            lambda: daily.lookup_commit_receipt(
+                "absent", review_id=card.review_id, action_evidence_id=bad
+            ),
+            lambda: daily.confirm(bad, "action", "absent"),
+            lambda: daily.confirm(card.review_id, bad, "absent"),
+        ):
+            with pytest.raises(LifecycleError, match="id"):
+                operation()
+    assert (
+        daily.lookup_commit_receipt("1", review_id=card.review_id, action_evidence_id="action")
+        == receipt
+    )
+    assert daily.confirm(card.review_id, "action", "1") == receipt
+    assert (
+        daily.lookup_commit_receipt("absent", review_id=card.review_id, action_evidence_id="action")
+        is None
+    )
+    assert inventory(ledger) == before
+
+
+def test_original_prefix_remains_valid_after_later_proposals_and_generation(live, tmp_path):
+    from dataclasses import replace
+
+    ledger, port, daily, reader, _ = setup(live)
+    _, _, original_card, first = create(ledger, port, daily)
+    account = first.account_ref.account_id
+    original_binding = ledger.binding
+    ledger.binding = replace(original_binding, generation="gen2")
+    second = change(
+        port, daily, reader.get_account(account), "account_rename", {"name": "Current"}, "rename"
+    )
+    assert second.receipt.version == 2
+    # A later ordinary pending proposal/card must not redefine earlier prefixes.
+    view = reader.get_account(account)
+    raw = "Correct opening; reason: corrected statement"
+    port.add_source("pending", raw)
+    reason = [raw.index("corrected statement"), len(raw)]
+    port.commands["pending"] = command(
+        "opening_correct", {"amount": "18.00", "as_of": unknown_time()}, reason
+    )
+    proposal = daily.propose_account_change(
+        account,
+        "pending",
+        view.bundle_ref,
+        "pending-propose",
+        reply_evidence_id="pending",
+        command_kind="opening_correct",
+    )
+    pending_card = daily.prepare_review(proposal.proposal_id, proposal.version)
+    daily.record_delivery(pending_card.review_id, "pending-delivery")
+    assert reader.get_account(account).bundle_ref.version == 2
+    assert len(daily.pending()) == 1
+    assert ledger.reader().full_audit()["fact_version_count"] == 2
+    # Exact outcome recovery keeps its original binding contract. Historical
+    # account reads above remain available in the newer admitted generation.
+    ledger.binding = original_binding
+    assert (
+        daily.lookup_commit_receipt(
+            "confirm1", review_id=original_card.review_id, action_evidence_id="action1"
+        )
+        == first
+    )
+    assert daily.confirm(original_card.review_id, "action1", "confirm1") == first
+    assert (
+        daily.record_delivery(original_card.review_id, "delivery1").material
+        == original_card.material
+    )
+    assert ledger.reader().full_audit()["fact_version_count"] == 2
+    # Inspect supported state read-only, using the audit's eligibility check.
+    from finance_core.lifecycle_v2.daily_v1._prefix_v1 import validate_eligibility
+    from finance_core.lifecycle_v2.daily_v1.accounts import _event_seq, _state_at
+    from finance_core.lifecycle_v2.daily_v1.contracts import decode_expected
+
+    with lifecycle_read_operation(ledger.owner) as conn:
+        conn.execute("BEGIN")
+        old_proposal = conn.execute(
+            "SELECT * FROM l2_proposals WHERE proposal_id=?", (original_card.proposal_id,)
+        ).fetchone()
+        old_expected = decode_expected(json.loads(old_proposal["observation_json"])["expected"])
+        original_context = _state_at(conn, old_expected, first.receipt.commit_seq)
+        original_proposal = (old_proposal["proposal_id"], old_proposal["version"])
+        assert original_context == (None, original_proposal)
+        validate_eligibility(
+            original_context[0],
+            old_expected.target_bundle_ref,
+            original_context[1],
+            original_proposal,
+        )
+        latest_row = conn.execute(
+            "SELECT * FROM l2_proposals WHERE proposal_id=?", (proposal.proposal_id,)
+        ).fetchone()
+        latest_expected = decode_expected(json.loads(latest_row["observation_json"])["expected"])
+        delivery_seq = _event_seq(conn, "delivery", pending_card.review_id)
+        latest_context = _state_at(conn, latest_expected, delivery_seq)
+        latest_proposal = (proposal.proposal_id, proposal.version)
+        validate_eligibility(
+            latest_context[0], latest_expected.target_bundle_ref, latest_context[1], latest_proposal
+        )
+        with pytest.raises(LifecycleError, match="stale_proposal"):
+            validate_eligibility(
+                latest_context[0],
+                latest_expected.target_bundle_ref,
+                latest_context[1],
+                original_proposal,
+            )
+        assert _state_at(conn, latest_expected) == latest_context
+        conn.rollback()
+    cut = ledger.seal_snapshot(tmp_path / "later-proposal.sqlite3")
+    assert cut.facts[0][1] == 2

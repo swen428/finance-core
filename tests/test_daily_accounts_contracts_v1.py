@@ -319,3 +319,55 @@ def test_valid_instant_and_negative_zero_have_exact_explicit_meaning():
     )
     assert bundle["opening"]["amount"] == "0.00"
     assert bundle["opening"]["as_of"]["timestamp"] == timestamp
+
+
+def prefix_api():
+    return importlib.import_module("finance_core.lifecycle_v2.daily_v1._prefix_v1")
+
+
+@pytest.mark.parametrize(
+    ("stage", "sequences"),
+    [
+        ("proposal", (1, 2)),
+        ("review", (1, 2, 4)),
+        ("delivery", (1, 2, 4, 7)),
+        ("confirm", (1, 2, 4, 7, 9)),
+    ],
+)
+def test_prefix_context_accepts_each_complete_phase(stage, sequences):
+    prefix_api().validate_order(stage, sequences)
+
+
+@pytest.mark.parametrize(
+    ("stage", "sequences"),
+    [
+        ("proposal", (2, 1)),
+        ("proposal", (1, 1)),
+        ("proposal", (True, 2)),
+        ("review", (1, 4, 2)),
+        ("delivery", (1, 2, 7, 4)),
+        ("confirm", (1, 2, 4, 9, 7)),
+        ("confirm", (1, 2, 7, 4, 9)),
+        ("confirm", (1, 2, 4, 7)),
+        ("review", (0, 2, 3)),
+        ("unknown", (1, 2)),
+        ("proposal", [1, 2]),
+    ],
+)
+def test_prefix_context_refuses_incomplete_or_unordered_phase_values(stage, sequences):
+    with pytest.raises(LifecycleError, match="prefix order"):
+        prefix_api().validate_order(stage, sequences)
+
+
+def test_prefix_context_requires_exact_target_and_proposal_at_that_point():
+    c = prefix_api()
+    target = {"record_id": "account-1", "version": 1, "fact_sha256": "a" * 64, "commit_seq": 4}
+    proposal = ("proposal-2", 2)
+    c.validate_eligibility(target, target.copy(), proposal, proposal)
+    c.validate_eligibility(None, None, None, None)
+    for current in (None, {**target, "version": 2}, {**target, "fact_sha256": "b" * 64}):
+        with pytest.raises(LifecycleError, match="stale_bundle_ref"):
+            c.validate_eligibility(current, target, proposal, proposal)
+    for current in (None, ("proposal-1", 1), ("proposal-3", 3), ("proposal-2", 3)):
+        with pytest.raises(LifecycleError, match="stale_proposal"):
+            c.validate_eligibility(target, target, current, proposal)
