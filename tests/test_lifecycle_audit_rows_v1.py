@@ -24,11 +24,15 @@ from finance_core.lifecycle_v2.contracts import canonical
 from finance_core.lifecycle_v2.daily_v1._prefix_v1 import validate_order
 from finance_core.lifecycle_v2.daily_v1.accounts import (
     _EvidenceReadPort,
+    _require_prefix,
     _state_at,
+    closure,
     registered_values,
+    verify_fact,
 )
 from finance_core.lifecycle_v2.daily_v1.contracts import decode_expected
 from finance_core.lifecycle_v2.reader import _audit_evidence_connection, audit_evidence_connection
+from tests.daily_account_support_v1 import unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import change, create, setup
 from tests.test_lifecycle_v2 import live as live
 
@@ -147,18 +151,66 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
     _, _, review, first = create(ledger, port, daily)
     view = reader.get_account(first.account_ref.account_id)
     change(port, daily, view, "account_rename", {"name": "Renamed"}, "rename")
+    for kind, fields, identity, reason in (
+        ("opening_correct", {"amount": "-300", "as_of": unknown_time()}, "correct", "wrong amount"),
+        ("opening_void", {}, "void", "wrong opening"),
+        ("opening_set", {"amount": "0", "as_of": unknown_time()}, "new-opening", None),
+    ):
+        view = reader.get_account(first.account_ref.account_id)
+        change(port, daily, view, kind, fields, identity, reason)
     observer = TracePort(port)
     protected = _EvidenceReadPort(observer)
+    fact_calls, confirm_prefixes, fact_closures, prior_opening_versions = [], [], [], []
+
+    def observe(frame, event, arg):
+        if frame.f_code is verify_fact.__code__:
+            if event == "call":
+                actual_rows = frame.f_locals["_rows"]
+                actual_conn = frame.f_locals["conn"]
+                fact = frame.f_locals["fact"]
+                if actual_rows is not None:
+                    assert actual_rows._active and actual_rows._conn is actual_conn
+                fact_calls.append((actual_rows, actual_conn, fact["version"]))
+            elif event == "return" and "old" in frame.f_locals:
+                prior_opening_versions.append(frame.f_locals["fact"]["version"])
+        elif event == "call" and frame.f_back.f_code is verify_fact.__code__:
+            if frame.f_code is _require_prefix.__code__:
+                confirm_prefixes.append((frame.f_locals["stage"], frame.f_locals["_rows"]))
+            elif frame.f_code is closure.__code__:
+                fact_closures.append(frame.f_locals["_rows"])
+
+    def observed(call):
+        for observations in (fact_calls, confirm_prefixes, fact_closures, prior_opening_versions):
+            observations.clear()
+        previous_profile = sys.getprofile()
+        sys.setprofile(observe)
+        try:
+            return call()
+        finally:
+            sys.setprofile(previous_profile)
+
+    def assert_fact_scope(expected_rows, expected_conn):
+        assert len(fact_calls) == 5
+        assert all(rows is expected_rows and conn is expected_conn for rows, conn, _ in fact_calls)
+        assert [version for _, _, version in fact_calls] == [1, 2, 3, 4, 5]
+        assert confirm_prefixes == [("confirm", expected_rows)] * 5
+        assert len(fact_closures) == 4 and all(rows is expected_rows for rows in fact_closures)
+        assert prior_opening_versions == [5]
+
     with lifecycle_read_operation(ledger.owner) as conn:
         conn.execute("BEGIN")
         try:
             before = _logical_database_digest(conn), conn.total_changes
-            sql = _audit_evidence_connection(conn, protected, ledger.binding)
+            sql = observed(lambda: _audit_evidence_connection(conn, protected, ledger.binding))
+            assert_fact_scope(None, conn)
             sql_trace = tuple(observer.trace)
             observer.trace.clear()
             with audit_rows(conn, protected) as rows:
                 assert rows is not None
-                indexed = _audit_evidence_connection(conn, protected, ledger.binding, _rows=rows)
+                indexed = observed(
+                    lambda: _audit_evidence_connection(conn, protected, ledger.binding, _rows=rows)
+                )
+                assert_fact_scope(rows, conn)
                 assert tuple(observer.trace) == sql_trace
                 for proposal in rows.table(conn, "proposals"):
                     expected = decode_expected(json.loads(proposal["observation_json"])["expected"])
@@ -174,8 +226,16 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
                 rows.table(conn, "facts")
             assert (_logical_database_digest(conn), conn.total_changes) == before
             observer.trace.clear()
-            assert audit_evidence_connection(conn, protected, ledger.binding) == sql
+            assert (
+                observed(lambda: audit_evidence_connection(conn, protected, ledger.binding)) == sql
+            )
+            public_rows = fact_calls[0][0]
+            assert public_rows is not None and public_rows is not rows
+            assert_fact_scope(public_rows, conn)
+            with pytest.raises(LifecycleError, match="Expired"):
+                public_rows.table(conn, "facts")
             assert tuple(observer.trace) == sql_trace
+            assert (_logical_database_digest(conn), conn.total_changes) == before
             assert len({id(token) for token in observer.tokens}) == len(observer.tokens)
             for cursor in observer.cursors:
                 with pytest.raises(InstanceAdmissionError, match="Expired"):

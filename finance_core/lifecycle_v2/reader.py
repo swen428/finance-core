@@ -465,7 +465,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if values.get("format") == "finance-daily-account-bundle-v1":
             from .daily_v1.accounts import verify_fact
 
-            verify_fact(service, conn, fact)
+            verify_fact(service, conn, fact, _rows=_rows)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous
