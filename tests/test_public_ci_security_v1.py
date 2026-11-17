@@ -35,6 +35,22 @@ PREPARED_ENVELOPE_SCOPE_PATHS = (
     "tests/lifecycle_recovery_material_support_v1.py",
     "tests/instance_admission_support_v1.py",
 )
+DAILY_ACCOUNTS_SCOPE_PATHS = (
+    "finance_core/lifecycle_v2/daily_v1/__init__.py",
+    "finance_core/lifecycle_v2/daily_v1/accounts.py",
+    "finance_core/lifecycle_v2/daily_v1/contracts.py",
+    "finance_core/lifecycle_v2/daily_v1/reader.py",
+    "finance_core/lifecycle_v2/daily_v1/nested/future_account.py",
+    "tests/test_finance_core_package_v1.py",
+    "tests/test_daily_accounts_contracts_v1.py",
+    "tests/test_daily_accounts_lifecycle_v1.py",
+    "tests/daily_account_support_v1.py",
+    "tests/installed_daily_accounts_probe_v1.py",
+)
+INSTANCE_ADMISSION_CALLBACK_SCOPE_PATHS = (
+    "finance_core/instance_admission/sessions.py",
+    "tests/test_daily_evidence_callback_scope_v1.py",
+)
 
 
 def test_public_workflow_has_read_only_top_level_permissions() -> None:
@@ -232,6 +248,7 @@ def _inline_namespace(step: str, label: str) -> dict[str, Any]:
         ("pull_request", "pyproject.toml", "true"),
         ("pull_request", ".github/workflows/validate.yml", "true"),
         *(("pull_request", path, "true") for path in PREPARED_ENVELOPE_SCOPE_PATHS),
+        *(("pull_request", path, "true") for path in INSTANCE_ADMISSION_CALLBACK_SCOPE_PATHS),
     ],
 )
 def test_actual_scope_script_produces_release_compatible_evidence(
@@ -345,6 +362,8 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
         "scripts/linux_ocr_assets_v1.json",
         "scripts/prepare_linux_ocr.py",
         *PREPARED_ENVELOPE_SCOPE_PATHS,
+        *DAILY_ACCOUNTS_SCOPE_PATHS,
+        *INSTANCE_ADMISSION_CALLBACK_SCOPE_PATHS,
         "README.md",
     ],
 )

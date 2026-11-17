@@ -12,6 +12,10 @@ defines an explicit opt-in current-fact collection, history, export, separate
 currency summaries and version-bound read-only reconciliation candidates. It
 preserves this lifecycle's financial, evidence and runtime boundaries.
 
+The separate [daily account and opening contract](daily_accounts_v1.md) adds
+explicit typed account bundles. Its registered audit support does not widen
+the old expense readers or prepared/native recovery formats.
+
 The root `finance_core.API_CONTRACT_VERSION` remains `finance-core-api-v1` because
 its existing exports and behavior are unchanged. `finance_core.lifecycle_v2` is a
 separately named, opt-in additive API; consumers must explicitly import it and
