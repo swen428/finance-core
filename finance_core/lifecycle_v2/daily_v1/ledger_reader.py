@@ -10,7 +10,7 @@ from finance_core.instance_admission.sessions import (
 )
 from finance_core.money import canonical_money_str
 
-from ..contracts import LifecycleError, digest
+from ..contracts import LifecycleError, VerifiedSource, digest
 from ._impacts_v1 import effect, require_effect_baseline
 from .accounts import _audit, _BoundService, bundle_ref
 from .contracts import BUNDLE_FORMAT, BundleFactRefV1, strict_json
@@ -210,6 +210,27 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         return tuple(self._ledger(limits)[1].get(record_id, ()))
 
     def source(self, source_id):
-        # Existing source access verifies the complete source identity.
-        self.collect()
-        return self._service.reader().source(source_id)
+        base = self._service
+        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
+            _require_runtime_scope(conn, base.binding, base.runtime_admission)
+            service = _BoundService(base)
+            conn.execute("BEGIN")
+            try:
+                _audit(service, conn)
+                row = service._source(conn, source_id, allow_archived=True)
+                evidence = VerifiedSource(
+                    row["evidence_id"],
+                    row["principal_id"],
+                    row["client_id"],
+                    row["source_key"],
+                    row["raw_input"],
+                    row["original_sha256"],
+                    row["created_at"],
+                )
+                if digest(asdict(evidence)) != row["source_sha256"]:
+                    raise LifecycleError(
+                        "Authenticated daily source DTO differs from retained source"
+                    )
+                return evidence
+            finally:
+                conn.rollback()

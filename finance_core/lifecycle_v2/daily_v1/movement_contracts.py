@@ -382,17 +382,14 @@ def _coverage(command, expected, values, account):
             raise LifecycleError("Unsupported opening coverage answer")
     answer = supplied["answer"] if supplied else "unknown"
     link = decode_instruction_link(expected.instruction_link)
-    bare = expected.instruction["raw_input"].strip().casefold() in {
-        "included",
-        "already included",
-        "已包含",
-        "已经包含",
-        "excluded",
-        "not included",
-        "尚未包含",
-        "未包含",
+    accepted = {
+        "included": {"included", "already included", "已包含", "已经包含"},
+        "excluded": {"excluded", "not included", "尚未包含", "未包含"},
     }
-    if bare and link["mode"] != "question_reply":
+    choices = {phrase: choice for choice, phrases in accepted.items() for phrase in phrases}
+    raw = expected.instruction["raw_input"]
+    whole_choice = choices.get(raw.strip().casefold())
+    if whole_choice is not None and link["mode"] != "question_reply":
         raise LifecycleError("Bare opening coverage reply requires actual linked question")
     if link["mode"] == "question_reply" and link["question"]["subject"] != coverage_subject(
         values, account
@@ -401,12 +398,24 @@ def _coverage(command, expected, values, account):
     reason = None
     if supplied and answer != "unknown":
         reason = _reason(supplied["span"], expected, True)
-        accepted = {
-            "included": {"included", "already included", "已包含", "已经包含"},
-            "excluded": {"excluded", "not included", "尚未包含", "未包含"},
-        }
-        if reason["quote"].casefold() not in accepted[answer]:
-            raise LifecycleError("Coverage answer must match genuine exact reply selection")
+        quote = reason["quote"].casefold()
+        if quote not in accepted[answer] or (whole_choice is not None and whole_choice != answer):
+            raise LifecycleError("Coverage answer must match the complete genuine choice")
+        start, end = supplied["span"]
+        if quote.isascii() and (
+            (start and (raw[start - 1].isalnum() or raw[start - 1] == "_"))
+            or (end < len(raw) and (raw[end].isalnum() or raw[end] == "_"))
+        ):
+            raise LifecycleError("Coverage selection must retain complete choice words")
+        # A fixed, bounded negator/choice rule rejects omitted negation. It
+        # does not infer answers from arbitrary natural-language sentences.
+        import re
+
+        for phrase in choices:
+            pattern = r"(?<!\w)not\s+" + re.escape(phrase) + r"(?!\w)"
+            for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
+                if match.start() < start and end <= match.end():
+                    raise LifecycleError("Coverage selection cannot discard a negative prefix")
     if not active:
         treatment, basis = "no_baseline", "no_active_opening"
     elif _later(values["funds_time"], opening["as_of"]):

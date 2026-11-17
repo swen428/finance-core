@@ -129,6 +129,36 @@ def main():
                 "source1", "Create my MYR credit card account; opening not yet specified"
             )
             source = ledger.capture("source1", "capture1")
+            source_reader = DailyLedgerReaderV1(ledger)
+            assert source_reader.source(source.source_id) == port.sources["source1"]
+            actual_source_callback = port.source
+            for control in ("commit", "rollback", "close"):
+                source_calls = []
+
+                def guarded_source(conn, identity):
+                    source_calls.append((id(conn), conn.in_transaction))
+                    if len(source_calls) == 2:
+                        try:
+                            getattr(conn, control)()
+                        except (InstanceAdmissionError, sqlite3.DatabaseError):
+                            pass
+                    return actual_source_callback(conn, identity)
+
+                port.source = guarded_source
+                try:
+                    source_reader.source(source.source_id)
+                except InstanceAdmissionError as exc:
+                    assert "read-only scope" in str(exc)
+                else:
+                    raise AssertionError(
+                        "Daily source callback controlled its transaction/connection"
+                    )
+                finally:
+                    port.source = actual_source_callback
+                assert len(source_calls) == 2
+                assert len({identity for identity, _ in source_calls}) == 1
+                assert all(in_transaction for _, in_transaction in source_calls)
+            assert source_reader.source(source.source_id) == port.sources["source1"]
             port.commands["draft"] = command(fields={"name": "Daily Card", "currency": "MYR"})
             draft = daily.propose_account_create(source.source_id, "draft", 0, "draft-propose")
             assert daily.pending()[0]["values"]["missing_fields"] == ["account_type", "opening"]
@@ -353,12 +383,30 @@ def main():
             question = port.register_opening_question(
                 binding, captured.source_id, "installed-opening-question", subject
             )
-            port.add_source("question-answer", "included")
+            port.add_source("question-answer", "not included")
             port.register_opening_reply(question, "question-answer")
+            port.commands["question-wrong-positive"] = {
+                "format": "finance-daily-movement-command-v1",
+                "command_kind": "movement_create",
+                "fields": {**question_fields, "coverage": {"answer": "included", "span": [4, 12]}},
+                "reason_span": None,
+            }
+            try:
+                movements.propose_movement_create(
+                    captured.source_id,
+                    "question-wrong-positive",
+                    1,
+                    "propose-question-wrong-positive",
+                    reply_evidence_id="question-answer",
+                )
+            except LifecycleError as exc:
+                assert "complete genuine choice" in str(exc)
+            else:
+                raise AssertionError("Negative actual answer was compiled as included")
             port.commands["question-complete"] = {
                 "format": "finance-daily-movement-command-v1",
                 "command_kind": "movement_create",
-                "fields": {**question_fields, "coverage": {"answer": "included", "span": [0, 8]}},
+                "fields": {**question_fields, "coverage": {"answer": "excluded", "span": [0, 12]}},
                 "reason_span": None,
             }
             proposal = movements.propose_movement_create(
@@ -374,7 +422,7 @@ def main():
             movements.confirm(
                 question_card.review_id, "independent-question-confirm", "confirm-question-expense"
             )
-            assert unified.collect().balances[0].balance_amount == "200.00"
+            assert unified.collect().balances[0].balance_amount == "191.00"
             cut = ledger.seal_snapshot(scratch / "snapshot.sqlite")
             state = {
                 key: {k: asdict(v) for k, v in getattr(port, key).items()}
@@ -437,6 +485,8 @@ def main():
                         "fact_versions": 9,
                         "proposal_count": 11,
                         "independent_instruction_question_link": True,
+                        "negative_coverage_preserved": True,
+                        "daily_source_guarded": True,
                         "movement_balance_correction_void": True,
                         "incomplete_preserved": True,
                         "single_confirm_bundle": True,
@@ -456,7 +506,7 @@ def main():
         else:
             result = reader.collect_accounts()
             assert len(result.accounts) == 1
-            assert DailyLedgerReaderV1(ledger).collect().balances[0].balance_amount == "200.00"
+            assert DailyLedgerReaderV1(ledger).collect().balances[0].balance_amount == "191.00"
             audit = ledger.reader().full_audit()
             from finance_core.instance_admission.authority import _logical_database_digest
             from finance_core.lifecycle_v2.reader import audit_evidence_connection

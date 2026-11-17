@@ -45,7 +45,11 @@ strictly later than its boundary automatically establishes excluded. Earlier,
 equal, same-day ambiguous or unknown time needs genuine exact included/excluded
 reply selection. Accepted quoted selections are `included`, `already included`,
 `已包含`, `已经包含`, `excluded`, `not included`, `尚未包含`, `未包含`.
-Unknown remains pending. Each decision binds account/opening versions, money,
+Unknown remains pending. A recognized whole bare choice must agree with its
+answer enum. A selected supported choice must retain complete word boundaries;
+trimming a fixed `not` prefix from a supported choice is refused, including
+inside longer text. This bounded check does not infer arbitrary natural-language
+answers. Each decision binds account/opening versions, money,
 business date, funds time and instruction evidence. Corrections revalidate
 these fields using the new actual reply. Changing description/category still
 requires a new complete card and independent confirmation.
@@ -126,3 +130,9 @@ Application integration still owns durable transport/question/provider journal w
 real service validation. This Core link contract and synthetic port do not
 establish Telegram reply routing, full application archive coverage or runtime
 activation. Old account/native DTOs and historical payload bytes are unchanged.
+
+`DailyLedgerReaderV1.source()` performs complete audit and the final authenticated
+source retrieval in one daily runtime/read transaction. The final callback uses
+the same original issued connection, read-only scope and exact scalar/DTO copyout;
+source identity and hash are revalidated there. It does not delegate this new
+accessor to the historical source reader's separate callback boundary.

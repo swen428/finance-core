@@ -955,3 +955,268 @@ def test_instruction_link_unknown_mode_pure_values_fail_closed(mode):
     }
     with pytest.raises(LifecycleError):
         decode_instruction_link({"evidence_id": "pure-unpersisted", "link_json": canonical(raw)})
+
+
+def pure_coverage_values(raw):
+    """Unpersisted answer-codec values; this is not transport authentication."""
+    import hashlib
+    from dataclasses import asdict
+    from types import SimpleNamespace
+
+    from finance_core.lifecycle_v2 import VerifiedSource
+    from finance_core.lifecycle_v2.contracts import canonical
+    from finance_core.lifecycle_v2.daily_v1.contracts import compile_bundle, instruction_ref
+    from finance_core.lifecycle_v2.daily_v1.movement_contracts import (
+        coverage_subject,
+        question_target,
+    )
+    from tests.test_daily_accounts_contracts_v1 import expected as account_expected
+
+    owner = account_expected()
+    account = compile_bundle(
+        command(
+            fields={
+                "name": "Bank",
+                "account_type": "bank",
+                "currency": "MYR",
+                "opening": {"amount": "1000", "as_of": unknown_time()},
+            }
+        ),
+        owner,
+    )
+    instruction = asdict(
+        VerifiedSource(
+            "pure-answer",
+            "user",
+            "chat",
+            "pure-message",
+            raw,
+            hashlib.sha256(raw.encode()).hexdigest(),
+            1794877200,
+        )
+    )
+    values = {
+        "kind": "expense",
+        "original_amount": "9.00",
+        "original_currency": "MYR",
+        "account_amount": "9.00",
+        "account_currency": "MYR",
+        "business_date": "2026-11-17",
+        "funds_time": unknown_time(),
+    }
+    target = {
+        "binding": asdict(owner.binding),
+        "source_id": "pure-source",
+        "source_sha256": "a" * 64,
+        "source_instruction_ref": instruction_ref(owner.instruction),
+        "instruction_ref": instruction_ref(instruction),
+        "record_id": "pure-record",
+        "command_kind": "movement_create",
+        "current_proposal": {
+            "proposal_id": "pure-proposal",
+            "version": 1,
+            "proposal_sha256": "b" * 64,
+        },
+        "target_fact_ref": None,
+    }
+    link = {
+        "format": "finance-daily-movement-instruction-link-v1",
+        "mode": "question_reply",
+        "target": target,
+        "association_ref": {"evidence_id": "pure-reply", "sha256": "c" * 64},
+        "question": {
+            "question_id": "pure-question",
+            "question_version": 1,
+            "delivery_ref": {"evidence_id": "pure-delivery", "sha256": "d" * 64},
+            "purpose": "opening_coverage",
+            "target": question_target(target),
+            "subject": coverage_subject(values, account),
+        },
+    }
+    return (
+        SimpleNamespace(
+            instruction=instruction,
+            instruction_link={"evidence_id": "pure-link", "link_json": canonical(link)},
+        ),
+        values,
+        account,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "choice", "quote", "valid"),
+    [
+        ("not included", "included", "included", False),
+        ("NOT INCLUDED", "included", "INCLUDED", False),
+        ("This debit was not included in opening.", "included", "included", False),
+        ("It was not already included.", "included", "already included", False),
+        ("It was not\t included.", "included", "included", False),
+        ("It was not excluded.", "excluded", "excluded", False),
+        ("unincluded", "included", "included", False),
+        ("includedness", "included", "included", False),
+        ("not included", "excluded", "not included", True),
+        ("This debit was not included in opening.", "excluded", "not included", True),
+        ("included", "included", "included", True),
+        ("already included", "included", "already included", True),
+        ("尚未包含", "excluded", "尚未包含", True),
+    ],
+)
+def test_coverage_choice_preserves_whole_answer_and_negative_prefix(raw, choice, quote, valid):
+    from finance_core.lifecycle_v2.daily_v1.movement_contracts import _coverage
+
+    expected, values, account = pure_coverage_values(raw)
+    start = raw.index(quote)
+    cmd = {"fields": {"coverage": {"answer": choice, "span": [start, start + len(quote)]}}}
+    if valid:
+        assert _coverage(cmd, expected, values, account)["treatment"] == choice
+    else:
+        with pytest.raises(LifecycleError):
+            _coverage(cmd, expected, values, account)
+
+
+def test_genuine_negative_question_reply_refuses_positive_slice_and_posts_once(live):
+    ledger, port, _, api, reader, account = prepare(live)
+    source, _ = linked_draft(ledger, port, api, account, "negative-draft")
+    q = port.register_opening_question(
+        ledger.binding,
+        source.source_id,
+        "negative-q",
+        opening_subject(fields(account), reader.get_account(account)),
+    )
+    port.add_source("negative-answer", "not included")
+    port.register_opening_reply(q, "negative-answer")
+    wrong = fields(account, coverage="included")
+    wrong["coverage"]["span"] = [4, 12]
+    port.commands["wrong-negative"] = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_create",
+        "fields": wrong,
+        "reason_span": None,
+    }
+    with pytest.raises(LifecycleError, match="complete genuine choice"):
+        api.propose_movement_create(
+            source.source_id,
+            "wrong-negative",
+            1,
+            "propose-wrong-negative",
+            reply_evidence_id="negative-answer",
+        )
+    assert reader.collect().movements == ()
+    proper = fields(account, coverage="excluded")
+    proper["coverage"]["span"] = [0, 12]
+    port.commands["proper-negative"] = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_create",
+        "fields": proper,
+        "reason_span": None,
+    }
+    proposal = api.propose_movement_create(
+        source.source_id,
+        "proper-negative",
+        1,
+        "propose-proper-negative",
+        reply_evidence_id="negative-answer",
+    )
+    port.remember_movement_proposal(proposal)
+    card = api.prepare_review(proposal.proposal_id, proposal.version)
+    assert card.material["after_values"]["coverage"]["treatment"] == "excluded"
+    assert reader.collect().balances[0].balance_amount == "1000.00"
+    api.record_delivery(card.review_id, "negative-card-delivery")
+    with pytest.raises(LifecycleError):
+        api.confirm(card.review_id, "negative-answer", "answer-is-not-confirm")
+    result = api.confirm(card.review_id, "negative-independent-action", "negative-confirm")
+    assert reader.collect().balances[0].balance_amount == "991.00"
+    assert api.confirm(card.review_id, "negative-independent-action", "negative-confirm") == result
+    assert reader.collect().balances[0].balance_amount == "991.00"
+
+
+def test_daily_source_uses_one_guarded_transaction_and_exact_original_identity(live, monkeypatch):
+    from dataclasses import asdict
+
+    from finance_core.instance_admission.sessions import _witness_for
+
+    ledger, port, _, _, _ = setup(live)
+    original = port.add_source("source-read", "Actual captured original")
+    captured = ledger.capture("source-read", "capture-source-read")
+    observed = []
+    callback = port.source
+
+    def inspect(conn, identity):
+        witness = _witness_for(conn)
+        observed.append(
+            (id(conn), conn.in_transaction, witness.evidence_callback_token is not None)
+        )
+        return callback(conn, identity)
+
+    monkeypatch.setattr(port, "source", inspect)
+    returned = DailyLedgerReaderV1(ledger).source(captured.source_id)
+    assert asdict(returned) == asdict(original)
+    assert len(observed) == 2
+    assert len({item[0] for item in observed}) == 1
+    assert all(in_transaction and guarded for _, in_transaction, guarded in observed)
+
+
+@pytest.mark.parametrize("action", ["commit", "rollback", "close"])
+def test_daily_source_final_callback_swallowed_control_is_sticky(live, monkeypatch, action):
+    from finance_core.instance_admission import InstanceAdmissionError
+
+    ledger, port, _, _, _ = setup(live)
+    original = port.add_source("source-control", "Actual original for control proof")
+    captured = ledger.capture("source-control", "capture-source-control")
+    callback = port.source
+    count = 0
+
+    def forbidden(conn, identity):
+        nonlocal count
+        count += 1
+        if count == 2:
+            try:
+                getattr(conn, action)()
+            except InstanceAdmissionError:
+                pass
+        return callback(conn, identity)
+
+    monkeypatch.setattr(port, "source", forbidden)
+    with pytest.raises(InstanceAdmissionError, match="read-only scope"):
+        DailyLedgerReaderV1(ledger).source(captured.source_id)
+    monkeypatch.setattr(port, "source", callback)
+    assert DailyLedgerReaderV1(ledger).source(captured.source_id) == original
+
+
+@pytest.mark.parametrize("bad", ["subclass", "timestamp_bool", "identity", "hash", "actor", "dict"])
+def test_daily_source_final_callback_rejects_wrong_dto_scalar_or_identity(live, monkeypatch, bad):
+    from dataclasses import asdict, replace
+
+    from finance_core.lifecycle_v2 import VerifiedSource
+
+    ledger, port, _, _, _ = setup(live)
+    port.add_source("source-invalid", "Actual captured identity")
+    captured = ledger.capture("source-invalid", "capture-source-invalid")
+    callback = port.source
+    count = 0
+
+    def invalid(conn, identity):
+        nonlocal count
+        count += 1
+        value = callback(conn, identity)
+        if count != 2:
+            return value
+        if bad == "subclass":
+
+            class DerivedSource(VerifiedSource):
+                pass
+
+            return DerivedSource(**asdict(value))
+        if bad == "timestamp_bool":
+            return replace(value, source_timestamp=True)
+        if bad == "identity":
+            return replace(value, evidence_id="other-source")
+        if bad == "hash":
+            return replace(value, original_sha256="0" * 64)
+        if bad == "actor":
+            return replace(value, principal_id="other")
+        return asdict(value)
+
+    monkeypatch.setattr(port, "source", invalid)
+    with pytest.raises(LifecycleError):
+        DailyLedgerReaderV1(ledger).source(captured.source_id)

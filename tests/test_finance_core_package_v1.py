@@ -904,6 +904,7 @@ def _probe_installed_daily(runtime_python, install_dir, outside_dir):
     assert payload["contract"] == "finance-daily-v1"
     assert payload["fact_versions"] == 9 and payload["proposal_count"] == 11
     assert payload["independent_instruction_question_link"]
+    assert payload["negative_coverage_preserved"] and payload["daily_source_guarded"]
     assert payload["movement_balance_correction_void"]
     assert payload["incomplete_preserved"] and payload["fresh_opening_id"]
     assert payload["callback_persistent_write_refused"]
