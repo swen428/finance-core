@@ -173,7 +173,71 @@ def _compose(
     return decode_expected(asdict(expected))
 
 
+def _opening_proposal_chain(conn, proposal):
+    """Collect one bounded supplement chain, without granting authentication.
+
+    Rows are local to this protected operation. Every collected item is fully
+    authenticated afterwards; structural collection never caches evidence or
+    substitutes for the original callback/prefix/hash checks.
+    """
+    chain, seen_ids, seen_versions = [], set(), set()
+    scope = None
+    while True:
+        if proposal is None:
+            raise LifecycleError("Opening proposal predecessor absent")
+        version = proposal["version"]
+        if type(version) is not int or version <= 0:
+            raise LifecycleError("Invalid bounded opening proposal version")
+        if version > MAX_PROPOSALS or len(chain) >= MAX_PROPOSALS:
+            raise LifecycleError("complete_read_limit_exceeded: opening proposal chain")
+        identity = text(proposal["proposal_id"], "opening proposal id")
+        sealed = strict_json(proposal["observation_json"])
+        exact(sealed, {"format", "expected", "observation"}, "opening observation")
+        if sealed["format"] != OBSERVATION_FORMAT:
+            raise LifecycleError("Unsupported opening observation")
+        expected = decode_expected(sealed["expected"])
+        if (
+            proposal["source_id"] != expected.source_id
+            or proposal["record_id"] != expected.record_id
+            or version != expected.expected_proposal_version + 1
+        ):
+            raise LifecycleError("Opening proposal chain identity differs")
+        current_scope = (expected.source_id, expected.record_id, expected.instruction)
+        if scope is None:
+            scope = current_scope
+        elif current_scope != scope:
+            raise LifecycleError("Opening proposal chain source/target/instruction differs")
+        version_key = (expected.source_id, version)
+        if identity in seen_ids or version_key in seen_versions:
+            raise LifecycleError("Repeated opening proposal predecessor")
+        seen_ids.add(identity)
+        seen_versions.add(version_key)
+        chain.append(proposal)
+        if expected.instruction["evidence_id"] == expected.reply_evidence_id:
+            return chain
+        previous = _previous(conn, expected.source_id, version - 1)
+        if (
+            previous is None
+            or previous["proposal_id"] != expected.current_proposal_id
+            or previous["version"] != version - 1
+            or previous["source_id"] != expected.source_id
+            or previous["record_id"] != expected.record_id
+        ):
+            raise LifecycleError("Opening proposal predecessor absent or inconsistent")
+        proposal = previous
+
+
 def verify_proposal(service, conn, proposal):
+    fingerprint = _fingerprint(conn)
+    chain = _opening_proposal_chain(conn, proposal)
+    for item in reversed(chain):
+        result = _verify_proposal_item(service, conn, item)
+    if _fingerprint(conn) != fingerprint:
+        raise LifecycleError("Evidence callback changed protected opening chain state")
+    return result
+
+
+def _verify_proposal_item(service, conn, proposal):
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
     exact(sealed, {"format", "expected", "observation"}, "opening observation")
@@ -186,8 +250,6 @@ def verify_proposal(service, conn, proposal):
     if len(events) != 1:
         raise LifecycleError("Opening proposal lacks exact original event")
     previous = _previous(conn, expected.source_id, proposal["version"] - 1)
-    if expected.instruction["evidence_id"] != expected.reply_evidence_id:
-        verify_proposal(service, conn, previous)
     source = service._source(conn, expected.source_id, allow_archived=True)
     actual_expected = _compose(
         service,

@@ -1183,3 +1183,331 @@ def test_complete_opening_choice_normal_literal_span_cannot_promote_negative_rep
     assert entry["answer_ref"]["quote"] == "已包含"
     assert entry["treatment"] == "included"
     assert reader.collect().balances[0].balance_amount == "900.00"
+
+
+def scalar_opening_chain(count):
+    """Traversal metadata only: never valid/authenticated or persisted ledger rows."""
+    return {
+        version: {
+            "proposal_id": "scalar-" + str(version),
+            "version": version,
+            "source_id": "scalar-source",
+            "record_id": "scalar-record",
+            "observation_json": canonical(
+                {
+                    "format": "finance-daily-opening-observation-v2",
+                    "expected": {
+                        "source_id": "scalar-source",
+                        "record_id": "scalar-record",
+                        "instruction": {"evidence_id": "scalar-original"},
+                        "reply_evidence_id": "scalar-original"
+                        if version == 1
+                        else "scalar-reply-" + str(version),
+                        "expected_proposal_version": version - 1,
+                        "current_proposal_id": "scalar-" + str(version - 1)
+                        if version > 1
+                        else None,
+                    },
+                    "observation": {},
+                }
+            ),
+        }
+        for version in range(1, count + 1)
+    }
+
+
+def scalar_chain_verifier(monkeypatch, rows, *, fail_at=None, fingerprint=None):
+    """Use real traversal/query helper; spy on the independent per-item seam.
+
+    This proves traversal and call ordering, not financial authentication.
+    Normal API tests below execute the real authentication kernel and ports.
+    """
+    from types import SimpleNamespace
+
+    from finance_core.lifecycle_v2.daily_v1 import opening_changes_v1 as module
+
+    queries, visits = [], []
+
+    class ScalarConnection:
+        def execute(self, query, parameters):
+            assert "l2_proposals WHERE source_id=? AND version=?" in query
+            source, version = parameters
+            assert source == "scalar-source"
+            queries.append(version)
+            return SimpleNamespace(fetchone=lambda: rows.get(version))
+
+    monkeypatch.setattr(module, "decode_expected", lambda value: SimpleNamespace(**value))
+    monkeypatch.setattr(module, "_fingerprint", fingerprint or (lambda _: "scalar-stable"))
+
+    def verify_item(_service, _conn, item):
+        version = item["version"]
+        visits.append(version)
+        if version == fail_at:
+            raise LifecycleError("scalar independent item authentication failed")
+        assert visits == list(range(1, version + 1))
+        return SimpleNamespace(verified_version=version)
+
+    monkeypatch.setattr(module, "_verify_proposal_item", verify_item)
+    return module, ScalarConnection(), queries, visits
+
+
+@pytest.mark.parametrize("count", [1500, 4096])
+def test_opening_chain_pure_iterates_all_items_oldest_first_within_existing_limit(
+    monkeypatch, count
+):
+    import sys
+
+    rows = scalar_opening_chain(count)
+    module, conn, queries, visits = scalar_chain_verifier(monkeypatch, rows)
+    original_limit = sys.getrecursionlimit()
+    assert count <= module.MAX_PROPOSALS
+    result = module.verify_proposal(object(), conn, rows[count])
+    assert result.verified_version == count
+    assert visits == list(range(1, count + 1))
+    assert queries == list(range(count - 1, 0, -1))
+    assert sys.getrecursionlimit() == original_limit
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "wrong_version",
+        "wrong_source",
+        "wrong_record",
+        "wrong_expected_source",
+        "wrong_identity",
+        "wrong_instruction",
+        "wrong_parent",
+        "repeated",
+        "over_limit",
+    ],
+)
+def test_opening_chain_pure_refuses_missing_wrong_or_repeated_predecessors(monkeypatch, invalid):
+    import json
+
+    count = 1500 if invalid != "over_limit" else 4097
+    rows = scalar_opening_chain(count)
+    current = rows[count]
+    if invalid == "missing":
+        del rows[700]
+    elif invalid == "wrong_version":
+        rows[700]["version"] = 699
+    elif invalid in {"wrong_source", "wrong_record", "wrong_identity"}:
+        key = {
+            "wrong_source": "source_id",
+            "wrong_record": "record_id",
+            "wrong_identity": "proposal_id",
+        }[invalid]
+        rows[700][key] = "other-identity"
+    elif invalid in {"wrong_expected_source", "wrong_instruction", "wrong_parent"}:
+        envelope = json.loads(rows[700]["observation_json"])
+        if invalid == "wrong_expected_source":
+            envelope["expected"]["source_id"] = "other-source"
+        elif invalid == "wrong_instruction":
+            envelope["expected"]["instruction"] = {"evidence_id": "other-instruction"}
+        else:
+            envelope["expected"]["current_proposal_id"] = "other-parent"
+        rows[700]["observation_json"] = canonical(envelope)
+    elif invalid == "repeated":
+        rows[700]["proposal_id"] = current["proposal_id"]
+        envelope = json.loads(rows[701]["observation_json"])
+        envelope["expected"]["current_proposal_id"] = current["proposal_id"]
+        rows[701]["observation_json"] = canonical(envelope)
+    module, conn, _, visits = scalar_chain_verifier(monkeypatch, rows)
+    with pytest.raises(LifecycleError):
+        module.verify_proposal(object(), conn, current)
+    assert visits == []
+
+
+def test_opening_chain_pure_stops_on_independent_item_failure(monkeypatch):
+    rows = scalar_opening_chain(1500)
+    module, conn, _, visits = scalar_chain_verifier(monkeypatch, rows, fail_at=751)
+    with pytest.raises(LifecycleError, match="independent item"):
+        module.verify_proposal(object(), conn, rows[1500])
+    assert visits == list(range(1, 752))
+
+
+def test_opening_chain_pure_retains_whole_operation_fingerprint(monkeypatch):
+    rows = scalar_opening_chain(3)
+    fingerprints = iter(("before", "changed"))
+    module, conn, _, visits = scalar_chain_verifier(
+        monkeypatch, rows, fingerprint=lambda _: next(fingerprints)
+    )
+    with pytest.raises(LifecycleError, match="protected opening chain state"):
+        module.verify_proposal(object(), conn, rows[3])
+    assert visits == [1, 2, 3]
+
+
+def test_opening_chain_normal_unknown_restart_confirmation_fresh_instruction_and_snapshot(
+    live, request, tmp_path, monkeypatch
+):
+    import sqlite3
+
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.instance_admission.authority import _logical_database_digest
+    from finance_core.lifecycle_v2 import LedgerService
+    from finance_core.lifecycle_v2.reader import audit_evidence_connection
+
+    ledger, port, daily, movements, reader, api, source, initial, account, cfg = prepare_opening(
+        live
+    )
+    _, expense_card, expense = movement(ledger, port, movements, account, "history-expense")
+    originals = financial_rows(ledger)
+    draft = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader.get_account(account),
+        "history-opening",
+        opening_command(),
+    )
+    links, observations = [], []
+    real_link, real_observation = port.opening_instruction_link_v1, port.opening_proposal_v2
+
+    def require_read_context(conn):
+        if type(conn) is sqlite3.Connection:
+            # Independent immutable snapshot audit has its original raw
+            # read-only connection, without a required explicit transaction.
+            assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        else:
+            assert conn.in_transaction
+
+    def read_link(conn, identity, expected):
+        require_read_context(conn)
+        links.append(identity)
+        return real_link(conn, identity, expected)
+
+    def read_observation(conn, identity, expected):
+        require_read_context(conn)
+        observations.append(identity)
+        return real_observation(conn, identity, expected)
+
+    monkeypatch.setattr(port, "opening_instruction_link_v1", read_link)
+    monkeypatch.setattr(port, "opening_proposal_v2", read_observation)
+    previous = draft
+    for number in (1, 2):
+        question = port.deliver_opening_question(
+            api.opening_questions_v1(previous.proposal_id), "history-q-" + str(number)
+        )
+        identity = "history-unknown-" + str(number)
+        answers = row_reply(port, identity, (question["subjects"][0], "unknown"))
+        previous = opening_proposal(
+            ledger,
+            port,
+            api,
+            source,
+            previous,
+            reader.get_account(account),
+            identity,
+            opening_command(answers=answers),
+            "history-opening",
+            question,
+        )
+    assert financial_rows(ledger) == originals
+    binding = ledger.binding
+    ledger.owner.close()
+    owner = acquire_production_owner(cfg)
+    request.addfinalizer(owner.close)
+    ledger = LedgerService(owner, port, binding, clock=lambda: NOW)
+    api, reader = DailyOpeningChangeServiceV1(ledger), DailyLedgerReaderV1(ledger)
+    movements = DailyMovementServiceV1(ledger)
+    assert api.pending()[0]["values"]["missing_fields"]
+    question = port.deliver_opening_question(
+        api.opening_questions_v1(previous.proposal_id), "history-q-3"
+    )
+    answers = row_reply(port, "history-unknown-3", (question["subjects"][0], "unknown"))
+    previous = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        previous,
+        reader.get_account(account),
+        "history-unknown-3",
+        opening_command(answers=answers),
+        "history-opening",
+        question,
+    )
+    links.clear()
+    observations.clear()
+    pending = api.pending()
+    required = {"history-opening", "history-unknown-1", "history-unknown-2", "history-unknown-3"}
+    assert set(links) == set(observations) == required
+    assert pending[0]["values"]["missing_fields"]
+    assert financial_rows(ledger) == originals
+    question = port.deliver_opening_question(
+        api.opening_questions_v1(previous.proposal_id), "history-final-q"
+    )
+    answers = row_reply(port, "history-positive", (question["subjects"][0], "included"))
+    complete = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        previous,
+        reader.get_account(account),
+        "history-positive",
+        opening_command(answers=answers),
+        "history-opening",
+        question,
+    )
+    card, receipt = finish(api, complete, "history-first")
+    assert reader.collect().balances[0].balance_amount == "900.00"
+    # A new genuine original instruction breaks no retained older audit chain.
+    fresh = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        complete,
+        reader,
+        account,
+        "history-fresh",
+        opening_command(amount="850"),
+        {"expense": "excluded"},
+    )
+    fresh_card, _ = finish(api, fresh, "history-fresh")
+    assert fresh_card.material["instruction_ref"]["evidence_id"] == "history-fresh"
+    result = reader.collect_with_effects_v1()
+    assert result.collection.balances[0].balance_amount == "841.00"
+    assert result.collection.expense_by_currency == (("MYR", "9.00"),)
+    assert (
+        ledger.reader().full_audit()["fact_version_count"]
+        == result.collection.fact_version_count
+        == 4
+    )
+    assert (
+        api.lookup_commit_receipt(
+            "confirm-history-first",
+            review_id=card.review_id,
+            action_evidence_id="action-history-first",
+        )
+        == receipt
+    )
+    assert (
+        movements.lookup_commit_receipt(
+            "confirm-history-expense",
+            review_id=expense_card.review_id,
+            action_evidence_id="action-history-expense",
+        )
+        == expense
+    )
+    cut = ledger.seal_snapshot(tmp_path / "history-chain.sqlite")
+    with sqlite3.connect(
+        (tmp_path / "history-chain.sqlite").as_uri() + "?mode=ro&immutable=1", uri=True
+    ) as copy:
+        copy.row_factory = sqlite3.Row
+        copy.execute("PRAGMA query_only=ON")
+        audit = audit_evidence_connection(copy, port, binding)
+        assert audit["fact_version_count"] == result.collection.fact_version_count
+        assert audit["event_count"] == cut.commit_seq == result.read_identity.event_seq
+        assert (
+            _logical_database_digest(copy)
+            == cut.logical_database_sha256
+            == result.read_identity.logical_database_sha256
+        )
+    current = {r[:2]: r[2:] for r in financial_rows(ledger)}
+    assert all(current[r[:2]] == r[2:] for r in originals)
