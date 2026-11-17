@@ -31,7 +31,7 @@ from finance_core.financial_audit import (
 from finance_core.instance_admission import (
     require_finance_write_connection,
 )
-from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
+from finance_core.money import MoneyValidationError, money_decimal
 from finance_core.parser_proposals.amendment_lineage import (
     AmendmentPublicationAuthority,
     refuse_legacy_amendment,
@@ -43,6 +43,9 @@ from finance_core.parser_proposals.content_hash import (
 from finance_core.parser_proposals.conversion_state import (
     has_legacy_transaction_conversion,
     has_receipt_registry_conversion,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.effective_payload import (
     EffectivePayloadError,

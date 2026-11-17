@@ -64,6 +64,7 @@ _SUPPORTED_CURRENCY_MINOR_UNITS: dict[str, int] = {
     "AUD": 2,
     "CNY": 2,
     "HKD": 2,
+    "MYR": 2,
     "JPY": 0,
 }
 

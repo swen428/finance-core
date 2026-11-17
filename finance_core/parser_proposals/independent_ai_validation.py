@@ -15,8 +15,10 @@ from finance_core.application.ai_invocation_contract import AiInvocationError
 from finance_core.money import (
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.independent_ai_source_grammar import (
     SourceMoneyAssessment,

@@ -249,14 +249,61 @@ class TestNormalizeCurrency:
         with pytest.raises(MoneyValidationError, match="Unsupported"):
             normalize_currency("XYZ")
 
-    def test_rejects_myr_unsupported(self):
-        with pytest.raises(MoneyValidationError, match="Unsupported"):
-            normalize_currency("MYR")
+    def test_normalizes_myr(self):
+        assert normalize_currency(" myr ") == "MYR"
 
 
 # ============================================================================
 # minor_units
 # ============================================================================
+
+
+class TestMyrMoney:
+    """MYR uses the existing signed Money contract, without implicit FX."""
+
+    @pytest.mark.parametrize(
+        "raw,scaled,minor", [("12.3", "12.30", 1230), ("-12.3", "-12.30", -1230), ("0", "0.00", 0)]
+    )
+    def test_signed_canonical_and_minor_units(self, raw, scaled, minor):
+        value = Money.from_string(raw, "myr")
+        assert value.currency == "MYR"
+        assert minor_units(value.currency) == 2
+        assert canonical_money_str(value.amount, value.currency) == scaled
+        assert value.amount * 100 == minor
+        assert Money(Decimal(minor) / 100, "MYR") == value
+        assert value.canonical_str() == canonical_decimal_str(Decimal(raw))
+        assert Money.zero("MYR").is_zero()
+
+    def test_same_currency_math(self):
+        value = Money.from_string("12.30", "MYR")
+        increment = Money.from_string("0.70", "MYR")
+        assert value + increment == Money.from_string("13", "MYR")
+        assert value - increment == Money.from_string("11.60", "MYR")
+        assert -value == Money.from_string("-12.30", "MYR")
+        assert abs(-value) == value
+        assert value * 2 == Money.from_string("24.60", "MYR")
+        assert increment < value
+
+    @pytest.mark.parametrize("amount", ["1.001", 12.3, "NaN", "Infinity", "-Infinity"])
+    def test_rejects_unsafe_amounts(self, amount):
+        with pytest.raises(MoneyValidationError):
+            Money(amount, "MYR")
+
+    @pytest.mark.parametrize("currency", ["RM", "XYZ", "ＭＹＲ", "MΥR", "M1R"])
+    def test_rejects_aliases_unknown_and_confusable_codes(self, currency):
+        with pytest.raises(MoneyValidationError):
+            Money.from_string("12.30", currency)
+
+    @pytest.mark.parametrize("operation", ["add", "subtract", "compare"])
+    def test_rejects_cross_currency(self, operation):
+        value, other = Money.from_string("1", "MYR"), Money.from_string("1", "SGD")
+        with pytest.raises(CurrencyMismatchError):
+            if operation == "add":
+                value + other
+            elif operation == "subtract":
+                value - other
+            else:
+                value < other
 
 
 class TestMinorUnits:
@@ -272,6 +319,7 @@ class TestMinorUnits:
             ("AUD", 2),
             ("CNY", 2),
             ("HKD", 2),
+            ("MYR", 2),
             ("JPY", 0),
         ],
     )

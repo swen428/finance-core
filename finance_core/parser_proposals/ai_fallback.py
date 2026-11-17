@@ -36,7 +36,6 @@ from finance_core.money import (
     SignPolicy,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
 )
 from finance_core.parser_proposals.ai_fallback_provenance import (
@@ -83,6 +82,9 @@ from finance_core.parser_proposals.ai_source_assessment import (
     _payload_field,
 )
 from finance_core.parser_proposals.content_hash import compute_effective_proposal_content_hash
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
+)
 from finance_core.parser_proposals.effective_payload import resolve_effective_payload
 from finance_core.parser_proposals.lifecycle import (
     PARSED_PENDING_CONFIRMATION,

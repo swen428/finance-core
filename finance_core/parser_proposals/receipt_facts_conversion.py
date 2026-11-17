@@ -51,7 +51,7 @@ from finance_core.instance_admission import (
     require_finance_read_connection,
     require_finance_write_connection,
 )
-from finance_core.money import MoneyValidationError, money_decimal, normalize_currency
+from finance_core.money import MoneyValidationError, money_decimal
 from finance_core.parser_proposals.ai_fallback import (
     AiFallbackServiceError,
     verify_ai_fallback_child,
@@ -62,6 +62,9 @@ from finance_core.parser_proposals.content_hash import (
     compute_effective_proposal_content_hash,
 )
 from finance_core.parser_proposals.conversion_state import has_legacy_transaction_conversion
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
+)
 from finance_core.parser_proposals.effective_payload import (
     EffectivePayloadError,
     resolve_effective_payload,

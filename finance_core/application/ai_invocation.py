@@ -104,7 +104,9 @@ class _AiInvocationServiceV1:
             provider,
             clock,
         )
-        from finance_core.money import normalize_currency
+        from finance_core.parser_proposals.currency_policy_v1 import (
+            normalize_currency_v1 as normalize_currency,
+        )
 
         if (
             type(interpretation_policy) is not InterpretationPolicy

@@ -16,13 +16,19 @@ from dataclasses import dataclass, field
 from typing import Sequence
 
 from finance_core.money import (
-    SUPPORTED_CURRENCIES,
     MoneyValidationError,
     SignPolicy,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
-    validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    SUPPORTED_CURRENCIES_V1 as SUPPORTED_CURRENCIES,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    validate_amount_for_currency_v1 as validate_amount_for_currency,
 )
 
 PARSER_CONTRACT_VERSION_DEFAULT = "receipt-total-proposal-v1"

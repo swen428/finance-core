@@ -27,8 +27,10 @@ from finance_core.calculation.authoritative_snapshot import (
 from finance_core.money import (
     MoneyValidationError,
     canonical_money_str,
-    normalize_currency,
     validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 
 if TYPE_CHECKING:

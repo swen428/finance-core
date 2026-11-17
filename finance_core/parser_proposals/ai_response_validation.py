@@ -16,7 +16,6 @@ from finance_core.money import (
     SignPolicy,
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
 )
 from finance_core.parser_proposals.ai_fact_observations import normalize_fact_observations
@@ -25,6 +24,9 @@ from finance_core.parser_proposals.ai_source_assessment import (
     _ocr_field_evidence_refs,
     _payload_field,
     assess_source,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.parser_proposals.receipt_total_parser import OcrLayoutContext
 

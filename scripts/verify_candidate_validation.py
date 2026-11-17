@@ -68,7 +68,7 @@ BRIDGE_SCOPE_PATTERN = (
     r"_prepared_[^/]+\.py)$|finance_core/(openclaw_staging_bridge|"
     r"application/|intake/(__init__\.py$|macos_vision_receipt_ocr|receipt_media\.py$|"
     r"_receipt_media_worker\.py$|receipt_ocr_evidence\.py$|receipt_ocr_proposal\.py$|"
-    r"tesseract_resources\.py$)|parser_proposals/(__init__\.py$|receipt_total_parser\.py$|"
+    r"tesseract_resources\.py$)|parser_proposals/(__init__\.py$|currency_policy_v1\.py$|receipt_total_parser\.py$|"
     r"ai_|independent_ai_)|resources/independent_ai/)|tests/(test_(native_age|"
     r"prepared_content_export|prepared_envelope(_faults)?|age_toolchain_qualification|"
     r"finance_core_package|candidate_validation|public_ci_security)_v1\.py$|"

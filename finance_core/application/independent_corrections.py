@@ -66,8 +66,10 @@ from finance_core.instance_admission import (
 from finance_core.money import (
     canonical_money_str,
     money_decimal,
-    normalize_currency,
     validate_amount_for_currency,
+)
+from finance_core.parser_proposals.currency_policy_v1 import (
+    normalize_currency_v1 as normalize_currency,
 )
 from finance_core.sqlite_connection import require_foreign_keys_enabled
 
