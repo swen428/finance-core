@@ -357,3 +357,33 @@ checks the complete owner prefix; later valid movement successors make an old
 entry inapplicable to that successor without erasing it. Source and independent
 snapshot audits share this interpretation. This source contract does not itself
 authorize a new release, consumer upgrade or live use.
+
+### Complete opening answer syntax
+
+New opening dependency replies use a finite complete-choice grammar. A reply
+containing only one complete choice applies to exactly one independently
+selected actual row. The accepted complete choices are `included`,
+`already included`, `已包含`, `已经包含`; `excluded`, `not included`, `未包含`,
+`尚未包含`; and explicit unknown choices `unknown`, `uncertain`, `unsure`,
+`not sure`, `不确定`, `未知`, `不清楚`. ASCII choices ignore case. Outer whitespace
+is permitted; a choice cannot be extracted from a larger sentence.
+
+An explicit row reply is `record_id:role=choice` or `ordinal=choice`, with
+semicolons or newlines separating rows. For example, `1=已包含; 2=未包含` names
+positions in the exact delivered complete list, whose identity and subjects
+remain bound to the actual reply. Each line must name a delivered row, match
+its exact fact reference and role, and retain the entire choice span. All lines
+and all actual selections must match; duplicates (including ID/ordinal aliases
+for one row), missing selections, leftover text and mixed bare/row replies
+refuse. Identifier and ordinal reference forms cannot be mixed in one reply.
+One bare choice cannot silently answer several rows.
+
+Explicit unknown choices remain incomplete and grant no positive treatment.
+Negation, uncertainty, contradictions and other free text outside this finite
+syntax are refused as answer proposals; the existing pending proposal remains.
+A later complete confirmation card cannot manufacture a different meaning for
+the original reply. Native buttons would require separately authenticated
+choice-code evidence; the current literal span link is not such evidence.
+Original opening instruction fields and their genuine reason retain their
+separate protocol and are not restricted to this answer syntax. The historical
+movement v1 compiler and its persisted bytes are unchanged by this extension.

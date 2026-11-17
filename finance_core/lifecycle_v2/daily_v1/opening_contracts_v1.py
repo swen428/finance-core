@@ -305,43 +305,132 @@ def validate_map(value, bundle):
     return value
 
 
-def _answer(raw, expected):
-    exact(raw, {"movement_fact_ref", "impact_role", "treatment", "span"}, "opening answer")
-    BundleFactRefV1(**raw["movement_fact_ref"])
-    if raw["treatment"] not in {"included", "excluded", "unknown"}:
-        raise LifecycleError("Unsupported opening answer")
-    if raw["treatment"] == "unknown":
-        if raw["span"] is not None:
-            raise LifecycleError("Unknown answer cannot invent a decision")
-        return None
-    # Preserve the complete actual reply and the existing negative-choice rule.
+# New opening replies use a finite complete-choice grammar. These aliases are
+# choices, not a natural-language negation or intent classifier.
+_OPENING_CHOICES = {
+    **dict.fromkeys(("included", "already included", "已包含", "已经包含"), "included"),
+    **dict.fromkeys(("excluded", "not included", "未包含", "尚未包含"), "excluded"),
+    **dict.fromkeys(
+        ("unknown", "uncertain", "unsure", "not sure", "不确定", "未知", "不清楚"), "unknown"
+    ),
+}
+
+
+def _selection_key(item):
+    ref = BundleFactRefV1(**item["movement_fact_ref"])
+    if item["impact_role"] not in {"debit", "credit"}:
+        raise LifecycleError("Unsupported actual opening row role")
+    return ref.record_id, item["impact_role"]
+
+
+def _parse_opening_choices(raw, subjects, selections):
+    """Consume the whole reply and bind each complete choice to an actual row.
+
+    A bare choice applies only to one independently selected row. Otherwise
+    every nonempty line is `record_id:role=choice` or `list_ordinal=choice`;
+    semicolons and newlines separate lines. Ordinals are explicit positions in
+    the exact delivered list, never inferred from provider ordering.
+    """
     import re
 
-    response = expected.response
-    reason = _reason(raw["span"], SimpleNamespace(instruction=response), True)
-    accepted = {
-        "included": {"included", "already included", "已包含", "已经包含"},
-        "excluded": {"excluded", "not included", "尚未包含", "未包含"},
-    }
-    choices = {p: t for t, phrases in accepted.items() for p in phrases}
-    quote = reason["quote"].casefold()
-    whole = choices.get(response["raw_input"].strip().casefold())
-    if quote not in accepted[raw["treatment"]] or (whole is not None and whole != raw["treatment"]):
-        raise LifecycleError("Opening answer must match complete genuine choice")
-    start, end = raw["span"]
-    text_value = response["raw_input"]
-    if quote.isascii() and (
-        (start and (text_value[start - 1].isalnum() or text_value[start - 1] == "_"))
-        or (end < len(text_value) and (text_value[end].isalnum() or text_value[end] == "_"))
-    ):
-        raise LifecycleError("Opening selection must retain whole choice words")
-    for phrase in choices:
-        for match in re.finditer(
-            r"(?<!\w)not\s+" + re.escape(phrase) + r"(?!\w)", text_value, re.IGNORECASE
+    if type(raw) is not str or not raw or len(raw.encode()) > 65536:
+        raise LifecycleError("Bounded complete opening reply required")
+    if type(subjects) is not list or type(selections) is not list or not selections:
+        raise LifecycleError("Actual opening row selections required")
+    known = {}
+    for item in subjects:
+        key = _selection_key(item)
+        if key in known:
+            raise LifecycleError("Duplicate delivered opening row")
+        known[key] = item
+    actual = {}
+    for item in selections:
+        key = _selection_key(item)
+        if (
+            key in actual
+            or key not in known
+            or item["movement_fact_ref"] != known[key]["movement_fact_ref"]
         ):
-            if match.start() < start and end <= match.end():
-                raise LifecycleError("Opening answer cannot discard negative prefix")
-    return reason
+            raise LifecycleError("Actual selection differs from delivered opening row")
+        actual[key] = item
+    body = raw.strip()
+    offset = len(raw) - len(raw.lstrip())
+    parsed = {}
+
+    def append(item, treatment, span):
+        key = _selection_key(item)
+        if key in parsed:
+            raise LifecycleError("Duplicate opening reply row")
+        parsed[key] = {
+            "movement_fact_ref": item["movement_fact_ref"],
+            "impact_role": item["impact_role"],
+            "treatment": treatment,
+            "span": span if treatment != "unknown" else None,
+        }
+
+    treatment = _OPENING_CHOICES.get(body.casefold())
+    if treatment is not None:
+        if len(actual) != 1:
+            raise LifecycleError("Bare opening choice requires one actual selected row")
+        append(next(iter(actual.values())), treatment, [offset, offset + len(body)])
+    else:
+        row_syntax = None
+        for match in re.finditer(r"(?:^|[;\n])([^;\n]*)", body):
+            line = match.group(1)
+            if "=" not in line:
+                raise LifecycleError("Unsupported complete opening answer syntax")
+            left, right = line.split("=", 1)
+            token, choice = left.strip(), right.strip()
+            treatment = _OPENING_CHOICES.get(choice.casefold())
+            if treatment is None:
+                raise LifecycleError("Unsupported complete opening answer syntax")
+            if (
+                token.isascii()
+                and token.isdecimal()
+                and len(token) <= 3
+                and token == str(int(token))
+                and 1 <= int(token) <= len(subjects)
+            ):
+                item = subjects[int(token) - 1]
+                syntax = "ordinal"
+            else:
+                syntax = "identity"
+                parts = token.rsplit(":", 1)
+                item = known.get(tuple(parts)) if len(parts) == 2 else None
+                if item is None:
+                    raise LifecycleError("Opening reply names an undelivered row")
+            if row_syntax is not None and syntax != row_syntax:
+                raise LifecycleError("Mixed opening row reference forms refused")
+            row_syntax = syntax
+            start = offset + match.start(1) + len(left) + 1 + len(right) - len(right.lstrip())
+            append(item, treatment, [start, start + len(choice)])
+    if not parsed or set(parsed) != set(actual):
+        raise LifecycleError("Opening reply rows differ from actual selections")
+    for key, item in parsed.items():
+        if (
+            actual[key]["movement_fact_ref"] != item["movement_fact_ref"]
+            or actual[key]["span"] != item["span"]
+        ):
+            raise LifecycleError("Opening answer must retain the complete choice span")
+    return parsed
+
+
+def _answer(raw, expected, *, choices=None):
+    exact(raw, {"movement_fact_ref", "impact_role", "treatment", "span"}, "opening answer")
+    key = _selection_key(raw)
+    if raw["treatment"] not in {"included", "excluded", "unknown"}:
+        raise LifecycleError("Unsupported opening answer")
+    if choices is None:
+        # Pure helper calls still require the whole reply. Actual compilation
+        # supplies the complete independently authenticated list/selection set.
+        selection = {k: raw[k] for k in ("movement_fact_ref", "impact_role", "span")}
+        choices = _parse_opening_choices(expected.response["raw_input"], [selection], [selection])
+    actual = choices.get(key)
+    if actual is None or actual != raw:
+        raise LifecycleError("Opening treatment differs from complete actual choice")
+    if raw["treatment"] == "unknown":
+        return None
+    return _reason(raw["span"], SimpleNamespace(instruction=expected.response), True)
 
 
 def compile_opening(command, expected):
@@ -389,9 +478,16 @@ def compile_opening(command, expected):
             raise LifecycleError("Opening answer row/span differs from independently linked reply")
     elif link["mode"] == "dependency_answers" and link["selections"]:
         raise LifecycleError("Opening command omitted actual reply selections")
+    choices = (
+        _parse_opening_choices(
+            expected.response["raw_input"], link["question"]["subjects"], link["selections"]
+        )
+        if link["mode"] == "dependency_answers"
+        else {}
+    )
     supplied = set()
     for answer in command["answers"]:
-        reason = _answer(answer, expected)
+        reason = _answer(answer, expected, choices=choices)
         key = (answer["movement_fact_ref"]["record_id"], answer["impact_role"])
         if key in supplied:
             raise LifecycleError("Duplicate opening answer")

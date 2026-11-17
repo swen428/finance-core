@@ -347,7 +347,18 @@ class OpeningPort(DailyPort):
                     {
                         "movement_fact_ref": matches[0]["movement_fact_ref"],
                         "impact_role": role,
-                        "span": [start, start + len(choice)] if choice != "unknown" else None,
+                        "span": None
+                        if choice.strip().casefold()
+                        in {
+                            "unknown",
+                            "uncertain",
+                            "unsure",
+                            "not sure",
+                            "不确定",
+                            "未知",
+                            "不清楚",
+                        }
+                        else [start, start + len(choice)],
                     }
                 )
         origin_id = "opening-association-" + response_id

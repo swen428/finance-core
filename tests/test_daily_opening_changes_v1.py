@@ -716,7 +716,7 @@ def test_wrong_question_answer_and_negative_span_refused(live):
         }
     ]
     before = financial_rows(ledger)
-    with pytest.raises(LifecycleError, match="negative prefix|row/span"):
+    with pytest.raises(LifecycleError, match="complete choice|complete opening answer|row/span"):
         opening_proposal(
             ledger,
             port,
@@ -871,3 +871,315 @@ def test_normal_opening_resolution_ignores_host_decimal_precision_and_traps(live
         card, _ = finish(api, complete, "precision-opening")
         assert card.material["opening_effects"]["after_balance"] == "900.00"
         assert reader.collect().balances[0].balance_amount == "900.00"
+
+
+def choice_rows():
+    return [
+        {
+            "movement_fact_ref": {
+                "record_id": "row-a",
+                "version": 1,
+                "fact_sha256": "a" * 64,
+                "commit_seq": 1,
+            },
+            "impact_role": "debit",
+        },
+        {
+            "movement_fact_ref": {
+                "record_id": "row-b",
+                "version": 1,
+                "fact_sha256": "b" * 64,
+                "commit_seq": 2,
+            },
+            "impact_role": "credit",
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw", "treatment"),
+    [
+        ("included", "included"),
+        ("already included", "included"),
+        ("已包含", "included"),
+        ("已经包含", "included"),
+        ("excluded", "excluded"),
+        ("not included", "excluded"),
+        ("未包含", "excluded"),
+        ("尚未包含", "excluded"),
+        ("unknown", "unknown"),
+        ("uncertain", "unknown"),
+        ("unsure", "unknown"),
+        ("not sure", "unknown"),
+        ("不确定", "unknown"),
+        ("未知", "unknown"),
+        ("不清楚", "unknown"),
+        ("  NOT INCLUDED  ", "excluded"),
+        ("\n 已包含 \n", "included"),
+    ],
+)
+def test_complete_opening_choice_pure_accepts_only_full_bare_choice(raw, treatment):
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import _parse_opening_choices
+
+    rows = choice_rows()
+    start = len(raw) - len(raw.lstrip())
+    span = None if treatment == "unknown" else [start, start + len(raw.strip())]
+    selected = {**rows[1], "span": span}
+    result = _parse_opening_choices(raw, rows, [selected])
+    assert list(result) == [("row-b", "credit")]
+    assert result[("row-b", "credit")] == {**selected, "treatment": treatment}
+
+
+@pytest.mark.parametrize(
+    ("raw", "quote"),
+    [
+        ("不是已包含", "已包含"),
+        ("并非已包含", "已包含"),
+        ("没有已经包含", "已经包含"),
+        ("未确定是否已包含", "已包含"),
+        ("已包含，但我不确定", "已包含"),
+        ("已包含或未包含", "已包含"),
+        ("I am unsure whether it is included", "included"),
+        ("included or excluded", "included"),
+        ("It was not included", "included"),
+        ("not included", "included"),
+        ("not already included", "already included"),
+        ("not excluded", "excluded"),
+        ("unincluded", "included"),
+        ("includedness", "included"),
+        ("row-a:debit=不是已包含", "已包含"),
+        ("1=included or excluded", "included"),
+        ("1=included; extra words", "included"),
+        ("1=included;", "included"),
+        ("included; 1=excluded", "included"),
+        ("1=included\n\n2=excluded", "included"),
+    ],
+)
+def test_complete_opening_choice_pure_rejects_free_text_even_with_authentic_literal_span(
+    raw, quote
+):
+    from types import SimpleNamespace
+
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import _answer
+
+    start = raw.index(quote)
+    selected = {
+        **choice_rows()[0],
+        "span": [start, start + len(quote)],
+        "treatment": "excluded" if quote == "excluded" else "included",
+    }
+    with pytest.raises(LifecycleError):
+        _answer(selected, SimpleNamespace(response={"raw_input": raw}))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "row-a:debit=included; row-b:credit=not included",
+        "1=已包含; 2=未包含",
+        "2=not included\n1=already included",
+    ],
+)
+def test_complete_opening_choice_pure_consumes_all_multirow_input(raw):
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import _parse_opening_choices
+
+    rows = choice_rows()
+    positive = (
+        "already included"
+        if "already included" in raw
+        else "已包含"
+        if "已包含" in raw
+        else "included"
+    )
+    negative = "未包含" if "未包含" in raw else "not included"
+    p, n = raw.index(positive), raw.index(negative)
+    selections = [
+        {**rows[0], "span": [p, p + len(positive)]},
+        {**rows[1], "span": [n, n + len(negative)]},
+    ]
+    result = _parse_opening_choices(raw, rows, selections)
+    assert result[("row-a", "debit")]["treatment"] == "included"
+    assert result[("row-b", "credit")]["treatment"] == "excluded"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1=included; 1=excluded",
+        "row-a:debit=included; 1=excluded",
+        "row-a:debit=included; 2=excluded",
+        "row-a:credit=included",
+        "3=included",
+        "01=included",
+        "1=included; 2=maybe",
+    ],
+)
+def test_complete_opening_choice_pure_rejects_duplicate_undelivered_or_mixed_rows(raw):
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import _parse_opening_choices
+
+    rows = choice_rows()
+    start = raw.index("included")
+    selections = [{**rows[0], "span": [start, start + 8]}]
+    if raw == "row-a:debit=included; 2=excluded":
+        negative = raw.index("excluded")
+        selections.append({**rows[1], "span": [negative, negative + 8]})
+    with pytest.raises(LifecycleError, match="Mixed" if len(selections) == 2 else None):
+        _parse_opening_choices(raw, rows, selections)
+
+
+@pytest.mark.parametrize(
+    "variant", ["bare_many", "omitted_row", "wrong_version", "inner_span", "unknown_positive"]
+)
+def test_complete_opening_choice_pure_binds_actual_rows_and_complete_choice(variant):
+    from types import SimpleNamespace
+
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import (
+        _answer,
+        _parse_opening_choices,
+    )
+
+    rows = choice_rows()
+    if variant == "unknown_positive":
+        with pytest.raises(LifecycleError):
+            _answer(
+                {**rows[0], "span": None, "treatment": "included"},
+                SimpleNamespace(response={"raw_input": "不确定"}),
+            )
+        return
+    raw = "included" if variant == "bare_many" else "1=not included"
+    selections = [{**rows[0], "span": [2, len(raw)]}]
+    if variant in {"bare_many", "omitted_row"}:
+        selections.append({**rows[1], "span": [0, 8]})
+    if variant == "wrong_version":
+        selections[0]["movement_fact_ref"] = {**rows[0]["movement_fact_ref"], "version": 2}
+    if variant == "inner_span":
+        selections[0]["span"] = [6, len(raw)]
+    with pytest.raises(LifecycleError):
+        _parse_opening_choices(raw, rows, selections)
+
+
+def test_complete_opening_choice_pure_keeps_explicit_unknown_unresolved_in_multirow_reply():
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import _parse_opening_choices
+
+    rows = choice_rows()
+    raw = "2=不确定; 1=already included"
+    start = raw.index("already included")
+    selected = [{**rows[0], "span": [start, len(raw)]}, {**rows[1], "span": None}]
+    parsed = _parse_opening_choices(raw, rows, selected)
+    assert parsed[("row-a", "debit")]["treatment"] == "included"
+    assert parsed[("row-b", "credit")]["treatment"] == "unknown"
+    assert parsed[("row-b", "credit")]["span"] is None
+
+
+def test_complete_opening_choice_normal_literal_span_cannot_promote_negative_reply(live):
+    from dataclasses import asdict
+
+    from finance_core.lifecycle_v2.daily_v1 import VerifiedOpeningInstructionLinkV1
+    from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref
+
+    ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement(ledger, port, movements, account, "literal-expense")
+    view = reader.get_account(account)
+    draft = opening_proposal(
+        ledger, port, api, source, initial, view, "literal-opening", opening_command()
+    )
+    original_callback = port.opening_instruction_link_v1
+    saved = {}
+
+    def literal_relation(conn, identity, expected_target):
+        if identity not in saved:
+            return original_callback(conn, identity, expected_target)
+        event, result = saved[identity]
+        from finance_core.lifecycle_v2.daily_v1.contracts import strict_json
+
+        material = strict_json(result["link_json"])
+        assert material["association_ref"]["sha256"] == digest(event)
+        assert material["target"] == event["target"]
+        assert material["selections"] == [event["selection"]]
+        assert port.sources[identity].original_sha256 == event["reply_sha256"]
+        question = event["question"]
+        assert port.opening_questions[question["question_id"] + ":1"] == question
+        assert (
+            digest(port.opening_deliveries[question["delivery_ref"]["evidence_id"]])
+            == question["delivery_ref"]["sha256"]
+        )
+        return VerifiedOpeningInstructionLinkV1(**result)
+
+    port.opening_instruction_link_v1 = literal_relation
+
+    def receive_literal(previous, identity, raw, span, treatment):
+        # Independently saved actual receive metadata, before any expected or
+        # provider callback. It authenticates literal text, never a choice code.
+        question = port.deliver_opening_question(
+            api.opening_questions_v1(previous.proposal_id), "literal-q-" + identity
+        )
+        row = question["subjects"][0]
+        actual = port.add_source(identity, raw)
+        selection = {
+            "movement_fact_ref": row["movement_fact_ref"],
+            "impact_role": row["impact_role"],
+            "span": span,
+        }
+        target = {
+            "binding": asdict(ledger.binding),
+            "source_id": source.source_id,
+            "source_sha256": source.source_sha256,
+            "source_instruction_ref": instruction_ref(asdict(port.sources["source1"])),
+            "instruction_ref": instruction_ref(asdict(port.sources["literal-opening"])),
+            "response_ref": instruction_ref(asdict(actual)),
+            "record_id": account,
+            "command_kind": "opening_correct",
+            "current_proposal": {
+                k: asdict(previous)[k] for k in ("proposal_id", "version", "proposal_sha256")
+            },
+            "target_fact_ref": asdict(view.bundle_ref),
+        }
+        event = {
+            "target": target,
+            "reply_sha256": actual.original_sha256,
+            "question": question,
+            "selection": selection,
+        }
+        result = {
+            "evidence_id": "literal-link-" + identity,
+            "link_json": canonical(
+                {
+                    "format": "finance-daily-opening-instruction-link-v1",
+                    "mode": "dependency_answers",
+                    "target": target,
+                    "association_ref": {
+                        "evidence_id": "actual-receive-" + identity,
+                        "sha256": digest(event),
+                    },
+                    "question": question,
+                    "selections": [selection],
+                }
+            ),
+        }
+        saved[identity] = event, result
+        port.commands[identity] = opening_command(answers=[{**selection, "treatment": treatment}])
+        return api.propose_opening_change_v2(
+            account,
+            identity,
+            view.bundle_ref,
+            "propose-" + identity,
+            reply_evidence_id=identity,
+            command_kind="opening_correct",
+            opening_instruction_evidence_id="literal-opening",
+        )
+
+    before = financial_rows(ledger)
+    with pytest.raises(LifecycleError, match="complete opening answer"):
+        receive_literal(draft, "literal-negative", "不是已包含", [2, 5], "included")
+    assert financial_rows(ledger) == before
+    assert api.pending()[0]["proposal"]["proposal_id"] == draft.proposal_id
+    unknown = receive_literal(draft, "literal-unknown", "不确定", None, "unknown")
+    with pytest.raises(LifecycleError, match="incomplete_proposal"):
+        api.prepare_review(unknown.proposal_id, unknown.version)
+    assert financial_rows(ledger) == before
+    positive = receive_literal(unknown, "literal-positive", "已包含", [0, 3], "included")
+    card, _ = finish(api, positive, "literal-positive")
+    entry = card.material["after_values"]["opening_dependency_map"]["entries"][0]
+    assert entry["answer_ref"]["quote"] == "已包含"
+    assert entry["treatment"] == "included"
+    assert reader.collect().balances[0].balance_amount == "900.00"
