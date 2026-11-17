@@ -15,7 +15,7 @@ from ..reader import audit_evidence_connection
 from ..service import LedgerService
 from .accounts import MAX_FACT_VERSIONS, MAX_RECORDS, _BoundService, _limits, bundle_ref
 from .contracts import (
-    BUNDLE_FORMAT,
+    BUNDLE_FORMATS,
     AccountDefinitionRefV1,
     BundleFactRefV1,
     OpeningRefV1,
@@ -154,7 +154,7 @@ class DailyAccountReaderV1:
 
                 for fact in rows:
                     values = strict_json(fact["values_json"])
-                    if values.get("format") == BUNDLE_FORMAT:
+                    if values.get("format") in BUNDLE_FORMATS:
                         validate_bundle(values)
                         view = _view(fact, values)
                         current[view.account_id] = view

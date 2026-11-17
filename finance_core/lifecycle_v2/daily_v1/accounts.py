@@ -28,7 +28,7 @@ from ..reader import SnapshotEvidenceVerifier
 from ..service import LedgerService, _event, _fact_material, _id, _row
 from ._prefix_v1 import validate_eligibility, validate_order
 from .contracts import (
-    BUNDLE_FORMAT,
+    BUNDLE_FORMATS,
     COMMANDS,
     INCOMPLETE_FORMAT,
     OBSERVATION_FORMAT,
@@ -106,7 +106,7 @@ def registered_values(value):
 
         if value["format"] == MOVEMENT_FORMAT:
             return validate_movement(value)
-        if value["format"] != BUNDLE_FORMAT:
+        if value["format"] not in BUNDLE_FORMATS:
             raise LifecycleError("unsupported_record_format")
         return validate_bundle(value)
     from ..service import _money
@@ -145,7 +145,7 @@ def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None
         )
     ):
         values = registered_values(strict_json(fact["values_json"]))
-        if values.get("format") == BUNDLE_FORMAT:
+        if values.get("format") in BUNDLE_FORMATS:
             if values["account"]["account_id"] != fact["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
             opening = values["opening"]
@@ -296,6 +296,10 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq,
 def verify_proposal(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
+    if sealed.get("format") == "finance-daily-opening-observation-v2":
+        from .opening_changes_v1 import verify_proposal as verify_opening_proposal
+
+        return verify_opening_proposal(service, conn, proposal)
     exact(sealed, {"format", "expected", "observation"}, "daily observation envelope")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported daily observation")
@@ -362,6 +366,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 
 def verify_review(service, conn, review, *, _rows=None):
+    if strict_json(review["material_json"]).get("format") == "finance-daily-opening-review-v2":
+        from .opening_changes_v1 import verify_review as verify_opening_review
+
+        return verify_opening_review(service, conn, review)
     fingerprint = _fingerprint(conn)
     proposal = (
         _rows.one(conn, "proposal", review["proposal_id"])
@@ -500,6 +508,13 @@ def verify_fact(service, conn, fact, *, _rows=None):
     )
     if proposal is None:
         raise LifecycleError("Missing l2_proposals identity")
+    if (
+        strict_json(proposal["observation_json"]).get("format")
+        == "finance-daily-opening-observation-v2"
+    ):
+        from .opening_changes_v1 import verify_fact as verify_opening_fact
+
+        return verify_opening_fact(service, conn, fact)
     expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
     _require_prefix(
         conn,
@@ -587,6 +602,24 @@ class _EvidenceReadPort:
         from .movement_contracts import VerifiedMovementProposalV1
 
         return self._call("movement_proposal", VerifiedMovementProposalV1, conn, identity, expected)
+
+    def opening_instruction_link_v1(self, conn, identity, expected):
+        from .opening_contracts_v1 import VerifiedOpeningInstructionLinkV1
+
+        return self._call(
+            "opening_instruction_link_v1",
+            VerifiedOpeningInstructionLinkV1,
+            conn,
+            identity,
+            expected,
+        )
+
+    def opening_proposal_v2(self, conn, identity, expected):
+        from .opening_contracts_v1 import VerifiedOpeningProposalV2
+
+        return self._call(
+            "opening_proposal_v2", VerifiedOpeningProposalV2, conn, identity, expected
+        )
 
     def delivery(self, conn, identity, expected):
         return self._call("delivery", VerifiedDelivery, conn, identity, expected)
@@ -1256,7 +1289,11 @@ class DailyAccountServiceV1:
                     raise LifecycleError("Daily action or callback state mismatch")
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
-                if needs_closure(values) and material["opening_dependency_closure"] != closure(
+                if material["format"] == "finance-daily-opening-review-v2":
+                    from .opening_changes_v1 import require_current_opening
+
+                    require_current_opening(conn, expected, proposal, values, action_evidence_id)
+                elif needs_closure(values) and material["opening_dependency_closure"] != closure(
                     conn, expected.record_id, before_values=expected.before_values
                 ):
                     raise LifecycleError("Opening dependency closure changed")
@@ -1280,6 +1317,12 @@ class DailyAccountServiceV1:
                 if _fingerprint(conn) != fingerprint:
                     raise LifecycleError("State changed during source revalidation")
                 _require_current(conn, expected, proposal=proposal)
+                if material["format"] == "finance-daily-opening-review-v2":
+                    require_current_opening(conn, expected, proposal, values, action_evidence_id)
+                elif needs_closure(values) and material["opening_dependency_closure"] != closure(
+                    conn, expected.record_id, before_values=expected.before_values
+                ):
+                    raise LifecycleError("Opening dependency closure changed after source callback")
                 version = expected.expected_version + 1
                 economic = predecessor["economic_event_id"] if predecessor else source["source_key"]
                 previous = predecessor["fact_sha256"] if predecessor else None

@@ -74,11 +74,12 @@ failures and existing bounds refuse complete results; bounds are refusal
 thresholds, not a lifetime capacity promise. Old complete expense readers
 continue to refuse typed daily payloads.
 
-This slice deliberately refuses setting, correcting or voiding an opening
-with any current effective movement dependency. Historical empty closure
-bytes remain unchanged. A later exact nonempty-opening treatment contract is
-required before that restriction can be removed. Source support does not
-establish installation, release, consumer, Telegram or real-ledger acceptance.
+The original account v1 entry points refuse setting, correcting or voiding an
+opening with current effective movement dependencies. The explicit controlled
+opening v2 protocol described below permits complete set/correction decisions;
+VOID still requires an empty closure. Historical empty-closure bytes remain
+unchanged. Source support does not establish installation, release, consumer,
+Telegram or real-ledger acceptance.
 
 ## Authenticated instruction association
 
@@ -136,3 +137,31 @@ source retrieval in one daily runtime/read transaction. The final callback uses
 the same original issued connection, read-only scope and exact scalar/DTO copyout;
 source identity and hash are revalidated there. It does not delegate this new
 accessor to the historical source reader's separate callback boundary.
+
+## Current effects after a controlled opening change
+
+Account bundle v2 may contain an opening-specific dependency map. One resolver
+serves current balances, opening dependency inventory and movement review
+before/after effects. An exact current movement fact-reference/role match uses
+the map treatment; otherwise the movement must have direct coverage bound to
+the current active opening (or lawful `no_baseline` when none is active).
+A later amount/date/account correction or VOID supersedes the old exact entry;
+it never applies by record ID alone. The map's original creation fact remains
+its authority through renames. Missing original facts or an invalid carry chain
+refuse a complete read.
+
+`DailyLedgerReaderV1.collect_with_effects_v1()` returns
+`DailyLedgerWithEffectsV1(collection, effects)` with the same collection
+`read_identity`. Each `DailyResolvedEffectV1.values` explicitly identifies the
+exact movement, account, role, current opening, `direct`/`map` source, map owner,
+effective treatment and balance impact. Historical movement `values` remain
+the original stored v1 coverage; they are never silently replaced by current
+interpretation. `collect()` uses the same resolver for balances and preserves
+original-currency income/expense statistics and recorded net account change.
+
+New movement cards involving a map use the explicit
+`finance-daily-movement-review-v2` format with resolved before/after proof and
+exact account dependencies. Existing v1 cards retain their original bytes and
+prefix formula. For example, voiding an old debit of 9 that the current opening
+map includes has balance change zero. Moving that debit to another account
+withdraws its resolved old effect and adds only the new account's direct effect.

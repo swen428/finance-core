@@ -350,3 +350,11 @@ database. Boundary cost grows with retained data and may require deterministic
 sorting; prior benchmark results do not establish the cost of this protocol.
 The source contract defines required behavior, not a claim that a particular
 candidate has passed its focused, installed, independent-review or hosted gates.
+
+Controlled opening decisions with current ordinary movements use the explicit
+[daily account bundle v2 protocol](daily_accounts_v1.md#explicit-controlled-opening-changes-with-existing-movements).
+They retain the original single-fact guarded finalization, migration ledger and
+root API. Registered source and independent snapshot audit dispatch the exact
+v2 proposal/review/fact formats, including incomplete pending-only material.
+The old complete personal-expense readers still refuse daily facts; they never
+ignore a dependency map to return an incorrect balance.

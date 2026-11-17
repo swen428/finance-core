@@ -8,12 +8,13 @@ It introduces no second ledger, SQL migration or root API export. The installed
 package, opt-in contract and complete 001–062 migration ledger must be bound
 together by a consumer's separate admission procedure.
 
-This contract covers account creation and renaming, setting an opening balance,
-and correcting or voiding an opening with a provably empty dependency closure.
+This contract covers account creation and renaming, the original empty-closure
+opening operations and the explicit v2 controlled opening set/correction below.
+Opening VOID requires a provably empty current dependency closure.
 Account-associated ordinary income/expense and current balances use the separate
-[ordinary movement contract](daily_movements_v1.md). Nonempty opening replacement,
-transfers and refunds still require their respective later contracts. An opening
-is a balance baseline, never income.
+[ordinary movement contract](daily_movements_v1.md). Transfers and refunds still
+require their respective later contracts. An opening is a balance baseline,
+never income.
 
 ## Explicit API
 
@@ -195,8 +196,8 @@ financial types and any current account impacts, including impacts without an
 opening reference. Looking up only records referencing the previous opening ID
 would be incomplete.
 
-This version permits these operations only when the actual authenticated
-closure is empty. Legacy personal expenses retain unknown account ownership;
+The original v1 entry points permit these operations only when the actual
+authenticated closure is empty. Legacy personal expenses retain unknown account ownership;
 they are not arbitrarily assigned to an account. Unknown formats, unreadable
 dependencies, nonempty impacts or incomplete domain coverage refuse the
 operation. A caller-supplied empty collection cannot prove emptiness.
@@ -292,3 +293,67 @@ validation, merge approval, immutable release publication, consumer admission
 and runtime activation remain separate evidence layers under the
 [release contract](release_validation_v1.md). This source API grants no provider
 access, recovery promotion or real-ledger activation.
+
+## Explicit controlled opening changes with existing movements
+
+`DailyOpeningChangeServiceV1(existing_ledger_service)` adds the explicit
+`expected_opening_change_v2` / `propose_opening_change_v2` protocol for
+`opening_set` and `opening_correct`. This also permits the first known opening
+when earlier movements were posted with `no_baseline`, and a fresh opening ID
+after a legitimate empty-dependency VOID. The original account v1 entry points
+retain their empty-closure rule. Opening VOID still requires no current active
+impacts, including included rows and zero-net sets.
+
+The new exact `finance-daily-account-bundle-v2` carries the unchanged definition
+and opening v1 components plus `opening_dependency_map`. The map binds the
+complete current active income/expense fact references and debit/credit roles,
+new opening, exact predecessor bundle, subjects and authenticated treatments.
+It affects only whether the actual account amount is already in this opening;
+it changes no movement bytes, source, receipt or income/expense statistic.
+Unknown formats refuse rather than dropping the map. Existing v1 bytes and
+meaning remain unchanged. A v2 rename carries the map and opening unchanged;
+empty VOID clears the current map but preserves its history.
+
+The trusted daily evidence port supplies scalar-only
+`VerifiedOpeningProposalV2` and `VerifiedOpeningInstructionLinkV1` from
+`opening_proposal_v2` and `opening_instruction_link_v1`, through the original
+issued-connection read-only and copy-out guards. The independent link binds
+runtime, account source/target, original instruction/reason, current response,
+previous proposal, actual question/version/delivery, complete list hash and
+actual selected row/codepoint spans. It must look up retained original
+relations, never manufacture them from the expected request or provider claim.
+
+The exact v2 command contains `format`, `command_kind`, `fields`, `reason_span`
+and `answers`. Each answer names an exact movement fact reference, impact role,
+`included`/`excluded`/`unknown` treatment and original response span. The whole
+actual choice, including negation, must match the treatment. Only funds known
+strictly later than the new opening are automatically excluded. Every other
+unanswered or uncertain row remains a durable incomplete proposal. Supplying
+new opening fields or a reason uses a fresh original instruction; completing
+coverage preserves that instruction separately from the response. Changed
+dependencies discard carried answers and require a newly delivered exact list.
+
+`opening_questions_v1(proposal_id)` returns the current complete subjects and
+list identity from an audited protected read. This call does not claim that
+questions were delivered. The adapter retains the actual question delivery and
+reply association before the next proposal callback. Its evidence includes the
+full list and selected rows, so a bare ambiguous reply cannot select a row.
+
+After all rows are resolved, `prepare_review` produces one v2 complete card with
+all subjects, original and new treatments, per-row balance changes, full
+before/after balances, difference and original reason. The full material hash
+must be delivered before a separate action can confirm it. The original
+instruction or any answer cannot serve as that action. Partial replies and
+restarts grant no posting right. One confirmation uses the original protected
+transaction and appends exactly one account fact, decision and confirm event.
+The target, complete closure and compiled questions/answers are checked again
+after the last external read-only callback. Stale cards refuse without posting;
+original operation replay first returns its original receipt.
+
+A map's authority owner is the exact creation fact at
+`predecessor_bundle_ref.version + 1`, with its original complete review,
+decision and confirmation. Later renames are carriers only. Historical audit
+checks the complete owner prefix; later valid movement successors make an old
+entry inapplicable to that successor without erasing it. Source and independent
+snapshot audits share this interpretation. This source contract does not itself
+authorize a new release, consumer upgrade or live use.

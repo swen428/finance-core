@@ -1,0 +1,873 @@
+"""Normal admitted opening dependency decisions with independent synthetic links."""
+
+import pytest
+
+from finance_core.instance_admission.sessions import lifecycle_read_operation
+from finance_core.lifecycle_v2 import LifecycleError
+from finance_core.lifecycle_v2.contracts import canonical, digest
+from finance_core.lifecycle_v2.daily_v1 import (
+    DailyAccountServiceV1,
+    DailyLedgerReaderV1,
+    DailyMovementServiceV1,
+    DailyOpeningChangeServiceV1,
+)
+from tests.daily_account_support_v1 import NOW, OpeningPort, command, unknown_time
+from tests.test_daily_accounts_lifecycle_v1 import change, create
+from tests.test_daily_movements_lifecycle_v1 import fields, movement
+from tests.test_lifecycle_v2 import live as live
+
+
+def prepare_opening(live, opening="1000", currency="MYR", account_type="bank"):
+    ledger, _, cfg = live
+    port = OpeningPort()
+    ledger.port = port
+    ledger.clock = lambda: NOW
+    daily = DailyAccountServiceV1(ledger)
+    source, proposal, _, receipt = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={
+                "name": "Bank",
+                "account_type": account_type,
+                "currency": currency,
+                "opening": {"amount": opening, "as_of": unknown_time()}
+                if opening is not None
+                else None,
+            }
+        ),
+    )
+    reader = DailyLedgerReaderV1(ledger)
+    return (
+        ledger,
+        port,
+        daily,
+        DailyMovementServiceV1(ledger),
+        reader,
+        DailyOpeningChangeServiceV1(ledger),
+        source,
+        proposal,
+        receipt.account_ref.account_id,
+        cfg,
+    )
+
+
+def opening_command(kind="opening_correct", amount="900", boundary=None, answers=None):
+    return {
+        "format": "finance-daily-opening-command-v2",
+        "command_kind": kind,
+        "fields": {"amount": amount, "as_of": boundary or unknown_time()},
+        "reason_span": [0, len("wrong opening")] if kind == "opening_correct" else None,
+        "answers": answers or [],
+    }
+
+
+def opening_proposal(
+    ledger, port, api, source, previous, account, identity, cmd, original=None, question=None
+):
+    if identity not in port.sources:
+        if original is not None:
+            raise AssertionError(
+                "Register the actual explicit row reply before its provider command"
+            )
+        port.add_source(
+            identity,
+            "wrong opening; set "
+            + cmd["fields"].get("amount", "unspecified")
+            + " "
+            + account.currency
+            + "; as-of "
+            + canonical(cmd["fields"].get("as_of")),
+        )
+    port.register_opening(
+        ledger.binding, source, account, previous, identity, original, cmd["command_kind"], question
+    )
+    port.commands[identity] = cmd
+    return api.propose_opening_change_v2(
+        account.account_id,
+        identity,
+        account.bundle_ref,
+        "propose-" + identity,
+        reply_evidence_id=identity,
+        command_kind=cmd["command_kind"],
+        opening_instruction_evidence_id=original,
+    )
+
+
+def row_reply(port, identity, *rows):
+    """A synthetic actual user message, before any provider callback runs."""
+    phrases = {"included": "included", "excluded": "not included", "unknown": "unknown"}
+    raw = "; ".join(
+        s["movement_fact_ref"]["record_id"] + ":" + s["impact_role"] + "=" + phrases[c]
+        for s, c in rows
+    )
+    port.add_source(identity, raw)
+    answers = []
+    for selected, choice in rows:
+        marker = selected["movement_fact_ref"]["record_id"] + ":" + selected["impact_role"] + "="
+        start = raw.index(marker) + len(marker)
+        answers.append(
+            {
+                "movement_fact_ref": selected["movement_fact_ref"],
+                "impact_role": selected["impact_role"],
+                "treatment": choice,
+                "span": [start, start + len(phrases[choice])] if choice != "unknown" else None,
+            }
+        )
+    return answers
+
+
+def finish(api, proposal, identity):
+    card = api.prepare_review(proposal.proposal_id, proposal.version)
+    api.record_delivery(card.review_id, "delivery-" + identity)
+    receipt = api.confirm(card.review_id, "action-" + identity, "confirm-" + identity)
+    return card, receipt
+
+
+def financial_rows(ledger):
+    with lifecycle_read_operation(ledger.owner) as conn:
+        return tuple(
+            tuple(row)
+            for row in conn.execute(
+                "SELECT record_id,version,values_json,fact_sha256 FROM l2_facts "
+                "ORDER BY record_id,version"
+            )
+        )
+
+
+def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, request):
+    ledger, port, daily, movements, reader, api, source, initial, account, cfg = prepare_opening(
+        live
+    )
+    _, income_card, income = movement(
+        ledger, port, movements, account, "income", fields(account, "200", "income")
+    )
+    _, _, expense = movement(ledger, port, movements, account, "expense")
+    originals = financial_rows(ledger)
+    draft = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader.get_account(account),
+        "opening",
+        opening_command(),
+    )
+    assert len(api.pending()[0]["values"]["missing_fields"]) == 2
+    with pytest.raises(LifecycleError, match="incomplete_proposal"):
+        api.prepare_review(draft.proposal_id, draft.version)
+    questions = api.opening_questions_v1(draft.proposal_id)
+    by_kind = {s["kind"]: s for s in questions["subjects"]}
+    q1 = port.deliver_opening_question(questions, "q1")
+    income_answer = row_reply(port, "answer1", (by_kind["income"], "included"))
+    first = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        draft,
+        reader.get_account(account),
+        "answer1",
+        opening_command(answers=income_answer),
+        "opening",
+        q1,
+    )
+    assert len(api.pending()[0]["values"]["missing_fields"]) == 1
+    assert reader.collect().balances[0].balance_amount == "1191.00"
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.lifecycle_v2 import LedgerService
+
+    binding = ledger.binding
+    ledger.owner.close()
+    reopened = acquire_production_owner(cfg)
+    request.addfinalizer(reopened.close)
+    ledger = LedgerService(reopened, port, binding, clock=lambda: NOW)
+    daily = DailyAccountServiceV1(ledger)
+    movements = DailyMovementServiceV1(ledger)
+    reader = DailyLedgerReaderV1(ledger)
+    api = DailyOpeningChangeServiceV1(ledger)
+    retained = api.pending()[0]["values"]
+    assert len(retained["missing_fields"]) == 1
+    assert (
+        next(a for a in retained["answers"] if a["subject"]["kind"] == "income")["answer_ref"][
+            "instruction_ref"
+        ]["evidence_id"]
+        == "answer1"
+    )
+    q2 = port.deliver_opening_question(api.opening_questions_v1(first.proposal_id), "q2")
+    expense_answer = row_reply(port, "answer2", (by_kind["expense"], "excluded"))
+    complete = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        first,
+        reader.get_account(account),
+        "answer2",
+        opening_command(answers=expense_answer),
+        "opening",
+        q2,
+    )
+    card, receipt = finish(api, complete, "opening")
+    effects = card.material["opening_effects"]
+    assert (effects["before_balance"], effects["after_balance"], effects["balance_delta"]) == (
+        "1191.00",
+        "891.00",
+        "-300.00",
+    )
+    assert len(effects["rows"]) == 2 and not effects["statistics_changed"]
+    result = reader.collect_with_effects_v1()
+    assert result.read_identity is result.collection.read_identity
+    assert result.collection.balances[0].balance_amount == "891.00"
+    assert result.collection.balances[0].recorded_net_change == "191.00"
+    assert result.collection.income_by_currency == (("MYR", "200.00"),)
+    assert result.collection.expense_by_currency == (("MYR", "9.00"),)
+    assert all(e.values["source"] == "map" for e in result.effects)
+    assert all(
+        e.values["map_owner_fact_ref"]["version"] == receipt.receipt.version for e in result.effects
+    )
+    now = {r[:2]: r[2:] for r in financial_rows(ledger)}
+    assert all(now[r[:2]] == r[2:] for r in originals)
+    assert len(now) == len(originals) + 1
+    with lifecycle_read_operation(ledger.owner) as conn:
+        assert tuple(
+            conn.execute(
+                "SELECT (SELECT count(*) FROM l2_facts),(SELECT count(*) FROM l2_decisions),"
+                "(SELECT count(*) FROM l2_events WHERE kind='confirm')"
+            ).fetchone()
+        ) == (4, 4, 4)
+    assert (
+        movements.lookup_commit_receipt(
+            "confirm-income", review_id=income_card.review_id, action_evidence_id="action-income"
+        )
+        == income
+    )
+    assert reader.source(source.source_id) == port.sources["source1"]
+    assert api.confirm(card.review_id, "action-opening", "confirm-opening") == receipt
+    old_map = reader.get_account(account).values["opening_dependency_map"]
+    port.add_source("rename", "Rename this bank to Renamed")
+    port.commands["rename"] = command("account_rename", {"name": "Renamed"})
+    renamed = daily.propose_account_change(
+        account,
+        "rename",
+        reader.get_account(account).bundle_ref,
+        "propose-rename",
+        reply_evidence_id="rename",
+        command_kind="account_rename",
+    )
+    finish(daily, renamed, "rename")
+    assert reader.get_account(account).values["opening_dependency_map"] == old_map
+    assert all(
+        e.values["map_owner_fact_ref"]["version"] == receipt.receipt.version
+        for e in reader.collect_with_effects_v1().effects
+    )
+    # The included income is withdrawn with zero balance effect.
+    target = reader.detail(income.receipt.record_id)
+    _, void_card, _ = movement(
+        ledger, port, movements, account, "void-income", {}, target, "movement_void"
+    )
+    assert void_card.material["format"] == "finance-daily-movement-review-v2"
+    assert void_card.material["account_impact_changes"][0]["balance_delta"] == "0.00"
+    assert reader.collect().balances[0].balance_amount == "891.00"
+    after_void = reader.collect()
+    assert after_void.income_by_currency == ()
+    assert after_void.expense_by_currency == (("MYR", "9.00"),)
+    assert after_void.balances[0].recorded_net_change == "-9.00"
+    assert reader.detail(expense.receipt.record_id).values["coverage"]["treatment"] == "excluded"
+    second = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        renamed,
+        reader,
+        account,
+        "opening-second",
+        opening_command(amount="850"),
+        {"expense": "included"},
+    )
+    second_card = api.prepare_review(second.proposal_id, second.version)
+    api.record_delivery(second_card.review_id, "delivery-opening-second")
+    port.add_source("source2", "Create another MYR bank with opening 500")
+    _, _, _, other = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={
+                "name": "Other",
+                "account_type": "bank",
+                "currency": "MYR",
+                "opening": {"amount": "500", "as_of": unknown_time()},
+            }
+        ),
+        "2",
+    )
+    movement(
+        ledger,
+        port,
+        movements,
+        other.account_ref.account_id,
+        "unrelated-income",
+        fields(other.account_ref.account_id, "50", "income"),
+    )
+    second_receipt = api.confirm(
+        second_card.review_id, "action-opening-second", "confirm-opening-second"
+    )
+    balances = {b.account_id: b.balance_amount for b in reader.collect().balances}
+    assert balances == {account: "850.00", other.account_ref.account_id: "550.00"}
+    assert second_card.material["opening_effects"]["before_balance"] == "891.00"
+    assert second_card.material["opening_effects"]["after_balance"] == "850.00"
+    assert second_receipt.opening_ref.opening_version == receipt.opening_ref.opening_version + 1
+    assert (
+        api.lookup_commit_receipt(
+            "confirm-opening", review_id=card.review_id, action_evidence_id="action-opening"
+        )
+        == receipt
+    )
+    assert (
+        movements.lookup_commit_receipt(
+            "confirm-income", review_id=income_card.review_id, action_evidence_id="action-income"
+        )
+        == income
+    )
+
+
+def complete_dependencies(
+    ledger, port, api, source, previous, reader, account, identity, cmd, choices
+):
+    draft = opening_proposal(
+        ledger, port, api, source, previous, reader.get_account(account), identity, cmd
+    )
+    material = api.opening_questions_v1(draft.proposal_id)
+    question = port.deliver_opening_question(material, "question-" + identity)
+    answers = row_reply(
+        port, "reply-" + identity, *((s, choices[s["kind"]]) for s in material["subjects"])
+    )
+    reply_cmd = {**cmd, "answers": answers}
+    complete = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        draft,
+        reader.get_account(account),
+        "reply-" + identity,
+        reply_cmd,
+        identity,
+        question,
+    )
+    return complete
+
+
+def test_unknown_opening_set_strictly_later_restart_and_snapshot(live, tmp_path):
+    import sqlite3
+
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.lifecycle_v2 import LedgerService
+    from finance_core.lifecycle_v2.reader import audit_evidence_connection
+
+    ledger, port, _, movements, reader, api, source, initial, account, cfg = prepare_opening(
+        live, None
+    )
+    movement(ledger, port, movements, account, "earlier", fields(account, "20", "income"))
+    later = fields(account)
+    later["funds_time"] = {
+        **unknown_time(),
+        "precision": "instant",
+        "timestamp": NOW + 10,
+        "local_date": "2026-11-17",
+    }
+    movement(ledger, port, movements, account, "later", later)
+    assert reader.collect().balances[0].balance_amount is None
+    originals = financial_rows(ledger)
+    boundary = {
+        **unknown_time(),
+        "precision": "instant",
+        "timestamp": NOW,
+        "local_date": "2026-11-17",
+    }
+    cmd = opening_command("opening_set", "100", boundary)
+    draft = opening_proposal(
+        ledger, port, api, source, initial, reader.get_account(account), "set-opening", cmd
+    )
+    assert len(api.pending()[0]["values"]["missing_fields"]) == 1
+    question = port.deliver_opening_question(api.opening_questions_v1(draft.proposal_id), "set-q")
+    chosen = next(s for s in question["subjects"] if s["kind"] == "income")
+    later_subject = next(s for s in question["subjects"] if s["kind"] == "expense")
+    contradiction = row_reply(port, "later-contradiction", (later_subject, "included"))
+    with pytest.raises(LifecycleError, match="contradicts strictly later"):
+        opening_proposal(
+            ledger,
+            port,
+            api,
+            source,
+            draft,
+            reader.get_account(account),
+            "later-contradiction",
+            {**cmd, "answers": contradiction},
+            "set-opening",
+            question,
+        )
+    assert financial_rows(ledger) == originals
+    # A real owner close/reacquisition, with retained synthetic transport receipts.
+    ledger.owner.close()
+    with acquire_production_owner(cfg) as reopened:
+        service = LedgerService(reopened, port, ledger.binding, clock=lambda: NOW)
+        api = DailyOpeningChangeServiceV1(service)
+        reader = DailyLedgerReaderV1(service)
+        assert len(api.pending()[0]["values"]["missing_fields"]) == 1
+        answers = row_reply(port, "set-answer", (chosen, "included"))
+        complete = opening_proposal(
+            service,
+            port,
+            api,
+            source,
+            draft,
+            reader.get_account(account),
+            "set-answer",
+            {**cmd, "answers": answers},
+            "set-opening",
+            question,
+        )
+        card, receipt = finish(api, complete, "set")
+        assert card.material["opening_effects"]["before_balance"] is None
+        result = reader.collect_with_effects_v1()
+        assert result.collection.balances[0].balance_amount == "91.00"
+        assert {e.values["treatment"] for e in result.effects} == {"included", "excluded"}
+        assert all(e.values["source"] == "map" for e in result.effects)
+        current = {r[:2]: r[2:] for r in financial_rows(service)}
+        assert all(current[r[:2]] == r[2:] for r in originals)
+        cut = service.seal_snapshot(tmp_path / "opening.sqlite")
+        with sqlite3.connect(
+            (tmp_path / "opening.sqlite").as_uri() + "?mode=ro&immutable=1", uri=True
+        ) as copy:
+            copy.row_factory = sqlite3.Row
+            copy.execute("PRAGMA query_only=ON")
+            audited = audit_evidence_connection(copy, port, service.binding)
+            assert audited["fact_version_count"] == result.collection.fact_version_count
+            from finance_core.instance_admission.authority import _logical_database_digest
+            from finance_core.lifecycle_v2.daily_v1._impacts_v1 import opening_inventory
+
+            copy_seq = copy.execute("SELECT coalesce(max(seq),0) FROM l2_events").fetchone()[0]
+            copy_facts = tuple(
+                tuple(r)
+                for r in copy.execute(
+                    "SELECT record_id,version,fact_sha256 FROM l2_facts f WHERE version="
+                    "(SELECT max(version) FROM l2_facts WHERE record_id=f.record_id) "
+                    "ORDER BY record_id"
+                )
+            )
+            assert copy_seq == cut.commit_seq == result.read_identity.event_seq
+            assert copy_facts == cut.facts
+            assert (
+                _logical_database_digest(copy)
+                == cut.logical_database_sha256
+                == result.read_identity.logical_database_sha256
+            )
+            assert audited["event_count"] == copy_seq
+            assert {
+                d["fact_ref"]["record_id"]: d["resolved_effect"]
+                for d in opening_inventory(copy, account)
+            } == {e.values["movement_fact_ref"]["record_id"]: e.values for e in result.effects}
+        assert (
+            api.lookup_commit_receipt(
+                "confirm-set", review_id=card.review_id, action_evidence_id="action-set"
+            )
+            == receipt
+        )
+
+
+def test_mapped_expense_correction_account_currency_change_and_void(live):
+    ledger, port, daily, movements, reader, api, source, initial, account, _ = prepare_opening(
+        live, "-300", currency="MYR", account_type="credit_card"
+    )
+    _, _, expense = movement(
+        ledger,
+        port,
+        movements,
+        account,
+        "jpy",
+        fields(account, "9", original="1000", currency="JPY"),
+    )
+    complete = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader,
+        account,
+        "correct-opening",
+        opening_command(amount="-400"),
+        {"expense": "included"},
+    )
+    _, opening_receipt = finish(api, complete, "correct-opening")
+    assert reader.collect().balances[0].balance_amount == "-400.00"
+    port.add_source("source2", "Create SGD bank opening 500")
+    _, _, _, b = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={
+                "name": "Other",
+                "account_type": "bank",
+                "currency": "SGD",
+                "opening": {"amount": "500", "as_of": unknown_time()},
+            }
+        ),
+        "2",
+    )
+    other = b.account_ref.account_id
+    target = reader.detail(expense.receipt.record_id)
+    _, corrected_card, corrected = movement(
+        ledger,
+        port,
+        movements,
+        other,
+        "reassign",
+        fields(other, "10", original="1000", currency="JPY"),
+        target,
+        "movement_correct",
+    )
+    assert {
+        r["account_id"]: r["balance_delta"]
+        for r in corrected_card.material["account_impact_changes"]
+    } == {account: "0.00", other: "-10.00"}
+    result = reader.collect_with_effects_v1()
+    assert {b.account_id: b.balance_amount for b in result.collection.balances} == {
+        account: "-400.00",
+        other: "490.00",
+    }
+    assert result.collection.expense_by_currency == (("JPY", "1000"),)
+    assert result.effects[0].values["source"] == "direct"
+    assert result.effects[0].values["map_owner_fact_ref"] is None
+    old_map = reader.get_account(account).values["opening_dependency_map"]
+    assert old_map["entries"][0]["movement_fact_ref"]["version"] == 1
+    _, void_card, _ = movement(
+        ledger,
+        port,
+        movements,
+        other,
+        "void-corrected",
+        {},
+        reader.detail(corrected.receipt.record_id),
+        "movement_void",
+    )
+    assert void_card.material["account_impact_changes"][0]["balance_delta"] == "10.00"
+    assert reader.collect().expense_by_currency == ()
+    assert opening_receipt.receipt.version == 2
+
+
+def test_nonempty_void_refused_then_empty_void_new_id_and_no_baseline_set(live):
+    ledger, port, daily, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    _, _, expense = movement(ledger, port, movements, account, "coffee")
+    complete = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader,
+        account,
+        "opening1",
+        opening_command(),
+        {"expense": "included"},
+    )
+    _, first = finish(api, complete, "opening1")
+    with pytest.raises(LifecycleError, match="nonempty_opening_dependencies"):
+        change(
+            port,
+            daily,
+            reader.get_account(account),
+            "opening_void",
+            {},
+            "refuse-void",
+            "still has dependency",
+        )
+    _, void_card, _ = movement(
+        ledger,
+        port,
+        movements,
+        account,
+        "void-coffee",
+        {},
+        reader.detail(expense.receipt.record_id),
+        "movement_void",
+    )
+    assert void_card.material["account_impact_changes"][0]["balance_delta"] == "0.00"
+    cleared = change(
+        port,
+        daily,
+        reader.get_account(account),
+        "opening_void",
+        {},
+        "clear-opening",
+        "wrong baseline",
+    )
+    assert reader.get_account(account).values["opening_dependency_map"] is None
+    movement(ledger, port, movements, account, "new-income", fields(account, "10", "income"))
+    # The latest account proposal is the legitimate opening VOID proposal.
+    with lifecycle_read_operation(ledger.owner) as conn:
+        latest = conn.execute(
+            "SELECT proposal_id,version,proposal_sha256 FROM l2_proposals WHERE source_id=? "
+            "ORDER BY version DESC LIMIT 1",
+            (source.source_id,),
+        ).fetchone()
+        from finance_core.lifecycle_v2.contracts import ProposalRef
+
+        previous = ProposalRef(latest[0], source.source_id, latest[1], latest[2])
+    complete = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        previous,
+        reader,
+        account,
+        "opening2",
+        opening_command("opening_set", "50"),
+        {"income": "excluded"},
+    )
+    _, second = finish(api, complete, "opening2")
+    assert second.opening_ref.opening_event_id != first.opening_ref.opening_event_id
+    assert cleared.opening_ref.opening_event_id == first.opening_ref.opening_event_id
+    assert reader.collect().balances[0].balance_amount == "60.00"
+
+
+def test_stale_closure_card_zero_append_and_fresh_card_required(live):
+    ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement(ledger, port, movements, account, "coffee")
+    complete = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader,
+        account,
+        "opening-stale",
+        opening_command(),
+        {"expense": "included"},
+    )
+    card = api.prepare_review(complete.proposal_id, complete.version)
+    api.record_delivery(card.review_id, "delivery-stale")
+    movement(ledger, port, movements, account, "new-income", fields(account, "20", "income"))
+    before = financial_rows(ledger)
+    with pytest.raises(LifecycleError, match="stale_opening_dependency_closure"):
+        api.confirm(card.review_id, "action-stale", "confirm-stale")
+    assert financial_rows(ledger) == before
+    assert reader.collect().balances[0].balance_amount == "1011.00"
+    # Fresh original instruction and complete current list replace the stale card.
+    fresh = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        complete,
+        reader,
+        account,
+        "opening-fresh",
+        opening_command(amount="950"),
+        {"income": "included", "expense": "excluded"},
+    )
+    fresh_card = api.prepare_review(fresh.proposal_id, fresh.version)
+    with pytest.raises(LifecycleError):
+        api.confirm(fresh_card.review_id, "action-without-delivery", "confirm-without-delivery")
+    api.record_delivery(fresh_card.review_id, "delivery-fresh")
+    with pytest.raises(LifecycleError, match="independent"):
+        api.confirm(fresh_card.review_id, "reply-opening-fresh", "cannot-borrow-answer")
+    receipt = api.confirm(fresh_card.review_id, "action-fresh", "confirm-fresh")
+    assert reader.collect().balances[0].balance_amount == "941.00"
+    assert (
+        api.lookup_commit_receipt(
+            "confirm-fresh", review_id=fresh_card.review_id, action_evidence_id="action-fresh"
+        )
+        == receipt
+    )
+
+
+def test_wrong_question_answer_and_negative_span_refused(live):
+    ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement(ledger, port, movements, account, "coffee")
+    draft = opening_proposal(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader.get_account(account),
+        "opening-draft",
+        opening_command(),
+    )
+    material = api.opening_questions_v1(draft.proposal_id)
+    question = port.deliver_opening_question(material, "negative-q")
+    chosen = question["subjects"][0]
+    answers = row_reply(port, "negative-answer", (chosen, "excluded"))
+    # An AI cannot slice `included` out of the genuine `not included` choice.
+    bad = [
+        {
+            **answers[0],
+            "treatment": "included",
+            "span": [answers[0]["span"][0] + 4, answers[0]["span"][1]],
+        }
+    ]
+    before = financial_rows(ledger)
+    with pytest.raises(LifecycleError, match="negative prefix|row/span"):
+        opening_proposal(
+            ledger,
+            port,
+            api,
+            source,
+            draft,
+            reader.get_account(account),
+            "negative-answer",
+            opening_command(answers=bad),
+            "opening-draft",
+            question,
+        )
+    assert financial_rows(ledger) == before
+    # A genuinely delivered but differently worded 90-unit subject cannot
+    # authorize treatment of the actual 9-unit row.
+    import copy
+
+    wrong = copy.deepcopy(material)
+    wrong["subjects"][0]["account_amount"] = "90.00"
+    wrong["list_sha256"] = digest({"format": material["format"], "subjects": wrong["subjects"]})
+    wrong_question = port.deliver_opening_question(wrong, "wrong-q")
+    answers = row_reply(port, "wrong-answer", (chosen, "included"))
+    with pytest.raises(LifecycleError, match="actual complete question"):
+        opening_proposal(
+            ledger,
+            port,
+            api,
+            source,
+            draft,
+            reader.get_account(account),
+            "wrong-answer",
+            opening_command(answers=answers),
+            "opening-draft",
+            wrong_question,
+        )
+    assert financial_rows(ledger) == before
+    assert api.pending()[0]["values"]["missing_fields"]
+
+
+@pytest.mark.parametrize("callback", ["opening_instruction_link_v1", "opening_proposal_v2"])
+def test_new_callbacks_keep_original_issued_connection_readonly_scope(live, monkeypatch, callback):
+    from finance_core.instance_admission import InstanceAdmissionError
+
+    ledger, port, _, _, reader, api, source, initial, account, _ = prepare_opening(live)
+    port.add_source("guarded-opening", "wrong opening; amount 900 MYR")
+    port.register_opening(
+        ledger.binding, source, reader.get_account(account), initial, "guarded-opening"
+    )
+    port.commands["guarded-opening"] = opening_command()
+    original = getattr(port, callback)
+    seen = []
+
+    def guarded(conn, identity, expected):
+        seen.append((id(conn), conn.in_transaction))
+        try:
+            conn.execute("CREATE TABLE opening_callback_write_forbidden(value)")
+        except (InstanceAdmissionError, LifecycleError):
+            pass
+        return original(conn, identity, expected)
+
+    monkeypatch.setattr(port, callback, guarded)
+    before = financial_rows(ledger)
+    with pytest.raises(InstanceAdmissionError, match="read-only scope"):
+        api.propose_opening_change_v2(
+            account,
+            "guarded-opening",
+            reader.get_account(account).bundle_ref,
+            "propose-guarded",
+            reply_evidence_id="guarded-opening",
+            command_kind="opening_correct",
+        )
+    assert financial_rows(ledger) == before
+    assert seen and all(active for _, active in seen)
+
+
+def test_v1_account_component_bytes_match_protected_baseline():
+    from dataclasses import replace
+
+    from finance_core.lifecycle_v2.daily_v1.contracts import compile_bundle
+    from tests.test_daily_accounts_contracts_v1 import as_of, command, expected
+
+    created = compile_bundle(
+        command(
+            fields={
+                "name": "Daily",
+                "account_type": "bank",
+                "currency": "MYR",
+                "opening": {"amount": "1000", "as_of": as_of()},
+            }
+        ),
+        expected(),
+    )
+    renamed = compile_bundle(
+        command("account_rename", {"name": "Renamed"}),
+        replace(expected("account_rename", created), opening_event_id="opening-2"),
+    )
+    corrected = compile_bundle(
+        command("opening_correct", {"amount": "900", "as_of": as_of()}, [30, 43]),
+        expected("opening_correct", renamed),
+    )
+    # Captured by executing the original exact codec from protected B=74943c3.
+    assert [digest(v) for v in (created, renamed, corrected)] == [
+        "f624e877a1d4e6d13603639b4c02bfb712db2d20b2f329a588ae501fbdd65d84",
+        "45cb0d12929c637788918236783771a50298c46e1054f078af7874a5ef89ba7c",
+        "bbfd9cdeffde80e83484256d1d6142b65fcb32298dc404bda7b0115d729e9e9a",
+    ]
+
+
+def test_historical_opening_expected_cannot_borrow_another_instance():
+    from types import SimpleNamespace
+
+    from finance_core.lifecycle_v2 import RuntimeBinding
+    from finance_core.lifecycle_v2.daily_v1.opening_changes_v1 import _compose
+
+    binding = RuntimeBinding("actual-instance", "generation", "user", "chat")
+    other = RuntimeBinding("other-instance", "generation", "user", "chat")
+    with pytest.raises(LifecycleError, match="another instance"):
+        _compose(
+            SimpleNamespace(binding=binding),
+            None,
+            None,
+            None,
+            None,
+            "opening_correct",
+            None,
+            None,
+            binding=other,
+        )
+
+
+def test_normal_opening_resolution_ignores_host_decimal_precision_and_traps(live):
+    from decimal import Inexact, Rounded, localcontext
+
+    ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement(ledger, port, movements, account, "precision-expense")
+    with localcontext() as context:
+        context.prec = 2
+        context.traps[Inexact] = True
+        context.traps[Rounded] = True
+        complete = complete_dependencies(
+            ledger,
+            port,
+            api,
+            source,
+            initial,
+            reader,
+            account,
+            "precision-opening",
+            opening_command(),
+            {"expense": "included"},
+        )
+        card, _ = finish(api, complete, "precision-opening")
+        assert card.material["opening_effects"]["after_balance"] == "900.00"
+        assert reader.collect().balances[0].balance_amount == "900.00"

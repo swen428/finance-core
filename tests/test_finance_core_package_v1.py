@@ -902,7 +902,8 @@ def _probe_installed_daily(runtime_python, install_dir, outside_dir):
     )
     payload = json.loads(completed.stdout)
     assert payload["contract"] == "finance-daily-v1"
-    assert payload["fact_versions"] == 9 and payload["proposal_count"] == 11
+    assert payload["fact_versions"] == 12 and payload["proposal_count"] == 15
+    assert payload["opening_dependency_map"] and payload["resolved_mapped_void"]
     assert payload["independent_instruction_question_link"]
     assert payload["negative_coverage_preserved"] and payload["daily_source_guarded"]
     assert payload["movement_balance_correction_void"]

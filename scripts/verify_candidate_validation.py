@@ -77,7 +77,7 @@ BRIDGE_SCOPE_PATTERN = (
     r"prepared_content_export|prepared_envelope(_faults)?|age_toolchain_qualification|"
     r"finance_core_package|candidate_validation|public_ci_security)_v1\.py$|"
     r"test_daily_(accounts|movements)_(contracts|lifecycle)_v1\.py$|"
-    r"test_daily_evidence_callback_scope_v1\.py$|"
+    r"test_daily_evidence_callback_scope_v1\.py$|test_daily_opening_changes_v1\.py$|"
     r"test_lifecycle_audit_rows_v1\.py$|"
     r"prepared_envelope_test_support\.py$|installed_prepared_envelope_probe\.py$|"
     r"lifecycle_recovery_material_support_v1\.py$|instance_admission_support_v1\.py$|"
