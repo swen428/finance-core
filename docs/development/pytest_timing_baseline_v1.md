@@ -322,8 +322,9 @@ artifact ZIP hash and extracted JSON hash are recorded separately:
   `5bb8ab66f411e6a921347bbb4334ef4f452d53fa693c467cd8250231b2d92fc9`.
 
 The generated manifest timestamp is `2026-11-17T17:29:13Z`. It contains 291
-measured files, 13,795 test cases and 41,145 timing samples; its unchanged P95
-fallback is 234.378 seconds per file. The production plan has digest
+measured files, 13,795 test cases and 41,145 timing samples. The same P95
+calculation yields a fallback of 234.378 seconds per file with the refreshed
+measurements, up from 231.880 seconds. The production plan has digest
 `sha256:96d61cd18ece059984b68d7d5b68e17b04384fc828f3be6c45abe064795010a8`.
 It assigns all 292 tracked test files exactly once across four non-empty
 single-process shards (69, 70, 83 and 70 files). One new file,
@@ -360,6 +361,8 @@ The current workflow assigns the same inventory to five single-process
 shards with 120 minutes per job. Both workflow planning steps select five,
 and aggregation requires the complete five-report plan. The planner and
 aggregator continue to accept the historical two- and four-shard formats.
+The aggregate command exits unsuccessfully for an incomplete or errored
+report and preserves the actual pytest exit code and statistics in the JSON.
 The production plan at this change assigns all 292 tracked test files once
 in groups of 54, 56, 56, 69 and 57, with digest
 `sha256:313f6c8769411e38a521faa8bb1f574b8866eb820fb95e507441e5476d8569de`.

@@ -563,3 +563,62 @@ def test_cli_json_and_exit_contract_remain_stable(
     assert failure_output.read_bytes() == (
         json.dumps(expected_failure, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
+
+
+@pytest.mark.parametrize("shard_count", [2, 4, 5])
+@pytest.mark.parametrize(
+    ("pytest_exit_code", "error", "process_exit_code"),
+    [(0, "shard_report_incomplete", 1), (3, "pytest_execution_failed", 3)],
+)
+def test_cli_rejects_incomplete_timing_and_preserves_report(
+    tmp_path: Path, shard_count: int, pytest_exit_code: int, error: str, process_exit_code: int
+) -> None:
+    plan = make_cli_plan(shard_count)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    output = tmp_path / "aggregate.json"
+    summary = tmp_path / "summary.md"
+    reports = make_reports(tuple(float(index + 2) for index in range(shard_count)))
+    plan_shards = [[f"tests/test_{index}.py"] for index in range(shard_count)]
+    complete_report = AGGREGATOR.aggregate_shard_reports(reports, plan_shards)
+
+    # Each input still represents its planned file. Model a partial final shard
+    # with pytest exit 0, or a complete shard report with pytest exit 3.
+    reports[-1].update(complete=pytest_exit_code != 0, pytest_exit_code=pytest_exit_code)
+    for index, report in enumerate(reports):
+        (tmp_path / f"shard-{index}.json").write_text(json.dumps(report), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/aggregate_pytest_timing.py"),
+            "--shard-dir",
+            str(tmp_path),
+            "--plan",
+            str(plan_path),
+            "--output",
+            str(output),
+            "--summary",
+            str(summary),
+            "--expected-shard-count",
+            str(shard_count),
+            "--now",
+            "2026-10-12T00:00:00Z",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert json.loads(output.read_bytes()) == {
+        **complete_report,
+        "complete": False,
+        "error": error,
+        "pytest_exit_code": pytest_exit_code,
+    }
+    rendered = summary.read_text(encoding="utf-8")
+    assert f"| Total tests | {shard_count} |" in rendered
+    assert "Performance diagnostics" in rendered
+    assert "not evaluable" in rendered
+    assert "aggregation failed" not in rendered
+    assert "✅ exit code 0" not in rendered
+    assert completed.returncode == process_exit_code, completed.stderr

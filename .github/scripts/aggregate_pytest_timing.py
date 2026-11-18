@@ -1112,6 +1112,8 @@ def main(argv: list[str] | None = None) -> int:
         ]
         report = aggregate_shard_reports(shard_reports, plan_shards)
         exit_code = int(report["pytest_exit_code"])
+        if exit_code == 0 and (report["complete"] is not True or report["error"] is not None):
+            exit_code = 1
         aggregation_succeeded = True
     except AggregationError as exc:
         report = {
