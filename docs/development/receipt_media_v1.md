@@ -3,8 +3,9 @@
 `finance_core.intake.receipt_media` provides an additive, local media evidence
 seam. It retains the **bytes actually received**, normalizes one supported
 static image to PNG, invokes the explicit local OCR engine on that exact PNG,
-and publishes an immutable, replayable reference. It performs no database,
-proposal, confirmation, final-fact, provider, Telegram or runtime operations.
+and publishes an immutable, replayable reference. Suggested fields can be read
+from that reference. The processor has no database, proposal persistence,
+confirmation, final-fact, provider, Telegram or runtime operations.
 
 Install the optional `finance-core[media]` extra: `Pillow==13.0.0` and
 `pillow-heif==1.8.0`. Base Core imports and existing consumers retain their
@@ -48,6 +49,8 @@ result = processor.process(
 )
 if result.reference is not None:
     verified = processor.read_verified(result.reference)
+    # When the OCR output supplies complete TSV hierarchy:
+    suggested = processor.read_total_fields_v1(result.reference)
 ```
 
 The composition fixes the source/evidence roots, local OCR identity/limits,
@@ -218,6 +221,24 @@ checks the reference, canonical manifests, immutable modes, member hashes,
 normalization policy/metadata, precise OCR links and canonical blocks. A
 caller-created DTO is a request to verify evidence, never a verified
 capability by itself. Missing, wrong or tampered references/members refuse.
+
+`read_total_fields_v1(reference)` verifies the same complete bundle before
+reading total, currency, date and merchant suggestions. It requires complete
+TSV positions and hierarchy for text-bearing results and returns the original
+reference, OCR status, parser version `media-fields-v1`, and the parser's field
+excerpts and block indexes.
+`no_text` leaves all fields empty. A numeric total line must contain one
+complete unsigned amount after the total label, with an explicit currency
+marker for the amount to resolve. Conflicts, split digits, negative totals,
+and unrecognized formatting leave the amount unresolved, even if a
+different line contains a well-formed total. The read uses a fixed decimal
+context and accepts explicit MYR under the Money Contract, including
+`RM12.34` and `RM 12.34`, while preserving the original evidence excerpt.
+The legacy parser versions `v1` and `v2` retain their original interpretation.
+
+Other engine layouts and unavailable or failed media references require a
+consumer's manual completion flow. This read invokes neither decoder nor
+OCR. Suggested fields are inputs to the later review and confirmation flow.
 Reference reads do not require the processing claim: the six-member evidence
 bundle remains portable and can be copied into a trusted reader-only root.
 Resuming processing after a root copy/restore requires preserving all claims

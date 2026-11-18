@@ -1,7 +1,7 @@
 """Immutable local image normalization and engine-only OCR evidence bundles.
 
-This additive seam has no SQLite, proposal, posting, provider or runtime write
-authority. Legacy receipt OCR attachment identity and fingerprints are untouched.
+This additive seam has no SQLite, posting, provider or runtime write authority.
+Legacy receipt OCR attachment identity and fingerprints are untouched.
 """
 
 from __future__ import annotations
@@ -27,6 +27,12 @@ from finance_core.intake.receipt_ocr_evidence import (
     ReceiptOcrExtractionStatus,
     ReceiptOcrLimits,
     ReceiptOcrSource,
+)
+from finance_core.parser_proposals.receipt_total_parser import (
+    PARSER_VERSION_MEDIA_FIELDS_V1,
+    ParserOcrBlock,
+    ReceiptTotalParseResult,
+    parse_receipt_total,
 )
 
 CONTRACT = "receipt-media-ocr-v1"
@@ -119,6 +125,16 @@ class VerifiedMediaOcrEvidence:
     manifest: dict[str, Any]
     blocks: tuple[ReceiptOcrBlock, ...]
     inventory: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class ReceiptMediaTotalFieldsV1:
+    """Suggested fields and their original immutable OCR reference."""
+
+    reference: MediaOcrReference
+    ocr_status: ReceiptOcrExtractionStatus
+    parser_version: str
+    fields: ReceiptTotalParseResult
 
 
 def _canonical(value: object) -> bytes:
@@ -1304,6 +1320,43 @@ class ReceiptMediaProcessor:
             publication.release_storage_root_lock(root)
             root.close()
 
+    def read_total_fields_v1(self, reference: MediaOcrReference) -> ReceiptMediaTotalFieldsV1:
+        """Read a total-level suggestion using the verified blocks' TSV hierarchy."""
+        verified = self.read_verified(reference)
+        # The evidence reader admits only succeeded with nonempty canonical blocks,
+        # or no_text with an empty sequence.
+        status = (
+            ReceiptOcrExtractionStatus.SUCCEEDED
+            if verified.blocks
+            else ReceiptOcrExtractionStatus.NO_TEXT
+        )
+        blocks = tuple(
+            ParserOcrBlock(
+                sequence_index=block.sequence_index,
+                page_index=block.page_index,
+                text=block.text,
+                left=block.left,
+                top=block.top,
+                engine_line_index=block.engine_line_index,
+                confidence_scaled=block.confidence_scaled,
+                engine_block_index=block.engine_block_index,
+                engine_paragraph_index=block.engine_paragraph_index,
+                height=block.height,
+            )
+            for block in verified.blocks
+        )
+        try:
+            fields = parse_receipt_total(
+                blocks,
+                extraction_status=status.value,
+                parser_version=PARSER_VERSION_MEDIA_FIELDS_V1,
+            )
+        except ValueError as exc:
+            raise ReceiptMediaError("Verified OCR evidence has no complete TSV layout") from exc
+        return ReceiptMediaTotalFieldsV1(
+            verified.reference, status, PARSER_VERSION_MEDIA_FIELDS_V1, fields
+        )
+
     def _read_verified(
         self, directory: int, reference: MediaOcrReference
     ) -> VerifiedMediaOcrEvidence:
@@ -1350,4 +1403,5 @@ __all__ = [
     "MediaOcrReference",
     "MediaProcessingResult",
     "VerifiedMediaOcrEvidence",
+    "ReceiptMediaTotalFieldsV1",
 ]
