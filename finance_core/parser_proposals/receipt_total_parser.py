@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import datetime
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_EVEN, Context, DecimalException, InvalidOperation, localcontext
 from typing import Sequence
 
 from finance_core.money import (
@@ -20,6 +22,9 @@ from finance_core.money import (
     SignPolicy,
     canonical_money_str,
     money_decimal,
+)
+from finance_core.money import (
+    validate_amount_for_currency as validate_current_amount_for_currency,
 )
 from finance_core.parser_proposals.currency_policy_v1 import (
     SUPPORTED_CURRENCIES_V1 as SUPPORTED_CURRENCIES,
@@ -36,6 +41,7 @@ PARSER_NAME = "receipt-total-ocr-parser"
 PARSER_VERSION = "v1"
 PARSER_VERSION_TSV_HIERARCHY = "v2"
 PARSER_CONTRACT_VERSION_TSV_HIERARCHY = "receipt-total-proposal-tsv-hierarchy-v2"
+PARSER_VERSION_MEDIA_FIELDS_V1 = "media-fields-v1"
 
 PROPOSAL_INTENT = "personal_expense_log"
 PROPOSAL_TRANSACTION_TYPE = "personal_expense"
@@ -87,9 +93,8 @@ _MAX_MERCHANT_LENGTH = 64
 _LINE_BAND = 12
 
 # Monetary number token: 12, 12.34, 1,234.56 (1-2 decimal places only).
-_NUM_RE = re.compile(
-    r"(?<![\dA-Za-z.,])(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)(?![\dA-Za-z.,])"
-)
+_AMOUNT_TOKEN_PATTERN = r"\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?"
+_NUM_RE = re.compile(rf"(?<![\dA-Za-z.,])({_AMOUNT_TOKEN_PATTERN})(?![\dA-Za-z.,])")
 
 # Explicit total labels only; SUBTOTAL is excluded by the negative lookbehind.
 _TOTAL_LABEL_RE = re.compile(r"(?<![A-Z])(GRAND\s+TOTAL|NET\s+TOTAL|AMOUNT\s+DUE|TOTAL)(?![A-Z])")
@@ -131,6 +136,14 @@ _MERCHANT_EXCLUDE_KEYWORDS = _NEGATIVE_KEYWORDS + (
 )
 
 _RECOGNIZED_CURRENCY_CODES = frozenset(SUPPORTED_CURRENCIES | {"MYR"})
+_CURRENCY_TOKEN_PATTERN = (
+    r"(?:" + "|".join(sorted(_RECOGNIZED_CURRENCY_CODES)) + r"|RM|(?:US|S)?\$)"
+)
+_MEDIA_TOTAL_VALUE_RE = re.compile(
+    rf"(?:\s*:)?\s*(?:(?P<before>{_CURRENCY_TOKEN_PATTERN})\s*)?"
+    rf"(?P<amount>{_AMOUNT_TOKEN_PATTERN})(?:\s*(?P<after>{_CURRENCY_TOKEN_PATTERN}))?\s*"
+)
+_MEDIA_CURRENCY_ALIASES = {"RM": "MYR", "US$": "USD", "S$": "SGD"}
 
 _ISO_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{2})-(\d{2})(?!\d)")
 _NUMERIC_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})[/.](\d{1,2})[/.](\d{4})(?!\d)")
@@ -282,7 +295,11 @@ def parse_receipt_total(
     non-``succeeded`` status yields an incomplete pending proposal with all
     financial fields null and a stable failure flag preserved.
     """
-    if parser_version not in (PARSER_VERSION, PARSER_VERSION_TSV_HIERARCHY):
+    if parser_version not in (
+        PARSER_VERSION,
+        PARSER_VERSION_TSV_HIERARCHY,
+        PARSER_VERSION_MEDIA_FIELDS_V1,
+    ):
         raise ValueError("Unknown receipt total parser version.")
     flags = _FlagSet()
 
@@ -295,7 +312,7 @@ def parse_receipt_total(
 
     lines = (
         _build_tsv_hierarchy_lines(blocks)
-        if parser_version == PARSER_VERSION_TSV_HIERARCHY
+        if parser_version != PARSER_VERSION
         else _build_lines(blocks)
     )
     confidence_by_seq = {
@@ -304,7 +321,29 @@ def parse_receipt_total(
         if block.confidence_scaled is not None
     }
 
-    amount_field, currency_field = _parse_total(lines, confidence_by_seq, flags)
+    media_fields = parser_version == PARSER_VERSION_MEDIA_FIELDS_V1
+    # The same media evidence must yield the same amount even if the caller
+    # changed Decimal precision or traps. Legacy parsers keep their context.
+    amount_context = (
+        localcontext(
+            Context(
+                prec=28,
+                rounding=ROUND_HALF_EVEN,
+                Emin=-999999,
+                Emax=999999,
+                capitals=1,
+                clamp=0,
+                flags=[],
+                traps=[InvalidOperation],
+            )
+        )
+        if media_fields
+        else nullcontext()
+    )
+    with amount_context:
+        amount_field, currency_field = _parse_total(
+            lines, confidence_by_seq, flags, media_fields=media_fields
+        )
     date_field = _parse_date(lines, confidence_by_seq, flags)
     merchant_field = _parse_merchant(lines, confidence_by_seq, flags)
 
@@ -439,16 +478,27 @@ def _parse_total(
     lines: Sequence[_Line],
     confidence_by_seq: dict[int, int],
     flags: _FlagSet,
+    *,
+    media_fields: bool,
 ) -> tuple[ParsedField, ParsedField]:
     # candidate -> (currency_marker, decimal_str) mapped to the supporting line.
     candidates: dict[tuple[str | None, str], _Line] = {}
     for line in lines:
         if not _is_total_line(line.upper):
             continue
-        line_candidate = _extract_line_total(line.upper)
+        line_candidate = (
+            _extract_media_line_total(line.upper, flags)
+            if media_fields
+            else _extract_line_total(line.upper)
+        )
         if line_candidate is None:
             continue
         candidates.setdefault(line_candidate, line)
+
+    if media_fields and any(
+        flag in flags.flags for flag in (FLAG_CONFLICTING_TOTALS, FLAG_TOTAL_AMOUNT_INVALID)
+    ):
+        return _empty_field(), _empty_field()
 
     if not candidates:
         flags.add(FLAG_TOTAL_NOT_FOUND)
@@ -477,20 +527,26 @@ def _parse_total(
         excerpt=excerpt,
     )
 
-    if currency_marker not in SUPPORTED_CURRENCIES:
-        # Recognized alias (e.g. MYR) that the Money Contract cannot validate.
+    if currency_marker not in SUPPORTED_CURRENCIES and not (
+        media_fields and currency_marker == "MYR"
+    ):
+        # Legacy parser versions retain their original currency policy.
         flags.add(FLAG_UNSUPPORTED_CURRENCY_FOR_AMOUNT)
         return _empty_field(), currency_field
 
     try:
-        normalized_currency = normalize_currency(currency_marker)
+        is_myr = currency_marker == "MYR"
+        normalized_currency = "MYR" if is_myr else normalize_currency(currency_marker)
         amount = money_decimal(decimal_str, label="receipt total")
-        amount = validate_amount_for_currency(amount, normalized_currency, label="receipt total")
+        validate = validate_current_amount_for_currency if is_myr else validate_amount_for_currency
+        amount = validate(amount, normalized_currency, label="receipt total")
         amount = SignPolicy.STRICTLY_POSITIVE.enforce(  # type: ignore[attr-defined]
             amount, label="receipt total"
         )
         canonical = canonical_money_str(amount, normalized_currency)
-    except MoneyValidationError:
+    except (MoneyValidationError, DecimalException) as exc:
+        if not media_fields and isinstance(exc, DecimalException):
+            raise
         flags.add(FLAG_TOTAL_AMOUNT_INVALID)
         return _empty_field(), currency_field
 
@@ -501,6 +557,31 @@ def _parse_total(
         excerpt=excerpt,
     )
     return amount_field, currency_field
+
+
+def _extract_media_line_total(upper_line: str, flags: _FlagSet) -> tuple[str | None, str] | None:
+    """Require one complete positive amount after the explicit total label."""
+    label = _TOTAL_LABEL_RE.search(upper_line)
+    if label is None or not any(character.isdecimal() for character in upper_line):
+        return None
+    # OCR can join a nearby word to the line before the label. Skip only plain
+    # words there, with no competing number, currency marker or sign.
+    leading_words = upper_line[: label.start()].split()
+    value = _MEDIA_TOTAL_VALUE_RE.fullmatch(upper_line[label.end() :])
+    if value is None or any(
+        not word.isalpha() or word in _RECOGNIZED_CURRENCY_CODES or word == "RM"
+        for word in leading_words
+    ):
+        flags.add(FLAG_TOTAL_AMOUNT_INVALID)
+        return None
+    before = value["before"]
+    after = value["after"]
+    left = _MEDIA_CURRENCY_ALIASES.get(before, before) if before else None
+    right = _MEDIA_CURRENCY_ALIASES.get(after, after) if after else None
+    if left is not None and right is not None and left != right:
+        flags.add(FLAG_CONFLICTING_TOTALS)
+        return None
+    return left or right, value["amount"].replace(",", "")
 
 
 def _extract_line_total(upper_line: str) -> tuple[str | None, str] | None:

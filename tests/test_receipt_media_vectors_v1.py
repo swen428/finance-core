@@ -876,6 +876,22 @@ def test_actual_linux_receipt_media_vector(
             )
             proof["operation"] = operation_record
             proof["source_bytes_unchanged"] = source_path.read_bytes() == source_raw
+            if case_id == "heif_24mp":
+                assert result.reference is not None
+                before_parse = (len(traced_decoder_worker), len(engine.invocations))
+                fields = processor.read_total_fields_v1(result.reference)
+                assert fields.reference == result.reference
+                assert fields.fields.amount.value == "12.34"
+                assert fields.fields.currency.value == "HKD"
+                assert fields.fields.transaction_date.value == "2026-10-01"
+                assert fields.fields.merchant.value == "测试 商店 TEST SHOP"
+                assert fields.fields.amount.block_sequence_indexes
+                assert (len(traced_decoder_worker), len(engine.invocations)) == before_parse
+                proof["total_fields"] = {
+                    "parser_version": fields.parser_version,
+                    "ocr_result_sha256": fields.reference.ocr_result_sha256,
+                    "expected_fields_verified": True,
+                }
             if case["kind"] == "exact_operation_replay":
                 assert result.reference is not None and verified is not None
                 calls_before_replay = len(engine.invocations)

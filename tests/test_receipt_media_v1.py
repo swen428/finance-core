@@ -14,6 +14,7 @@ import sys
 import warnings
 import zlib
 from dataclasses import replace
+from decimal import localcontext
 
 import pytest
 from PIL import Image
@@ -139,6 +140,156 @@ def test_exact_png_ocr_reference_and_idempotent_replay(seam):
     assert second.reference == first.reference
     assert second.persistence_idempotent
     assert engine.calls == len(worker_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "receipt",
+        "joined_rm",
+        "matching_currencies",
+        "grouped_total",
+        "whole_total",
+        "colon_after_label",
+        "no_text",
+        "conflicting_totals",
+        "incomplete_tsv",
+        "signed_before_rm",
+        "parenthesized",
+        "parenthesized_currency_after",
+        "trailing_minus",
+        "trailing_minus_with_text",
+        "trailing_minus_before_currency",
+        "fullwidth_minus",
+        "split_decimal",
+        "split_integer",
+        "conflicting_currencies",
+        "conflicting_amounts_on_line",
+        "amount_too_large",
+        "malformed_scale",
+        "malformed_group",
+        "time_like_amount",
+        "percentage",
+        "unknown_currency_affix",
+        "parenthesized_currency_conflict",
+        "punctuated_currency_conflict",
+        "negative_dash",
+    ],
+)
+def test_read_total_fields_from_verified_local_receipt(seam, monkeypatch, sample):
+    _, engine, request, source, evidence, raw, worker_calls = seam
+    calls = []
+
+    def extract(ocr_source, *, limits, deadline):
+        calls.append(ocr_source.content_hash)
+        if sample == "no_text":
+            return ReceiptOcrEngineResult(ReceiptOcrExtractionStatus.NO_TEXT, (), "no_text")
+        total = {
+            "joined_rm": "TOTAL RM12.34",
+            "matching_currencies": "TOTAL RM 12.34 MYR",
+            "grouped_total": "TOTAL RM 1,234.50",
+            "whole_total": "TOTAL RM 12",
+            "colon_after_label": "fit GRAND TOTAL: RM12.34",
+            "signed_before_rm": "TOTAL - RM12.34",
+            "parenthesized": "TOTAL ( RM12.34 )",
+            "parenthesized_currency_after": "TOTAL ( 12.34 MYR )",
+            "trailing_minus": "TOTAL RM12.34-",
+            "trailing_minus_with_text": "TOTAL RM 12.34- (REFUND)",
+            "trailing_minus_before_currency": "TOTAL RM 12.34- MYR",
+            "fullwidth_minus": "TOTAL － RM12.34",
+            "split_decimal": "TOTAL RM 12 . 34",
+            "split_integer": "TOTAL RM 1 234",
+            "conflicting_currencies": "TOTAL RM 12.34 USD",
+            "conflicting_amounts_on_line": "TOTAL RM 12.34 RM 15.00",
+            "amount_too_large": "TOTAL RM 999999999999999999999999999.00",
+            "malformed_scale": "TOTAL RM 12.345",
+            "malformed_group": "TOTAL RM 12,34",
+            "time_like_amount": "TOTAL RM 12:34",
+            "percentage": "TOTAL RM 12.34%",
+            "unknown_currency_affix": "TOTAL AUS$12.34",
+            "parenthesized_currency_conflict": "TOTAL RM 12.34 (USD)",
+            "punctuated_currency_conflict": "TOTAL USD: 12.34 RM",
+            "negative_dash": "TOTAL RM 12.34– (REFUND)",
+        }.get(sample, "TOTAL RM 12.34")
+        lines = ["TEST SHOP", "Date 2026-10-01", total]
+        if sample in {
+            "conflicting_totals",
+            "conflicting_amounts_on_line",
+            "split_decimal",
+            "malformed_scale",
+            "malformed_group",
+        }:
+            lines.append("TOTAL RM 15.00")
+        blocks = []
+        for i, line in enumerate(lines):
+            words = line.split() if i == 2 and sample.startswith("split_") else [line]
+            for word_index, word in enumerate(words):
+                blocks.append(
+                    ReceiptOcrBlock(
+                        len(blocks), 0, 0, 0, i, word_index, word, 0, 0, 2, 2, 4, 3, 9500
+                    )
+                )
+        if sample == "incomplete_tsv":
+            blocks[-1] = replace(blocks[-1], engine_line_index=None)
+        return ReceiptOcrEngineResult(ReceiptOcrExtractionStatus.SUCCEEDED, tuple(blocks), "ok")
+
+    monkeypatch.setattr(engine, "extract", extract)
+    processor = media.ReceiptMediaProcessor(source, evidence, ocr_engine=engine)
+    result = processor.process(**request)
+    assert result.reference is not None
+    original = processor.read_verified(result.reference)
+    if sample == "incomplete_tsv":
+        with pytest.raises(media.ReceiptMediaError, match="no complete TSV layout"):
+            processor.read_total_fields_v1(result.reference)
+        assert processor.read_verified(result.reference) == original
+        assert len(calls) == len(worker_calls) == 1
+        return
+    with localcontext() as context:
+        if sample == "joined_rm":
+            context.prec = 3
+        suggested = processor.read_total_fields_v1(result.reference)
+    assert suggested.reference == result.reference
+    assert suggested.reference.original_sha256 == hashlib.sha256(raw).hexdigest()
+    assert suggested.parser_version == "media-fields-v1"
+    fields = suggested.fields
+    if sample == "no_text":
+        assert suggested.ocr_status is ReceiptOcrExtractionStatus.NO_TEXT
+        for field in (fields.amount, fields.currency, fields.transaction_date, fields.merchant):
+            assert field.value is None and not field.block_sequence_indexes
+        assert fields.ambiguity_flags == ("ocr_no_text",)
+    else:
+        assert suggested.ocr_status is ReceiptOcrExtractionStatus.SUCCEEDED
+        assert fields.merchant.value == "TEST SHOP"
+        assert fields.merchant.block_sequence_indexes == (0,)
+        assert fields.transaction_date.value == "2026-10-01"
+        assert fields.transaction_date.block_sequence_indexes == (1,)
+        expected = {
+            "receipt": ("12.34", "TOTAL RM 12.34"),
+            "joined_rm": ("12.34", "TOTAL RM12.34"),
+            "matching_currencies": ("12.34", "TOTAL RM 12.34 MYR"),
+            "grouped_total": ("1234.50", "TOTAL RM 1,234.50"),
+            "whole_total": ("12.00", "TOTAL RM 12"),
+            "colon_after_label": ("12.34", "fit GRAND TOTAL: RM12.34"),
+        }
+        if sample in expected:
+            assert (fields.amount.value, fields.amount.excerpt) == expected[sample]
+            assert fields.currency.value == "MYR"
+            assert fields.amount.block_sequence_indexes == (2,)
+            assert fields.currency.block_sequence_indexes == (2,)
+            assert not fields.ambiguity_flags
+        elif sample in {"conflicting_totals", "conflicting_currencies"}:
+            assert fields.amount.value is None and fields.currency.value is None
+            assert fields.ambiguity_flags == ("conflicting_total_candidates",)
+        elif sample == "amount_too_large":
+            assert fields.amount.value is None and fields.currency.value == "MYR"
+            assert fields.ambiguity_flags == ("total_amount_invalid",)
+        else:
+            assert fields.amount.value is None and fields.currency.value is None
+            assert fields.ambiguity_flags == ("total_amount_invalid",)
+    assert processor.read_verified(result.reference) == original
+    with pytest.raises(media.MediaIntegrityError):
+        processor.read_total_fields_v1(replace(result.reference, original_sha256="f" * 64))
+    assert len(calls) == len(worker_calls) == 1
 
 
 @pytest.mark.parametrize(
