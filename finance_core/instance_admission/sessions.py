@@ -365,8 +365,7 @@ class _Witness:
                 "Production SQL requires configured SQLite.Row/str factories"
             )
         self.control._assert_file_valid()
-        self.profile.revalidate()
-        self.gate.assert_valid()
+        GateLease._assert_valid_for_production(self.gate, self.profile)
         # _state->_read performs the final complete shared-config proof, including
         # installed migration bytes. No proof survives this admission call.
         state = _state(self.owner.config, _proof=self if self.immutable_migration_digest else None)

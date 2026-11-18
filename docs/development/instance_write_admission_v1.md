@@ -169,7 +169,9 @@ service's transaction boundary and prevents an implicit pending write from
 starting outside it.
 
 Every application-issued `execute()` is checked against the current issued
-connection and authority before SQLite sees it. Each `executemany()` row is
+connection and authority before SQLite sees it. Each full session check
+revalidates the same issued production profile before and after checking its
+shared gate descriptor, file and ACL. Each `executemany()` row is
 normalized and receives a fresh full admission check immediately before it is
 passed to SQLite; a row is refused if the service ended its explicit
 transaction after an earlier row. The normal service-owned `commit()` and
