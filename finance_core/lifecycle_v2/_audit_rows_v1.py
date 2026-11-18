@@ -151,6 +151,7 @@ class _AuditRows:
         self._tables = MappingProxyType(tables)
         self._indexes = _indexes(tables)
         self._vectors = MappingProxyType(vectors)
+        self._daily_projections = {}
         self._active = True
 
     def _check(self, conn):
@@ -204,6 +205,19 @@ class _AuditRows:
         self._check(conn)
         return _prefix_state(self._indexes, record_id, source_id, cutoff)
 
+    def daily_projection(self, conn, name, registry, cutoff, raw, build):
+        # View identity binds all retained input bytes. Each named projection
+        # keeps only its last cut and exact extra raw input. Builders return
+        # immutable row data and never call an evidence or admission port.
+        self._check(conn)
+        key = (registry, cutoff, raw)
+        previous = self._daily_projections.get(name)
+        if previous is not None and previous[0] == key:
+            return previous[1]
+        result = build()
+        self._daily_projections[name] = (key, result)
+        return result
+
     def finish(self, conn):
         # Full current permission proof in the original read/write mode, even
         # when the last validation work touched only immutable Python values.
@@ -212,6 +226,7 @@ class _AuditRows:
 
     def invalidate(self):
         self._active = False
+        self._daily_projections.clear()
         self._tables = self._indexes = self._vectors = MappingProxyType({})
 
 

@@ -165,3 +165,12 @@ exact account dependencies. Existing v1 cards retain their original bytes and
 prefix formula. For example, voiding an old debit of 9 that the current opening
 map includes has balance change zero. Moving that debit to another account
 withdraws its resolved old effect and adds only the new account's direct effect.
+
+Within an eligible protected source audit, movement proposal, review and fact
+checks can reconstruct their historical account and opening dependencies from
+the operation's complete immutable rows. The same strict commit cut applies to
+versioned review effects and original map ownership. Each movement source,
+instruction, proposal, delivery and action evidence check still uses the real
+port and the original request. Independent snapshot-copy audits and writer
+checks for the live target and dependencies use SQL. The private optimization
+has the same financial limits and complete-scope requirements as the SQL path.

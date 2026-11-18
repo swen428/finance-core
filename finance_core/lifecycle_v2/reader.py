@@ -257,11 +257,11 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     if sealed.get("format") == "finance-daily-opening-observation-v2":
         from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
 
-        return verify_opening_proposal(service, conn, proposal)
+        return verify_opening_proposal(service, conn, proposal, _rows=_rows)
     if sealed.get("format") == "finance-daily-movement-observation-v1":
         from .daily_v1.movements import verify_proposal as verify_movement_proposal
 
-        return verify_movement_proposal(service, conn, proposal)
+        return verify_movement_proposal(service, conn, proposal, _rows=_rows)
     if "format" in sealed:
         if sealed["format"] != "finance-daily-proposal-observation-v1":
             raise LifecycleError("Unsupported proposal observation format")
@@ -399,14 +399,14 @@ def verify_review(service, conn, review, *, _rows=None):
     if material.get("format") == "finance-daily-opening-review-v2":
         from .daily_v1.opening_changes_v1 import verify_review as verify_opening_review
 
-        return verify_opening_review(service, conn, review)
+        return verify_opening_review(service, conn, review, _rows=_rows)
     if material.get("format") in {
         "finance-daily-movement-review-v1",
         "finance-daily-movement-review-v2",
     }:
         from .daily_v1.movements import verify_review as verify_movement_review
 
-        return verify_movement_review(service, conn, review)
+        return verify_movement_review(service, conn, review, _rows=_rows)
     if "format" in material:
         if material["format"] != "finance-daily-review-v1":
             raise LifecycleError("Unsupported review format")
@@ -504,7 +504,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         elif values.get("format") == "finance-daily-movement-v1":
             from .daily_v1.movements import verify_fact as verify_movement_fact
 
-            verify_movement_fact(service, conn, fact)
+            verify_movement_fact(service, conn, fact, _rows=_rows)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous

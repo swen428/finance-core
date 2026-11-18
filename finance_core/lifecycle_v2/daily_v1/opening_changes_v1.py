@@ -54,15 +54,30 @@ from .opening_contracts_v1 import (
 )
 
 
-def _previous(conn, source_id, version=None):
+def _previous(conn, source_id, version=None, *, _rows=None):
     if version is None:
         return conn.execute(
             "SELECT * FROM l2_proposals WHERE source_id=? ORDER BY version DESC LIMIT 1",
             (source_id,),
         ).fetchone()
+    if _rows is not None:
+        return _rows.one(conn, "proposal_version", source_id, version)
     return conn.execute(
         "SELECT * FROM l2_proposals WHERE source_id=? AND version=?", (source_id, version)
     ).fetchone()
+
+
+def _prior_observations(conn, source_id, version, *, _rows=None):
+    if _rows is not None:
+        for row in _rows.many(conn, "source_proposals", source_id):
+            if row["version"] <= version:
+                yield row["observation_json"]
+    else:
+        for row in conn.execute(
+            "SELECT observation_json FROM l2_proposals WHERE source_id=? AND version<=?",
+            (source_id, version),
+        ):
+            yield row[0]
 
 
 def _source(service, conn, identity):
@@ -75,16 +90,31 @@ def _source(service, conn, identity):
 
 
 def _compose(
-    service, conn, source, ref, reply, kind, original_id, previous, before_seq=None, *, binding=None
+    service,
+    conn,
+    source,
+    ref,
+    reply,
+    kind,
+    original_id,
+    previous,
+    before_seq=None,
+    *,
+    binding=None,
+    _rows=None,
 ):
     binding = service.binding if binding is None else binding
     if binding.instance_id != service.binding.instance_id:
         raise LifecycleError("Opening request belongs to another instance")
     if type(ref) is not BundleFactRefV1 or kind not in {"opening_set", "opening_correct"}:
         raise LifecycleError("Exact opening target and command required")
-    fact = conn.execute(
-        "SELECT * FROM l2_facts WHERE record_id=? AND version=?", (ref.record_id, ref.version)
-    ).fetchone()
+    fact = (
+        _rows.one(conn, "fact_version", ref.record_id, ref.version)
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_facts WHERE record_id=? AND version=?", (ref.record_id, ref.version)
+        ).fetchone()
+    )
     if fact is None or bundle_ref(fact) != ref or fact["source_id"] != source["source_id"]:
         raise LifecycleError("stale_bundle_ref")
     before = validate_bundle(strict_json(fact["values_json"]))
@@ -93,7 +123,7 @@ def _compose(
     response = _source(service, conn, reply)
     original = response if original_id == reply else _source(service, conn, original_id)
     version = previous["version"] if previous else 0
-    dependencies = opening_inventory(conn, ref.record_id, before_seq)
+    dependencies = opening_inventory(conn, ref.record_id, before_seq, _rows=_rows)
     retained, original_command = [], None
     if original_id != reply:
         if (
@@ -121,11 +151,8 @@ def _compose(
                 if old_values["format"] == INCOMPLETE_FORMAT
                 else old_values["opening_dependency_map"]["entries"]
             )
-    for row in conn.execute(
-        "SELECT observation_json FROM l2_proposals WHERE source_id=? AND version<=?",
-        (source["source_id"], version),
-    ):
-        if strict_json(row[0]).get("expected", {}).get("reply_evidence_id") == reply:
+    for raw in _prior_observations(conn, source["source_id"], version, _rows=_rows):
+        if strict_json(raw).get("expected", {}).get("reply_evidence_id") == reply:
             raise LifecycleError("reply_evidence_already_used")
     previous_ref = (
         {
@@ -175,7 +202,7 @@ def _compose(
     return decode_expected(asdict(expected))
 
 
-def _opening_proposal_chain(conn, proposal):
+def _opening_proposal_chain(conn, proposal, *, _rows=None):
     """Collect one bounded supplement chain, without granting authentication.
 
     Rows are local to this protected operation. Every collected item is fully
@@ -217,7 +244,7 @@ def _opening_proposal_chain(conn, proposal):
         chain.append(proposal)
         if expected.instruction["evidence_id"] == expected.reply_evidence_id:
             return chain
-        previous = _previous(conn, expected.source_id, version - 1)
+        previous = _previous(conn, expected.source_id, version - 1, _rows=_rows)
         if (
             previous is None
             or previous["proposal_id"] != expected.current_proposal_id
@@ -229,29 +256,38 @@ def _opening_proposal_chain(conn, proposal):
         proposal = previous
 
 
-def verify_proposal(service, conn, proposal):
+def verify_proposal(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
-    chain = _opening_proposal_chain(conn, proposal)
+    chain = _opening_proposal_chain(conn, proposal, _rows=_rows)
     for item in reversed(chain):
-        result = _verify_proposal_item(service, conn, item)
+        result = (
+            _verify_proposal_item(service, conn, item, _rows=_rows)
+            if _rows is not None
+            else _verify_proposal_item(service, conn, item)
+        )
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Evidence callback changed protected opening chain state")
     return result
 
 
-def _verify_proposal_item(service, conn, proposal):
+def _verify_proposal_item(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
     exact(sealed, {"format", "expected", "observation"}, "opening observation")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported opening observation")
     expected = decode_expected(sealed["expected"])
-    events = conn.execute(
-        "SELECT * FROM l2_events WHERE kind='propose' AND entity_id=?", (proposal["proposal_id"],)
-    ).fetchall()
+    events = (
+        _rows.many(conn, "entity_events", "propose", proposal["proposal_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_events WHERE kind='propose' AND entity_id=?",
+            (proposal["proposal_id"],),
+        ).fetchall()
+    )
     if len(events) != 1:
         raise LifecycleError("Opening proposal lacks exact original event")
-    previous = _previous(conn, expected.source_id, proposal["version"] - 1)
+    previous = _previous(conn, expected.source_id, proposal["version"] - 1, _rows=_rows)
     source = service._source(conn, expected.source_id, allow_archived=True)
     actual_expected = _compose(
         service,
@@ -264,12 +300,13 @@ def _verify_proposal_item(service, conn, proposal):
         previous,
         events[0]["seq"],
         binding=expected.binding,
+        _rows=_rows,
     )
     # Historical runtime binding belongs to the retained request, not today's
     # service generation. Source/link verification uses that exact binding.
     if actual_expected != expected:
         raise LifecycleError("Opening request differs from original source/prefix")
-    _require_prefix(conn, expected, proposal, "proposal")
+    _require_prefix(conn, expected, proposal, "proposal", _rows=_rows)
     actual = service.port.opening_proposal_v2(conn, proposal["observation_id"], expected)
     if (
         type(actual) is not VerifiedOpeningProposalV2
@@ -305,8 +342,11 @@ def _verify_proposal_item(service, conn, proposal):
     return expected
 
 
-def require_dependencies(conn, expected, before_seq=None):
-    if opening_inventory(conn, expected.record_id, before_seq) != expected.dependencies:
+def require_dependencies(conn, expected, before_seq=None, *, _rows=None):
+    if (
+        opening_inventory(conn, expected.record_id, before_seq, _rows=_rows)
+        != expected.dependencies
+    ):
         raise LifecycleError("stale_opening_dependency_closure")
 
 
@@ -387,14 +427,24 @@ def _material(expected, proposal, values, review_id, created_at):
     }
 
 
-def verify_review(service, conn, review):
+def verify_review(service, conn, review, *, _rows=None):
     fingerprint = _fingerprint(conn)
-    proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
-    expected = verify_proposal(service, conn, proposal)
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    )
+    if proposal is None:
+        raise LifecycleError("Missing l2_proposals identity")
+    expected = verify_proposal(service, conn, proposal, _rows=_rows)
     values = validate_bundle(strict_json(proposal["values_json"]))
-    events = conn.execute(
-        "SELECT * FROM l2_events WHERE kind='review' AND entity_id=?", (review["review_id"],)
-    ).fetchall()
+    events = (
+        _rows.many(conn, "entity_events", "review", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_events WHERE kind='review' AND entity_id=?", (review["review_id"],)
+        ).fetchall()
+    )
     material = strict_json(review["material_json"])
     if (
         len(events) != 1
@@ -407,16 +457,20 @@ def verify_review(service, conn, review):
         or review["values_json"] != proposal["values_json"]
     ):
         raise LifecycleError("Opening complete review differs")
-    require_dependencies(conn, expected, events[0]["seq"])
-    _require_prefix(conn, expected, proposal, "review", review_id=review["review_id"])
-    delivery = conn.execute(
-        "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
-    ).fetchone()
+    require_dependencies(conn, expected, events[0]["seq"], _rows=_rows)
+    _require_prefix(conn, expected, proposal, "review", review_id=review["review_id"], _rows=_rows)
+    delivery = (
+        _rows.one(conn, "delivery", review["review_id"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
+        ).fetchone()
+    )
     if delivery:
         delivery_seq = _require_prefix(
-            conn, expected, proposal, "delivery", review_id=review["review_id"]
+            conn, expected, proposal, "delivery", review_id=review["review_id"], _rows=_rows
         )
-        require_dependencies(conn, expected, before_seq=delivery_seq)
+        require_dependencies(conn, expected, before_seq=delivery_seq, _rows=_rows)
         actual = service.port.delivery(
             conn,
             delivery["evidence_id"],
@@ -436,9 +490,21 @@ def verify_review(service, conn, review):
     return expected, delivery
 
 
-def verify_fact(service, conn, fact):
-    review = _row(conn, "l2_reviews", "review_id", fact["review_id"])
-    proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+def verify_fact(service, conn, fact, *, _rows=None):
+    review = (
+        _rows.one(conn, "review", fact["review_id"])
+        if _rows is not None
+        else _row(conn, "l2_reviews", "review_id", fact["review_id"])
+    )
+    if review is None:
+        raise LifecycleError("Missing l2_reviews identity")
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    )
+    if proposal is None:
+        raise LifecycleError("Missing l2_proposals identity")
     expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
     _require_prefix(
         conn,
@@ -447,25 +513,40 @@ def verify_fact(service, conn, fact):
         "confirm",
         review_id=review["review_id"],
         commit_seq=fact["commit_seq"],
+        _rows=_rows,
     )
-    require_dependencies(conn, expected, fact["commit_seq"])
+    require_dependencies(conn, expected, fact["commit_seq"], _rows=_rows)
     values = validate_bundle(strict_json(fact["values_json"]))
     if values["format"] != BUNDLE_V2 or values != compile_opening(
         decode_command(strict_json(proposal["observation_json"])["observation"]["raw_proposal"]),
         expected,
     ):
         raise LifecycleError("Opening fact differs from complete decision")
-    decision = conn.execute(
-        "SELECT action_evidence_id FROM l2_decisions WHERE record_id=? AND version=?",
-        (fact["record_id"], fact["version"]),
-    ).fetchone()
+    decision = (
+        _rows.project(
+            conn, "decision_version", ("action_evidence_id",), fact["record_id"], fact["version"]
+        )
+        if _rows is not None
+        else conn.execute(
+            "SELECT action_evidence_id FROM l2_decisions WHERE record_id=? AND version=?",
+            (fact["record_id"], fact["version"]),
+        ).fetchone()
+    )
     if decision is None:
         raise LifecycleError("Opening fact lacks original decision")
-    require_independent_action(conn, expected, proposal, decision[0])
+    require_independent_action(conn, expected, proposal, decision[0], _rows=_rows)
     if values["transition"] == "opening_set":
-        for old in conn.execute(
-            "SELECT values_json FROM l2_facts WHERE record_id=? AND version<?",
-            (fact["record_id"], fact["version"]),
+        for old in (
+            (
+                (row["values_json"],)
+                for row in _rows.many(conn, "record_facts", fact["record_id"])
+                if row["version"] < fact["version"]
+            )
+            if _rows is not None
+            else conn.execute(
+                "SELECT values_json FROM l2_facts WHERE record_id=? AND version<?",
+                (fact["record_id"], fact["version"]),
+            )
         ):
             opening = validate_bundle(strict_json(old[0]))["opening"]
             if opening and opening["opening_event_id"] == values["opening"]["opening_event_id"]:
@@ -721,7 +802,7 @@ def require_current_opening(conn, expected, proposal, values, action_id):
     require_independent_action(conn, expected, proposal, action_id)
 
 
-def require_independent_action(conn, expected, proposal, action_id):
+def require_independent_action(conn, expected, proposal, action_id, *, _rows=None):
     link = strict_json(expected.instruction_link["link_json"])
     used = {
         expected.instruction["evidence_id"],
@@ -729,11 +810,8 @@ def require_independent_action(conn, expected, proposal, action_id):
         link["target"]["source_instruction_ref"]["evidence_id"],
         expected.instruction_link["evidence_id"],
     }
-    for row in conn.execute(
-        "SELECT observation_json FROM l2_proposals WHERE source_id=? AND version<=?",
-        (expected.source_id, proposal["version"]),
-    ):
-        envelope = strict_json(row[0])
+    for raw in _prior_observations(conn, expected.source_id, proposal["version"], _rows=_rows):
+        envelope = strict_json(raw)
         prior = envelope.get("expected", {})
         if (
             envelope.get("format") == OBSERVATION_FORMAT

@@ -164,7 +164,7 @@ def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None
         current[fact["record_id"]] = values
     from ._impacts_v1 import current_impacts
 
-    if current_impacts(conn, account_id, before_seq):
+    if current_impacts(conn, account_id, before_seq, _rows=_rows):
         raise LifecycleError("unsupported_nonempty_opening_dependencies")
     # Historical empty-closure bytes remain unchanged. Current effective
     # movement dependencies are explicitly refused by this account format.
@@ -299,7 +299,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     if sealed.get("format") == "finance-daily-opening-observation-v2":
         from .opening_changes_v1 import verify_proposal as verify_opening_proposal
 
-        return verify_opening_proposal(service, conn, proposal)
+        return verify_opening_proposal(service, conn, proposal, _rows=_rows)
     exact(sealed, {"format", "expected", "observation"}, "daily observation envelope")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported daily observation")
@@ -369,7 +369,7 @@ def verify_review(service, conn, review, *, _rows=None):
     if strict_json(review["material_json"]).get("format") == "finance-daily-opening-review-v2":
         from .opening_changes_v1 import verify_review as verify_opening_review
 
-        return verify_opening_review(service, conn, review)
+        return verify_opening_review(service, conn, review, _rows=_rows)
     fingerprint = _fingerprint(conn)
     proposal = (
         _rows.one(conn, "proposal", review["proposal_id"])
@@ -514,7 +514,7 @@ def verify_fact(service, conn, fact, *, _rows=None):
     ):
         from .opening_changes_v1 import verify_fact as verify_opening_fact
 
-        return verify_opening_fact(service, conn, fact)
+        return verify_opening_fact(service, conn, fact, _rows=_rows)
     expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
     _require_prefix(
         conn,
@@ -763,10 +763,14 @@ def _fingerprint(conn):
         "l2_finalization_materials",
         "l2_finalization_outcomes",
     )
-    counts = conn.execute(
-        "SELECT " + ",".join("(SELECT count(*) FROM " + name + ")" for name in tables)
+    counts = ",".join("(SELECT count(*) FROM " + name + ")" for name in tables)
+    row = conn.execute(
+        "SELECT coalesce(tail.seq,0),tail.event_sha256,"
+        + counts
+        + " FROM (SELECT 1) LEFT JOIN (SELECT seq,event_sha256 FROM l2_events"
+        " ORDER BY seq DESC LIMIT 1) AS tail ON 1"
     ).fetchone()
-    return _tail(conn), tuple(counts)
+    return (row[0], row[1]), tuple(row)[2:]
 
 
 def _review_dto(conn, row):

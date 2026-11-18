@@ -243,15 +243,28 @@ registered semantic audit. The existing SnapshotCut binds bundle watermarks,
 all history and the complete logical database digest.
 
 An eligible source audit may load complete immutable raw rows and private
-indexes within its existing protected transaction. All original semantic
-validators, repeated evidence callbacks on the actual connection, callback
-cursor lifetimes, fingerprints and full current admission checks remain in
-force. The view expires before audit return; subsequent current-state checks,
-projection, backup and writes keep their original SQL reads. Independent raw
-snapshot copies and default old/legacy contexts retain independent SQL audits.
-A private row/byte optimization budget chooses the original SQL path before
-callbacks when complete loading would exceed it; it never lowers the financial
-bounds, skips rows or retries failed validation.
+indexes within its existing protected transaction. Account and controlled
+opening checks can use them to resolve exact historical proposals, decisions,
+facts and dependencies. A historical prefix includes only commits strictly
+before its event cutoff. The operation can reuse immutable prefix rows and
+map-owner rows derived from its exact retained input. Each caller receives
+fresh values, and a rename with a carried map still resolves to the original
+confirmed owner.
+
+Every original evidence callback still runs on the actual connection in the
+original order, with the same expected and actual evidence checks and callback
+cursor lifetimes. Each existing fingerprint check reads the live event tail
+and all eleven owned table counts in one guarded statement. This and the
+in-memory lookups reduce SQL and its associated admission calls. Every actual
+SQL operation, evidence callback boundary and audit exit retains its applicable
+admission checks.
+
+The view expires before audit return. Subsequent current-state checks,
+projection, backup and writes use SQL. Independent raw snapshot copies and
+old/legacy contexts use independent SQL audits. The private row/byte budget
+selects the original SQL path before callbacks when complete loading would
+exceed it. Both paths retain the same financial bounds and complete inventory
+requirements.
 
 Current review and delivery creation require the exact currently eligible
 proposal and runtime binding before appending anything. Historical audit checks
