@@ -1,6 +1,6 @@
 # Public pytest timing baseline
 
-The four-shard planner uses measured per-file medians from at least three
+The pytest planner uses measured per-file medians from at least three
 successful first-attempt protected-main push runs of `validate.yml`. Public
 source identity is GitHub repository ID `1375123906`; its numeric identity is
 stable across owner/repository renaming and does not need an owner-name
@@ -19,12 +19,12 @@ metadata and the retained `pytest-timing-v1` compatibility option. Do not
 invent timings for new files or change source metadata to make an untrusted
 run eligible. Review a refresh against its downloaded public evidence.
 
-The 5% unknown-file limit, 30-day age limit, P95 fallback, deterministic LPT
-assignment, four shards and exact once-only current Git test inventory remain
-unchanged. Run the production `plan` command locally before requesting full
-hosted validation; focused pytest alone does not prove that the hosted planner
-can admit the candidate's current inventory. A passing baseline regression
-uses a fixed sample date; the production planner still enforces current age.
+The planner enforces the 5% unknown-file limit, 30-day age limit, P95
+fallback, deterministic LPT assignment and exact once-only current Git test
+inventory. Run the production `plan --shard-count 5` command locally before
+requesting full Hosted validation. A baseline regression uses a fixed sample
+date. The production planner checks age against the current date and admits
+the candidate's actual inventory.
 
 The September 22 provenance above is retained as refresh history. The October 1, 2026
 refresh uses the three newest successful first-attempt `validate.yml` runs from push
@@ -102,13 +102,13 @@ artifact. It does not change the stable planner or aggregator command line,
   zero-denominator value is not evaluable; it must not be shown as zero or
   treated as a pass.
 - The maximum-to-mean ratio is the longest shard's cumulative test duration
-  divided by the arithmetic mean across the four shards. Top-ten file and case
+  divided by the arithmetic mean across all shards. Top-ten file and case
   rows show each measured contribution and its share of the total measured
-  test duration across all four shards.
-- The total test time is the sum of shard test durations. Dividing it by four
-  gives the ideal balanced-shard lower bound on the longest shard's test work;
-  it is not a wall-time guarantee. Setup, scheduling, runner variation and
-  resource contention are outside that lower bound.
+  test duration across all shards.
+- The total test time is the sum of shard test durations. Dividing it by
+  the shard count gives the ideal balanced-shard lower bound on the longest
+  shard's test work. Setup, scheduling, runner variation and resource
+  contention are outside that lower bound.
 - Unknown actual cost is measured from tests whose file has no baseline
   weight. The plan applies the P95 fallback weight to each such file. Keep the
   unknown-file count, measured unknown cost and fallback estimate distinct.
@@ -345,3 +345,29 @@ The 120-minute job limit, four shards, 11-job workflow, complete inventory,
 reporting and failure propagation are unchanged. Only the trusted timing
 manifest and this evidence record were refreshed. A complete successful
 exact-head hosted run remains the acceptance authority.
+
+## November 18, 2026 five-shard capacity repair
+
+PR 78 run `44191676341`, attempt 1, tested the preceding four-shard
+refresh. Shard 0 wrote complete JUnit timing before the runner marked it
+cancelled at the 120-minute job limit. The aggregate recorded 13,499
+passed and 362 skipped tests, with no failures or errors. The timing
+report job succeeded, and final validation correctly rejected the
+cancelled pytest matrix. The failed run is diagnostic evidence.
+The baseline retains the three protected-main sources recorded above.
+
+The current workflow assigns the same inventory to five single-process
+shards with 120 minutes per job. Both workflow planning steps select five,
+and aggregation requires the complete five-report plan. The planner and
+aggregator continue to accept the historical two- and four-shard formats.
+The production plan at this change assigns all 292 tracked test files once
+in groups of 54, 56, 56, 69 and 57, with digest
+`sha256:313f6c8769411e38a521faa8bb1f574b8866eb820fb95e507441e5476d8569de`.
+
+Replaying the five assignments with complete timings from the failed run
+sets the longest shard at 83.021 cumulative test minutes, compared with
+119.300 in the actual four-shard assignment. Replaying complete timings
+from PR 77 sets it at 80.257 minutes. These replays measure test work.
+Hosted elapsed time also includes setup, scheduling and runner variance.
+The repair requires successful exact-head Hosted validation and a
+successful protected-main push with the current graph.

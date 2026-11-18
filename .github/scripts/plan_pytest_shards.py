@@ -10,7 +10,7 @@ Two subcommands are provided:
 
 * ``plan`` reads the committed manifest plus the *current* tracked test-file
   inventory (discovered from Git, never from history artifacts) and assigns
-  every test file to two or four shards using deterministic LPT
+  every test file to two, four, or five shards using deterministic LPT
   (longest-processing-time-first).  New test files without historical timing
   receive the manifest's P95 fallback weight; baseline files that no longer
   exist are ignored and reported.  Planning fails closed when more than 5% of
@@ -52,7 +52,7 @@ PLAN_SCHEMA = "pytest-shard-plan-v1"
 AGGREGATION_METHOD = "available_test_median_then_sum_by_file"
 
 DEFAULT_SHARD_COUNT = 4
-ALLOWED_SHARD_COUNTS = frozenset({2, 4})
+ALLOWED_SHARD_COUNTS = frozenset({2, 4, 5})
 MIN_SOURCE_RUNS = 3
 MAX_BASELINE_AGE_DAYS = 30
 MAX_UNKNOWN_FILE_PERCENT = 5
@@ -770,7 +770,7 @@ def plan_shards(
 ) -> dict[str, Any]:
     """Build a deterministic shard plan for the current test inventory."""
     if shard_count not in ALLOWED_SHARD_COUNTS:
-        raise ShardPlanningError("shard count must be 2 or 4")
+        raise ShardPlanningError("shard count must be 2, 4, or 5")
 
     inventory = discover_test_files(repository_root)
     if not inventory:

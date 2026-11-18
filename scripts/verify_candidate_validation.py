@@ -22,13 +22,14 @@ from typing import Any
 
 WORKFLOW = ".github/workflows/validate.yml"
 SHA = re.compile(r"[0-9a-f]{40}")
+PYTEST_JOBS = tuple(f"pytest ({index})" for index in range(5))
 CORE_JOBS = {
     "classify",
     "quality",
     "pytest-report",
     "validate",
     "candidate-package",
-} | {f"pytest ({index})" for index in range(4)}
+} | set(PYTEST_JOBS)
 BRIDGE_JOBS = {"bridge (ubuntu-latest)", "bridge (macos-15)"}
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_PACKAGE_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -654,10 +655,8 @@ def verify(
         "Upload candidate build identity, not release approval",
     ):
         _require_job_step(package_job, step_name)
-    for index in range(4):
-        _require_job_step(
-            by_name[f"pytest ({index})"], "Prepare pinned Linux age tools for this shard"
-        )
+    for name in PYTEST_JOBS:
+        _require_job_step(by_name[name], "Prepare pinned Linux age tools for this shard")
     package = proof.get("package")
     require(
         isinstance(package, dict)
