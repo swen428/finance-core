@@ -729,6 +729,7 @@ def _require_prefix(
         else (proposal["proposal_id"], proposal["version"])
     )
     validate_eligibility(target, expected.target_bundle_ref, latest, required)
+    return sequences[-1]
 
 
 def _require_current_authority(service, conn, expected):
@@ -1205,6 +1206,8 @@ class DailyAccountServiceV1:
         return result
 
     def record_delivery(self, review_id, delivery_evidence_id):
+        from .opening_contracts_v1 import ExpectedOpeningInvocationV2
+
         with self._write() as (service, conn):
             _audit(service, conn)
             row = _row(conn, "l2_reviews", "review_id", review_id)
@@ -1236,6 +1239,10 @@ class DailyAccountServiceV1:
             else:
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
+                if type(expected) is ExpectedOpeningInvocationV2:
+                    from .opening_changes_v1 import require_dependencies
+
+                    require_dependencies(conn, expected)
                 conn.execute(
                     "INSERT INTO l2_deliveries VALUES(?,?,?)",
                     (review_id, delivery_evidence_id, canonical(asdict(actual))),

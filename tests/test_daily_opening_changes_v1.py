@@ -638,7 +638,82 @@ def test_nonempty_void_refused_then_empty_void_new_id_and_no_baseline_set(live):
     assert reader.collect().balances[0].balance_amount == "60.00"
 
 
-def test_stale_closure_card_zero_append_and_fresh_card_required(live):
+@pytest.mark.parametrize("same_account", [True, False], ids=["same-account", "other-account"])
+def test_first_delivery_checks_current_opening_dependencies(live, same_account):
+    from finance_core.lifecycle_v2 import VerifiedDelivery
+
+    ledger, port, daily, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement_account = account
+    if not same_account:
+        port.add_source("source2", "Create another MYR cash account with opening 100")
+        _, _, _, other = create(
+            ledger,
+            port,
+            daily,
+            command(
+                fields={
+                    "name": "Cash",
+                    "account_type": "cash",
+                    "currency": "MYR",
+                    "opening": {"amount": "100", "as_of": unknown_time()},
+                }
+            ),
+            suffix="2",
+        )
+        movement_account = other.account_ref.account_id
+
+    movement(ledger, port, movements, account, "first-delivery-coffee")
+    complete = complete_dependencies(
+        ledger,
+        port,
+        api,
+        source,
+        initial,
+        reader,
+        account,
+        "first-delivery-opening",
+        opening_command(),
+        {"expense": "included"},
+    )
+    card = api.prepare_review(complete.proposal_id, complete.version)
+    movement(
+        ledger,
+        port,
+        movements,
+        movement_account,
+        "first-delivery-income",
+        fields(movement_account, "20", "income"),
+    )
+    port.deliveries["delivery-first-opening"] = VerifiedDelivery(
+        "delivery-first-opening", card.review_id, card.review_sha256, "user", "chat"
+    )
+
+    def counts():
+        with lifecycle_read_operation(ledger.owner) as conn:
+            return tuple(
+                conn.execute(
+                    "SELECT (SELECT count(*) FROM l2_deliveries),"
+                    "(SELECT count(*) FROM l2_events),"
+                    "(SELECT count(*) FROM l2_decisions),"
+                    "(SELECT count(*) FROM l2_facts)"
+                ).fetchone()
+            )
+
+    before = counts()
+    if same_account:
+        with pytest.raises(LifecycleError, match="stale_opening_dependency_closure"):
+            api.record_delivery(card.review_id, "delivery-first-opening")
+        assert counts() == before
+        assert api.prepare_review(complete.proposal_id, complete.version) == card
+    else:
+        delivered = api.record_delivery(card.review_id, "delivery-first-opening")
+        assert delivered.delivery_evidence_id == "delivery-first-opening"
+        assert counts() == (before[0] + 1, before[1] + 1, *before[2:])
+
+
+def test_stale_closure_card_zero_append_and_fresh_card_required(live, monkeypatch):
+    from finance_core.lifecycle_v2.daily_v1 import opening_changes_v1 as opening
+
     ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
     movement(ledger, port, movements, account, "coffee")
     complete = complete_dependencies(
@@ -654,8 +729,34 @@ def test_stale_closure_card_zero_append_and_fresh_card_required(live):
         {"expense": "included"},
     )
     card = api.prepare_review(complete.proposal_id, complete.version)
-    api.record_delivery(card.review_id, "delivery-stale")
+    delivered = api.record_delivery(card.review_id, "delivery-stale")
     movement(ledger, port, movements, account, "new-income", fields(account, "20", "income"))
+    with lifecycle_read_operation(ledger.owner) as conn:
+        review_seq, delivery_seq = (
+            row[0]
+            for row in conn.execute(
+                "SELECT seq FROM l2_events WHERE entity_id=? AND kind IN ('review','delivery') "
+                "ORDER BY seq",
+                (card.review_id,),
+            )
+        )
+        event_count = conn.execute("SELECT count(*) FROM l2_events").fetchone()[0]
+
+    dependency_prefixes = set()
+    require_dependencies = opening.require_dependencies
+
+    def observe_dependencies(conn, expected, before_seq=None):
+        if expected.reply_evidence_id == "reply-opening-stale":
+            dependency_prefixes.add(before_seq)
+        return require_dependencies(conn, expected, before_seq)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(opening, "require_dependencies", observe_dependencies)
+        assert ledger.reader().full_audit()["event_count"] == event_count
+    assert dependency_prefixes == {review_seq, delivery_seq}
+    assert api.record_delivery(card.review_id, "delivery-stale") == delivered
+    assert ledger.reader().full_audit()["event_count"] == event_count
+
     before = financial_rows(ledger)
     with pytest.raises(LifecycleError, match="stale_opening_dependency_closure"):
         api.confirm(card.review_id, "action-stale", "confirm-stale")
@@ -845,6 +946,51 @@ def test_historical_opening_expected_cannot_borrow_another_instance():
             None,
             binding=other,
         )
+
+
+def test_opening_answer_composition_requires_the_predecessor_binding(live):
+    from dataclasses import replace
+
+    from finance_core.lifecycle_v2.daily_v1.opening_changes_v1 import _compose, _previous
+
+    ledger, port, _, movements, reader, api, source, initial, account, _ = prepare_opening(live)
+    movement(ledger, port, movements, account, "binding-coffee")
+    view = reader.get_account(account)
+    draft = opening_proposal(
+        ledger, port, api, source, initial, view, "binding-opening", opening_command()
+    )
+    question = port.deliver_opening_question(
+        api.opening_questions_v1(draft.proposal_id), "binding-question"
+    )
+    row_reply(port, "binding-answer", (question["subjects"][0], "included"))
+    port.register_opening(
+        ledger.binding,
+        source,
+        view,
+        draft,
+        "binding-answer",
+        "binding-opening",
+        "opening_correct",
+        question,
+    )
+    with api._read() as (service, conn):
+        captured = service._source(conn, source.source_id, allow_archived=True)
+        previous = _previous(conn, source.source_id)
+        args = (
+            service,
+            conn,
+            captured,
+            view.bundle_ref,
+            "binding-answer",
+            "opening_correct",
+            "binding-opening",
+            previous,
+        )
+        current = _compose(*args)
+        assert current.binding == ledger.binding
+        assert _compose(*args, binding=current.binding) == current
+        with pytest.raises(LifecycleError, match="stale_proposal_binding"):
+            _compose(*args, binding=replace(current.binding, generation="alternate"))
 
 
 def test_normal_opening_resolution_ignores_host_decimal_precision_and_traps(live):

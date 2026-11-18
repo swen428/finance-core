@@ -330,8 +330,9 @@ actual choice, including negation, must match the treatment. Only funds known
 strictly later than the new opening are automatically excluded. Every other
 unanswered or uncertain row remains a durable incomplete proposal. Supplying
 new opening fields or a reason uses a fresh original instruction; completing
-coverage preserves that instruction separately from the response. Changed
-dependencies discard carried answers and require a newly delivered exact list.
+coverage preserves that instruction separately from the response and requires
+the same runtime binding as the preceding proposal. Changed dependencies
+discard carried answers and require a newly delivered exact list.
 
 `opening_questions_v1(proposal_id)` returns the current complete subjects and
 list identity from an audited protected read. This call does not claim that
@@ -343,10 +344,12 @@ After all rows are resolved, `prepare_review` produces one v2 complete card with
 all subjects, original and new treatments, per-row balance changes, full
 before/after balances, difference and original reason. The full material hash
 must be delivered before a separate action can confirm it. The original
-instruction or any answer cannot serve as that action. Partial replies and
-restarts grant no posting right. One confirmation uses the original protected
-transaction and appends exactly one account fact, decision and confirm event.
-The target, complete closure and compiled questions/answers are checked again
+dependency list must still match when Core first records delivery. Historical
+reads and replays check the list at the original delivery event. The original
+instruction or any answer cannot serve as the confirmation action. Partial
+replies and restarts grant no posting right. One confirmation uses the original
+protected transaction and appends exactly one account fact, decision and confirm
+event. The target, complete closure and compiled questions/answers are checked again
 after the last external read-only callback. Stale cards refuse without posting;
 original operation replay first returns its original receipt.
 

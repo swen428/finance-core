@@ -102,6 +102,8 @@ def _compose(
         ):
             raise LifecycleError("Opening answers lack original proposal")
         old = decode_expected(strict_json(previous["observation_json"])["expected"])
+        if old.binding != binding:
+            raise LifecycleError("stale_proposal_binding")
         if (
             old.instruction != original
             or old.target_bundle_ref != asdict(ref)
@@ -411,7 +413,10 @@ def verify_review(service, conn, review):
         "SELECT * FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
     ).fetchone()
     if delivery:
-        _require_prefix(conn, expected, proposal, "delivery", review_id=review["review_id"])
+        delivery_seq = _require_prefix(
+            conn, expected, proposal, "delivery", review_id=review["review_id"]
+        )
+        require_dependencies(conn, expected, before_seq=delivery_seq)
         actual = service.port.delivery(
             conn,
             delivery["evidence_id"],
