@@ -3,7 +3,9 @@
 import json
 import sqlite3
 import sys
+from contextlib import closing
 from dataclasses import asdict, replace
+from decimal import Context, InvalidOperation, getcontext, localcontext
 
 import pytest
 
@@ -21,6 +23,12 @@ from finance_core.lifecycle_v2._audit_rows_v1 import (
     audit_rows,
 )
 from finance_core.lifecycle_v2.contracts import canonical
+from finance_core.lifecycle_v2.daily_v1 import DailyMovementServiceV1
+from finance_core.lifecycle_v2.daily_v1._impacts_v1 import (
+    account_inventory,
+    map_owner,
+    opening_inventory,
+)
 from finance_core.lifecycle_v2.daily_v1._prefix_v1 import validate_order
 from finance_core.lifecycle_v2.daily_v1.accounts import (
     _EvidenceReadPort,
@@ -32,9 +40,19 @@ from finance_core.lifecycle_v2.daily_v1.accounts import (
 )
 from finance_core.lifecycle_v2.daily_v1.contracts import decode_expected
 from finance_core.lifecycle_v2.reader import _audit_evidence_connection, audit_evidence_connection
-from tests.daily_account_support_v1 import unknown_time
+from tests.daily_account_support_v1 import command, unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import change, create, setup
+from tests.test_daily_movements_lifecycle_v1 import fields as movement_fields
+from tests.test_daily_movements_lifecycle_v1 import movement
+from tests.test_daily_opening_changes_v1 import (
+    complete_dependencies,
+    finish,
+    opening_command,
+    opening_proposal,
+    prepare_opening,
+)
 from tests.test_lifecycle_v2 import live as live
+from tests.test_lifecycle_v2 import response
 
 
 def raw(table, **values):
@@ -107,9 +125,10 @@ def test_pure_prefix_uses_strict_event_cutoff_and_proposal_version():
 
 
 class TracePort:
-    def __init__(self, port, *, changed_repeat=False):
+    def __init__(self, port, *, changed_repeat=False, raw_conn=None):
         self.port = port
         self.changed_repeat = changed_repeat
+        self.raw_conn = raw_conn
         self.trace = []
         self.tokens = []
         self.cursors = []
@@ -117,11 +136,14 @@ class TracePort:
     def __getattr__(self, name):
         def call(conn, identity, expected=None):
             witness = _witness_for(conn)
-            assert witness is not None and witness.evidence_callback_token is not None
-            self.tokens.append(witness.evidence_callback_token)
-            cursor = conn.execute("SELECT count(*) FROM l2_events")
-            assert cursor.fetchone()[0] > 0
-            self.cursors.append(cursor)
+            if self.raw_conn is not None:
+                assert conn is self.raw_conn and witness is None
+            else:
+                assert witness is not None and witness.evidence_callback_token is not None
+                self.tokens.append(witness.evidence_callback_token)
+                cursor = conn.execute("SELECT count(*) FROM l2_events")
+                assert cursor.fetchone()[0] > 0
+                self.cursors.append(cursor)
             method = getattr(self.port, name)
             result = (
                 method(conn, identity) if expected is None else method(conn, identity, expected)
@@ -248,6 +270,290 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
         )
         == first
     )
+
+
+def test_movement_opening_prefixes_and_independent_copy_match_original_sql(
+    live, tmp_path, monkeypatch
+):
+    ledger, port, daily, movements, reader, opening, source, initial, account, _ = prepare_opening(
+        live
+    )
+    _, income_card, income = movement(
+        ledger, port, movements, account, "income", movement_fields(account, "200", "income")
+    )
+    _, _, expense = movement(ledger, port, movements, account, "expense")
+    completed = complete_dependencies(
+        ledger,
+        port,
+        opening,
+        source,
+        initial,
+        reader,
+        account,
+        "opening",
+        opening_command(),
+        {"expense": "excluded", "income": "included"},
+    )
+    opening_card, owner = finish(opening, completed, "opening")
+    port.add_source("rename", "Rename bank to Renamed")
+    port.commands["rename"] = command("account_rename", {"name": "Renamed"})
+    rename_proposal = daily.propose_account_change(
+        account,
+        "rename",
+        reader.get_account(account).bundle_ref,
+        "propose-rename",
+        reply_evidence_id="rename",
+        command_kind="account_rename",
+    )
+    _, renamed = finish(daily, rename_proposal, "rename")
+    _, void_card, voided = movement(
+        ledger,
+        port,
+        movements,
+        account,
+        "void-income",
+        {},
+        reader.detail(income.receipt.record_id),
+        "movement_void",
+    )
+    opening_proposal(
+        ledger,
+        port,
+        opening,
+        source,
+        rename_proposal,
+        reader.get_account(account),
+        "pending",
+        opening_command(amount="850"),
+    )
+    assert void_card.material["format"] == "finance-daily-movement-review-v2"
+    assert void_card.material["account_impact_changes"][0]["balance_delta"] == "0.00"
+    result = reader.collect_with_effects_v1()
+    assert result.collection.pending_count == 1
+    assert result.collection.balances[0].balance_amount == "891.00"
+    assert result.collection.income_by_currency == ()
+    assert result.collection.expense_by_currency == (("MYR", "9.00"),)
+    assert result.collection.fact_version_count == 6
+
+    observer = TracePort(port)
+    protected = _EvidenceReadPort(observer)
+    with lifecycle_read_operation(ledger.owner) as conn:
+        conn.execute("BEGIN")
+        try:
+            before = _logical_database_digest(conn), conn.total_changes
+            reference = _audit_evidence_connection(conn, protected, ledger.binding)
+            trace = tuple(observer.trace)
+            observer.trace.clear()
+            assert {
+                "opening_instruction_link_v1",
+                "opening_proposal_v2",
+                "movement_instruction_link",
+                "movement_proposal",
+                "action",
+                "delivery",
+            } <= {call[0] for call in trace}
+            with audit_rows(conn, protected) as rows:
+                assert rows is not None
+                assert (
+                    _audit_evidence_connection(conn, protected, ledger.binding, _rows=rows)
+                    == reference
+                )
+                assert tuple(observer.trace) == trace
+                # A commit is excluded at its own cutoff, included at the next sequence.
+                for cut, count, bundle_version in (
+                    (expense.receipt.commit_seq, 1, 1),
+                    (owner.receipt.commit_seq, 2, 1),
+                    (renamed.receipt.commit_seq, 2, 2),
+                    (voided.receipt.commit_seq, 2, 3),
+                    (voided.receipt.commit_seq + 1, 1, 3),
+                    (None, 1, 3),
+                ):
+                    dependencies = opening_inventory(conn, account, cut, _rows=rows)
+                    assert canonical(dependencies) == canonical(
+                        opening_inventory(conn, account, cut)
+                    )
+                    accounts = account_inventory(conn, cut, _rows=rows)
+                    assert canonical(accounts) == canonical(account_inventory(conn, cut))
+                    assert len(dependencies) == count
+                    assert accounts[0]["fact_ref"]["version"] == bundle_version
+                    values = accounts[0]["values"]
+                    mapped = map_owner(conn, values, cut, _rows=rows)
+                    assert mapped == map_owner(conn, values, cut)
+                    if bundle_version > 1:
+                        assert mapped["version"] == owner.receipt.version
+                        assert mapped["fact_sha256"] == owner.receipt.fact_sha256
+                    else:
+                        assert mapped is None
+                    # Mutating a returned DTO cannot affect a warm projection.
+                    accounts[0]["values"]["account"]["name"] = "changed"
+                    assert account_inventory(conn, cut, _rows=rows)[0] != accounts[0]
+                    if mapped is not None:
+                        with pytest.raises(LifecycleError, match="carrier differs from prefix"):
+                            map_owner(conn, values, cut, _rows=rows)
+            assert (_logical_database_digest(conn), conn.total_changes) == before
+            with pytest.raises(LifecycleError, match="Expired"):
+                account_inventory(conn, _rows=rows)
+
+            # A changed second result for the same proposal must still be
+            # observed and rejected even with warmed prefix data.
+            original = port.opening_proposal_v2
+            failed = []
+            for indexed in (False, True):
+                seen = []
+
+                def changed(conn, identity, expected):
+                    actual = original(conn, identity, expected)
+                    if identity == "opening":
+                        seen.append(identity)
+                        if len(seen) == 2:
+                            return replace(actual, raw_proposal=actual.raw_proposal + " ")
+                    return actual
+
+                observer = TracePort(port)
+                protected = _EvidenceReadPort(observer)
+                with (
+                    monkeypatch.context() as patch,
+                    pytest.raises(LifecycleError, match="Authenticated opening proposal differs"),
+                ):
+                    patch.setattr(port, "opening_proposal_v2", changed)
+                    if indexed:
+                        with audit_rows(conn, protected) as rows:
+                            assert rows is not None
+                            _audit_evidence_connection(conn, protected, ledger.binding, _rows=rows)
+                    else:
+                        _audit_evidence_connection(conn, protected, ledger.binding)
+                assert seen == ["opening", "opening"]
+                failed.append(observer.trace)
+            assert failed[0] == failed[1]
+            assert (_logical_database_digest(conn), conn.total_changes) == before
+        finally:
+            conn.rollback()
+
+    with monkeypatch.context() as patch:
+        patch.setattr("finance_core.lifecycle_v2._audit_rows_v1._MAX_BYTES", 1)
+        assert reader.collect_with_effects_v1() == result
+        assert (
+            opening.lookup_commit_receipt(
+                "confirm-opening",
+                review_id=opening_card.review_id,
+                action_evidence_id="action-opening",
+            )
+            == owner
+        )
+        assert (
+            movements.lookup_commit_receipt(
+                "confirm-income",
+                review_id=income_card.review_id,
+                action_evidence_id="action-income",
+            )
+            == income
+        )
+
+    path = tmp_path / "daily-copy.sqlite"
+    cut = ledger.seal_snapshot(path)
+    with closing(sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True)) as copy:
+        copy.row_factory = sqlite3.Row
+        copy.execute("PRAGMA query_only=ON")
+        observer = TracePort(port, raw_conn=copy)
+        with audit_rows(copy, _EvidenceReadPort(observer)) as rows:
+            assert rows is None
+        assert audit_evidence_connection(copy, observer, ledger.binding) == reference
+        assert [c[:-1] for c in observer.trace] == [c[:-1] for c in trace]
+        assert all(c[-1] == id(copy) for c in observer.trace)
+        assert (
+            _logical_database_digest(copy)
+            == cut.logical_database_sha256
+            == result.read_identity.logical_database_sha256
+        )
+        assert cut.commit_seq == result.read_identity.event_seq
+        assert (
+            canonical(opening_inventory(copy, account)[0]["resolved_effect"])
+            == result.effects[0].material_json
+        )
+
+
+def test_warm_mixed_native_prefix_revalidates_in_current_decimal_context(live, monkeypatch):
+    ledger, port, daily, _, _ = setup(live)
+    raw = "2026-10-24 Cafe SGD 12.34"
+    port.add_source("native", raw)
+    port.native_raw["native-observation"] = response(
+        raw,
+        fields={
+            "amount": "12.34",
+            "currency": "SGD",
+            "merchant": "Cafe",
+            "transaction_date": "2026-10-24",
+        },
+    )
+    source = ledger.capture("native", "capture-native")
+    proposal = ledger.propose(source.source_id, "native-observation", 0, "propose-native")
+    finish(ledger, proposal, "native")
+    _, _, _, receipt = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={"name": "Bank", "account_type": "bank", "currency": "MYR", "opening": None}
+        ),
+    )
+    movement(ledger, port, DailyMovementServiceV1(ledger), receipt.account_ref.account_id, "daily")
+
+    normal_precision = 28
+    original_source, original_link = port.source, port.movement_instruction_link
+    with lifecycle_read_operation(ledger.owner) as conn:
+        conn.execute("BEGIN")
+        try:
+            before = _logical_database_digest(conn), conn.total_changes
+            traces = []
+            for indexed in (False, True):
+                stages = []
+                source_calls = 0
+
+                def source_at_cut(actual_conn, identity):
+                    nonlocal source_calls
+                    assert actual_conn is conn
+                    actual = original_source(actual_conn, identity)
+                    if identity == "daily":
+                        source_calls += 1
+                        if source_calls == 3:
+                            # The standalone proposal already warmed this cut.
+                            # Its review now rechecks the same original proposal.
+                            getcontext().prec = 1
+                        stages.append(("source", getcontext().prec))
+                    return actual
+
+                def link_at_cut(actual_conn, identity, expected):
+                    assert actual_conn is conn
+                    if identity == "daily":
+                        stages.append(("link", getcontext().prec))
+                        getcontext().prec = normal_precision
+                    return original_link(actual_conn, identity, expected)
+
+                with monkeypatch.context() as patch, localcontext(Context(prec=normal_precision)):
+                    patch.setattr(port, "source", source_at_cut)
+                    patch.setattr(port, "movement_instruction_link", link_at_cut)
+                    observer = TracePort(port)
+                    protected = _EvidenceReadPort(observer)
+                    with pytest.raises(InvalidOperation):
+                        if indexed:
+                            with audit_rows(conn, protected) as rows:
+                                assert rows is not None
+                                _audit_evidence_connection(
+                                    conn, protected, ledger.binding, _rows=rows
+                                )
+                        else:
+                            _audit_evidence_connection(conn, protected, ledger.binding)
+                    assert stages == [
+                        ("source", normal_precision),
+                        ("source", normal_precision),
+                        ("link", normal_precision),
+                        ("source", 1),
+                    ]
+                    traces.append(observer.trace)
+            assert traces[0] == traces[1]
+            assert (_logical_database_digest(conn), conn.total_changes) == before
+        finally:
+            conn.rollback()
 
 
 def test_changed_repeated_evidence_is_called_and_refused_without_retry(live):

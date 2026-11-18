@@ -745,10 +745,10 @@ def test_stale_closure_card_zero_append_and_fresh_card_required(live, monkeypatc
     dependency_prefixes = set()
     require_dependencies = opening.require_dependencies
 
-    def observe_dependencies(conn, expected, before_seq=None):
+    def observe_dependencies(conn, expected, before_seq=None, *, _rows=None):
         if expected.reply_evidence_id == "reply-opening-stale":
             dependency_prefixes.add(before_seq)
-        return require_dependencies(conn, expected, before_seq)
+        return require_dependencies(conn, expected, before_seq, _rows=_rows)
 
     with monkeypatch.context() as patch:
         patch.setattr(opening, "require_dependencies", observe_dependencies)
