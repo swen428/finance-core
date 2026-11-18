@@ -15,13 +15,18 @@ from .contracts import (
 from .movement_contracts import MOVEMENT_FORMAT
 
 
-def _inventory(facts):
+def _inventory(facts, *, daily_only=False):
     from ..effective_v1 import _business_fields
     from .accounts import bundle_ref, registered_values
 
     accounts, current = {}, {}
     for row in facts:
-        value = registered_values(strict_json(row["values_json"]))
+        value = strict_json(row["values_json"])
+        if daily_only and type(value) is dict and "format" not in value:
+            # Native expense validation uses the caller's Decimal context,
+            # which an evidence callback can change between these reads.
+            return None
+        value = registered_values(value)
         if value.get("format") in BUNDLE_FORMATS:
             if value["account"]["account_id"] != row["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
@@ -40,23 +45,22 @@ def _prefix_inventory(conn, before_seq, rows):
         facts = (
             rows.table(conn, "facts") if before_seq is None else rows.facts_before(conn, before_seq)
         )
-        return _inventory(facts)
+        return _inventory(facts, daily_only=True)
 
     return rows.daily_projection(conn, "prefix", REGISTRY_ID, before_seq, None, collect)
 
 
 def account_inventory(conn, before_seq=None, *, _rows=None):
-    accounts, _ = (
-        _prefix_inventory(conn, before_seq, _rows)
-        if _rows is not None
-        else _inventory(
+    inventory = _prefix_inventory(conn, before_seq, _rows) if _rows is not None else None
+    if inventory is None:
+        inventory = _inventory(
             conn.execute(
                 "SELECT * FROM l2_facts WHERE (? IS NULL OR commit_seq<?)"
                 " ORDER BY record_id,version",
                 (before_seq, before_seq),
             )
         )
-    )
+    accounts, _ = inventory
     return [
         {"fact_ref": asdict(ref), "values": strict_json(row["values_json"])}
         for ref, row in accounts
@@ -349,8 +353,9 @@ def opening_inventory(conn, account_id, before_seq=None, *, _rows=None):
         ).fetchone()
     ):
         raise LifecycleError("unsupported_ledger_scope: opening dependency inventory")
-    if _rows is not None:
-        account_rows, current = _prefix_inventory(conn, before_seq, _rows)
+    inventory = _prefix_inventory(conn, before_seq, _rows) if _rows is not None else None
+    if inventory is not None:
+        account_rows, current = inventory
         accounts = {ref.record_id: strict_json(row["values_json"]) for ref, row in account_rows}
     else:
         accounts = {

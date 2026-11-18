@@ -5,6 +5,7 @@ import sqlite3
 import sys
 from contextlib import closing
 from dataclasses import asdict, replace
+from decimal import Context, InvalidOperation, getcontext, localcontext
 
 import pytest
 
@@ -22,6 +23,7 @@ from finance_core.lifecycle_v2._audit_rows_v1 import (
     audit_rows,
 )
 from finance_core.lifecycle_v2.contracts import canonical
+from finance_core.lifecycle_v2.daily_v1 import DailyMovementServiceV1
 from finance_core.lifecycle_v2.daily_v1._impacts_v1 import (
     account_inventory,
     map_owner,
@@ -50,6 +52,7 @@ from tests.test_daily_opening_changes_v1 import (
     prepare_opening,
 )
 from tests.test_lifecycle_v2 import live as live
+from tests.test_lifecycle_v2 import response
 
 
 def raw(table, **values):
@@ -467,6 +470,90 @@ def test_movement_opening_prefixes_and_independent_copy_match_original_sql(
             canonical(opening_inventory(copy, account)[0]["resolved_effect"])
             == result.effects[0].material_json
         )
+
+
+def test_warm_mixed_native_prefix_revalidates_in_current_decimal_context(live, monkeypatch):
+    ledger, port, daily, _, _ = setup(live)
+    raw = "2026-10-24 Cafe SGD 12.34"
+    port.add_source("native", raw)
+    port.native_raw["native-observation"] = response(
+        raw,
+        fields={
+            "amount": "12.34",
+            "currency": "SGD",
+            "merchant": "Cafe",
+            "transaction_date": "2026-10-24",
+        },
+    )
+    source = ledger.capture("native", "capture-native")
+    proposal = ledger.propose(source.source_id, "native-observation", 0, "propose-native")
+    finish(ledger, proposal, "native")
+    _, _, _, receipt = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={"name": "Bank", "account_type": "bank", "currency": "MYR", "opening": None}
+        ),
+    )
+    movement(ledger, port, DailyMovementServiceV1(ledger), receipt.account_ref.account_id, "daily")
+
+    normal_precision = 28
+    original_source, original_link = port.source, port.movement_instruction_link
+    with lifecycle_read_operation(ledger.owner) as conn:
+        conn.execute("BEGIN")
+        try:
+            before = _logical_database_digest(conn), conn.total_changes
+            traces = []
+            for indexed in (False, True):
+                stages = []
+                source_calls = 0
+
+                def source_at_cut(actual_conn, identity):
+                    nonlocal source_calls
+                    assert actual_conn is conn
+                    actual = original_source(actual_conn, identity)
+                    if identity == "daily":
+                        source_calls += 1
+                        if source_calls == 3:
+                            # The standalone proposal already warmed this cut.
+                            # Its review now rechecks the same original proposal.
+                            getcontext().prec = 1
+                        stages.append(("source", getcontext().prec))
+                    return actual
+
+                def link_at_cut(actual_conn, identity, expected):
+                    assert actual_conn is conn
+                    if identity == "daily":
+                        stages.append(("link", getcontext().prec))
+                        getcontext().prec = normal_precision
+                    return original_link(actual_conn, identity, expected)
+
+                with monkeypatch.context() as patch, localcontext(Context(prec=normal_precision)):
+                    patch.setattr(port, "source", source_at_cut)
+                    patch.setattr(port, "movement_instruction_link", link_at_cut)
+                    observer = TracePort(port)
+                    protected = _EvidenceReadPort(observer)
+                    with pytest.raises(InvalidOperation):
+                        if indexed:
+                            with audit_rows(conn, protected) as rows:
+                                assert rows is not None
+                                _audit_evidence_connection(
+                                    conn, protected, ledger.binding, _rows=rows
+                                )
+                        else:
+                            _audit_evidence_connection(conn, protected, ledger.binding)
+                    assert stages == [
+                        ("source", normal_precision),
+                        ("source", normal_precision),
+                        ("link", normal_precision),
+                        ("source", 1),
+                    ]
+                    traces.append(observer.trace)
+            assert traces[0] == traces[1]
+            assert (_logical_database_digest(conn), conn.total_changes) == before
+        finally:
+            conn.rollback()
 
 
 def test_changed_repeated_evidence_is_called_and_refused_without_retry(live):
