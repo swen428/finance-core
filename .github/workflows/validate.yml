@@ -196,7 +196,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -245,7 +245,7 @@ jobs:
             --baseline .github/scripts/pytest-shard-weights-v2.json \
             --repository-root . \
             --output-dir /tmp/finance-core-shards \
-            --shard-count 4
+            --shard-count 5
 
       - name: Run shard
         id: pytest
@@ -1499,7 +1499,7 @@ jobs:
             --baseline .github/scripts/pytest-shard-weights-v2.json \
             --repository-root . \
             --output-dir /tmp/finance-core-shards \
-            --shard-count 4
+            --shard-count 5
 
       - name: Download shard timings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1513,6 +1513,7 @@ jobs:
           python .github/scripts/aggregate_pytest_timing.py \
             --shard-dir /tmp/finance-core-shard-timings \
             --plan /tmp/finance-core-shards/plan.json \
+            --expected-shard-count 5 \
             --output /tmp/pytest-timing-v1.json \
             --summary "$GITHUB_STEP_SUMMARY"
 

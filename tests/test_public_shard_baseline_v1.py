@@ -34,17 +34,22 @@ def baseline():
     return PLANNER.load_baseline_manifest(ROOT / ".github/scripts/pytest-shard-weights-v2.json")
 
 
-def test_public_baseline_covers_current_inventory_exactly_once() -> None:
+@pytest.mark.parametrize("shard_count", [2, 4, 5])
+def test_public_baseline_covers_current_inventory_exactly_once(shard_count: int) -> None:
     manifest = baseline()
     # The production CLI enforces today's age. This regression fixes time to
     # the recorded sample so future baseline maintenance is not a test timer.
     now = datetime.fromisoformat(manifest["baseline_at"].replace("Z", "+00:00"))
-    plan = PLANNER.plan_shards(manifest, repository_root=ROOT, now=now)
-    assert plan == PLANNER.plan_shards(manifest, repository_root=ROOT, now=now)
+    plan = PLANNER.plan_shards(manifest, repository_root=ROOT, shard_count=shard_count, now=now)
+    assert plan == PLANNER.plan_shards(
+        manifest, repository_root=ROOT, shard_count=shard_count, now=now
+    )
     assigned = [file for shard in plan["shards"] for file in shard["files"]]
     assert len(assigned) == len(set(assigned))
     assert sorted(assigned) == list(PLANNER.discover_test_files(ROOT))
-    assert plan["shard_count"] == 4
+    assert plan["shard_count"] == shard_count
+    assert plan["indexes"] == list(range(shard_count))
+    assert len(plan["shards"]) == shard_count and all(shard["files"] for shard in plan["shards"])
     assert plan["unknown_file_count"] * 100 <= plan["total_files"] * 5
     assert len(manifest["source_runs"]) >= 3
     for run in manifest["source_runs"]:
@@ -357,8 +362,8 @@ def test_failed_or_incomplete_summary_never_shows_zero_as_success() -> None:
     assert "✅ exit code 0" not in summary
 
 
-def make_cli_plan() -> dict[str, object]:
-    files = [f"tests/test_{index}.py" for index in range(4)]
+def make_cli_plan(shard_count: int) -> dict[str, object]:
+    files = [f"tests/test_{index}.py" for index in range(shard_count)]
     shards = [
         {
             "index": index,
@@ -370,19 +375,19 @@ def make_cli_plan() -> dict[str, object]:
     ]
     plan: dict[str, object] = {
         "schema": AGGREGATOR.PLAN_SCHEMA,
-        "shard_count": 4,
-        "indexes": [0, 1, 2, 3],
-        "total_files": 4,
+        "shard_count": shard_count,
+        "indexes": list(range(shard_count)),
+        "total_files": shard_count,
         "shards": shards,
         "new_files": [],
         "deleted_files": [],
-        "known_file_count": 4,
+        "known_file_count": shard_count,
         "unknown_file_count": 0,
         "known_file_coverage": 1.0,
         "baseline_at": "2026-10-12T00:00:00Z",
         "unknown_file_weight_seconds": 0.0,
     }
-    plan["digest"] = AGGREGATOR._plan_digest(4, [[file] for file in files])
+    plan["digest"] = AGGREGATOR._plan_digest(shard_count, [[file] for file in files])
     return plan
 
 
@@ -456,13 +461,26 @@ def test_plan_and_report_trust_rejections_and_incomplete_report_contract(tmp_pat
         AGGREGATOR._load_shard_report(report_path, 0)
 
 
-def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
-    plan = make_cli_plan()
+@pytest.mark.parametrize(
+    ("shard_count", "fault", "error"),
+    [
+        (2, "missing", "shard_report_missing"),
+        (4, "missing", "shard_report_missing"),
+        (5, "missing", "shard_report_missing"),
+        (5, "extra", "shard_report_index_mismatch"),
+        (5, "duplicate-test", "duplicate_test_id"),
+        (5, "wrong-file", "shard_assignment_mismatch"),
+    ],
+)
+def test_cli_json_and_exit_contract_remain_stable(
+    tmp_path: Path, shard_count: int, fault: str, error: str
+) -> None:
+    plan = make_cli_plan(shard_count)
     plan_path = tmp_path / "plan.json"
     plan_path.write_text(json.dumps(plan), encoding="utf-8")
     shard_dir = tmp_path / "shards"
     shard_dir.mkdir()
-    reports = make_reports((2.0, 3.0, 4.0, 5.0))
+    reports = make_reports(tuple(float(index + 2) for index in range(shard_count)))
     for index, report in enumerate(reports):
         (shard_dir / f"shard-{index}.json").write_text(json.dumps(report), encoding="utf-8")
 
@@ -481,7 +499,7 @@ def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
             "--summary",
             str(success_summary),
             "--expected-shard-count",
-            "4",
+            str(shard_count),
             "--now",
             "2026-10-12T00:00:00Z",
         ],
@@ -489,16 +507,26 @@ def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
         check=False,
         text=True,
     )
-    assert success.returncode == 0
+    assert success.returncode == 0, success.stderr
     expected_success = AGGREGATOR.aggregate_shard_reports(
-        reports, [[f"tests/test_{index}.py"] for index in range(4)]
+        reports, [[f"tests/test_{index}.py"] for index in range(shard_count)]
     )
     assert success_output.read_bytes() == (
         json.dumps(expected_success, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
     assert "Performance diagnostics" in success_summary.read_text(encoding="utf-8")
 
-    (shard_dir / "shard-3.json").unlink()
+    last_report = shard_dir / f"shard-{shard_count - 1}.json"
+    if fault == "missing":
+        last_report.unlink()
+    elif fault == "extra":
+        (shard_dir / f"shard-{shard_count}.json").write_bytes(last_report.read_bytes())
+    else:
+        wrong_report = copy.deepcopy(reports[0])
+        if fault == "wrong-file":
+            wrong_report["tests"][0]["id"] = "tests.test_0::test_other_case"
+            wrong_report["slowest"] = wrong_report["tests"]
+        last_report.write_text(json.dumps(wrong_report), encoding="utf-8")
     failure_output = tmp_path / "failure.json"
     failure = subprocess.run(
         [
@@ -511,7 +539,7 @@ def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
             "--output",
             str(failure_output),
             "--expected-shard-count",
-            "4",
+            str(shard_count),
             "--now",
             "2026-10-12T00:00:00Z",
         ],
@@ -523,7 +551,7 @@ def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
         "schema": AGGREGATOR.TIMING_SCHEMA,
         "plan_digest": plan["digest"],
         "complete": False,
-        "error": "shard_report_missing",
+        "error": error,
         "pytest_exit_code": 1,
         "total_tests": 0,
         "counts": {outcome: 0 for outcome in AGGREGATOR._OUTCOMES},
@@ -535,3 +563,62 @@ def test_cli_json_and_exit_contract_remain_stable(tmp_path: Path) -> None:
     assert failure_output.read_bytes() == (
         json.dumps(expected_failure, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
+
+
+@pytest.mark.parametrize("shard_count", [2, 4, 5])
+@pytest.mark.parametrize(
+    ("pytest_exit_code", "error", "process_exit_code"),
+    [(0, "shard_report_incomplete", 1), (3, "pytest_execution_failed", 3)],
+)
+def test_cli_rejects_incomplete_timing_and_preserves_report(
+    tmp_path: Path, shard_count: int, pytest_exit_code: int, error: str, process_exit_code: int
+) -> None:
+    plan = make_cli_plan(shard_count)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    output = tmp_path / "aggregate.json"
+    summary = tmp_path / "summary.md"
+    reports = make_reports(tuple(float(index + 2) for index in range(shard_count)))
+    plan_shards = [[f"tests/test_{index}.py"] for index in range(shard_count)]
+    complete_report = AGGREGATOR.aggregate_shard_reports(reports, plan_shards)
+
+    # Each input still represents its planned file. Model a partial final shard
+    # with pytest exit 0, or a complete shard report with pytest exit 3.
+    reports[-1].update(complete=pytest_exit_code != 0, pytest_exit_code=pytest_exit_code)
+    for index, report in enumerate(reports):
+        (tmp_path / f"shard-{index}.json").write_text(json.dumps(report), encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / ".github/scripts/aggregate_pytest_timing.py"),
+            "--shard-dir",
+            str(tmp_path),
+            "--plan",
+            str(plan_path),
+            "--output",
+            str(output),
+            "--summary",
+            str(summary),
+            "--expected-shard-count",
+            str(shard_count),
+            "--now",
+            "2026-10-12T00:00:00Z",
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    assert json.loads(output.read_bytes()) == {
+        **complete_report,
+        "complete": False,
+        "error": error,
+        "pytest_exit_code": pytest_exit_code,
+    }
+    rendered = summary.read_text(encoding="utf-8")
+    assert f"| Total tests | {shard_count} |" in rendered
+    assert "Performance diagnostics" in rendered
+    assert "not evaluable" in rendered
+    assert "aggregation failed" not in rendered
+    assert "✅ exit code 0" not in rendered
+    assert completed.returncode == process_exit_code, completed.stderr

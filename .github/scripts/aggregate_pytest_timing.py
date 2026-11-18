@@ -40,7 +40,7 @@ from typing import Any
 
 TIMING_SCHEMA = "pytest-timing-v1"
 PLAN_SCHEMA = "pytest-shard-plan-v1"
-ALLOWED_SHARD_COUNTS = frozenset({2, 4})
+ALLOWED_SHARD_COUNTS = frozenset({2, 4, 5})
 SLOWEST_N = 25
 MAX_FIELD_LENGTH = 500
 MAX_BASELINE_AGE_DAYS = 30
@@ -1072,7 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plan", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--summary", default="")
-    parser.add_argument("--expected-shard-count", type=int, choices=(2, 4), default=None)
+    parser.add_argument("--expected-shard-count", type=int, choices=sorted(ALLOWED_SHARD_COUNTS))
     parser.add_argument(
         "--now",
         default="",
@@ -1112,6 +1112,8 @@ def main(argv: list[str] | None = None) -> int:
         ]
         report = aggregate_shard_reports(shard_reports, plan_shards)
         exit_code = int(report["pytest_exit_code"])
+        if exit_code == 0 and (report["complete"] is not True or report["error"] is not None):
+            exit_code = 1
         aggregation_succeeded = True
     except AggregationError as exc:
         report = {

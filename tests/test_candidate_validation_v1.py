@@ -509,6 +509,17 @@ def test_every_required_job_must_belong_to_successful_exact_run(name: str, failu
         verify(evidence)
 
 
+@pytest.mark.parametrize("bridge", [False, True])
+def test_current_verifier_rejects_legacy_graph_missing_fifth_shard(bridge: bool) -> None:
+    evidence = sample(bridge=bridge)
+    jobs = evidence["jobs"]
+    jobs["jobs"] = [job for job in jobs["jobs"] if job["name"] != "pytest (4)"]
+    jobs["total_count"] = len(jobs["jobs"])
+
+    with pytest.raises(ValueError, match="job inventory mismatch"):
+        verify(evidence)
+
+
 def test_duplicate_or_truncated_job_and_comparison_inventory_rejected() -> None:
     for kind in ("duplicate", "truncated", "paths"):
         evidence = sample()
@@ -687,7 +698,7 @@ def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
     assert (
         "REVIEWED_CHECKOUT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}" in source
     )
-    assert "shard: [0, 1, 2, 3]" in source
+    assert "shard: [0, 1, 2, 3, 4]" in source
     assert "os: [ubuntu-latest, macos-15]" in source
     assert set(VERIFIER.CORE_JOBS | VERIFIER.BRIDGE_JOBS) == {
         "classify",
@@ -696,6 +707,7 @@ def test_every_checkout_and_build_reference_is_the_candidate_head() -> None:
         "pytest (1)",
         "pytest (2)",
         "pytest (3)",
+        "pytest (4)",
         "bridge (ubuntu-latest)",
         "bridge (macos-15)",
         "pytest-report",
@@ -993,6 +1005,7 @@ def test_candidate_package_missing_or_skipped_job_cannot_validate():
         ),
         ("candidate-package", "Upload prepared-envelope acceptance proof"),
         ("pytest (2)", "Prepare pinned Linux age tools for this shard"),
+        ("pytest (4)", "Prepare pinned Linux age tools for this shard"),
     ],
 )
 def test_native_qualification_and_installed_acceptance_steps_must_execute(

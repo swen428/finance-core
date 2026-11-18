@@ -282,22 +282,23 @@ def test_actual_scope_script_produces_release_compatible_evidence(
 
 
 @pytest.mark.parametrize(
-    ("event", "scope", "bridge", "report", "accepted"),
+    ("event", "scope", "bridge", "report", "pytest_result", "accepted"),
     [
-        ("push", "true", "success", "success", True),
-        ("push", "false", "skipped", "success", False),
-        ("workflow_dispatch", "false", "skipped", "success", False),
-        ("pull_request", "false", "skipped", "success", True),
-        ("pull_request", "true", "skipped", "success", False),
-        ("pull_request", "true", "failure", "success", False),
-        ("push", "true", "success", "failure", False),
-        ("push", "true", "success", "cancelled", False),
-        ("pull_request", "false", "skipped", "failure", False),
-        ("pull_request", "unknown", "skipped", "success", False),
+        ("push", "true", "success", "success", "success", True),
+        ("push", "false", "skipped", "success", "success", False),
+        ("workflow_dispatch", "false", "skipped", "success", "success", False),
+        ("pull_request", "false", "skipped", "success", "success", True),
+        ("pull_request", "true", "skipped", "success", "success", False),
+        ("pull_request", "true", "failure", "success", "success", False),
+        ("push", "true", "success", "failure", "success", False),
+        ("push", "true", "success", "cancelled", "success", False),
+        ("pull_request", "false", "skipped", "failure", "success", False),
+        ("pull_request", "unknown", "skipped", "success", "success", False),
+        ("pull_request", "true", "success", "success", "cancelled", False),
     ],
 )
 def test_actual_validation_gate_rejects_missing_release_evidence(
-    event: str, scope: str, bridge: str, report: str, accepted: bool
+    event: str, scope: str, bridge: str, report: str, pytest_result: str, accepted: bool
 ) -> None:
     completed = subprocess.run(
         ["bash", "-c", _step_script("Require all applicable validation")],
@@ -308,7 +309,7 @@ def test_actual_validation_gate_rejects_missing_release_evidence(
             "BRIDGE_RESULT": bridge,
             "REPORT_RESULT": report,
             "CLASSIFY_RESULT": "success",
-            "PYTEST_RESULT": "success",
+            "PYTEST_RESULT": pytest_result,
             "QUALITY_RESULT": "success",
             "PACKAGE_RESULT": "success",
         },
@@ -2057,9 +2058,9 @@ def test_prepared_envelope_acceptance_is_mandatory_before_candidate_publication(
     assert "candidate-package/" not in upload
 
 
-def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_execution() -> None:
+def test_all_pytest_shards_require_qualified_tools_before_inventory_and_execution() -> None:
     job = _workflow_job_source("pytest")
-    assert "shard: [0, 1, 2, 3]" in job
+    assert "shard: [0, 1, 2, 3, 4]" in job
     names = (
         "Prepare pinned Linux age tools for this shard",
         "Plan exact test inventory",
@@ -2088,7 +2089,7 @@ def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_exe
         "--baseline .github/scripts/pytest-shard-weights-v2.json",
         "--repository-root .",
         "--output-dir /tmp/finance-core-shards",
-        "--shard-count 4",
+        "--shard-count 5",
     ):
         assert command_fragment in plan
 
@@ -2104,7 +2105,7 @@ def test_all_four_pytest_shards_require_qualified_tools_before_inventory_and_exe
     assert 'exit "$rc"' in run
 
 
-def test_prepared_envelope_keeps_the_existing_eleven_job_graph() -> None:
+def test_prepared_envelope_requires_the_complete_twelve_job_graph() -> None:
     source = WORKFLOW.read_text(encoding="utf-8").split("\njobs:\n", 1)[1]
     jobs = re.findall(r"^  ([a-z][a-z-]+):$", source, re.MULTILINE)
     assert set(jobs) == {
@@ -2117,9 +2118,15 @@ def test_prepared_envelope_keeps_the_existing_eleven_job_graph() -> None:
         "validate",
     }
     assert len(jobs) == 7
-    assert "shard: [0, 1, 2, 3]" in _workflow_job_source("pytest")
+    assert "shard: [0, 1, 2, 3, 4]" in _workflow_job_source("pytest")
     assert "os: [ubuntu-latest, macos-15]" in _workflow_job_source("bridge")
-    assert len(jobs) - 2 + 4 + 2 == 11
+    assert len(jobs) - 2 + 5 + 2 == 12
+    assert "--shard-count 5" in _workflow_step_source(
+        "pytest-report", "Recreate deterministic shard plan"
+    )
+    assert "--expected-shard-count 5" in _workflow_step_source(
+        "pytest-report", "Aggregate timing report"
+    )
     package = _workflow_job_source("candidate-package")
     assert "runs-on: ubuntu-24.04" in package
     assert "    needs:" not in package.split("    steps:\n", 1)[0]
@@ -2754,7 +2761,7 @@ def test_actual_pytest_tool_setup_gives_each_shard_a_distinct_private_path(
     script = _step_script("Prepare pinned Linux age tools for this shard")
     paths: set[str] = set()
 
-    for shard in range(4):
+    for shard in range(5):
         trace = tmp_path / f"command-{shard}.json"
         env_file = tmp_path / f"github-env-{shard}"
         script_with_run = script.replace("${{ github.run_id }}", "123").replace(
@@ -2785,4 +2792,4 @@ def test_actual_pytest_tool_setup_gives_each_shard_a_distinct_private_path(
             tmp_path / "different-runner-temp" / "prepared-age-qualification"
         )
         assert env_file.read_text() == f"FINANCE_PREPARED_AGE_TOOL_DIR={expected}\n"
-    assert len(paths) == 4
+    assert len(paths) == 5

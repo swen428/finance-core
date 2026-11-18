@@ -1,6 +1,6 @@
 # Public pytest timing baseline
 
-The four-shard planner uses measured per-file medians from at least three
+The pytest planner uses measured per-file medians from at least three
 successful first-attempt protected-main push runs of `validate.yml`. Public
 source identity is GitHub repository ID `1375123906`; its numeric identity is
 stable across owner/repository renaming and does not need an owner-name
@@ -19,12 +19,12 @@ metadata and the retained `pytest-timing-v1` compatibility option. Do not
 invent timings for new files or change source metadata to make an untrusted
 run eligible. Review a refresh against its downloaded public evidence.
 
-The 5% unknown-file limit, 30-day age limit, P95 fallback, deterministic LPT
-assignment, four shards and exact once-only current Git test inventory remain
-unchanged. Run the production `plan` command locally before requesting full
-hosted validation; focused pytest alone does not prove that the hosted planner
-can admit the candidate's current inventory. A passing baseline regression
-uses a fixed sample date; the production planner still enforces current age.
+The planner enforces the 5% unknown-file limit, 30-day age limit, P95
+fallback, deterministic LPT assignment and exact once-only current Git test
+inventory. Run the production `plan --shard-count 5` command locally before
+requesting full Hosted validation. A baseline regression uses a fixed sample
+date. The production planner checks age against the current date and admits
+the candidate's actual inventory.
 
 The September 22 provenance above is retained as refresh history. The October 1, 2026
 refresh uses the three newest successful first-attempt `validate.yml` runs from push
@@ -102,13 +102,13 @@ artifact. It does not change the stable planner or aggregator command line,
   zero-denominator value is not evaluable; it must not be shown as zero or
   treated as a pass.
 - The maximum-to-mean ratio is the longest shard's cumulative test duration
-  divided by the arithmetic mean across the four shards. Top-ten file and case
+  divided by the arithmetic mean across all shards. Top-ten file and case
   rows show each measured contribution and its share of the total measured
-  test duration across all four shards.
-- The total test time is the sum of shard test durations. Dividing it by four
-  gives the ideal balanced-shard lower bound on the longest shard's test work;
-  it is not a wall-time guarantee. Setup, scheduling, runner variation and
-  resource contention are outside that lower bound.
+  test duration across all shards.
+- The total test time is the sum of shard test durations. Dividing it by
+  the shard count gives the ideal balanced-shard lower bound on the longest
+  shard's test work. Setup, scheduling, runner variation and resource
+  contention are outside that lower bound.
 - Unknown actual cost is measured from tests whose file has no baseline
   weight. The plan applies the P95 fallback weight to each such file. Keep the
   unknown-file count, measured unknown cost and fallback estimate distinct.
@@ -280,3 +280,97 @@ or final case count. Failed-PR timing remains diagnostic evidence and was not
 imported. The four shards, full inventory, job timeout, required jobs and
 acceptance criteria remain unchanged. Authoritative acceptance requires a
 complete successful exact-head run.
+
+## November 18, 2026 qualified-main refresh after the main timeout
+
+Main push run `44164836792` at `74943c34fa38f40663aeaaa4cf84987cec25ca0d`
+reached the existing 120-minute pytest job limit. The run did not pass:
+eight jobs succeeded, one pytest shard was cancelled, and `pytest-report` and
+`validate` failed because that shard had no complete JUnit report. Its partial
+log showed 4,339 collected cases and 4,307 terminal outcomes (4,108 passed,
+199 skipped, zero logged failures or errors); 32 cases had no terminal outcome.
+All 32 are in `tests/test_telegram_attachment_evidence.py`. Missing terminal
+outcomes may include work already in progress, and the partial log is not a
+complete test result.
+
+The prior manifest timestamp, `2026-11-17T09:27:49Z`, was still within the
+existing 30-day limit. This refresh responds to the observed timeout and the
+newer qualified-main timing distribution; it does not treat the prior baseline
+as expired. The existing two-sample `refresh_unknown_weights` advisory remains
+manual and unchanged. This incident does not add an automatic timeout trigger.
+
+The manifest was rebuilt with the unchanged production `build-baseline` CLI
+from three successful first-attempt protected-main push runs of
+`validate.yml`. Each had a complete aggregate timing artifact and all 11 jobs
+successful. The source identity is GitHub repository ID `1375123906`; the
+artifact ZIP hash and extracted JSON hash are recorded separately:
+
+- Run `44006821314`, head `699ab8e61f3d1c2dd0b8435f6e22f3fe9009d32c`,
+  artifact `14297479848`; ZIP SHA-256
+  `348bce425ef0f85ab401c2860887b967686e6cd7f63b221d948117eb57500f6d`;
+  JSON SHA-256
+  `efe7c6282ea5a3613e87ca83da6b4f4c1c2ce6e23e5e21f5e4c5ed95878ead2c`.
+- Run `44055796273`, head `0c2aacc7fb9e7a43bf36841ab10bf2784caea754`,
+  artifact `14323070228`; ZIP SHA-256
+  `ae71cf846b190158314bacd50938af19507ca7b39e4b1aef48fb41c15d02e3f3`;
+  JSON SHA-256
+  `1bb7184b0f60e8683fccddf34a511300a657143e83c5a7526fcf2fb048c8bbf2`.
+- Run `44137500031`, head `f358a6b11be9576cb6c7f4b64fb7a7b3b7e2d243`,
+  artifact `14361932616`; ZIP SHA-256
+  `aa11d7c649793e0b5a9884bbeba70f49f38564d5623edc22f76283fe53ff4697`;
+  JSON SHA-256
+  `5bb8ab66f411e6a921347bbb4334ef4f452d53fa693c467cd8250231b2d92fc9`.
+
+The generated manifest timestamp is `2026-11-17T17:29:13Z`. It contains 291
+measured files, 13,795 test cases and 41,145 timing samples. The same P95
+calculation yields a fallback of 234.378 seconds per file with the refreshed
+measurements, up from 231.880 seconds. The production plan has digest
+`sha256:96d61cd18ece059984b68d7d5b68e17b04384fc828f3be6c45abe064795010a8`.
+It assigns all 292 tracked test files exactly once across four non-empty
+single-process shards (69, 70, 83 and 70 files). One new file,
+`tests/test_daily_movements_lifecycle_v1.py`, uses the existing fallback;
+known-file coverage is 99.6575%. The 5% unknown-file limit and 30-day age
+limit remain unchanged. The manifest SHA-256 is
+`c8f98622ec6cb4034905d40026928b85bb614acf3aeebd3071110d112150c263`.
+
+A complete same-tree PR77 run, `44143242310`, is diagnostic comparison only
+and was not imported as a source or used to assign weights. Replaying its
+complete testcase timings on the old and refreshed plans changes the longest
+shard from 115.706 to 97.635 minutes and max-to-mean from 1.3463 to 1.1360.
+These are testcase-time estimates, not hosted wall-time or acceptance proof.
+For the three complete shards on main versus that same-tree PR run, testcase
+times ranged from 0.688x to 1.377x; the cause of this run-to-run variation is
+not established, and no replay guarantees completion on a future runner.
+
+The 120-minute job limit, four shards, 11-job workflow, complete inventory,
+reporting and failure propagation are unchanged. Only the trusted timing
+manifest and this evidence record were refreshed. A complete successful
+exact-head hosted run remains the acceptance authority.
+
+## November 18, 2026 five-shard capacity repair
+
+PR 78 run `44191676341`, attempt 1, tested the preceding four-shard
+refresh. Shard 0 wrote complete JUnit timing before the runner marked it
+cancelled at the 120-minute job limit. The aggregate recorded 13,499
+passed and 362 skipped tests, with no failures or errors. The timing
+report job succeeded, and final validation correctly rejected the
+cancelled pytest matrix. The failed run is diagnostic evidence.
+The baseline retains the three protected-main sources recorded above.
+
+The current workflow assigns the same inventory to five single-process
+shards with 120 minutes per job. Both workflow planning steps select five,
+and aggregation requires the complete five-report plan. The planner and
+aggregator continue to accept the historical two- and four-shard formats.
+The aggregate command exits unsuccessfully for an incomplete or errored
+report and preserves the actual pytest exit code and statistics in the JSON.
+The production plan at this change assigns all 292 tracked test files once
+in groups of 54, 56, 56, 69 and 57, with digest
+`sha256:313f6c8769411e38a521faa8bb1f574b8866eb820fb95e507441e5476d8569de`.
+
+Replaying the five assignments with complete timings from the failed run
+sets the longest shard at 83.021 cumulative test minutes, compared with
+119.300 in the actual four-shard assignment. Replaying complete timings
+from PR 77 sets it at 80.257 minutes. These replays measure test work.
+Hosted elapsed time also includes setup, scheduling and runner variance.
+The repair requires successful exact-head Hosted validation and a
+successful protected-main push with the current graph.

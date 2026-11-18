@@ -11,8 +11,8 @@ event/workflow identity, not the tested source identity. See the official
 
 PR validation runs Python quality checks, the complete sharded Python inventory
 and its aggregated inventory/timing proof. The quality job runs the focused
-public CI security guards before the four complete Python shards may start;
-these checks use the host's canonical temporary directory and preserve the
+public CI security guards before the five complete Python shards may start.
+These checks use the host's canonical temporary directory and preserve the
 existing runtime/custody assertions. A failed guard blocks the shards instead
 of waiting for the full inventory to expose a bootstrap-test failure. The
 Bridge runs when its inputs or
@@ -25,7 +25,7 @@ All required Linux control and Python validation jobs select Ubuntu 24.04
 explicitly, matching the existing platform assertion. This prevents a moving
 `ubuntu-latest` label from selecting a different operating-system release.
 The Bridge retains its established `bridge (ubuntu-latest)` display name and
-explicit Ubuntu 24.04 runner mapping; required jobs and acceptance stay unchanged.
+explicit Ubuntu 24.04 runner mapping.
 
 The required `validate` job depends on classification, quality, Python tests,
 Bridge, the aggregate report and the bounded `candidate-package` job. A failed, cancelled or missing required result
@@ -63,9 +63,10 @@ identity, receipt and both distribution digests, actual platform/tool versions
 and hashes, and required executed positive/negative/source-free/large-frame
 outcomes. Missing tools, skips or incomplete outcomes fail the job. Each Python
 shard also prepares its own task-local qualified tools for the actual native
-tests. Existing OCR/media minima and the eleven-job graph remain unchanged.
+tests. The full workflow requires 12 jobs, including both Bridge systems
+and all five qualified Python shards. The existing OCR/media minima apply.
 The package receipt remains `BUILT_NOT_VALIDATED`, and the exact
-`candidate-validation-v2` schema/package fields remain unchanged.
+`candidate-validation-v2` schema and package fields apply to the new graph.
 
 The Core independent candidate verifier additionally checks actual native
 acceptance ZIP bytes and package receipt/digest correspondence. Source pins
@@ -106,6 +107,9 @@ This read-only check fetches the current PR/main, immutable commit/workflow
 records, exact run/attempt/job inventory and that run's proof artifact. It
 verifies the downloaded artifact digest, candidate and synthetic-merge tree
 binding, workflow bytes, applicable Bridge scope and every required job result.
+The current verifier requires all five indexed pytest jobs and their
+successful native-age preparation steps. Use the frozen verifier and exact
+11-job expectations for historical four-shard v2 evidence.
 It rejects changed base/head, missing/failed/cancelled/duplicate jobs, stale or
 foreign proof, incomplete changed-file inventories and workflow mismatches.
 The artifact alone is insufficient. Its receipt is a point-in-time observation;
@@ -132,8 +136,8 @@ the push-event evidence accepted by consumers.
 Before publishing a new release, require a successful attempt-1 `push` run on
 the exact protected-main commit, with this exact successful job inventory:
 
-- `classify`, `quality`, `pytest (0)` through `pytest (3)`;
-- `bridge (ubuntu-latest)`, `bridge (macos-15)`;
+- `classify`, `quality`, `pytest (0)` through `pytest (4)`
+- `bridge (ubuntu-latest)`, `bridge (macos-15)`
 - `candidate-package`, `pytest-report`, `validate`.
 
 Preserve its run/job identities and workflow digest. PR checks alone are not
@@ -352,4 +356,7 @@ historical ten-job release proof; it must not add a nonexistent package job to
 that historical run. New candidate admission requires a separate consumer
 update that verifies candidate v2 and the package build receipt/artifact while
 retaining the old active-release rules. No active lock or historical receipt is
-changed by this candidate-package source work.
+changed by this candidate-package source work. Existing consumers pinned to
+an immutable 11-job v2 run continue to use its original graph. A consumer
+admitting a new 12-job Core identity needs a separate trusted update for the
+new graph and its workflow digest.
