@@ -57,7 +57,10 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _validate_lock_fd(profile: ProfilePaths, fd: int) -> Path:
-    path = _require_profile(profile)
+    return _validate_lock_file(profile, fd, _require_profile(profile))
+
+
+def _validate_lock_file(profile: ProfilePaths, fd: int, path: Path) -> Path:
     try:
         opened = os.fstat(fd)
         named = path.lstat()
@@ -170,7 +173,7 @@ def _try_lock(fd: int, operation: int) -> bool:
 class GateLease:
     """A module-issued lock lease on one independent open; release is close only."""
 
-    __slots__ = ("_profile", "_fd", "_hold_deadline")
+    __slots__ = ("_profile", "_fd", "_hold_deadline", "_standard_shared")
 
     def __init__(
         self,
@@ -185,6 +188,7 @@ class GateLease:
         self._profile = profile
         self._fd = fd
         self._hold_deadline = hold_deadline
+        self._standard_shared = False
 
     def fileno(self) -> int:
         if self._fd < 0:
@@ -201,6 +205,26 @@ class GateLease:
         fd = self.fileno()
         self._check_hold_deadline()
         _validate_lock_fd(self._profile, fd)
+        self._check_hold_deadline()
+
+    def _assert_valid_for_production(self, profile: ProfilePaths) -> None:
+        """Bracket the gate file checks with fresh proofs of one issued profile."""
+        from finance_core.instance_admission.authority import ProductionProfile
+
+        if type(profile) is not ProductionProfile:
+            raise ProfileGateError("Production session requires an issued production profile")
+        # Preserve the session's first profile error before examining the gate.
+        profile.revalidate()
+        if (
+            type(self) is not GateLease
+            or not getattr(self, "_standard_shared", False)
+            or self._profile is not profile
+            or self._hold_deadline is not None
+        ):
+            raise ProfileGateError("Production session requires its own standard shared gate")
+        fd = self.fileno()
+        self._check_hold_deadline()
+        _validate_lock_file(profile, fd, profile.profile / LOCK_FILENAME)
         self._check_hold_deadline()
 
     def _check_hold_deadline(self) -> None:
@@ -254,12 +278,14 @@ def _acquire(
                 _validate_lock_fd(profile, fd)
                 if hold_deadline is not None and time.monotonic() >= hold_deadline:
                     raise ProfileGateHoldExpired("Exclusive profile cut exceeded its hold deadline")
-                return GateLease(
+                lease = GateLease(
                     profile,
                     fd,
                     hold_deadline=hold_deadline,
                     _constructor_token=_LEASE_CONSTRUCTOR_TOKEN,
                 )
+                lease._standard_shared = operation == fcntl.LOCK_SH
+                return lease
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ProfileGateBusy("Fixed profile gate is contended")

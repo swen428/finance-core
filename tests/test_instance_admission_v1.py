@@ -46,6 +46,118 @@ def test_real_production_schema_and_factory_witness(tmp_path, monkeypatch):
         profile.close()
 
 
+def test_issued_session_revalidates_profile_on_both_sides_of_gate_check(tmp_path, monkeypatch):
+    from finance_core import profile_gate
+    from finance_core.instance_admission.sessions import _witness_for
+    from finance_core.profile_paths import ProfilePathError
+
+    config = synthetic_config(tmp_path, monkeypatch)
+    with prepare_production_profile(
+        config, operation_id="prepare-1", approval_ref="approved"
+    ) as other_profile:
+        admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
+        with (
+            acquire_production_owner(config) as owner,
+            production_read_operation(owner) as conn,
+        ):
+            witness = _witness_for(conn)
+            assert witness is not None
+            profile_type = type(witness.profile)
+            revalidate = profile_type.revalidate
+            gate_fd = witness.gate.fileno()
+            reject_acl_grants = profile_gate._reject_acl_grants
+            observed = []
+            expected = ["profile", "gate", "profile"]
+            profile_failure_at = None
+            profile_error = ProfilePathError("synthetic profile refusal")
+
+            def observe_profile(profile):
+                if profile is witness.profile:
+                    observed.append("profile")
+                    if len(observed) == profile_failure_at:
+                        raise profile_error
+                revalidate(profile)
+
+            def observe_gate_acl(fd, path):
+                if fd == gate_fd:
+                    assert path == witness.profile.profile / profile_gate.LOCK_FILENAME
+                    observed.append("gate")
+                reject_acl_grants(fd, path)
+
+            with monkeypatch.context() as trace:
+                trace.setattr(profile_type, "revalidate", observe_profile)
+                trace.setattr(profile_gate, "_reject_acl_grants", observe_gate_acl)
+                cursor = conn.execute("SELECT 41 UNION ALL SELECT 42 ORDER BY 1")
+                assert observed == expected
+                observed.clear()
+                assert cursor.fetchone()[0] == 41
+                assert observed == expected
+
+                observed.clear()
+                profile_failure_at = 1
+                with pytest.raises(ProfilePathError) as first:
+                    cursor.fetchone()
+                assert first.value is profile_error
+                assert observed == ["profile"]
+
+                observed.clear()
+                profile_failure_at = None
+                gate_error = profile_gate.ProfileGateError("synthetic descriptor refusal")
+
+                def refuse_descriptor(_lease):
+                    observed.append("descriptor")
+                    raise gate_error
+
+                with monkeypatch.context() as failed_gate:
+                    failed_gate.setattr(profile_gate.GateLease, "fileno", refuse_descriptor)
+                    with pytest.raises(profile_gate.ProfileGateError) as refused:
+                        cursor.fetchone()
+                assert refused.value is gate_error
+                assert observed == ["profile", "descriptor"]
+
+                observed.clear()
+                profile_failure_at = 3
+                with pytest.raises(
+                    profile_gate.ProfileGateError, match="cannot be validated"
+                ) as last:
+                    cursor.fetchone()
+                assert last.value.__cause__ is profile_error
+                assert observed == expected
+                profile_failure_at = None
+
+                observed.clear()
+                with monkeypatch.context() as mismatched:
+                    assert other_profile is not witness.profile
+                    assert other_profile.profile == witness.profile.profile
+                    mismatched.setattr(witness.gate, "_profile", other_profile)
+                    with pytest.raises(
+                        profile_gate.ProfileGateError, match="own standard shared gate"
+                    ):
+                        cursor.fetchone()
+                    assert observed == ["profile"]
+                    observed.clear()
+                    profile_failure_at = 1
+                    with pytest.raises(ProfilePathError) as earlier_failure:
+                        cursor.fetchone()
+                    assert earlier_failure.value is profile_error
+                    assert observed == ["profile"]
+                    profile_failure_at = None
+
+                with profile_gate.writer_gate_from_parent(witness.profile, gate_fd) as inherited:
+                    observed.clear()
+                    with monkeypatch.context() as substituted:
+                        substituted.setattr(witness, "gate", inherited)
+                        with pytest.raises(
+                            profile_gate.ProfileGateError, match="own standard shared gate"
+                        ):
+                            cursor.fetchone()
+                    assert observed == ["profile"]
+
+                observed.clear()
+                assert cursor.fetchone()[0] == 42
+                assert observed == expected
+
+
 def test_fence_is_permanent_and_reads_are_real_readonly(tmp_path, monkeypatch):
     config = synthetic_config(tmp_path, monkeypatch)
     prepare_production_profile(config, operation_id="prepare-1", approval_ref="approved").close()
