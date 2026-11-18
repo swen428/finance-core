@@ -51,10 +51,12 @@ def test_issued_session_revalidates_profile_on_both_sides_of_gate_check(tmp_path
     from finance_core.instance_admission.sessions import _witness_for
     from finance_core.profile_paths import ProfilePathError
 
-    config = synthetic_config(tmp_path, monkeypatch)
-    with prepare_production_profile(
-        config, operation_id="prepare-1", approval_ref="approved"
-    ) as other_profile:
+    with (
+        synthetic_config(tmp_path, monkeypatch) as config,
+        prepare_production_profile(
+            config, operation_id="prepare-1", approval_ref="approved"
+        ) as other_profile,
+    ):
         admit_production_instance(config, operation_id="admit-1", approval_ref="approved")
         with (
             acquire_production_owner(config) as owner,
