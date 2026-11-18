@@ -10,10 +10,10 @@ from finance_core.instance_admission.sessions import (
 )
 from finance_core.money import canonical_money_str
 
-from ..contracts import LifecycleError, VerifiedSource, digest
-from ._impacts_v1 import effect, require_effect_baseline
+from ..contracts import LifecycleError, VerifiedSource, canonical, digest
+from ._impacts_v1 import effect, resolve_effect_v1
 from .accounts import _audit, _BoundService, bundle_ref
-from .contracts import BUNDLE_FORMAT, BundleFactRefV1, strict_json
+from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
 from .reader import DailyAccountReaderV1, DailyReadIdentityV1, DailyReadLimitsV1, _view
 
@@ -59,6 +59,26 @@ class DailyLedgerCollectionV1:
     complete: bool = True
 
 
+@dataclass(frozen=True)
+class DailyResolvedEffectV1:
+    material_json: str
+
+    @property
+    def values(self):
+        return strict_json(self.material_json)
+
+
+@dataclass(frozen=True)
+class DailyLedgerWithEffectsV1:
+    collection: DailyLedgerCollectionV1
+    effects: tuple[DailyResolvedEffectV1, ...]
+    format: str = "finance-daily-ledger-with-effects-v1"
+
+    @property
+    def read_identity(self):
+        return self.collection.read_identity
+
+
 class DailyLedgerReaderV1(DailyAccountReaderV1):
     def _ledger(self, limits=None):
         limits = DailyReadLimitsV1() if limits is None else limits
@@ -92,7 +112,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                 for identity in sorted(current):
                     view = current[identity]
                     values = view.values
-                    if values.get("format") == BUNDLE_FORMAT:
+                    if values.get("format") in BUNDLE_FORMATS:
                         accounts[identity] = _view(
                             next(r for r in reversed(rows) if r["record_id"] == identity), values
                         )
@@ -101,6 +121,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     else:
                         legacy.append(view)
                 income, expense = {}, {}
+                resolved_effects = []
                 net = {k: Decimal(0) for k in accounts}
                 delta = dict(net)
                 with localcontext(
@@ -113,10 +134,12 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                             account = accounts.get(impact["account_id"])
                             if account is None:
                                 raise LifecycleError("Movement refers to absent account")
-                            require_effect_baseline(values, account.values)
+                            resolved = resolve_effect_v1(
+                                conn, values, asdict(view.fact_ref), account.values
+                            )
+                            resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
                             net[account.account_id] += Decimal(impact["amount"])
-                            if values["coverage"]["treatment"] != "included":
-                                delta[account.account_id] += Decimal(impact["amount"])
+                            delta[account.account_id] += Decimal(resolved["balance_impact"])
                             totals = expense if values["kind"] == "expense" else income
                             currency = values["original_currency"]
                             totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
@@ -195,12 +218,16 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         gaps,
                         len(rows),
                     )
-                return collection, history
+                return collection, history, tuple(resolved_effects)
             finally:
                 conn.rollback()
 
     def collect(self, *, limits=None):
         return self._ledger(limits)[0]
+
+    def collect_with_effects_v1(self, *, limits=None):
+        collection, _, effects = self._ledger(limits)
+        return DailyLedgerWithEffectsV1(collection, effects)
 
     def detail(self, record_id, *, limits=None):
         history = self._ledger(limits)[1].get(record_id, ())

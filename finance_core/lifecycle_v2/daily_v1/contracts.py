@@ -16,6 +16,7 @@ from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, canonical
 
 DAILY_CONTRACT_VERSION = "finance-daily-v1"
 BUNDLE_FORMAT = "finance-daily-account-bundle-v1"
+BUNDLE_FORMATS = frozenset({BUNDLE_FORMAT, "finance-daily-account-bundle-v2"})
 OBSERVATION_FORMAT = "finance-daily-proposal-observation-v1"
 REVIEW_FORMAT = "finance-daily-review-v1"
 COMMAND_FORMAT = "finance-daily-command-v1"
@@ -344,9 +345,11 @@ def opening_ref(value):
 
 
 def validate_bundle(value):
-    exact(value, {"format", "kind", "transition", "account", "opening"}, "account bundle")
+    v2 = type(value) is dict and value.get("format") == "finance-daily-account-bundle-v2"
+    keys = {"format", "kind", "transition", "account", "opening"}
+    exact(value, keys | ({"opening_dependency_map"} if v2 else set()), "account bundle")
     if (
-        value["format"] != BUNDLE_FORMAT
+        value["format"] not in BUNDLE_FORMATS
         or value["kind"] != "account_bundle"
         or value["transition"] not in COMMANDS
     ):
@@ -446,6 +449,10 @@ def validate_bundle(value):
             raise LifecycleError("VOID needs original reason")
         if digest({k: v for k, v in o.items() if k != "opening_sha256"}) != o["opening_sha256"]:
             raise LifecycleError("Opening component hash mismatch")
+    if v2 and value["opening_dependency_map"] is not None:
+        from .opening_contracts_v1 import validate_map
+
+        validate_map(value["opening_dependency_map"], value)
     return value
 
 
@@ -584,15 +591,18 @@ def compile_bundle(command, expected):
             and all(opening[k] == old[k] for k in ("amount", "as_of"))
         ):
             raise LifecycleError("Opening correction has no material change")
-    return validate_bundle(
-        {
-            "format": BUNDLE_FORMAT,
-            "kind": "account_bundle",
-            "transition": kind,
-            "account": a,
-            "opening": opening,
-        }
-    )
+    result = {
+        "format": before["format"] if before else BUNDLE_FORMAT,
+        "kind": "account_bundle",
+        "transition": kind,
+        "account": a,
+        "opening": opening,
+    }
+    if result["format"] == "finance-daily-account-bundle-v2":
+        result["opening_dependency_map"] = (
+            before["opening_dependency_map"] if kind == "account_rename" else None
+        )
+    return validate_bundle(result)
 
 
 INCOMPLETE_FORMAT = "finance-daily-incomplete-proposal-v1"

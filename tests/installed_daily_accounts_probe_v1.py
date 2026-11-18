@@ -15,7 +15,7 @@ def main():
     installed, helpers, outside, checkout = map(Path, sys.argv[1:5])
     mode = sys.argv[5] if len(sys.argv) > 5 else "flow"
     sys.path[:0] = [str(installed), str(helpers), str(helpers / "runtime-dependencies")]
-    from daily_account_support_v1 import NOW, DailyPort, command, unknown_time
+    from daily_account_support_v1 import NOW, OpeningPort, command, unknown_time
 
     import finance_core
     from finance_core.instance_admission import (
@@ -40,8 +40,10 @@ def main():
         DailyAccountServiceV1,
         DailyLedgerReaderV1,
         DailyMovementServiceV1,
+        DailyOpeningChangeServiceV1,
         VerifiedDailyProposalV1,
         VerifiedMovementProposalV1,
+        VerifiedOpeningProposalV2,
     )
     from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1, EffectiveReadError
     from finance_core.profile_layout import product_root, profile_root
@@ -97,7 +99,7 @@ def main():
             prepare_production_profile(cfg, operation_id="prepare", approval_ref="approved").close()
             admit_production_instance(cfg, operation_id="admit", approval_ref="approved")
         owner = acquire_production_owner(cfg)
-        port = DailyPort()
+        port = OpeningPort()
         state_path = scratch / "trusted-synthetic-port.json"
         if mode == "readback":
             state = json.loads(state_path.read_text())
@@ -105,6 +107,7 @@ def main():
                 ("sources", VerifiedSource),
                 ("observations", VerifiedDailyProposalV1),
                 ("movement_observations", VerifiedMovementProposalV1),
+                ("opening_observations", VerifiedOpeningProposalV2),
                 ("deliveries", VerifiedDelivery),
                 ("actions", VerifiedAction),
             ):
@@ -118,6 +121,12 @@ def main():
                 "movement_questions",
                 "movement_delivered_questions",
                 "movement_latest_question",
+                "opening_links",
+                "opening_origins",
+                "opening_questions",
+                "opening_deliveries",
+                "latest_opening_questions",
+                "opening_reply_associations",
             ):
                 setattr(port, key, state[key])
         binding = RuntimeBinding(cfg.instance_id, "daily-generation-1", "user", "chat")
@@ -219,7 +228,10 @@ def main():
             original_opening = first.opening_ref
             assert reader.get_account(account).opening_amount == "-300.00"
 
+            latest_account_proposal = proposal
+
             def change(kind, fields, identity, reason=None):
+                nonlocal latest_account_proposal
                 view = reader.get_account(account)
                 raw = "Explicit account instruction; reason: " + (reason or "requested update")
                 port.add_source(identity, raw)
@@ -233,6 +245,7 @@ def main():
                     reply_evidence_id=identity,
                     command_kind=kind,
                 )
+                latest_account_proposal = proposal
                 review = daily.prepare_review(proposal.proposal_id, proposal.version)
                 daily.record_delivery(review.review_id, "delivery-" + identity)
                 return daily.confirm(review.review_id, "action-" + identity, "confirm-" + identity)
@@ -419,10 +432,123 @@ def main():
             port.remember_movement_proposal(proposal)
             question_card = movements.prepare_review(proposal.proposal_id, proposal.version)
             movements.record_delivery(question_card.review_id, "delivery-question-card")
-            movements.confirm(
+            question_receipt = movements.confirm(
                 question_card.review_id, "independent-question-confirm", "confirm-question-expense"
             )
             assert unified.collect().balances[0].balance_amount == "191.00"
+
+            def daily_counts():
+                with daily._read() as (_, conn):
+                    return tuple(
+                        conn.execute(
+                            "SELECT (SELECT count(*) FROM l2_facts),"
+                            "(SELECT count(*) FROM l2_proposals),"
+                            "(SELECT count(*) FROM l2_decisions),"
+                            "(SELECT count(*) FROM l2_events WHERE kind='confirm')"
+                        ).fetchone()
+                    )
+
+            assert daily_counts() == (9, 11, 9, 9)
+            # One complete opening decision with actual delivered row choices.
+            opening_api = DailyOpeningChangeServiceV1(ledger)
+            port.add_source("mapped-opening", "wrong opening; correct to MYR 100; as-of unknown")
+            view = reader.get_account(account)
+            port.register_opening(binding, source, view, latest_account_proposal, "mapped-opening")
+            opening_command = {
+                "format": "finance-daily-opening-command-v2",
+                "command_kind": "opening_correct",
+                "fields": {"amount": "100", "as_of": unknown_time()},
+                "reason_span": [0, 13],
+                "answers": [],
+            }
+            port.commands["mapped-opening"] = opening_command
+            opening_draft = opening_api.propose_opening_change_v2(
+                account,
+                "mapped-opening",
+                view.bundle_ref,
+                "propose-mapped-opening",
+                reply_evidence_id="mapped-opening",
+                command_kind="opening_correct",
+            )
+            assert len(opening_api.pending()[0]["values"]["missing_fields"]) == 2
+            question = port.deliver_opening_question(
+                opening_api.opening_questions_v1(opening_draft.proposal_id), "map-question"
+            )
+            raw = "; ".join(
+                row["movement_fact_ref"]["record_id"] + ":" + row["impact_role"] + "=included"
+                for row in question["subjects"]
+            )
+            port.add_source("map-answer", raw)
+            port.register_opening(
+                binding,
+                source,
+                view,
+                opening_draft,
+                "map-answer",
+                "mapped-opening",
+                question=question,
+            )
+            answers = []
+            for row in question["subjects"]:
+                marker = row["movement_fact_ref"]["record_id"] + ":" + row["impact_role"] + "="
+                start = raw.index(marker) + len(marker)
+                answers.append(
+                    {
+                        "movement_fact_ref": row["movement_fact_ref"],
+                        "impact_role": row["impact_role"],
+                        "treatment": "included",
+                        "span": [start, start + 8],
+                    }
+                )
+            port.commands["map-answer"] = {**opening_command, "answers": answers}
+            opening_complete = opening_api.propose_opening_change_v2(
+                account,
+                "map-answer",
+                view.bundle_ref,
+                "propose-map-answer",
+                reply_evidence_id="map-answer",
+                command_kind="opening_correct",
+                opening_instruction_evidence_id="mapped-opening",
+            )
+            map_card = opening_api.prepare_review(
+                opening_complete.proposal_id, opening_complete.version
+            )
+            assert map_card.material["opening_effects"]["before_balance"] == "191.00"
+            assert map_card.material["opening_effects"]["after_balance"] == "100.00"
+            assert len(map_card.material["opening_effects"]["rows"]) == 2
+            opening_api.record_delivery(map_card.review_id, "delivery-map-card")
+            mapped = opening_api.confirm(
+                map_card.review_id, "independent-map-confirm", "confirm-map"
+            )
+            assert (
+                opening_api.confirm(map_card.review_id, "independent-map-confirm", "confirm-map")
+                == mapped
+            )
+            assert daily_counts() == (10, 13, 10, 10)
+            latest_account_proposal = opening_complete
+            change("account_rename", {"name": "Mapped Card"}, "mapped-rename")
+            assert daily_counts() == (11, 14, 11, 11)
+            resolved = unified.collect_with_effects_v1()
+            assert all(
+                e.values["map_owner_fact_ref"]["version"] == mapped.receipt.version
+                for e in resolved.effects
+            )
+            movement(
+                "mapped-void", "movement_void", unified.detail(question_receipt.receipt.record_id)
+            )
+            assert (
+                movement_reviews["mapped-void"].material["account_impact_changes"][0][
+                    "balance_delta"
+                ]
+                == "0.00"
+            )
+            assert daily_counts() == (12, 15, 12, 12)
+            final_fact_count, final_proposal_count, _, _ = daily_counts()
+            final = unified.collect_with_effects_v1()
+            assert final.collection.balances[0].balance_amount == "100.00"
+            assert final.collection.balances[0].recorded_net_change == "200.00"
+            assert final.collection.expense_by_currency == ()
+            assert final.collection.income_by_currency == (("MYR", "200.00"),)
             cut = ledger.seal_snapshot(scratch / "snapshot.sqlite")
             state = {
                 key: {k: asdict(v) for k, v in getattr(port, key).items()}
@@ -430,6 +556,7 @@ def main():
                     "sources",
                     "observations",
                     "movement_observations",
+                    "opening_observations",
                     "deliveries",
                     "actions",
                 )
@@ -443,6 +570,12 @@ def main():
                 "movement_questions",
                 "movement_delivered_questions",
                 "movement_latest_question",
+                "opening_links",
+                "opening_origins",
+                "opening_questions",
+                "opening_deliveries",
+                "latest_opening_questions",
+                "opening_reply_associations",
             ):
                 state[key] = getattr(port, key)
             state_path.write_text(json.dumps(state))
@@ -471,19 +604,21 @@ def main():
                 check=True,
             )
             reopened = json.loads(child.stdout)
-            assert reopened["fact_versions"] == 9 and reopened["snapshot_fact_versions"] == 9
+            assert reopened["fact_versions"] == 12 and reopened["snapshot_fact_versions"] == 12
             assert (
                 reopened["logical_database_sha256"]
                 == before["logical_database_sha256"]
                 == cut.logical_database_sha256
             )
-            assert reopened["installed_only"] and reopened["opening_amount"] == "0.00"
+            assert reopened["installed_only"] and reopened["opening_amount"] == "100.00"
             print(
                 json.dumps(
                     {
                         "contract": DAILY_CONTRACT_VERSION,
-                        "fact_versions": 9,
-                        "proposal_count": 11,
+                        "fact_versions": final_fact_count,
+                        "proposal_count": final_proposal_count,
+                        "opening_dependency_map": True,
+                        "resolved_mapped_void": True,
                         "independent_instruction_question_link": True,
                         "negative_coverage_preserved": True,
                         "daily_source_guarded": True,
@@ -506,7 +641,10 @@ def main():
         else:
             result = reader.collect_accounts()
             assert len(result.accounts) == 1
-            assert DailyLedgerReaderV1(ledger).collect().balances[0].balance_amount == "191.00"
+            effects = DailyLedgerReaderV1(ledger).collect_with_effects_v1()
+            assert effects.collection.balances[0].balance_amount == "100.00"
+            assert effects.effects[0].values["source"] == "map"
+            assert effects.effects[0].values["map_owner_fact_ref"]["version"] == 5
             audit = ledger.reader().full_audit()
             from finance_core.instance_admission.authority import _logical_database_digest
             from finance_core.lifecycle_v2.reader import audit_evidence_connection

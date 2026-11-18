@@ -231,6 +231,8 @@ def _inline_namespace(step: str, label: str) -> dict[str, Any]:
         ("pull_request", "tests/test_tesseract_pinned_resources_v1.py", "true"),
         ("pull_request", "tests/test_linux_receipt_ocr_acceptance_v1.py", "true"),
         ("pull_request", "tests/test_receipt_ocr_evidence.py", "true"),
+        ("pull_request", "tests/test_daily_opening_changes_v1.py", "true"),
+        ("pull_request", "tests/test_daily_opening_changes_v1.py.extra", "false"),
         (
             "pull_request",
             "tests/test_openclaw_staging_bridge_ocr_production_boundary_v1.py",

@@ -15,6 +15,7 @@ from ..contracts import (
 from ..service import _event, _fact_material, _id, _row
 from ._impacts_v1 import (
     account_inventory,
+    movement_review_effects,
     require_accounts,
     review_impact_changes,
     selected_dependency,
@@ -253,9 +254,11 @@ def verify_review(service, conn, review):
         raise LifecycleError("Daily review lacks proposal")
     expected = verify_proposal(service, conn, proposal)
     material = strict_json(review["material_json"])
+    v2 = material.get("format") == "finance-daily-movement-review-v2"
     exact(
         material,
-        {
+        ({"resolved_effects"} if v2 else set())
+        | {
             "format",
             "binding",
             "review_id",
@@ -288,7 +291,7 @@ def verify_review(service, conn, review):
 
     if (
         len(events) != 1
-        or material["format"] != REVIEW_FORMAT
+        or material["format"] != ("finance-daily-movement-review-v2" if v2 else REVIEW_FORMAT)
         or material["binding"] != asdict(expected.binding)
         or material["review_id"] != review["review_id"]
         or material["proposal_id"] != proposal["proposal_id"]
@@ -305,7 +308,18 @@ def verify_review(service, conn, review):
             expected.command_kind in {"movement_correct", "movement_void"},
         )
         or material["account_impact_changes"]
-        != review_impact_changes(expected.before_values, values)
+        != (
+            movement_review_effects(conn, expected, values, events[0]["seq"])[0]
+            if v2
+            else review_impact_changes(expected.before_values, values)
+        )
+        or (
+            v2
+            and material["resolved_effects"]
+            != movement_review_effects(conn, expected, values, events[0]["seq"])[1]
+        )
+        or v2
+        != any(i["values"].get("opening_dependency_map") is not None for i in expected_closure)
         or material["account_dependencies"] != expected_closure
         or review["record_id"] != expected.record_id
         or review["expected_version"] != expected.expected_version
@@ -723,6 +737,11 @@ class DailyMovementServiceV1:
                     "created_at": now,
                     "expires_at": now + 600,
                 }
+                if any(i["values"].get("opening_dependency_map") is not None for i in dependency):
+                    changes, effects = movement_review_effects(conn, expected, values)
+                    material["format"] = "finance-daily-movement-review-v2"
+                    material["account_impact_changes"] = changes
+                    material["resolved_effects"] = effects
                 sha = digest(material)
                 conn.execute(
                     "INSERT INTO l2_reviews VALUES(?,?,?,?,?,?,?,?)",

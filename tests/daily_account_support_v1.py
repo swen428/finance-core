@@ -5,13 +5,22 @@ import json
 from dataclasses import asdict
 
 from finance_core.lifecycle_v2 import (
+    LifecycleError,
     VerifiedAction,
     VerifiedDelivery,
     VerifiedObservation,
     VerifiedSource,
 )
-from finance_core.lifecycle_v2.contracts import digest
-from finance_core.lifecycle_v2.daily_v1.contracts import VerifiedDailyProposalV1
+from finance_core.lifecycle_v2.contracts import canonical, digest
+from finance_core.lifecycle_v2.daily_v1.contracts import (
+    VerifiedDailyProposalV1,
+    instruction_ref,
+    strict_json,
+)
+from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import (
+    VerifiedOpeningInstructionLinkV1,
+    VerifiedOpeningProposalV2,
+)
 
 NOW = 1794877200
 
@@ -281,6 +290,170 @@ class DailyPort:
                 "chat",
             )
         return self.actions[identity]
+
+
+class OpeningPort(DailyPort):
+    def __init__(self):
+        super().__init__()
+        self.opening_links = {}
+        self.opening_origins = {}
+        self.opening_observations = {}
+        self.opening_questions = {}
+        self.opening_deliveries = {}
+        self.latest_opening_questions = {}
+        self.opening_reply_associations = {}
+
+    def register_opening(
+        self,
+        binding,
+        source,
+        account,
+        previous,
+        response_id,
+        original_id=None,
+        kind="opening_correct",
+        question=None,
+    ):
+        original_id = original_id or response_id
+        target = {
+            "binding": asdict(binding),
+            "source_id": source.source_id,
+            "source_sha256": source.source_sha256,
+            "source_instruction_ref": instruction_ref(asdict(self.sources["source1"])),
+            "instruction_ref": instruction_ref(asdict(self.sources[original_id])),
+            "response_ref": instruction_ref(asdict(self.sources[response_id])),
+            "record_id": account.account_id,
+            "command_kind": kind,
+            "current_proposal": {
+                k: asdict(previous)[k] for k in ("proposal_id", "version", "proposal_sha256")
+            },
+            "target_fact_ref": asdict(account.bundle_ref),
+        }
+        selections = []
+        if question:
+            raw = self.sources[response_id].raw_input
+            for line in raw.split("; "):
+                selected, choice = line.split("=", 1)
+                record_id, role = selected.rsplit(":", 1)
+                matches = [
+                    s
+                    for s in question["subjects"]
+                    if s["movement_fact_ref"]["record_id"] == record_id and s["impact_role"] == role
+                ]
+                if len(matches) != 1:
+                    raise LifecycleError("Actual reply selects an unlisted row")
+                start = raw.index(line) + len(selected) + 1
+                selections.append(
+                    {
+                        "movement_fact_ref": matches[0]["movement_fact_ref"],
+                        "impact_role": role,
+                        "span": None
+                        if choice.strip().casefold()
+                        in {
+                            "unknown",
+                            "uncertain",
+                            "unsure",
+                            "not sure",
+                            "不确定",
+                            "未知",
+                            "不清楚",
+                        }
+                        else [start, start + len(choice)],
+                    }
+                )
+        origin_id = "opening-association-" + response_id
+        origin = {
+            "target": target,
+            "response_id": response_id,
+            "question": question,
+            "selections": selections,
+        }
+        self.opening_origins[origin_id] = origin
+        self.opening_reply_associations[response_id] = (
+            {
+                "question_id": question["question_id"],
+                "question_version": question["question_version"],
+                "delivery_ref": question["delivery_ref"],
+                "current_version_at_reply": self.latest_opening_questions[question["question_id"]],
+            }
+            if question
+            else None
+        )
+        self.opening_links[response_id] = {
+            "evidence_id": "opening-link-" + response_id,
+            "link_json": canonical(
+                {
+                    "format": "finance-daily-opening-instruction-link-v1",
+                    "mode": "dependency_answers" if question else "opening_instruction",
+                    "target": target,
+                    "association_ref": {"evidence_id": origin_id, "sha256": digest(origin)},
+                    "question": question,
+                    "selections": selections,
+                }
+            ),
+        }
+
+    def deliver_opening_question(self, material, question_id, version=1):
+        proposal = {
+            k: material["proposal_ref"][k] for k in ("proposal_id", "version", "proposal_sha256")
+        }
+        delivered = {
+            "question_id": question_id,
+            "question_version": version,
+            "proposal_ref": proposal,
+            "list_sha256": material["list_sha256"],
+            "subjects": material["subjects"],
+        }
+        delivery_id = "opening-question-delivery-" + question_id + ":" + str(version)
+        self.opening_deliveries[delivery_id] = delivered
+        question = {
+            **delivered,
+            "delivery_ref": {"evidence_id": delivery_id, "sha256": digest(delivered)},
+        }
+        self.opening_questions[question_id + ":" + str(version)] = question
+        self.latest_opening_questions[question_id] = version
+        return question
+
+    def opening_instruction_link_v1(self, conn, identity, expected_target):
+        # Lookup original relation; expected is never copied into evidence.
+        result = self.opening_links[identity]
+        value = strict_json(result["link_json"])
+        origin = self.opening_origins[value["association_ref"]["evidence_id"]]
+        if (
+            digest(origin) != value["association_ref"]["sha256"]
+            or origin["target"] != value["target"]
+            or origin["selections"] != value["selections"]
+        ):
+            raise LifecycleError("Synthetic independent opening target changed")
+        if value["mode"] == "dependency_answers":
+            question = value["question"]
+            actual_reply = self.opening_reply_associations[identity]
+            delivery = self.opening_deliveries[actual_reply["delivery_ref"]["evidence_id"]]
+            if (
+                self.opening_questions[
+                    question["question_id"] + ":" + str(question["question_version"])
+                ]
+                != question
+                or actual_reply["question_id"] != question["question_id"]
+                or actual_reply["question_version"] != question["question_version"]
+                or actual_reply["current_version_at_reply"] != question["question_version"]
+                or actual_reply["delivery_ref"] != question["delivery_ref"]
+                or digest(delivery) != question["delivery_ref"]["sha256"]
+            ):
+                raise LifecycleError("Synthetic original opening question/delivery/reply differs")
+        return VerifiedOpeningInstructionLinkV1(**result)
+
+    def opening_proposal_v2(self, conn, identity, expected):
+        if identity not in self.opening_observations:
+            self.opening_observations[identity] = VerifiedOpeningProposalV2(
+                identity,
+                expected.source_id,
+                "user",
+                "chat",
+                digest(asdict(expected)),
+                canonical(self.commands[identity]),
+            )
+        return self.opening_observations[identity]
 
 
 def unknown_time():

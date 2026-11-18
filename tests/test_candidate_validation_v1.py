@@ -814,6 +814,7 @@ def test_collector_binds_api_inventory_archive_and_latest_pr_state(monkeypatch) 
         "tests/lifecycle_recovery_material_support_v1.py",
         "tests/instance_admission_support_v1.py",
         "tests/test_daily_evidence_callback_scope_v1.py",
+        "tests/test_daily_opening_changes_v1.py",
         "tests/test_daily_accounts_contracts_v1.py",
         "tests/test_daily_accounts_lifecycle_v1.py",
         "tests/test_daily_movements_lifecycle_v1.py",
@@ -889,6 +890,17 @@ def test_each_high_risk_bridge_input_requires_bridge_for_modify_delete_and_renam
         missing["jobs"]["total_count"] = len(missing["jobs"]["jobs"])
         with pytest.raises(ValueError, match="required job inventory mismatch"):
             verify(missing)
+
+
+def test_daily_opening_classifier_near_miss_does_not_require_bridge() -> None:
+    evidence = sample(bridge=False)
+    evidence["comparison"]["files"] = [
+        {
+            "filename": "tests/test_daily_opening_changes_v1.py.extra",
+            "status": "modified",
+        }
+    ]
+    assert verify(evidence)["bridge_required"] is False
 
 
 @pytest.mark.parametrize(

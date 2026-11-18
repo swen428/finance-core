@@ -107,12 +107,19 @@ def audit_connection(conn, *, _rows=None):
         if "format" in material and material["format"] not in {
             "finance-daily-review-v1",
             "finance-daily-movement-review-v1",
+            "finance-daily-movement-review-v2",
+            "finance-daily-opening-review-v2",
         }:
             raise LifecycleError("Unsupported review format")
         values_key = (
             "after_values"
             if material.get("format")
-            in {"finance-daily-review-v1", "finance-daily-movement-review-v1"}
+            in {
+                "finance-daily-review-v1",
+                "finance-daily-movement-review-v1",
+                "finance-daily-movement-review-v2",
+                "finance-daily-opening-review-v2",
+            }
             else "values"
         )
         if (
@@ -247,6 +254,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     from .contracts import ExpectedInvocation, RuntimeBinding
 
     sealed = json.loads(proposal["observation_json"])
+    if sealed.get("format") == "finance-daily-opening-observation-v2":
+        from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
+
+        return verify_opening_proposal(service, conn, proposal)
     if sealed.get("format") == "finance-daily-movement-observation-v1":
         from .daily_v1.movements import verify_proposal as verify_movement_proposal
 
@@ -385,7 +396,14 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
-    if material.get("format") == "finance-daily-movement-review-v1":
+    if material.get("format") == "finance-daily-opening-review-v2":
+        from .daily_v1.opening_changes_v1 import verify_review as verify_opening_review
+
+        return verify_opening_review(service, conn, review)
+    if material.get("format") in {
+        "finance-daily-movement-review-v1",
+        "finance-daily-movement-review-v2",
+    }:
         from .daily_v1.movements import verify_review as verify_movement_review
 
         return verify_movement_review(service, conn, review)
@@ -476,7 +494,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
     ):
         version += 1
         values = _registered_values(json.loads(fact["values_json"]))
-        if values.get("format") == "finance-daily-account-bundle-v1":
+        if values.get("format") in {
+            "finance-daily-account-bundle-v1",
+            "finance-daily-account-bundle-v2",
+        }:
             from .daily_v1.accounts import verify_fact
 
             verify_fact(service, conn, fact, _rows=_rows)
@@ -620,6 +641,8 @@ def _has_daily_values(conn):
         json.loads(row[0]).get("format")
         in {
             BUNDLE_FORMAT,
+            "finance-daily-account-bundle-v2",
+            "finance-daily-opening-incomplete-v2",
             INCOMPLETE_FORMAT,
             "finance-daily-movement-v1",
             "finance-daily-movement-incomplete-v1",
