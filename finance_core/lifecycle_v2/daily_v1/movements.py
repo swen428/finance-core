@@ -68,6 +68,20 @@ def _movement_id(source_id):
     return movement_record_id_v1(source_id)
 
 
+def _pending_view(row):
+    return {
+        "proposal": asdict(
+            ProposalRef(
+                row["proposal_id"],
+                row["source_id"],
+                row["version"],
+                row["proposal_sha256"],
+            )
+        ),
+        "values": strict_json(row["values_json"]),
+    }
+
+
 def _instruction_target(binding, source, instruction, record_id, kind, previous, ref):
     return MovementInstructionTargetV1(
         binding,
@@ -992,17 +1006,29 @@ class DailyMovementServiceV1:
             result = []
             for row in rows:
                 if strict_json(row["observation_json"]).get("format") == OBSERVATION_FORMAT:
-                    result.append(
-                        {
-                            "proposal": asdict(
-                                ProposalRef(
-                                    row["proposal_id"],
-                                    row["source_id"],
-                                    row["version"],
-                                    row["proposal_sha256"],
-                                )
-                            ),
-                            "values": strict_json(row["values_json"]),
-                        }
-                    )
+                    result.append(_pending_view(row))
             return tuple(result)
+
+    def pending_for_source(self, source_id: str) -> dict | None:
+        """Find the current unfinished movement for an exact captured source."""
+        text(source_id, "movement source id")
+        with self._read() as (service, conn):
+            _audit(service, conn)
+            proposal = conn.execute(
+                "SELECT * FROM l2_proposals WHERE source_id=? ORDER BY version DESC LIMIT 1",
+                (source_id,),
+            ).fetchone()
+            if proposal is None:
+                return None
+            observation = strict_json(proposal["observation_json"])
+            if observation.get("format") != OBSERVATION_FORMAT:
+                return None
+            if observation["expected"]["binding"] != asdict(service.binding):
+                return None
+            if conn.execute(
+                "SELECT 1 FROM l2_reviews r JOIN l2_decisions d ON d.review_id=r.review_id "
+                "WHERE r.proposal_id=? LIMIT 1",
+                (proposal["proposal_id"],),
+            ).fetchone():
+                return None
+            return _pending_view(proposal)

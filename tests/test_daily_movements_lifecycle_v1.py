@@ -238,6 +238,74 @@ def test_opening_coverage_draft_then_separate_complete_card_and_nonempty_refusal
     assert reader.collect().balances[0].balance_amount == "1000.00"
 
 
+def test_exact_source_pending_lookup_survives_owner_reopen(live):
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.lifecycle_v2 import LedgerService
+
+    ledger, port, _, api, _, account = prepare(live)
+    _, _, cfg = live
+    drafts = []
+    for name, missing in (("coffee", "account_id"), ("lunch", "account_amount")):
+        port.add_source(name, "excluded; record " + name)
+        source = ledger.capture(name, "capture-" + name)
+        port.remember_movement_source(source, name)
+        port.register_movement_instruction(ledger.binding, source.source_id, name)
+        values = fields(account)
+        del values[missing]
+        port.commands[name] = {
+            "format": "finance-daily-movement-command-v1",
+            "command_kind": "movement_create",
+            "fields": values,
+            "reason_span": None,
+        }
+        proposal = api.propose_movement_create(source.source_id, name, 0, "propose-" + name)
+        port.remember_movement_proposal(proposal)
+        result = api.pending_for_source(source.source_id)
+        assert result["proposal"]["proposal_id"] == proposal.proposal_id
+        assert result["values"]["missing_fields"] == [missing]
+        drafts.append((source.source_id, result))
+
+    (coffee_id, coffee), (lunch_id, lunch) = drafts
+    assert len(api.pending(limit=1)) == 1
+    assert api.pending_for_source("no-captured-movement") is None
+    ledger.owner.close()
+    with acquire_production_owner(cfg) as owner:
+        reopened = LedgerService(owner, port, ledger.binding, clock=ledger.clock)
+        api = DailyMovementServiceV1(reopened)
+        assert api.pending_for_source(coffee_id) == coffee
+        assert api.pending_for_source(lunch_id) == lunch
+        assert DailyLedgerReaderV1(reopened).collect().expense_by_currency == ()
+
+        reply = "coffee-account-reply"
+        port.add_source(reply, "excluded; use my bank account")
+        port.register_movement_instruction(reopened.binding, coffee_id, reply)
+        port.commands[reply] = {
+            "format": "finance-daily-movement-command-v1",
+            "command_kind": "movement_create",
+            "fields": fields(account),
+            "reason_span": None,
+        }
+        proposal = api.propose_movement_create(
+            coffee_id,
+            reply,
+            coffee["proposal"]["version"],
+            "propose-coffee-v2",
+            reply_evidence_id=reply,
+        )
+        port.remember_movement_proposal(proposal)
+        current = api.pending_for_source(coffee_id)
+        assert current["proposal"]["proposal_id"] == proposal.proposal_id
+        assert current["proposal"]["version"] == 2
+        assert api.pending_for_source(lunch_id) == lunch
+        card = api.prepare_review(proposal.proposal_id, proposal.version)
+        api.record_delivery(card.review_id, "coffee-v2-delivery")
+        assert api.pending_for_source(coffee_id) == current
+        api.confirm(card.review_id, "coffee-v2-confirm", "confirm-coffee-v2")
+        assert api.pending_for_source(coffee_id) is None
+        assert api.pending_for_source(lunch_id) == lunch
+        assert DailyLedgerReaderV1(reopened).collect().expense_by_currency == (("MYR", "9.00"),)
+
+
 def test_account_reassignment_replaces_one_impact_and_duplicate_void_keeps_other(live, tmp_path):
     import sqlite3
 

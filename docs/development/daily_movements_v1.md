@@ -16,6 +16,15 @@ card. `expected_movement_change` / `propose_movement_change` bind the current
 Repeating an original operation returns its original receipt; changing its
 review/action is refused. A second new VOID reports `movement_already_void`.
 
+`DailyMovementServiceV1.pending_for_source(source_id)` reads the latest
+undecided proposal for an exact captured source and the current runtime
+binding. It returns the same proposal reference and values as `pending()`,
+including the missing fields for an incomplete proposal. It returns `None`
+when the source has no eligible proposal. The caller retrieves the source
+identity from the original saved interaction. A read is a point-in-time
+observation. Any later reply, review or confirmation must pass its own
+current-version and authority checks.
+
 The trusted port's `movement_proposal` returns an exact
 `VerifiedMovementProposalV1` bound to the complete expected invocation digest.
 Its JSON command has exactly `format=finance-daily-movement-command-v1`,
