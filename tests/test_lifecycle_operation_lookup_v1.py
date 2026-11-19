@@ -342,10 +342,10 @@ def test_lookup_uses_actual_readonly_uri_and_one_audited_snapshot(lookup_case, m
             uris.append((args[0], kwargs.get("uri")))
         return connect(*args, **kwargs)
 
-    def audited(conn, *args):
+    def audited(conn, *args, **kwargs):
         assert conn.in_transaction and sessions._witness_for(conn).read_only
         points.append(("audit", conn))
-        return audit(conn, *args)
+        return audit(conn, *args, **kwargs)
 
     def original_receipt(actual_service, conn, *args):
         assert actual_service is service and conn is points[0][1] and conn.in_transaction
