@@ -209,6 +209,22 @@ class LedgerReader:
         source = self.receipt_source_v1(source_id)
         return _read_recorded_fields(source_id, source, processor, reference)
 
+    def receipt_manual_draft_v1(self, source_id):
+        """Project a draft from exact source and manual reply on one read snapshot."""
+        from .receipt_draft_v1 import _project_manual_draft
+
+        verify = getattr(self.service.port, "receipt_manual_reply_v1", None)
+        if not callable(verify):
+            raise LifecycleError("Installed evidence port lacks authenticated receipt replies")
+        with lifecycle_read_operation(self.service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                source = self.service._receipt_source(conn, source_id, allow_archived=True)
+                reply = verify(conn, source)
+                return None if reply is None else _project_manual_draft(source_id, source, reply)
+            finally:
+                conn.rollback()
+
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
             raise LifecycleError("Bounded page size required")
