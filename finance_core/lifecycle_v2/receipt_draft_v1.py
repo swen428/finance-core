@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 
 from .contracts import LifecycleError, VerifiedReceiptSourceV1, digest
@@ -36,6 +36,7 @@ class ReceiptManualFieldV1:
     name: str
     value: str
     raw_codepoint_span: tuple[int, int]
+    reply_update_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class ReceiptManualDraftV1:
     reply_text_sha256: str
     fields: tuple[ReceiptManualFieldV1, ...]
     missing_receipt_fields: tuple[str, ...]
+    manual_supplements: tuple[VerifiedReceiptManualReplyV1, ...] = ()
 
 
 def _manual_fields(raw):
@@ -78,13 +80,12 @@ def _manual_fields(raw):
     return fields
 
 
-def _project_manual_draft(source_id, source, reply):
+def _verify_manual_reply(source_id, source, source_sha256, reply):
     if (
         type(source) is not VerifiedReceiptSourceV1
         or type(reply) is not VerifiedReceiptManualReplyV1
     ):
         raise LifecycleError("Exact authenticated receipt source and manual reply required")
-    source_sha256 = digest(asdict(source))
     if (
         reply.source_evidence_id != source.evidence_id
         or reply.source_sha256 != source_sha256
@@ -108,17 +109,44 @@ def _project_manual_draft(source_id, source, reply):
         or not 1 <= len(reply.raw_text) <= 4096
     ):
         raise LifecycleError("Manual receipt reply differs from original source custody")
-    fields = _manual_fields(reply.raw_text)
+
+
+def _project_manual_draft(source_id, source, replies):
+    if type(replies) is not tuple or not 1 <= len(replies) <= len(_LABELS):
+        raise LifecycleError("Exact bounded receipt reply history required")
+    source_sha256 = digest(asdict(source))
+    first = replies[0]
+    previous = None
+    fields = {}
+    for reply in replies:
+        _verify_manual_reply(source_id, source, source_sha256, reply)
+        if previous is not None and (
+            reply.request_id != first.request_id
+            or reply.question_message_id != first.question_message_id
+            or reply.reply_update_id <= previous.reply_update_id
+            or reply.reply_message_id <= previous.reply_message_id
+            or reply.reply_timestamp < previous.reply_timestamp
+        ):
+            raise LifecycleError("Manual receipt supplement is outside its original reply history")
+        new_fields = _manual_fields(reply.raw_text)
+        if fields.keys() & new_fields.keys():
+            raise LifecycleError("Manual receipt supplement overlaps retained fields")
+        fields.update(
+            (name, replace(field, reply_update_id=reply.reply_update_id))
+            for name, field in new_fields.items()
+        )
+        previous = reply
     ordered = tuple(_LABELS.values())
     return ReceiptManualDraftV1(
-        draft_id="receipt_draft_" + digest(["receipt-manual-draft-v1", source_id, asdict(reply)]),
+        draft_id="receipt_draft_" + digest(["receipt-manual-draft-v1", source_id, asdict(first)]),
         source_id=source_id,
         source_evidence_id=source.evidence_id,
         source_sha256=source_sha256,
         original_message_sha256=source.original_message_sha256,
         original_image_sha256=source.original_sha256,
-        manual_reply=reply,
-        reply_text_sha256=hashlib.sha256(reply.raw_text.encode()).hexdigest(),
+        manual_reply=first,
+        reply_text_sha256=hashlib.sha256(first.raw_text.encode()).hexdigest(),
         fields=tuple(fields[name] for name in ordered if name in fields),
         missing_receipt_fields=tuple(name for name in ordered if name not in fields),
+        manual_supplements=replies[1:],
     )

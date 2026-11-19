@@ -213,15 +213,20 @@ class LedgerReader:
         """Project a draft from exact source and manual reply on one read snapshot."""
         from .receipt_draft_v1 import _project_manual_draft
 
-        verify = getattr(self.service.port, "receipt_manual_reply_v1", None)
-        if not callable(verify):
+        verify_history = getattr(self.service.port, "receipt_manual_replies_v1", None)
+        verify_first = getattr(self.service.port, "receipt_manual_reply_v1", None)
+        if not callable(verify_history) and not callable(verify_first):
             raise LifecycleError("Installed evidence port lacks authenticated receipt replies")
         with lifecycle_read_operation(self.service.owner) as conn:
             conn.execute("BEGIN")
             try:
                 source = self.service._receipt_source(conn, source_id, allow_archived=True)
-                reply = verify(conn, source)
-                return None if reply is None else _project_manual_draft(source_id, source, reply)
+                if callable(verify_history):
+                    replies = verify_history(conn, source)
+                else:
+                    reply = verify_first(conn, source)
+                    replies = () if reply is None else (reply,)
+                return None if replies == () else _project_manual_draft(source_id, source, replies)
             finally:
                 conn.rollback()
 
