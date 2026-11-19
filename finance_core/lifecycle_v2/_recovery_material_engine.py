@@ -78,7 +78,7 @@ from .recovery_material_v1 import (
     _ArtifactV1,
     _EvidenceEntryV1,
 )
-from .service import LedgerService, _capture_generation, _snapshot_integrity
+from .service import LedgerService, _capture_generation, _receipt_capture_ids, _snapshot_integrity
 
 
 @dataclass(frozen=True)
@@ -460,6 +460,8 @@ def _required_evidence(rows):
 
 
 def _scope(conn, rows):
+    if _receipt_capture_ids(conn):
+        fail("unsupported_scope", "Typed receipt captures require receipt-aware recovery")
     for table, column in (
         ("l2_proposals", "observation_json"),
         ("l2_reviews", "material_json"),

@@ -15,6 +15,7 @@ from .contracts import (
     VerifiedAction,
     VerifiedDelivery,
     VerifiedObservation,
+    VerifiedReceiptSourceV1,
     VerifiedSource,
 )
 from .reader import LedgerReader
@@ -35,6 +36,7 @@ __all__ = [
     "VerifiedAction",
     "VerifiedDelivery",
     "VerifiedObservation",
+    "VerifiedReceiptSourceV1",
     "VerifiedSource",
     "LedgerReader",
     "LedgerService",

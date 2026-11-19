@@ -20,7 +20,7 @@ from .contracts import (
     digest,
     validate_daily_capacity,
 )
-from .service import _capture_generation, _fact_material
+from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 
 def _registered_values(value):
@@ -192,6 +192,15 @@ class LedgerReader:
             if digest(asdict(evidence)) != row["source_sha256"]:
                 raise LifecycleError("Authenticated source DTO differs from retained source")
             return evidence
+
+    def receipt_source_v1(self, source_id: str):
+        """Read the original receipt identity through its typed evidence port."""
+        with lifecycle_read_operation(self.service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                return self.service._receipt_source(conn, source_id, allow_archived=True)
+            finally:
+                conn.rollback()
 
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -672,11 +681,16 @@ class SnapshotEvidenceVerifier:
             self, conn, source_id, allow_archived=allow_archived, _rows=_rows
         )
 
+    def _receipt_source(self, conn, source_id, *, allow_archived=True):
+        from .service import LedgerService
+
+        return LedgerService._receipt_source(self, conn, source_id, allow_archived=allow_archived)
+
 
 def _has_daily_values(conn):
     from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
 
-    return any(
+    return bool(_receipt_capture_ids(conn)) or any(
         json.loads(row[0]).get("format")
         in {
             BUNDLE_FORMAT,
@@ -741,8 +755,12 @@ def _audit_evidence_connection(
         if _rows is not None
         else conn.execute("SELECT source_id FROM l2_sources")
     )
-    for source in sources:
-        verifier._source(conn, source[0], allow_archived=True, _rows=_rows)
+    receipts = _receipt_capture_ids(conn)
+    for (identity,) in sources:
+        if identity in receipts:
+            verifier._receipt_source(conn, identity, allow_archived=True)
+        else:
+            verifier._source(conn, identity, allow_archived=True, _rows=_rows)
     proposals = (
         _rows.table(conn, "proposals")
         if _rows is not None

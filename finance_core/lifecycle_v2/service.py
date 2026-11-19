@@ -38,6 +38,8 @@ from .contracts import (
     RuntimeBinding,
     SnapshotCut,
     SourceRef,
+    VerifiedReceiptSourceV1,
+    VerifiedSource,
     canonical,
     digest,
     validate_daily_capacity,
@@ -115,6 +117,57 @@ def _snapshot_integrity(conn):
         raise LifecycleError("Snapshot SQLite integrity or foreign keys invalid")
 
 
+_RECEIPT_CAPTURE = "lifecycle-receipt-capture-v1"
+
+
+def _receipt_capture_ids(conn):
+    return {
+        row[0]
+        for row in conn.execute(
+            "SELECT entity_id FROM l2_events WHERE kind='capture' "
+            "AND json_extract(payload_json, '$.format')=?",
+            (_RECEIPT_CAPTURE,),
+        )
+    }
+
+
+def _capture_payload(conn, source_id):
+    rows = conn.execute(
+        "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?", (source_id,)
+    ).fetchall()
+    if len(rows) != 1:
+        raise LifecycleError("Source lacks its exact original capture event")
+    return rows[0][0]
+
+
+def _receipt_capture_material(payload):
+    try:
+        retained = payload["source"]
+        value = VerifiedReceiptSourceV1(**retained)
+        if canonical(asdict(value)) != canonical(retained):
+            raise LifecycleError("Receipt capture differs from its exact retained material")
+        return value
+    except (KeyError, TypeError) as exc:
+        raise LifecycleError("Exact retained receipt evidence required") from exc
+
+
+def _original_receipt_evidence(port, conn, evidence_id):
+    from finance_core.instance_admission.sessions import _witness_for
+
+    from .daily_v1.accounts import _EvidenceReadPort
+
+    if _witness_for(conn) is not None and type(port) is not _EvidenceReadPort:
+        port = _EvidenceReadPort(port)
+    read = getattr(port, "receipt_source_v1", None)
+    if not callable(read):
+        raise LifecycleError("Original receipt evidence port is unavailable")
+    value = read(conn, evidence_id)
+    if type(value) is not VerifiedReceiptSourceV1 or value.evidence_id != evidence_id:
+        raise LifecycleError("Exact original receipt evidence required")
+    # Also check detached adapters that do not use the protected scalar-copy wrapper.
+    return VerifiedReceiptSourceV1(**asdict(value))
+
+
 def _capture_generation(row, payload_json):
     """Verify retained native capture material; old plain captures have no generation proof."""
     payload = json.loads(payload_json)
@@ -130,15 +183,21 @@ def _capture_generation(row, payload_json):
         "source_timestamp": row["created_at"],
         "timezone": "Asia/Singapore",
     }
+    receipt = type(payload) is dict and payload.get("format") == _RECEIPT_CAPTURE
+    if receipt:
+        material = asdict(_receipt_capture_material(payload))
+        if any(material[name] != value for name, value in source.items()):
+            raise LifecycleError("Capture event inventory lacks its exact source")
+        source = material
     if row["source_sha256"] != digest(source):
         raise LifecycleError("Capture event inventory lacks its exact source")
-    if canonical(payload) == canonical(source):
+    if not receipt and canonical(payload) == canonical(source):
         # Historical capture bytes stay readable, but cannot prove initial-write authority.
         return None
     if (
         not isinstance(payload, dict)
         or set(payload) != {"format", "generation", "source"}
-        or payload["format"] != "lifecycle-capture-v2"
+        or payload["format"] != (_RECEIPT_CAPTURE if receipt else "lifecycle-capture-v2")
         or not isinstance(payload["generation"], str)
         or not 1 <= len(payload["generation"]) <= 256
         or payload["generation"] != row["generation"]
@@ -265,6 +324,10 @@ class LedgerService:
             if not allow_archived and row["generation"] != self.binding.generation:
                 raise LifecycleError("Archived imported source has no current write authority")
             return row
+        if row["source_key"].startswith("receipt:v1:"):
+            capture = json.loads(_capture_payload(conn, source_id))
+            if capture.get("format") == _RECEIPT_CAPTURE:
+                raise LifecycleError("Receipt source requires the typed receipt entry point")
         evidence = self.port.source(conn, row["evidence_id"])
         self._actor(evidence)
         material = asdict(evidence)
@@ -300,6 +363,30 @@ class LedgerService:
                 raise LifecycleError("Source belongs to archived generation")
         return row
 
+    def _receipt_source(self, conn, source_id, *, allow_archived=False):
+        row = _row(conn, "l2_sources", "source_id", source_id)
+        payload = _capture_payload(conn, source_id)
+        retained = json.loads(payload)
+        if type(retained) is not dict or retained.get("format") != _RECEIPT_CAPTURE:
+            raise LifecycleError("Source is outside the typed receipt entry point")
+        actual = _original_receipt_evidence(self.port, conn, row["evidence_id"])
+        self._actor(actual)
+        if actual != _receipt_capture_material(retained):
+            raise LifecycleError("Original receipt evidence changed")
+        if _capture_payload(conn, source_id) != payload:
+            raise LifecycleError("Original receipt capture changed during verification")
+        generation = _capture_generation(row, payload)
+        if not allow_archived and generation != self.binding.generation:
+            raise LifecycleError("Source belongs to archived generation")
+        return actual
+
+    def capture_receipt_v1(self, source_evidence_id: str, operation_id: str) -> SourceRef:
+        """Record an authenticated original receipt message before any financial proposal."""
+        with self._write_operation() as conn:
+            evidence = _original_receipt_evidence(self.port, conn, source_evidence_id)
+            self._actor(evidence)
+            return self._capture_verified(conn, evidence, operation_id, _RECEIPT_CAPTURE)
+
     def capture(self, source_evidence_id, operation_id):
         with self._write_operation() as conn:
             evidence = self.port.source(conn, source_evidence_id)
@@ -315,56 +402,62 @@ class LedgerService:
                 raise LifecycleError("Exact nonempty source evidence required")
             if hashlib.sha256(evidence.raw_input.encode()).hexdigest() != evidence.original_sha256:
                 raise LifecycleError("Original text hash mismatch")
-            sha = digest(asdict(evidence))
-            existing = conn.execute(
-                "SELECT * FROM l2_sources WHERE evidence_id=? OR source_key=?",
-                (source_evidence_id, evidence.source_key),
+            return self._capture_verified(conn, evidence, operation_id, "lifecycle-capture-v2")
+
+    def _capture_verified(
+        self, conn, evidence: VerifiedSource | VerifiedReceiptSourceV1, operation_id, capture_format
+    ):
+        sha = digest(asdict(evidence))
+        existing = conn.execute(
+            "SELECT * FROM l2_sources WHERE evidence_id=? OR source_key=?",
+            (evidence.evidence_id, evidence.source_key),
+        ).fetchone()
+        if existing:
+            event = conn.execute(
+                "SELECT * FROM l2_events WHERE operation_id=?", (operation_id,)
             ).fetchone()
-            if existing:
-                event = conn.execute(
-                    "SELECT * FROM l2_events WHERE operation_id=?", (operation_id,)
-                ).fetchone()
-                if (
-                    event is None
-                    or event["kind"] != "capture"
-                    or event["entity_id"] != existing["source_id"]
-                    or existing["source_sha256"] != sha
-                ):
-                    raise LifecycleError(
-                        "Duplicate source requires exact original operation replay"
-                    )
-                self._source(conn, existing["source_id"], allow_archived=True)
-                return SourceRef(existing["source_id"], sha)
-            source_id = _id("source")
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO l2_sources VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (
-                    source_id,
-                    evidence.source_key,
-                    evidence.evidence_id,
-                    evidence.principal_id,
-                    evidence.client_id,
-                    evidence.raw_input,
-                    evidence.original_sha256,
-                    sha,
-                    self.binding.generation,
-                    evidence.source_timestamp,
-                ),
+            if (
+                event is None
+                or event["kind"] != "capture"
+                or event["entity_id"] != existing["source_id"]
+                or existing["source_sha256"] != sha
+            ):
+                raise LifecycleError("Duplicate source requires exact original operation replay")
+            authenticate = (
+                self._receipt_source if capture_format == _RECEIPT_CAPTURE else self._source
             )
-            _event(
-                conn,
-                operation_id,
-                "capture",
+            authenticate(conn, existing["source_id"], allow_archived=True)
+            return SourceRef(existing["source_id"], sha)
+        source_id = _id("source")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "INSERT INTO l2_sources VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
                 source_id,
-                {
-                    "format": "lifecycle-capture-v2",
-                    "generation": self.binding.generation,
-                    "source": asdict(evidence),
-                },
-            )
-            conn.commit()
-            return SourceRef(source_id, sha)
+                evidence.source_key,
+                evidence.evidence_id,
+                evidence.principal_id,
+                evidence.client_id,
+                evidence.raw_input,
+                evidence.original_sha256,
+                sha,
+                self.binding.generation,
+                evidence.source_timestamp,
+            ),
+        )
+        _event(
+            conn,
+            operation_id,
+            "capture",
+            source_id,
+            {
+                "format": capture_format,
+                "generation": self.binding.generation,
+                "source": asdict(evidence),
+            },
+        )
+        conn.commit()
+        return SourceRef(source_id, sha)
 
     def _projection(self, source, current, version, record_id):
         now = datetime.fromtimestamp(source["created_at"], ZoneInfo("Asia/Singapore"))

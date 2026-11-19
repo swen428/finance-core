@@ -4,6 +4,7 @@ import hashlib
 import json
 from contextlib import contextmanager
 from dataclasses import asdict, replace
+from pathlib import Path
 
 import pytest
 from instance_admission_support_v1 import synthetic_config
@@ -149,6 +150,63 @@ def ready(service):
     review = service.prepare_review(proposal.proposal_id, proposal.version)
     service.record_delivery(review.review_id, "delivery1")
     return source, proposal, review
+
+
+def test_receipt_capture_keeps_original_media_after_owner_reopen_and_copy(live, tmp_path):
+    from zipfile import ZipFile
+
+    from finance_core.lifecycle_v2 import VerifiedReceiptSourceV1
+    from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
+
+    service, port, config = live
+    media = tmp_path / "original.png"
+    fixtures = Path(__file__).parent / "fixtures" / "receipt_media_v1" / "vectors.zip"
+    with ZipFile(fixtures) as archive:
+        media.write_bytes(archive.read("apng_two_frames.png"))
+
+    def receipt(conn, evidence_id):
+        number = {"receipt-1": 1, "receipt-2": 2}[evidence_id]
+        original = media.read_bytes()
+        message = {"message_id": number, "caption": ""}
+        return VerifiedReceiptSourceV1(
+            evidence_id,
+            "user",
+            "chat",
+            f"receipt:v1:message-{number}",
+            "",
+            hashlib.sha256(original).hexdigest(),
+            1792800000,
+            len(original),
+            digest(message),
+        )
+
+    port.receipt_source_v1 = receipt
+    text = service.capture("source1", "text-capture")
+    first = service.capture_receipt_v1("receipt-1", "receipt-capture-1")
+    second = service.capture_receipt_v1("receipt-2", "receipt-capture-2")
+    assert service.capture_receipt_v1("receipt-1", "receipt-capture-1") == first
+    assert first.source_id != second.source_id
+    with pytest.raises(LifecycleError, match="typed receipt entry point"):
+        service.reader().source(first.source_id)
+    with pytest.raises(LifecycleError, match="typed receipt entry point"):
+        service.propose(first.source_id, "text-observation", 0, "text-proposal")
+    service.owner.close()
+    with acquire_production_owner(config) as owner:
+        ledger = LedgerService(owner, port, service.binding, service.clock)
+        reader = ledger.reader()
+        one, two = (
+            reader.receipt_source_v1(first.source_id),
+            reader.receipt_source_v1(second.source_id),
+        )
+        assert one.raw_input == two.raw_input == ""
+        assert one.original_sha256 == two.original_sha256
+        assert one.original_message_sha256 != two.original_message_sha256
+        assert reader.source(text.source_id).raw_input == TEXT
+        original = reader.full_audit()
+        assert original["event_count"] == 3 and original["fact_version_count"] == 0
+        snapshot = tmp_path / "receipt-source-snapshot.sqlite"
+        cut = ledger.seal_snapshot(snapshot)
+        assert verify_snapshot_evidence(snapshot, port, ledger.binding, cut) == original
 
 
 def test_actual_owner_posting_replay_wrong_actor_and_audit(live, tmp_path):

@@ -75,6 +75,47 @@ class VerifiedSource:
 
 
 @dataclass(frozen=True)
+class VerifiedReceiptSourceV1:
+    """Original message and received-media identity from the installed evidence port."""
+
+    evidence_id: str
+    principal_id: str
+    client_id: str
+    source_key: str
+    raw_input: str
+    original_sha256: str
+    source_timestamp: int
+    original_size_bytes: int
+    original_message_sha256: str
+    timezone: str = "Asia/Singapore"
+
+    def __post_init__(self):
+        identifiers = (self.evidence_id, self.principal_id, self.client_id, self.source_key)
+        hashes = (self.original_sha256, self.original_message_sha256)
+        if (
+            any(
+                type(value) is not str or not 0 < len(value.encode()) <= 512
+                for value in identifiers
+            )
+            or not self.source_key.startswith("receipt:v1:")
+            or self.source_key == "receipt:v1:"
+            or any(
+                type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in hashes
+            )
+            or type(self.raw_input) is not str
+            or len(self.raw_input.encode()) > 65536
+            or type(self.source_timestamp) is not int
+            or not 0 < self.source_timestamp < 2**63
+            or type(self.original_size_bytes) is not int
+            or not 0 < self.original_size_bytes < 2**63
+            or type(self.timezone) is not str
+            or self.timezone != "Asia/Singapore"
+        ):
+            raise LifecycleError("Exact original receipt evidence required")
+
+
+@dataclass(frozen=True)
 class ExpectedInvocation:
     binding: RuntimeBinding
     source_id: str

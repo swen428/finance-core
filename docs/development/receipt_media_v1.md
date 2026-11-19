@@ -276,3 +276,29 @@ exposes ordered actual primary transformation properties. Real acceptance
 requires asymmetric pixel/geometry vectors, 10-bit readable-content evidence,
 actual local OCR, refusal/replay/resource/crash coverage and an exact installed
 Ubuntu worker run; an earlier CLI decoder proof is not this binding's proof.
+
+
+### Capture the original receipt in an admitted ledger
+
+`LedgerService.capture_receipt_v1(evidence_id, operation_id)` consumes an exact
+`VerifiedReceiptSourceV1` from the adapter's `receipt_source_v1(conn, evidence_id)`
+read callback. The adapter supplies the hash of the original message, a unique
+source key in the `receipt:v1:` namespace, the exact caption even when empty,
+the received attachment's byte count and SHA-256, and the original actor and
+timestamp. The adapter reopens its original message and attachment separately
+on verification. The caption and the attachment have separate identities,
+and OCR output does not serve as the original caption.
+
+Core stores the original receipt identity in the capture event and compares it
+with the adapter's evidence during protected audit and independent snapshot
+readback. `LedgerReader.receipt_source_v1(source_id)` returns the verified
+receipt origin. Exact replay returns the original source reference. Separate
+messages can carry identical image bytes and still have separate source
+references.
+
+Capturing a receipt adds no financial fact. Receipt-derived draft proposals and
+their verification are delivered in separate versioned entry points. Existing
+text proposal entry points require their original text source. Native legacy
+expense recovery material explicitly rejects ledgers with typed receipt sources.
+Archive composition must register the attachment and its original message
+evidence before enabling this entry point in an installed application.

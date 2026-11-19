@@ -21,6 +21,7 @@ from ..contracts import (
     VerifiedAction,
     VerifiedDelivery,
     VerifiedObservation,
+    VerifiedReceiptSourceV1,
     VerifiedSource,
     canonical,
     digest,
@@ -604,7 +605,10 @@ class _EvidenceReadPort:
             for field in fields(dto_type):
                 value = getattr(actual, field.name)
                 required_type = (
-                    int if dto_type is VerifiedSource and field.name == "source_timestamp" else str
+                    int
+                    if dto_type in {VerifiedSource, VerifiedReceiptSourceV1}
+                    and field.name in {"source_timestamp", "original_size_bytes"}
+                    else str
                 )
                 if type(value) is not required_type:
                     raise LifecycleError("Evidence fields require exact scalar values")
@@ -616,6 +620,11 @@ class _EvidenceReadPort:
 
     def source(self, conn, identity):
         return self._call("source", VerifiedSource, conn, identity)
+
+    def receipt_source_v1(self, conn, identity):
+        if not callable(getattr(self._port, "receipt_source_v1", None)):
+            raise LifecycleError("Original receipt evidence port is unavailable")
+        return self._call("receipt_source_v1", VerifiedReceiptSourceV1, conn, identity)
 
     def provider(self, conn, identity, expected):
         return self._call("provider", VerifiedObservation, conn, identity, expected)
