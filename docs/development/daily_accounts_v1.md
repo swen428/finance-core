@@ -306,10 +306,12 @@ For ordinary workload measurement, a synthetic service can explicitly select
 total record inventory bound to 512 for that service and its daily account and
 movement operations. Fact-version and proposal bounds are the same. An
 independent caller specifies the same synthetic profile when verifying a sealed
-snapshot. The profile is fixed when a service is constructed. All of the old
-entry points use the existing bound by default. The profile is available only
-on synthetic bindings and does not enlarge the separate opening-answer and
-opening-map limits. Each ordinary expense still follows capture, proposal,
+snapshot. Retained proposals must authenticate a synthetic request scope, and
+legacy imports and archives are outside this test profile. A protected full
+audit also checks the actual current runtime registration. The profile is fixed
+when a service is constructed. Existing entry points use the default bound
+unless the profile is explicitly selected. The separate opening-answer and
+opening-map limits still apply. Each ordinary expense still follows capture, proposal,
 review, delivery and confirmation.
 
 Source validation, independently installed wheel/sdist acceptance, hosted

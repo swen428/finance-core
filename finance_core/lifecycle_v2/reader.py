@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 
-from finance_core.instance_admission.sessions import lifecycle_read_operation
+from finance_core.instance_admission.sessions import (
+    _require_runtime_scope,
+    lifecycle_read_operation,
+)
 
 from .contracts import (
     DailyCapacityV2,
     LifecycleError,
+    RuntimeBinding,
     VerifiedSource,
     canonical,
     digest,
@@ -219,18 +224,23 @@ class LedgerReader:
             return [self.service._review_dto(conn, row) for row in rows]
 
     def full_audit(self):
-        with lifecycle_read_operation(self.service.owner) as conn:
-            if _has_daily_values(conn):
+        service = self.service
+        capacity = service.daily_capacity
+        scope = service._runtime_scope() if capacity is not None else nullcontext()
+        with scope, lifecycle_read_operation(service.owner) as conn:
+            if capacity is not None:
+                _require_runtime_scope(conn, service.binding, service.runtime_admission)
+            if capacity is not None or _has_daily_values(conn):
                 # New opt-in formats require an operation-local evidence port.
                 # The historical expense-only read path keeps its contract.
                 conn.execute("BEGIN")
                 try:
                     return audit_evidence_connection(
                         conn,
-                        self.service.port,
-                        self.service.binding,
-                        self.service.legacy_verifier,
-                        daily_capacity=self.service.daily_capacity,
+                        service.port,
+                        service.binding,
+                        service.legacy_verifier,
+                        daily_capacity=capacity,
                     )
                 finally:
                     conn.rollback()
@@ -262,9 +272,23 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
     from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
-    from .contracts import ExpectedInvocation, RuntimeBinding
+    from .contracts import ExpectedInvocation
 
     sealed = json.loads(proposal["observation_json"])
+    capacity = getattr(service, "daily_capacity", None)
+    if capacity is not None:
+        # Successful verification below also authenticates this expected request.
+        expected_scope = sealed.get("expected")
+        raw_binding = expected_scope.get("binding") if type(expected_scope) is dict else None
+        if type(raw_binding) is not dict or "environment" not in raw_binding:
+            raise LifecycleError("Synthetic daily capacity requires retained synthetic scope")
+        try:
+            retained = RuntimeBinding(**raw_binding)
+        except TypeError as exc:
+            raise LifecycleError(
+                "Synthetic daily capacity requires retained synthetic scope"
+            ) from exc
+        validate_daily_capacity(retained, capacity)
     if sealed.get("format") == "finance-daily-opening-observation-v2":
         from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
 
@@ -707,6 +731,8 @@ def _audit_evidence_connection(
             "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
         ).fetchone()
     ):
+        if daily_capacity is not None:
+            raise LifecycleError("Synthetic daily capacity requires retained synthetic scope")
         from .legacy import verify_import_archives
 
         verify_import_archives(conn, legacy_verifier)
