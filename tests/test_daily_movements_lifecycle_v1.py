@@ -250,8 +250,11 @@ def test_synthetic_capacity_profile_covers_write_lookup_and_snapshot(live, monke
     assert api.pending_for_source(proposal.source_id) is None
     reader = DailyLedgerReaderV1(ledger)
     assert reader.collect().balances[0].balance_amount == "982.00"
+    query = reader.collect_with_contributions_v1()
+    assert query.collection.balances[0].balance_amount == "982.00"
+    assert len(query.contributions) == 2
     with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
-        legacy_reader.collect()
+        legacy_reader.collect_with_contributions_v1()
 
     database = tmp_path.resolve() / "snapshot.sqlite"
     cut = ledger.seal_snapshot(database)
