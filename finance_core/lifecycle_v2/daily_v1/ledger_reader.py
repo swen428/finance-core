@@ -16,7 +16,7 @@ from ._impacts_v1 import effect, resolve_effect_v1
 from .accounts import _audit, _BoundService, bundle_ref
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
-from .reader import DailyAccountReaderV1, DailyReadIdentityV1, DailyReadLimitsV1, _view
+from .reader import DailyAccountReaderV1, DailyReadIdentityV1, _read_limits, _view
 
 
 @dataclass(frozen=True)
@@ -103,10 +103,8 @@ class DailyLedgerWithContributionsV1:
 
 class DailyLedgerReaderV1(DailyAccountReaderV1):
     def _ledger(self, limits=None, *, include_contributions=False):
-        limits = DailyReadLimitsV1() if limits is None else limits
-        if type(limits) is not DailyReadLimitsV1:
-            raise LifecycleError("Exact daily read limits required")
         base = self._service
+        max_records, max_versions = _read_limits(limits, base.daily_capacity)
         with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
             _require_runtime_scope(conn, base.binding, base.runtime_admission)
             service = _BoundService(base)
@@ -114,10 +112,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
             try:
                 audit = _audit(service, conn)
                 rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
-                if (
-                    len(rows) > limits.max_fact_versions
-                    or len({r["record_id"] for r in rows}) > limits.max_records
-                ):
+                if len(rows) > max_versions or len({r["record_id"] for r in rows}) > max_records:
                     raise LifecycleError("complete_read_limit_exceeded")
                 current, history = {}, {}
                 for row in rows:

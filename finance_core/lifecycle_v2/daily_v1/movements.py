@@ -21,14 +21,13 @@ from ._impacts_v1 import (
     selected_dependency,
 )
 from .accounts import (
-    MAX_FACT_VERSIONS,
     MAX_PROPOSALS,
-    MAX_RECORDS,
     DailyAccountServiceV1,
     _audit,
     _fingerprint,
     _require_current,
     _require_current_authority,
+    _require_fact_capacity,
     _require_prefix,
     _review_dto,
     _row_version,
@@ -127,7 +126,7 @@ def _instruction_link(service, conn, instruction, target, previous):
 
 def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq, _rows=None):
     expected = decode_expected(asdict(expected))
-    source = service._source(conn, expected.source_id, allow_archived=True)
+    source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     if (
         expected.source_sha256 != source["source_sha256"]
         or expected.binding.instance_id != service.binding.instance_id
@@ -922,18 +921,13 @@ class DailyMovementServiceV1:
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
                 require_accounts(conn, expected, values)
-                if conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0] >= MAX_FACT_VERSIONS:
-                    raise LifecycleError("complete_read_limit_exceeded")
                 predecessor = conn.execute(
                     "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
                     (expected.record_id,),
                 ).fetchone()
-                if (
-                    predecessor is None
-                    and conn.execute("SELECT count(DISTINCT record_id) FROM l2_facts").fetchone()[0]
-                    >= MAX_RECORDS
-                ):
-                    raise LifecycleError("complete_read_limit_exceeded")
+                _require_fact_capacity(
+                    conn, new_record=predecessor is None, daily_capacity=service.daily_capacity
+                )
                 source = service._source(
                     conn, expected.source_id, allow_archived=predecessor is not None
                 )

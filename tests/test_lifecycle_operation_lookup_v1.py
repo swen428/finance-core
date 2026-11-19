@@ -84,6 +84,47 @@ def test_lookup_absent_receipt_is_read_only(lookup_case):
     assert _rows(lookup_case.owner) == before
 
 
+def test_larger_daily_audit_requires_protected_and_retained_synthetic_scope(lookup_case, tmp_path):
+    from finance_core.lifecycle_v2.contracts import DailyCapacityV2
+    from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
+
+    service = lookup_case.service
+    _, _, review = ready(service)
+    service.confirm(review.review_id, "action1", "confirm1")
+    database = tmp_path / "snapshot.sqlite"
+    cut = service.seal_snapshot(database)
+    original = service.reader().full_audit()
+    assert verify_snapshot_evidence(database, service.port, service.binding, cut) == original
+
+    real = service.binding.environment == "single-host-real"
+    binding = (
+        replace(service.binding, environment="single-host-synthetic") if real else service.binding
+    )
+    expanded = LedgerService(
+        service.owner,
+        service.port,
+        binding,
+        clock=service.clock,
+        runtime_admission=service.runtime_admission,
+        daily_capacity=DailyCapacityV2.SYNTHETIC_512,
+    )
+    if real:
+        with pytest.raises(InstanceAdmissionError, match="differs from protected registration"):
+            expanded.reader().full_audit()
+        with pytest.raises(LifecycleError, match="synthetic daily capacity"):
+            verify_snapshot_evidence(
+                database, service.port, binding, cut, daily_capacity=DailyCapacityV2.SYNTHETIC_512
+            )
+    else:
+        assert expanded.reader().full_audit() == original
+        assert (
+            verify_snapshot_evidence(
+                database, service.port, binding, cut, daily_capacity=DailyCapacityV2.SYNTHETIC_512
+            )
+            == original
+        )
+
+
 def test_lookup_unconfirmed_review_never_creates_a_fact(lookup_case):
     service = lookup_case.service
     _, _, review = ready(service)
@@ -301,10 +342,10 @@ def test_lookup_uses_actual_readonly_uri_and_one_audited_snapshot(lookup_case, m
             uris.append((args[0], kwargs.get("uri")))
         return connect(*args, **kwargs)
 
-    def audited(conn, *args):
+    def audited(conn, *args, **kwargs):
         assert conn.in_transaction and sessions._witness_for(conn).read_only
         points.append(("audit", conn))
-        return audit(conn, *args)
+        return audit(conn, *args, **kwargs)
 
     def original_receipt(actual_service, conn, *args):
         assert actual_service is service and conn is points[0][1] and conn.in_transaction

@@ -66,6 +66,36 @@ def as_of(precision="unknown", timestamp=None, local_date=None):
     }
 
 
+def test_daily_text_keeps_ascii_character_rules_and_unicode_byte_bound():
+    c = api()
+    for number in range(128):
+        value = f"a{chr(number)}b"
+        if 32 <= number <= 126:
+            assert c.text(value, "description", 3) == value
+        else:
+            with pytest.raises(LifecycleError, match="Invalid bounded description"):
+                c.text(value, "description", 3)
+    assert c.text("咖啡", "description", 6) == "咖啡"
+    for value, limit in (("咖啡", 5), ("e\u0301", 10), ("x\u200dx", 10), (" a", 10)):
+        with pytest.raises(LifecycleError, match="Invalid bounded description"):
+            c.text(value, "description", limit)
+
+
+def test_daily_sha_requires_exact_lowercase_ascii_and_length():
+    c = api()
+    for number in range(128):
+        char = chr(number)
+        value = "a" * 32 + char + "0" * 31
+        if char in "0123456789abcdef":
+            assert c.sha(value) == value
+        else:
+            with pytest.raises(LifecycleError, match="Exact lowercase SHA-256 required"):
+                c.sha(value)
+    for value in ("a" * 63, "a" * 65, "a" * 63 + "Ａ"):
+        with pytest.raises(LifecycleError, match="Exact lowercase SHA-256 required"):
+            c.sha(value)
+
+
 def test_unknown_opening_and_explicit_signed_zero_are_distinct():
     c = api()
     e = expected()

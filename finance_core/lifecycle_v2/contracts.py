@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Protocol
 
 
@@ -42,6 +43,23 @@ class RuntimeBinding:
             )
         ):
             raise LifecycleError("Exact supported runtime binding fields required")
+
+
+class DailyCapacityV2(Enum):
+    """Exact opt-in for measuring the ordinary 512-record synthetic workload."""
+
+    SYNTHETIC_512 = "finance-daily-synthetic-512-v2"
+
+
+def validate_daily_capacity(binding: RuntimeBinding, capacity: DailyCapacityV2 | None) -> None:
+    if capacity is None:
+        return
+    if (
+        capacity is not DailyCapacityV2.SYNTHETIC_512
+        or type(binding) is not RuntimeBinding
+        or binding.environment not in {"offline-synthetic", "single-host-synthetic"}
+    ):
+        raise LifecycleError("Exact synthetic daily capacity profile required")
 
 
 @dataclass(frozen=True)

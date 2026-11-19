@@ -13,7 +13,14 @@ from finance_core.instance_admission.sessions import (
 from ..contracts import LifecycleError, digest
 from ..reader import audit_evidence_connection
 from ..service import LedgerService
-from .accounts import MAX_FACT_VERSIONS, MAX_RECORDS, _BoundService, _limits, bundle_ref
+from .accounts import (
+    MAX_FACT_VERSIONS,
+    MAX_RECORDS,
+    _BoundService,
+    _limits,
+    _record_limit,
+    bundle_ref,
+)
 from .contracts import (
     BUNDLE_FORMATS,
     AccountDefinitionRefV1,
@@ -39,6 +46,14 @@ class DailyReadLimitsV1:
             or not 1 <= self.max_fact_versions <= MAX_FACT_VERSIONS
         ):
             raise LifecycleError("Exact bounded daily read limits required")
+
+
+def _read_limits(limits, daily_capacity):
+    if limits is None:
+        return _record_limit(daily_capacity), MAX_FACT_VERSIONS
+    if type(limits) is not DailyReadLimitsV1:
+        raise LifecycleError("Exact daily read limits required")
+    return limits.max_records, limits.max_fact_versions
 
 
 @dataclass(frozen=True)
@@ -120,16 +135,14 @@ class DailyAccountReaderV1:
         self._service = service
 
     def _read(self, limits=None):
-        limits = DailyReadLimitsV1() if limits is None else limits
-        if type(limits) is not DailyReadLimitsV1:
-            raise LifecycleError("Exact daily read limits required")
         base = self._service
+        max_records, max_versions = _read_limits(limits, base.daily_capacity)
         with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
             _require_runtime_scope(conn, base.binding, base.runtime_admission)
             service = _BoundService(base)
             conn.execute("BEGIN")
             try:
-                _limits(conn)
+                _limits(conn, daily_capacity=service.daily_capacity)
                 if (
                     conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
                     or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
@@ -138,13 +151,14 @@ class DailyAccountReaderV1:
                         "unsupported_ledger_scope: imported accounts are unsupported"
                     )
                 rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
-                if (
-                    len(rows) > limits.max_fact_versions
-                    or len({r["record_id"] for r in rows}) > limits.max_records
-                ):
+                if len(rows) > max_versions or len({r["record_id"] for r in rows}) > max_records:
                     raise LifecycleError("complete_read_limit_exceeded")
                 audit = audit_evidence_connection(
-                    conn, service.port, service.binding, service.legacy_verifier
+                    conn,
+                    service.port,
+                    service.binding,
+                    service.legacy_verifier,
+                    daily_capacity=service.daily_capacity,
                 )
                 current = {}
                 history = {}

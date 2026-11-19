@@ -43,6 +43,7 @@ from finance_core.runtime_paths import RUNTIME_ROOT_ENV
 from finance_core.sqlite_connection import configure_sqlite_connection
 
 from .contracts import (
+    DailyCapacityV2,
     LifecycleError,
     RuntimeBinding,
     SnapshotCut,
@@ -814,7 +815,15 @@ def verify_held_profile_evidence(restored: RestoredProfile, port, binding, legac
         return _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
 
 
-def verify_snapshot_evidence(database: Path, port, binding, cut: SnapshotCut, legacy_verifier=None):
+def verify_snapshot_evidence(
+    database: Path,
+    port,
+    binding,
+    cut: SnapshotCut,
+    legacy_verifier=None,
+    *,
+    daily_capacity: DailyCapacityV2 | None = None,
+):
     from .reader import audit_evidence_connection
 
     database = Path(database).resolve(strict=True)
@@ -824,7 +833,9 @@ def verify_snapshot_evidence(database: Path, port, binding, cut: SnapshotCut, le
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN")
-        result = audit_evidence_connection(conn, port, binding, legacy_verifier)
+        result = audit_evidence_connection(
+            conn, port, binding, legacy_verifier, daily_capacity=daily_capacity
+        )
         _verify_cut_connection(conn, cut)
         return result
     finally:

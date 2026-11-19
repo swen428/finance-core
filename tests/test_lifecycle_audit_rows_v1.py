@@ -11,7 +11,11 @@ import pytest
 
 from finance_core.instance_admission import InstanceAdmissionError
 from finance_core.instance_admission.authority import _logical_database_digest
-from finance_core.instance_admission.sessions import _witness_for, lifecycle_read_operation
+from finance_core.instance_admission.sessions import (
+    _ProductionConnection,
+    _witness_for,
+    lifecycle_read_operation,
+)
 from finance_core.lifecycle_v2 import LifecycleError
 from finance_core.lifecycle_v2._audit_rows_v1 import (
     _COLUMNS,
@@ -183,9 +187,18 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
     observer = TracePort(port)
     protected = _EvidenceReadPort(observer)
     fact_calls, confirm_prefixes, fact_closures, prior_opening_versions = [], [], [], []
+    source_queries = set()
+    source_lookup_sql = {
+        "SELECT * FROM l2_sources WHERE source_id=?",
+        "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?",
+    }
 
     def observe(frame, event, arg):
-        if frame.f_code is verify_fact.__code__:
+        if event == "call" and frame.f_code is _ProductionConnection.execute.__code__:
+            sql = frame.f_locals["sql"]
+            if sql in source_lookup_sql:
+                source_queries.add(sql)
+        elif frame.f_code is verify_fact.__code__:
             if event == "call":
                 actual_rows = frame.f_locals["_rows"]
                 actual_conn = frame.f_locals["conn"]
@@ -204,6 +217,7 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
     def observed(call):
         for observations in (fact_calls, confirm_prefixes, fact_closures, prior_opening_versions):
             observations.clear()
+        source_queries.clear()
         previous_profile = sys.getprofile()
         sys.setprofile(observe)
         try:
@@ -225,6 +239,7 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
             before = _logical_database_digest(conn), conn.total_changes
             sql = observed(lambda: _audit_evidence_connection(conn, protected, ledger.binding))
             assert_fact_scope(None, conn)
+            assert source_queries == source_lookup_sql
             sql_trace = tuple(observer.trace)
             observer.trace.clear()
             with audit_rows(conn, protected) as rows:
@@ -234,6 +249,7 @@ def test_same_real_connection_sql_index_trace_prefix_and_no_writes(live):
                 )
                 assert_fact_scope(rows, conn)
                 assert tuple(observer.trace) == sql_trace
+                assert not source_queries
                 for proposal in rows.table(conn, "proposals"):
                     expected = decode_expected(json.loads(proposal["observation_json"])["expected"])
                     for cutoff in (1, 2, 5, 6, 10, 11, None):

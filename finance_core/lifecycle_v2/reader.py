@@ -4,10 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import nullcontext
 
-from finance_core.instance_admission.sessions import lifecycle_read_operation
+from finance_core.instance_admission.sessions import (
+    _require_runtime_scope,
+    lifecycle_read_operation,
+)
 
-from .contracts import LifecycleError, VerifiedSource, canonical, digest
+from .contracts import (
+    DailyCapacityV2,
+    LifecycleError,
+    RuntimeBinding,
+    VerifiedSource,
+    canonical,
+    digest,
+    validate_daily_capacity,
+)
 from .service import _capture_generation, _fact_material
 
 
@@ -212,14 +224,23 @@ class LedgerReader:
             return [self.service._review_dto(conn, row) for row in rows]
 
     def full_audit(self):
-        with lifecycle_read_operation(self.service.owner) as conn:
-            if _has_daily_values(conn):
+        service = self.service
+        capacity = service.daily_capacity
+        scope = service._runtime_scope() if capacity is not None else nullcontext()
+        with scope, lifecycle_read_operation(service.owner) as conn:
+            if capacity is not None:
+                _require_runtime_scope(conn, service.binding, service.runtime_admission)
+            if capacity is not None or _has_daily_values(conn):
                 # New opt-in formats require an operation-local evidence port.
                 # The historical expense-only read path keeps its contract.
                 conn.execute("BEGIN")
                 try:
                     return audit_evidence_connection(
-                        conn, self.service.port, self.service.binding, self.service.legacy_verifier
+                        conn,
+                        service.port,
+                        service.binding,
+                        service.legacy_verifier,
+                        daily_capacity=capacity,
                     )
                 finally:
                     conn.rollback()
@@ -251,9 +272,23 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
     from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
-    from .contracts import ExpectedInvocation, RuntimeBinding
+    from .contracts import ExpectedInvocation
 
     sealed = json.loads(proposal["observation_json"])
+    capacity = getattr(service, "daily_capacity", None)
+    if capacity is not None:
+        # Successful verification below also authenticates this expected request.
+        expected_scope = sealed.get("expected")
+        raw_binding = expected_scope.get("binding") if type(expected_scope) is dict else None
+        if type(raw_binding) is not dict or "environment" not in raw_binding:
+            raise LifecycleError("Synthetic daily capacity requires retained synthetic scope")
+        try:
+            retained = RuntimeBinding(**raw_binding)
+        except TypeError as exc:
+            raise LifecycleError(
+                "Synthetic daily capacity requires retained synthetic scope"
+            ) from exc
+        validate_daily_capacity(retained, capacity)
     if sealed.get("format") == "finance-daily-opening-observation-v2":
         from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
 
@@ -268,7 +303,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.accounts import verify_proposal as verify_daily_proposal
 
         return verify_daily_proposal(service, conn, proposal, _rows=_rows)
-    source = service._source(conn, proposal["source_id"], allow_archived=True)
+    source = service._source(conn, proposal["source_id"], allow_archived=True, _rows=_rows)
     raw_expected = dict(sealed["expected"])
     raw_expected["binding"] = RuntimeBinding(**raw_expected["binding"])
     expected = ExpectedInvocation(**raw_expected)
@@ -548,7 +583,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if review is None:
             raise LifecycleError("Record lacks original review")
         expected, delivery = verify_review(service, conn, review, _rows=_rows)
-        source = service._source(conn, expected.source_id, allow_archived=True)
+        source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
         if fact["source_id"] != expected.source_id or (
             version == 1 and fact["economic_event_id"] != source["source_key"]
         ):
@@ -618,8 +653,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
 class SnapshotEvidenceVerifier:
     """Read-only snapshot proof context; has no owner or operation capability."""
 
-    def __init__(self, port, binding, legacy_verifier=None):
+    def __init__(self, port, binding, legacy_verifier=None, *, daily_capacity=None):
+        validate_daily_capacity(binding, daily_capacity)
         self.port, self.binding, self.legacy_verifier = port, binding, legacy_verifier
+        self.daily_capacity = daily_capacity
 
     def _actor(self, evidence):
         if (
@@ -628,10 +665,12 @@ class SnapshotEvidenceVerifier:
         ):
             raise LifecycleError("Snapshot source actor/client differs from admitted principal")
 
-    def _source(self, conn, source_id, *, allow_archived=True):
+    def _source(self, conn, source_id, *, allow_archived=True, _rows=None):
         from .service import LedgerService
 
-        return LedgerService._source(self, conn, source_id, allow_archived=allow_archived)
+        return LedgerService._source(
+            self, conn, source_id, allow_archived=allow_archived, _rows=_rows
+        )
 
 
 def _has_daily_values(conn):
@@ -651,7 +690,9 @@ def _has_daily_values(conn):
     )
 
 
-def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
+def audit_evidence_connection(
+    conn, port, binding, legacy_verifier=None, *, daily_capacity: DailyCapacityV2 | None = None
+):
     """Authenticate every signed source/provider/display/action and dormant archive."""
     from finance_core.instance_admission.sessions import _witness_for
 
@@ -664,14 +705,25 @@ def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
             port = _EvidenceReadPort(port)
     # Raw immutable snapshot readback retains its independent SQL boundary.
     # An exact adapter alone is not admission; the selector proves its context.
+    if daily_capacity is not None:
+        from .daily_v1.accounts import _limits
+
+        validate_daily_capacity(binding, daily_capacity)
+        _limits(conn, daily_capacity=daily_capacity)
     with audit_rows(conn, port) as rows:
-        return _audit_evidence_connection(conn, port, binding, legacy_verifier, _rows=rows)
+        return _audit_evidence_connection(
+            conn, port, binding, legacy_verifier, _rows=rows, daily_capacity=daily_capacity
+        )
 
 
-def _audit_evidence_connection(conn, port, binding, legacy_verifier=None, *, _rows=None):
+def _audit_evidence_connection(
+    conn, port, binding, legacy_verifier=None, *, _rows=None, daily_capacity=None
+):
     """Original SQL reference with optional private, audit-local raw lookups."""
     result = audit_connection(conn, _rows=_rows)
-    verifier = SnapshotEvidenceVerifier(port, binding, legacy_verifier)
+    verifier = SnapshotEvidenceVerifier(
+        port, binding, legacy_verifier, daily_capacity=daily_capacity
+    )
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
@@ -679,6 +731,8 @@ def _audit_evidence_connection(conn, port, binding, legacy_verifier=None, *, _ro
             "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
         ).fetchone()
     ):
+        if daily_capacity is not None:
+            raise LifecycleError("Synthetic daily capacity requires retained synthetic scope")
         from .legacy import verify_import_archives
 
         verify_import_archives(conn, legacy_verifier)
@@ -688,7 +742,7 @@ def _audit_evidence_connection(conn, port, binding, legacy_verifier=None, *, _ro
         else conn.execute("SELECT source_id FROM l2_sources")
     )
     for source in sources:
-        verifier._source(conn, source[0], allow_archived=True)
+        verifier._source(conn, source[0], allow_archived=True, _rows=_rows)
     proposals = (
         _rows.table(conn, "proposals")
         if _rows is not None

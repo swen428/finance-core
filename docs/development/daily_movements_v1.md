@@ -194,7 +194,9 @@ checks can reconstruct their historical account and opening dependencies from
 the operation's complete immutable rows. The same strict commit cut applies to
 versioned review effects and original map ownership. Each movement source,
 instruction, proposal, delivery and action evidence check still uses the real
-port and the original request. Independent snapshot-copy audits and writer
+port and the original request. A native source check can read the source row
+and, after the evidence callback, its unique capture event from the same
+protected inventory. Independent snapshot-copy audits and writer
 checks for the live target and dependencies use SQL. The private optimization
 has the same financial limits and complete-scope requirements as the SQL path.
 

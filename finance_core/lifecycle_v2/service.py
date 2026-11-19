@@ -27,6 +27,7 @@ from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
 
 from .contracts import (
     CommitReceipt,
+    DailyCapacityV2,
     EvidencePort,
     ExpectedDisplay,
     ExpectedInvocation,
@@ -38,6 +39,7 @@ from .contracts import (
     SourceRef,
     canonical,
     digest,
+    validate_daily_capacity,
 )
 
 
@@ -154,25 +156,31 @@ class LedgerService:
             )
 
     def __setattr__(self, name, value):
-        if name in {"owner", "binding", "runtime_admission"}:
+        if name in {"owner", "binding", "runtime_admission", "daily_capacity"}:
             self._assert_runtime_process()
         lock = self.__dict__.get("_runtime_scope_lock")
-        if lock is not None and name in {"owner", "binding", "runtime_admission"}:
+        if lock is not None and name in {"owner", "binding", "runtime_admission", "daily_capacity"}:
             with lock:
                 if self._active_runtime_scopes:
                     raise LifecycleError("Runtime identity cannot change during an operation")
+                if name == "daily_capacity" and name in self.__dict__:
+                    raise LifecycleError("Daily capacity profile is fixed for this service")
+                if name == "binding" and "daily_capacity" in self.__dict__:
+                    validate_daily_capacity(value, self.daily_capacity)
                 object.__setattr__(self, name, value)
         else:
             object.__setattr__(self, name, value)
 
     def __delattr__(self, name):
-        if name in {"owner", "binding", "runtime_admission"}:
+        if name in {"owner", "binding", "runtime_admission", "daily_capacity"}:
             self._assert_runtime_process()
         lock = self.__dict__.get("_runtime_scope_lock")
-        if lock is not None and name in {"owner", "binding", "runtime_admission"}:
+        if lock is not None and name in {"owner", "binding", "runtime_admission", "daily_capacity"}:
             with lock:
                 if self._active_runtime_scopes:
                     raise LifecycleError("Runtime identity cannot change during an operation")
+                if name == "daily_capacity":
+                    raise LifecycleError("Daily capacity profile is fixed for this service")
                 object.__delattr__(self, name)
         else:
             object.__delattr__(self, name)
@@ -186,6 +194,7 @@ class LedgerService:
         *,
         legacy_verifier=None,
         runtime_admission=None,
+        daily_capacity: DailyCapacityV2 | None = None,
     ):
         if (
             not isinstance(owner, ProductionOwner)
@@ -193,6 +202,7 @@ class LedgerService:
             or owner.config.instance_id != binding.instance_id
         ):
             raise LifecycleError("Actual matching production owner required")
+        validate_daily_capacity(binding, daily_capacity)
         owner.assert_valid()
         self._runtime_scope_pid = os.getpid()
         self._runtime_scope_lock = threading.Lock()
@@ -200,6 +210,7 @@ class LedgerService:
         self.owner, self.port, self.binding, self.clock = owner, port, binding, clock
         self.legacy_verifier = legacy_verifier
         self.runtime_admission = runtime_admission
+        self.daily_capacity = daily_capacity
 
     @contextmanager
     def _runtime_scope(self):
@@ -236,11 +247,19 @@ class LedgerService:
         ):
             raise LifecycleError("Evidence actor/client mismatch")
 
-    def _source(self, conn, source_id, *, allow_archived=False):
-        row = _row(conn, "l2_sources", "source_id", source_id)
+    def _source(self, conn, source_id, *, allow_archived=False, _rows=None):
+        row = (
+            _rows.one(conn, "source", source_id)
+            if _rows is not None
+            else _row(conn, "l2_sources", "source_id", source_id)
+        )
+        if row is None:
+            raise LifecycleError("Missing l2_sources identity")
         if row["source_key"].startswith("legacy:"):
             from .legacy import verify_imported_source
 
+            if _rows is not None:
+                raise LifecycleError("Imported source requires original SQL verification")
             verify_imported_source(conn, row, self.binding, self.legacy_verifier)
             if not allow_archived and row["generation"] != self.binding.generation:
                 raise LifecycleError("Archived imported source has no current write authority")
@@ -261,9 +280,15 @@ class LedgerService:
             or hashlib.sha256(evidence.raw_input.encode()).hexdigest() != evidence.original_sha256
         ):
             raise LifecycleError("Source/original evidence changed")
-        captures = conn.execute(
-            "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?", (source_id,)
-        ).fetchall()
+        # This lookup follows the real evidence callback in both audit paths.
+        captures = (
+            _rows.project_many(conn, "entity_events", ("payload_json",), "capture", source_id)
+            if _rows is not None
+            else conn.execute(
+                "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?",
+                (source_id,),
+            ).fetchall()
+        )
         if len(captures) != 1:
             raise LifecycleError("Source lacks its exact original capture event")
         generation = _capture_generation(row, captures[0][0])
@@ -743,7 +768,13 @@ class LedgerService:
             _require_runtime_scope(conn, self.binding, self.runtime_admission)
             conn.execute("BEGIN")
             try:
-                audit_evidence_connection(conn, self.port, self.binding, self.legacy_verifier)
+                audit_evidence_connection(
+                    conn,
+                    self.port,
+                    self.binding,
+                    self.legacy_verifier,
+                    daily_capacity=self.daily_capacity,
+                )
                 event = conn.execute(
                     "SELECT kind FROM l2_events WHERE operation_id=?", (operation_id,)
                 ).fetchone()
@@ -823,7 +854,13 @@ class LedgerService:
                     core_identity = config.core_identity
                     source_binding_sha256 = config.binding_sha256
                     conn.execute("BEGIN")
-                    audit_evidence_connection(conn, port, binding, self.legacy_verifier)
+                    audit_evidence_connection(
+                        conn,
+                        port,
+                        binding,
+                        self.legacy_verifier,
+                        daily_capacity=self.daily_capacity,
+                    )
                     sealed_ledger = ledger_sha256(conn)
                     validate_application_database(conn, migration, schema, sealed_ledger)
                     source_logical = _logical_database_digest(conn)
@@ -839,7 +876,13 @@ class LedgerService:
                     validate_application_database(readback, migration, schema, sealed_ledger)
                     _snapshot_integrity(readback)
                     readback.row_factory = sqlite3.Row
-                    audit_evidence_connection(readback, port, binding, self.legacy_verifier)
+                    audit_evidence_connection(
+                        readback,
+                        port,
+                        binding,
+                        self.legacy_verifier,
+                        daily_capacity=self.daily_capacity,
+                    )
                     if _logical_database_digest(readback) != source_logical or _snapshot_inventory(
                         readback
                     ) != (facts, seq):

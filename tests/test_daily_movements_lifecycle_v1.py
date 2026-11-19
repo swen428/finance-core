@@ -194,6 +194,75 @@ def test_equal_expenses_contribute_separate_record_versions_to_one_total(live):
     )
 
 
+def test_account_and_movement_share_confirmation_capacity(live, monkeypatch):
+    from finance_core.lifecycle_v2.daily_v1 import accounts
+
+    monkeypatch.setattr(accounts, "MAX_RECORDS", 2)
+    ledger, port, daily, api, reader, account = prepare(live)
+    _, _, expense = movement(ledger, port, api, account, "expense")
+
+    with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
+        movement(ledger, port, api, account, "over-capacity")
+    port.add_source("source2", "Create another bank account")
+    with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
+        create(ledger, port, daily, suffix="2")
+
+    current = reader.detail(expense.receipt.record_id)
+    assert len(reader.collect().accounts) == 1
+    assert reader.collect().balances[0].balance_amount == "991.00"
+
+    movement(
+        ledger,
+        port,
+        api,
+        account,
+        "correct-at-capacity",
+        fields(account, "10"),
+        current,
+        "movement_correct",
+    )
+    assert len(reader.history(current.record_id)) == 2
+    assert reader.collect().balances[0].balance_amount == "990.00"
+
+
+def test_synthetic_capacity_profile_covers_write_lookup_and_snapshot(live, monkeypatch, tmp_path):
+    from finance_core.lifecycle_v2.contracts import DailyCapacityV2
+    from finance_core.lifecycle_v2.daily_v1 import accounts
+    from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
+    from finance_core.lifecycle_v2.service import LedgerService
+
+    monkeypatch.setattr(accounts, "MAX_RECORDS", 2)
+    legacy, port, _, _, legacy_reader, account = prepare(live)
+    capacity = DailyCapacityV2.SYNTHETIC_512
+    ledger = LedgerService(
+        legacy.owner,
+        port,
+        legacy.binding,
+        legacy.clock,
+        legacy_verifier=legacy.legacy_verifier,
+        runtime_admission=legacy.runtime_admission,
+        daily_capacity=capacity,
+    )
+    api = DailyMovementServiceV1(ledger)
+    movement(ledger, port, api, account, "first")
+    proposal, _, _ = movement(ledger, port, api, account, "second")
+
+    assert api.pending_for_source(proposal.source_id) is None
+    reader = DailyLedgerReaderV1(ledger)
+    assert reader.collect().balances[0].balance_amount == "982.00"
+    query = reader.collect_with_contributions_v1()
+    assert query.collection.balances[0].balance_amount == "982.00"
+    assert len(query.contributions) == 2
+    with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
+        legacy_reader.collect_with_contributions_v1()
+
+    database = tmp_path.resolve() / "snapshot.sqlite"
+    cut = ledger.seal_snapshot(database)
+    current = ledger.reader().full_audit()
+    copied = verify_snapshot_evidence(database, port, ledger.binding, cut, daily_capacity=capacity)
+    assert current == copied and len(cut.facts) == 3
+
+
 def test_unknown_opening_reports_net_change_without_balance(live):
     ledger, port, _, api, reader, account = prepare(live, None)
     movement(ledger, port, api, account, "income", fields(account, "200", "income"))

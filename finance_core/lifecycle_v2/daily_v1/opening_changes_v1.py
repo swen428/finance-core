@@ -288,7 +288,7 @@ def _verify_proposal_item(service, conn, proposal, *, _rows=None):
     if len(events) != 1:
         raise LifecycleError("Opening proposal lacks exact original event")
     previous = _previous(conn, expected.source_id, proposal["version"] - 1, _rows=_rows)
-    source = service._source(conn, expected.source_id, allow_archived=True)
+    source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     actual_expected = _compose(
         service,
         conn,
