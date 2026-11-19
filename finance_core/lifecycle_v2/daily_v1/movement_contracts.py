@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from finance_core.money import normalize_currency
 
-from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, digest
+from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, canonical, digest
 from .contracts import (
     AccountDefinitionRefV1,
     BundleFactRefV1,
@@ -137,7 +137,7 @@ def _validate_account_question(subject, target):
         or not fields.keys() <= FIELDS
         or fields.get("kind") != "expense"
         or fields.get("account_id") is not None
-        or fields.get("coverage") is not None
+        or fields.get("coverage") not in (None, {"answer": "unknown", "span": None})
     ):
         raise LifecycleError("Account selection requires an expense draft without an account")
     if type(subject["offered_accounts"]) is not list or not subject["offered_accounts"]:
@@ -158,8 +158,6 @@ def decode_instruction_link(value, target=None):
     exact(value, {"evidence_id", "link_json"}, "verified movement instruction link")
     text(value["evidence_id"], "instruction link id")
     material = strict_json(value["link_json"])
-    from ..contracts import canonical
-
     if canonical(material) != value["link_json"]:
         raise LifecycleError("Canonical movement instruction link required")
     exact(material, {"format", "mode", "target", "association_ref", "question"}, "instruction link")
@@ -305,8 +303,6 @@ def validate_before(value):
     from ..service import _money as legacy_money
 
     legacy_money(value)
-    from ..contracts import canonical
-
     _business_fields(canonical(value))
     return value
 
@@ -496,7 +492,6 @@ def compile_proposal(command, expected):
             raise LifecycleError("Whole-event VOID cannot modify business values")
         if before.get("format") != MOVEMENT_FORMAT:
             # A legacy unknown-account event has no account impact to undo.
-            from ..contracts import canonical
             from ..effective_v1 import _business_fields
 
             old = _business_fields(canonical(before))
@@ -542,7 +537,7 @@ def compile_proposal(command, expected):
             **selection["draft_fields"],
             "account_id": selection["selected_account"]["account_id"],
         }
-        if f != selected_fields or command["reason_span"] is not None:
+        if canonical(f) != canonical(selected_fields) or command["reason_span"] is not None:
             raise LifecycleError("Account reply can only set the account selected by the person")
     required = FIELDS - {"coverage", "original_amount", "original_currency"}
     missing = [k for k in sorted(required) if f.get(k) is None]

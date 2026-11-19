@@ -164,6 +164,10 @@ class DailyPort:
     ):
         from finance_core.lifecycle_v2.daily_v1.movement_contracts import question_target
 
+        if purpose == "account_selection" and set(subject) != {"draft_fields", "offered_accounts"}:
+            raise ValueError(
+                "Delivered account question contains only the draft and offered accounts"
+            )
         registered = self.movement_sources[source_id]
         target = question_target(
             self._registered_target(binding, source_id, registered["evidence_id"], kind, fact_ref)
@@ -206,7 +210,9 @@ class DailyPort:
             "delivery_evidence_id": actual_delivery_id or question["delivery_ref"]["evidence_id"],
             "current_version_at_reply": self.movement_latest_question[question["question_id"]],
         }
-        if selected_account is not None:
+        if question["purpose"] == "account_selection":
+            if selected_account is None:
+                raise ValueError("The actual account reply must identify the selected account")
             origin["selected_account"] = selected_account
             question = {
                 **question,

@@ -116,7 +116,8 @@ def _instruction_link(service, conn, instruction, target, previous):
             prior.get("format") != INCOMPLETE_FORMAT
             or prior.get("missing_fields") != ["account_id"]
             or prior["command"]["reason_span"] is not None
-            or prior["command"]["fields"] != question["subject"]["draft_fields"]
+            or canonical(prior["command"]["fields"])
+            != canonical(question["subject"]["draft_fields"])
         ):
             raise LifecycleError("Account question differs from the previous incomplete draft")
     if _fingerprint(conn) != fingerprint:
