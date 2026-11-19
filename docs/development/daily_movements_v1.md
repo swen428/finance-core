@@ -113,16 +113,30 @@ The canonical link JSON has exactly `format` (the
 - `direct_targeted_instruction` binds a genuine target selection or explicit
   controlled command, independently preserved by the adapter. It has no
   question. A bare included/excluded answer is insufficient for this mode.
-- `question_reply` binds an actual delivered `opening_coverage` question for
-  creation/correction. It cannot supply a whole-event VOID instruction; VOID
-  requires a direct targeted instruction and genuine reason. The question contains `question_id`, `question_version`, `delivery_ref`, `purpose`,
-  `target` and `subject`. The question target contains the same source,
-  binding, prior proposal and fact context, excluding the future reply's
-  instruction reference. Subject contains account/opening references, financial
-  kind, original and actual money/currencies, business date and funds time.
-  Core compares subject against the proposed financial values exactly. An
+- `question_reply` binds an actual delivered question and the person's reply.
+  It cannot supply a whole-event VOID instruction. VOID requires a direct
+  targeted instruction and genuine reason. The question contains `question_id`,
+  `question_version`, `delivery_ref`, `purpose`, `target` and `subject`. The
+  question target contains the same source, binding, prior proposal and fact
+  context, excluding the future reply's instruction reference.
+- An `opening_coverage` question for creation or correction retains
+  account and opening references, financial kind, original and actual money
+  and currencies, business date, and funds time in its subject. Core compares
+  the subject against the proposed financial values exactly. An
   answer to a question about 9 cannot authorize a proposal for 90; the latter
   remains pending until a new matching question/reply or explicit instruction.
+- An `account_selection` question applies to a new expense whose previous
+  draft is missing only the account. Its subject includes the exact draft
+  fields and offered account definitions from the delivered question, plus
+  the selected account definition from the person's reply. The delivery
+  reference continues to bind the question as it was sent. The adapter
+  authenticates the selected definition from the preserved reply association
+  separately. Core rechecks the
+  prior draft, the exact current definition and the selected account's currency.
+  The proposal may fill only the account, and the expense currency must match
+  that account. If the opening balance still needs a coverage answer, the
+  expense remains pending. A separate complete card and confirmation are
+  required for posting.
 
 The adapter authenticates actual question version, delivery, reply-to or choice,
 actor/client, causal order and eligibility at the original instruction event.

@@ -145,11 +145,17 @@ class DailyPort:
             "link_json": canonical(material),
         }
 
-    def register_opening_question(
+    def register_opening_question(self, binding, source_id, question_id, subject, **kwargs):
+        return self.register_movement_question(
+            binding, source_id, question_id, "opening_coverage", subject, **kwargs
+        )
+
+    def register_movement_question(
         self,
         binding,
         source_id,
         question_id,
+        purpose,
         subject,
         *,
         version=1,
@@ -166,7 +172,7 @@ class DailyPort:
         delivered = {
             "question_id": question_id,
             "question_version": version,
-            "purpose": "opening_coverage",
+            "purpose": purpose,
             "target": target,
             "subject": subject,
         }
@@ -180,6 +186,13 @@ class DailyPort:
         return question
 
     def register_opening_reply(self, question, instruction_id, *, actual_delivery_id=None):
+        self.register_movement_reply(
+            question, instruction_id, actual_delivery_id=actual_delivery_id
+        )
+
+    def register_movement_reply(
+        self, question, instruction_id, *, actual_delivery_id=None, selected_account=None
+    ):
         from finance_core.lifecycle_v2.contracts import canonical
         from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref
 
@@ -193,6 +206,12 @@ class DailyPort:
             "delivery_evidence_id": actual_delivery_id or question["delivery_ref"]["evidence_id"],
             "current_version_at_reply": self.movement_latest_question[question["question_id"]],
         }
+        if selected_account is not None:
+            origin["selected_account"] = selected_account
+            question = {
+                **question,
+                "subject": {**question["subject"], "selected_account": selected_account},
+            }
         self.movement_link_origins[identity] = origin
         material = {
             "format": "finance-daily-movement-instruction-link-v1",
@@ -228,6 +247,14 @@ class DailyPort:
                 retained = self.movement_questions[
                     question["question_id"] + ":" + str(question["question_version"])
                 ]
+                if "selected_account" in original:
+                    retained = {
+                        **retained,
+                        "subject": {
+                            **retained["subject"],
+                            "selected_account": original["selected_account"],
+                        },
+                    }
                 delivered = self.movement_delivered_questions[original["delivery_evidence_id"]]
                 if (
                     retained != question
