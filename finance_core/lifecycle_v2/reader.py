@@ -213,8 +213,9 @@ class LedgerReader:
         """Project a draft from exact source and manual reply on one read snapshot."""
         from .daily_v1.accounts import _BoundService
 
-        service = _BoundService(self.service)
-        with lifecycle_read_operation(service.owner) as conn:
+        base = self.service
+        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
+            service = _BoundService(base)
             conn.execute("BEGIN")
             try:
                 return self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
@@ -240,8 +241,8 @@ class LedgerReader:
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
         service = self.service
-        bound = _BoundService(service)
-        with service._runtime_scope(), lifecycle_read_operation(bound.owner) as conn:
+        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
+            bound = _BoundService(service)
             _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
             conn.execute("BEGIN")
             try:
