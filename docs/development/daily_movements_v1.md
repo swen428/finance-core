@@ -197,3 +197,12 @@ instruction, proposal, delivery and action evidence check still uses the real
 port and the original request. Independent snapshot-copy audits and writer
 checks for the live target and dependencies use SQL. The private optimization
 has the same financial limits and complete-scope requirements as the SQL path.
+
+`collect_with_contributions_v1()` supplies the existing account, movement and
+original-currency totals with the exact record versions and original amounts
+used for income and expense statistics. It returns resolved balance effects
+and the same read identity in the same protected snapshot. Unknown-account
+legacy expenses contribute to expense totals and retain their completeness
+warning. A correction contributes its current version, and a voided movement
+has no current contribution. Consumers can use the read identity to decide
+whether a follow-up still describes the same snapshot.

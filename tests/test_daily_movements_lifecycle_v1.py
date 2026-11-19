@@ -123,8 +123,16 @@ def test_normal_income_expense_one_balance_and_original_receipts(live):
         ledger, port, api, account, "income", fields(account, "200", "income")
     )
     _, _, expense = movement(ledger, port, api, account, "expense")
-    result = reader.collect()
+    original_read = reader.collect_with_contributions_v1()
+    result = original_read.collection
     assert result.balances[0].balance_amount == "1191.00"
+    assert {(part.kind, part.currency, part.amount) for part in original_read.contributions} == {
+        ("income", "MYR", "200.00"),
+        ("expense", "MYR", "9.00"),
+    }
+    assert {
+        (part.fact_ref.record_id, part.fact_ref.version) for part in original_read.contributions
+    } == {(first.receipt.record_id, 1), (expense.receipt.record_id, 1)}
     assert result.income_by_currency == (("MYR", "200.00"),)
     assert result.expense_by_currency == (("MYR", "9.00"),)
     assert result.read_identity.event_seq > 0 and result.complete
@@ -133,11 +141,24 @@ def test_normal_income_expense_one_balance_and_original_receipts(live):
     _, _, corrected = movement(
         ledger, port, api, account, "correct", fields(account, "10"), current, "movement_correct"
     )
-    assert reader.collect().balances[0].balance_amount == "1190.00"
+    corrected_read = reader.collect_with_contributions_v1()
+    assert corrected_read.collection.balances[0].balance_amount == "1190.00"
+    repaired = [detail for detail in corrected_read.contributions if detail.kind == "expense"]
+    assert len(repaired) == 1
+    assert repaired[0].fact_ref.version == corrected.receipt.version == 2
+    assert repaired[0].fact_ref.fact_sha256 == corrected.receipt.fact_sha256
+    assert repaired[0].amount == "9.00"
+    assert corrected_read.collection.expense_by_currency == (("MYR", "9.00"),)
+    assert corrected_read.read_identity != original_read.read_identity
     current = reader.detail(corrected.receipt.record_id)
     movement(ledger, port, api, account, "void", {}, current, "movement_void", "duplicate coffee")
-    result = reader.collect()
+    voided_read = reader.collect_with_contributions_v1()
+    result = voided_read.collection
     assert result.balances[0].balance_amount == "1200.00"
+    assert voided_read.contributions == tuple(
+        detail for detail in original_read.contributions if detail.kind == "income"
+    )
+    assert voided_read.read_identity != corrected_read.read_identity
     assert result.expense_by_currency == ()
     assert len(reader.history(current.record_id)) == 3
     assert api.confirm(review.review_id, "action-income", "confirm-income") == first
@@ -152,6 +173,25 @@ def test_normal_income_expense_one_balance_and_original_receipts(live):
             reader.detail(current.record_id),
             "movement_void",
         )
+
+
+def test_equal_expenses_contribute_separate_record_versions_to_one_total(live):
+    ledger, port, _, api, reader, account = prepare(live)
+    _, _, first = movement(ledger, port, api, account, "first-coffee")
+    _, _, second = movement(ledger, port, api, account, "second-coffee")
+    snapshot = reader.collect_with_contributions_v1()
+
+    assert snapshot.collection.expense_by_currency == (("MYR", "18.00"),)
+    assert snapshot.collection.balances[0].balance_amount == "982.00"
+    assert len(snapshot.contributions) == 2
+    assert {item.fact_ref.record_id for item in snapshot.contributions} == {
+        first.receipt.record_id,
+        second.receipt.record_id,
+    }
+    assert all(
+        (item.kind, item.amount, item.currency) == ("expense", "9.00", "MYR")
+        for item in snapshot.contributions
+    )
 
 
 def test_unknown_opening_reports_net_change_without_balance(live):
@@ -169,7 +209,14 @@ def test_dual_amount_and_credit_debt(live):
     movement(
         ledger, port, api, account, "jpy", fields(account, "9", original="1000", currency="JPY")
     )
-    result = reader.collect()
+    snapshot = reader.collect_with_contributions_v1()
+    (contribution,) = snapshot.contributions
+    assert (contribution.kind, contribution.amount, contribution.currency) == (
+        "expense",
+        "1000",
+        "JPY",
+    )
+    result = snapshot.collection
     assert result.expense_by_currency == (("JPY", "1000"),)
     assert result.balances[0].balance_amount == "-309.00"
     assert result.balances[0].credit_card_debt == "309.00"
@@ -783,11 +830,18 @@ def test_legacy_unknown_expense_whole_void_preserves_original_receipt_and_cash_b
     original_card = ledger.prepare_review(proposal.proposal_id, proposal.version)
     ledger.record_delivery(original_card.review_id, "delivery-legacy-void")
     original = ledger.confirm(original_card.review_id, "action-legacy-void", "confirm-legacy-void")
+    snapshot = reader.collect_with_contributions_v1()
+    (detail,) = snapshot.contributions
+    assert (detail.amount, detail.currency, detail.business_date) == ("12.00", "SGD", "2026-10-24")
+    assert detail.fact_ref.record_id == original.record_id
+    assert "unassigned_personal_expense" in snapshot.collection.completeness_gaps
     target = reader.detail(original.record_id)
     movement(
         ledger, port, api, account, "whole-void", {}, target, "movement_void", "duplicate coffee"
     )
-    result = reader.collect()
+    after = reader.collect_with_contributions_v1()
+    assert after.contributions == ()
+    result = after.collection
     assert result.expense_by_currency == ()
     assert result.unassigned_personal_expense_count == 0
     assert result.balances[0].balance_amount == "1000.00"
