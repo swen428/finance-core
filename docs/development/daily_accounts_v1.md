@@ -301,6 +301,17 @@ the later complete financial domain need their own measured volume, history,
 pending-state and installation evidence. No audit, callback, resource or
 transaction check may be skipped to satisfy a timing target.
 
+For ordinary workload measurement, a synthetic service can explicitly select
+`DailyCapacityV2.SYNTHETIC_512` when constructing `LedgerService`. It raises the
+total record inventory bound to 512 for that service and its daily account and
+movement operations. Fact-version and proposal bounds are the same. An
+independent caller specifies the same synthetic profile when verifying a sealed
+snapshot. The profile is fixed when a service is constructed. All of the old
+entry points use the existing bound by default. The profile is available only
+on synthetic bindings and does not enlarge the separate opening-answer and
+opening-map limits. Each ordinary expense still follows capture, proposal,
+review, delivery and confirmation.
+
 Source validation, independently installed wheel/sdist acceptance, hosted
 validation, merge approval, immutable release publication, consumer admission
 and runtime activation remain separate evidence layers under the

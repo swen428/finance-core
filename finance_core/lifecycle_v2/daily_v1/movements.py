@@ -925,7 +925,9 @@ class DailyMovementServiceV1:
                     "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
                     (expected.record_id,),
                 ).fetchone()
-                _require_fact_capacity(conn, new_record=predecessor is None)
+                _require_fact_capacity(
+                    conn, new_record=predecessor is None, daily_capacity=service.daily_capacity
+                )
                 source = service._source(
                     conn, expected.source_id, allow_archived=predecessor is not None
                 )

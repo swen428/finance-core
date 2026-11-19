@@ -13,6 +13,7 @@ from finance_core.instance_admission.sessions import (
 
 from ..contracts import (
     CommitReceipt,
+    DailyCapacityV2,
     ExpectedAction,
     ExpectedDisplay,
     LifecycleError,
@@ -56,6 +57,10 @@ MAX_FACT_VERSIONS = 2048
 MAX_PROPOSALS = 4096
 
 
+def _record_limit(daily_capacity: DailyCapacityV2 | None) -> int:
+    return 512 if daily_capacity is DailyCapacityV2.SYNTHETIC_512 else MAX_RECORDS
+
+
 def bundle_ref(fact):
     return BundleFactRefV1(
         fact["record_id"], fact["version"], fact["fact_sha256"], fact["commit_seq"]
@@ -88,7 +93,7 @@ def _source_instruction(source):
     )
 
 
-def _limits(conn, *, _rows=None):
+def _limits(conn, *, _rows=None, daily_capacity=None):
     if _rows is None:
         records, versions = conn.execute(
             "SELECT count(DISTINCT record_id),count(*) FROM l2_facts"
@@ -96,7 +101,7 @@ def _limits(conn, *, _rows=None):
     else:
         records = len(_rows.vector(conn, "records"))
         versions = len(_rows.table(conn, "facts"))
-    if records > MAX_RECORDS or versions > MAX_FACT_VERSIONS:
+    if records > _record_limit(daily_capacity) or versions > MAX_FACT_VERSIONS:
         raise LifecycleError("complete_read_limit_exceeded")
     proposals = (
         len(_rows.table(conn, "proposals"))
@@ -107,13 +112,13 @@ def _limits(conn, *, _rows=None):
         raise LifecycleError("complete_read_limit_exceeded")
 
 
-def _require_fact_capacity(conn, *, new_record: bool) -> None:
+def _require_fact_capacity(conn, *, new_record: bool, daily_capacity=None) -> None:
     """Check the projected inventory for either kind of daily confirmation."""
     if new_record:
         records, versions = conn.execute(
             "SELECT count(DISTINCT record_id),count(*) FROM l2_facts"
         ).fetchone()
-        at_record_limit = records >= MAX_RECORDS
+        at_record_limit = records >= _record_limit(daily_capacity)
     else:
         versions = conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0]
         at_record_limit = False
@@ -137,13 +142,15 @@ def registered_values(value):
     return _money(value)
 
 
-def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None):
+def closure(
+    conn, account_id, *, before_seq=None, before_values=None, _rows=None, daily_capacity=None
+):
     """Scan every registered domain by account, never by an old opening ID.
 
     Caller supplies a commit/review prefix only for authenticated historical
     reconstruction. Current writes invoke a full evidence audit first.
     """
-    _limits(conn, _rows=_rows)
+    _limits(conn, _rows=_rows, daily_capacity=daily_capacity)
     if before_seq is None:
         before_seq = conn.execute("SELECT coalesce(max(seq),0)+1 FROM l2_events").fetchone()[0]
     if (
@@ -441,6 +448,7 @@ def verify_review(service, conn, review, *, _rows=None):
             before_seq=events[0]["seq"],
             before_values=expected.before_values,
             _rows=_rows,
+            daily_capacity=service.daily_capacity,
         )
         if len(events) == 1 and needs_closure(values)
         else None
@@ -555,6 +563,7 @@ def verify_fact(service, conn, fact, *, _rows=None):
         before_seq=fact["commit_seq"],
         before_values=material["before_values"],
         _rows=_rows,
+        daily_capacity=service.daily_capacity,
     ):
         raise LifecycleError("Daily commit-prefix dependency closure changed")
     if values["transition"] in {"account_create", "opening_set"} and values["opening"]:
@@ -655,7 +664,12 @@ class _BoundService(SnapshotEvidenceVerifier):
     """One operation's exact base service and evidence port references."""
 
     def __init__(self, base):
-        super().__init__(_EvidenceReadPort(base.port), base.binding, base.legacy_verifier)
+        super().__init__(
+            _EvidenceReadPort(base.port),
+            base.binding,
+            base.legacy_verifier,
+            daily_capacity=base.daily_capacity,
+        )
         self.owner = base.owner
         self.runtime_admission = base.runtime_admission
         self.clock = base.clock
@@ -665,7 +679,7 @@ class _BoundService(SnapshotEvidenceVerifier):
 
 
 def _audit(service, conn):
-    _limits(conn)
+    _limits(conn, daily_capacity=service.daily_capacity)
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
@@ -674,7 +688,13 @@ def _audit(service, conn):
     from ..reader import audit_evidence_connection
 
     fingerprint = _fingerprint(conn)
-    result = audit_evidence_connection(conn, service.port, service.binding, service.legacy_verifier)
+    result = audit_evidence_connection(
+        conn,
+        service.port,
+        service.binding,
+        service.legacy_verifier,
+        daily_capacity=service.daily_capacity,
+    )
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Evidence callback changed protected state")
     return result
@@ -1185,7 +1205,12 @@ class DailyAccountServiceV1:
                 review_id = _id("daily-review")
                 now = service._now()
                 dependency = (
-                    closure(conn, expected.record_id, before_values=expected.before_values)
+                    closure(
+                        conn,
+                        expected.record_id,
+                        before_values=expected.before_values,
+                        daily_capacity=service.daily_capacity,
+                    )
                     if needs_closure(values)
                     else None
                 )
@@ -1328,14 +1353,19 @@ class DailyAccountServiceV1:
 
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
                 elif needs_closure(values) and material["opening_dependency_closure"] != closure(
-                    conn, expected.record_id, before_values=expected.before_values
+                    conn,
+                    expected.record_id,
+                    before_values=expected.before_values,
+                    daily_capacity=service.daily_capacity,
                 ):
                     raise LifecycleError("Opening dependency closure changed")
                 predecessor = conn.execute(
                     "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
                     (expected.record_id,),
                 ).fetchone()
-                _require_fact_capacity(conn, new_record=predecessor is None)
+                _require_fact_capacity(
+                    conn, new_record=predecessor is None, daily_capacity=service.daily_capacity
+                )
                 source = service._source(
                     conn, expected.source_id, allow_archived=predecessor is not None
                 )
@@ -1347,7 +1377,10 @@ class DailyAccountServiceV1:
                 if material["format"] == "finance-daily-opening-review-v2":
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
                 elif needs_closure(values) and material["opening_dependency_closure"] != closure(
-                    conn, expected.record_id, before_values=expected.before_values
+                    conn,
+                    expected.record_id,
+                    before_values=expected.before_values,
+                    daily_capacity=service.daily_capacity,
                 ):
                     raise LifecycleError("Opening dependency closure changed after source callback")
                 version = expected.expected_version + 1

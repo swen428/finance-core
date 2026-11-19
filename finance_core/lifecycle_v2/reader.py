@@ -7,7 +7,14 @@ import json
 
 from finance_core.instance_admission.sessions import lifecycle_read_operation
 
-from .contracts import LifecycleError, VerifiedSource, canonical, digest
+from .contracts import (
+    DailyCapacityV2,
+    LifecycleError,
+    VerifiedSource,
+    canonical,
+    digest,
+    validate_daily_capacity,
+)
 from .service import _capture_generation, _fact_material
 
 
@@ -219,7 +226,11 @@ class LedgerReader:
                 conn.execute("BEGIN")
                 try:
                     return audit_evidence_connection(
-                        conn, self.service.port, self.service.binding, self.service.legacy_verifier
+                        conn,
+                        self.service.port,
+                        self.service.binding,
+                        self.service.legacy_verifier,
+                        daily_capacity=self.service.daily_capacity,
                     )
                 finally:
                     conn.rollback()
@@ -618,8 +629,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
 class SnapshotEvidenceVerifier:
     """Read-only snapshot proof context; has no owner or operation capability."""
 
-    def __init__(self, port, binding, legacy_verifier=None):
+    def __init__(self, port, binding, legacy_verifier=None, *, daily_capacity=None):
+        validate_daily_capacity(binding, daily_capacity)
         self.port, self.binding, self.legacy_verifier = port, binding, legacy_verifier
+        self.daily_capacity = daily_capacity
 
     def _actor(self, evidence):
         if (
@@ -651,7 +664,9 @@ def _has_daily_values(conn):
     )
 
 
-def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
+def audit_evidence_connection(
+    conn, port, binding, legacy_verifier=None, *, daily_capacity: DailyCapacityV2 | None = None
+):
     """Authenticate every signed source/provider/display/action and dormant archive."""
     from finance_core.instance_admission.sessions import _witness_for
 
@@ -664,14 +679,25 @@ def audit_evidence_connection(conn, port, binding, legacy_verifier=None):
             port = _EvidenceReadPort(port)
     # Raw immutable snapshot readback retains its independent SQL boundary.
     # An exact adapter alone is not admission; the selector proves its context.
+    if daily_capacity is not None:
+        from .daily_v1.accounts import _limits
+
+        validate_daily_capacity(binding, daily_capacity)
+        _limits(conn, daily_capacity=daily_capacity)
     with audit_rows(conn, port) as rows:
-        return _audit_evidence_connection(conn, port, binding, legacy_verifier, _rows=rows)
+        return _audit_evidence_connection(
+            conn, port, binding, legacy_verifier, _rows=rows, daily_capacity=daily_capacity
+        )
 
 
-def _audit_evidence_connection(conn, port, binding, legacy_verifier=None, *, _rows=None):
+def _audit_evidence_connection(
+    conn, port, binding, legacy_verifier=None, *, _rows=None, daily_capacity=None
+):
     """Original SQL reference with optional private, audit-local raw lookups."""
     result = audit_connection(conn, _rows=_rows)
-    verifier = SnapshotEvidenceVerifier(port, binding, legacy_verifier)
+    verifier = SnapshotEvidenceVerifier(
+        port, binding, legacy_verifier, daily_capacity=daily_capacity
+    )
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
