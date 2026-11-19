@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -24,6 +25,7 @@ REGISTRY_ID = "finance-daily-account-opening-domains-v1"
 COMMANDS = frozenset(
     {"account_create", "account_rename", "opening_set", "opening_correct", "opening_void"}
 )
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def exact(value, keys, label):
@@ -33,24 +35,23 @@ def exact(value, keys, label):
 
 
 def text(value, label, limit=256):
-    if (
-        type(value) is not str
-        or not value
-        or value != value.strip()
-        or len(value.encode("utf-8")) > limit
-        or unicodedata.normalize("NFC", value) != value
-        or any(unicodedata.category(c).startswith("C") for c in value)
-    ):
+    if type(value) is not str or not value or value != value.strip():
+        raise LifecycleError("Invalid bounded " + label)
+    if value.isascii():
+        invalid = len(value) > limit or not value.isprintable()
+    else:
+        invalid = (
+            len(value.encode("utf-8")) > limit
+            or unicodedata.normalize("NFC", value) != value
+            or any(unicodedata.category(c).startswith("C") for c in value)
+        )
+    if invalid:
         raise LifecycleError("Invalid bounded " + label)
     return value
 
 
 def sha(value):
-    if (
-        type(value) is not str
-        or len(value) != 64
-        or any(c not in "0123456789abcdef" for c in value)
-    ):
+    if type(value) is not str or _SHA256.fullmatch(value) is None:
         raise LifecycleError("Exact lowercase SHA-256 required")
     return value
 
