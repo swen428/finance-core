@@ -2,6 +2,7 @@
 
 from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
+from typing import Literal
 
 from finance_core.instance_admission.authority import _logical_database_digest
 from finance_core.instance_admission.sessions import (
@@ -79,8 +80,29 @@ class DailyLedgerWithEffectsV1:
         return self.collection.read_identity
 
 
+@dataclass(frozen=True)
+class DailyStatisticContributionV1:
+    kind: Literal["income", "expense"]
+    currency: str
+    amount: str
+    business_date: str
+    fact_ref: BundleFactRefV1
+
+
+@dataclass(frozen=True)
+class DailyLedgerWithContributionsV1:
+    collection: DailyLedgerCollectionV1
+    contributions: tuple[DailyStatisticContributionV1, ...]
+    effects: tuple[DailyResolvedEffectV1, ...]
+    format: str = "finance-daily-ledger-with-contributions-v1"
+
+    @property
+    def read_identity(self):
+        return self.collection.read_identity
+
+
 class DailyLedgerReaderV1(DailyAccountReaderV1):
-    def _ledger(self, limits=None):
+    def _ledger(self, limits=None, *, include_contributions=False):
         limits = DailyReadLimitsV1() if limits is None else limits
         if type(limits) is not DailyReadLimitsV1:
             raise LifecycleError("Exact daily read limits required")
@@ -122,11 +144,24 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         legacy.append(view)
                 income, expense = {}, {}
                 resolved_effects = []
+                contributions = []
                 net = {k: Decimal(0) for k in accounts}
                 delta = dict(net)
                 with localcontext(
                     Context(prec=256, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999)
                 ):
+
+                    def add_total(kind, currency, amount, business_date, fact_ref):
+                        totals = expense if kind == "expense" else income
+                        value = Decimal(amount)
+                        totals[currency] = totals.get(currency, Decimal(0)) + value
+                        if include_contributions:
+                            contributions.append(
+                                DailyStatisticContributionV1(
+                                    kind, currency, amount, business_date, fact_ref
+                                )
+                            )
+
                     for view in movements:
                         values = view.values
                         impact = effect(values)
@@ -140,18 +175,23 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                             resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
                             net[account.account_id] += Decimal(impact["amount"])
                             delta[account.account_id] += Decimal(resolved["balance_impact"])
-                            totals = expense if values["kind"] == "expense" else income
-                            currency = values["original_currency"]
-                            totals[currency] = totals.get(currency, Decimal(0)) + Decimal(
-                                values["original_amount"]
+                            add_total(
+                                values["kind"],
+                                values["original_currency"],
+                                values["original_amount"],
+                                values["business_date"],
+                                view.fact_ref,
                             )
                     from ..effective_v1 import _business_fields
 
                     for view in legacy:
                         old = _business_fields(view.values_json)
-                        currency = old["currency"]
-                        expense[currency] = expense.get(currency, Decimal(0)) + Decimal(
-                            old["amount"]
+                        add_total(
+                            "expense",
+                            old["currency"],
+                            old["amount"],
+                            old["transaction_date"],
+                            view.fact_ref,
                         )
                     balances = []
                     for key, account in accounts.items():
@@ -218,7 +258,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         gaps,
                         len(rows),
                     )
-                return collection, history, tuple(resolved_effects)
+                return collection, history, tuple(resolved_effects), tuple(contributions)
             finally:
                 conn.rollback()
 
@@ -226,8 +266,12 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         return self._ledger(limits)[0]
 
     def collect_with_effects_v1(self, *, limits=None):
-        collection, _, effects = self._ledger(limits)
+        collection, _, effects, _ = self._ledger(limits)
         return DailyLedgerWithEffectsV1(collection, effects)
+
+    def collect_with_contributions_v1(self, *, limits=None):
+        collection, _, effects, contributions = self._ledger(limits, include_contributions=True)
+        return DailyLedgerWithContributionsV1(collection, contributions, effects)
 
     def detail(self, record_id, *, limits=None):
         history = self._ledger(limits)[1].get(record_id, ())

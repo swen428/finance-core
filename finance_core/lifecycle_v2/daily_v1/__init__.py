@@ -11,7 +11,12 @@ from .contracts import (
     OpeningRefV1,
     VerifiedDailyProposalV1,
 )
-from .ledger_reader import DailyLedgerWithEffectsV1, DailyResolvedEffectV1
+from .ledger_reader import (
+    DailyLedgerWithContributionsV1,
+    DailyLedgerWithEffectsV1,
+    DailyResolvedEffectV1,
+    DailyStatisticContributionV1,
+)
 from .opening_changes_v1 import DailyOpeningChangeServiceV1
 from .opening_contracts_v1 import (
     ExpectedOpeningInvocationV2,
@@ -79,4 +84,6 @@ __all__ += [
     "VerifiedOpeningProposalV2",
     "DailyResolvedEffectV1",
     "DailyLedgerWithEffectsV1",
+    "DailyLedgerWithContributionsV1",
+    "DailyStatisticContributionV1",
 ]
