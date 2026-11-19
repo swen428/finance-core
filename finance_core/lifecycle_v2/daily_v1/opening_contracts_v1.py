@@ -228,6 +228,40 @@ def list_material(dependencies, candidate):
     }
 
 
+def question_pages_v2(current: dict) -> dict:
+    """Frame one authenticated ordered question list as bounded presentation pages."""
+    proposal = current["proposal_ref"]
+    list_sha256 = current["list_sha256"]
+    subjects = current["subjects"]
+    if type(subjects) is not list or len(subjects) > 512:
+        raise LifecycleError("Complete opening question list exceeds page capacity")
+    if digest({"format": current["format"], "subjects": subjects}) != list_sha256:
+        raise LifecycleError("Opening question list identity differs")
+
+    pages = []
+    for index, start in enumerate(range(0, len(subjects), 16), start=1):
+        page = {
+            "format": "finance-daily-opening-question-page-v2",
+            "proposal_ref": proposal,
+            "list_sha256": list_sha256,
+            "index": index,
+            "subjects": subjects[start : start + 16],
+        }
+        complete_page = {**page, "page_sha256": digest(page)}
+        if len(canonical(complete_page).encode("utf-8")) > 64 * 1024:
+            raise LifecycleError("Opening question page exceeds byte bound")
+        pages.append(complete_page)
+
+    manifest = {
+        "format": "finance-daily-opening-question-pages-v2",
+        "proposal_ref": proposal,
+        "list_sha256": list_sha256,
+        "subject_count": len(subjects),
+        "page_sha256": [page["page_sha256"] for page in pages],
+    }
+    return {**manifest, "manifest_sha256": digest(manifest), "pages": pages}
+
+
 def validate_map(value, bundle):
     exact(
         value,

@@ -51,6 +51,7 @@ from .opening_contracts_v1 import (
     decode_expected,
     decode_link,
     list_material,
+    question_pages_v2,
 )
 
 
@@ -723,6 +724,10 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                 "list_sha256": digest(material),
                 **material,
             }
+
+    def opening_questions_v2(self, proposal_id):
+        """Present the complete current questions without granting answer or commit authority."""
+        return question_pages_v2(self.opening_questions_v1(proposal_id))
 
     def prepare_review(self, proposal_id, expected_proposal_version):
         with self._write() as (service, conn):

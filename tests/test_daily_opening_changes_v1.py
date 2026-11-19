@@ -136,6 +136,35 @@ def financial_rows(ledger):
         )
 
 
+def test_question_page_format_binds_all_five_hundred_subjects():
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import question_pages_v2
+
+    subjects = [
+        {
+            "movement_fact_ref": {"record_id": f"movement-{ordinal:03}"},
+            "impact_role": "debit",
+            "description": "测试消费 " * 32,
+        }
+        for ordinal in range(500)
+    ]
+    material = {"format": "finance-daily-opening-question-list-v1", "subjects": subjects}
+    current = {
+        **material,
+        "proposal_ref": {"proposal_id": "synthetic-proposal"},
+        "list_sha256": digest(material),
+    }
+    result = question_pages_v2(current)
+    assert result["subject_count"] == 500 and len(result["pages"]) == 32
+    assert [s for page in result["pages"] for s in page["subjects"]] == subjects
+    for index, page in enumerate(result["pages"], 1):
+        assert page["index"] == index
+        assert page["page_sha256"] == digest({k: v for k, v in page.items() if k != "page_sha256"})
+    assert result["page_sha256"] == [page["page_sha256"] for page in result["pages"]]
+    assert result["manifest_sha256"] == digest(
+        {key: value for key, value in result.items() if key not in {"manifest_sha256", "pages"}}
+    )
+
+
 def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, request):
     ledger, port, daily, movements, reader, api, source, initial, account, cfg = prepare_opening(
         live
@@ -159,6 +188,13 @@ def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, requ
     with pytest.raises(LifecycleError, match="incomplete_proposal"):
         api.prepare_review(draft.proposal_id, draft.version)
     questions = api.opening_questions_v1(draft.proposal_id)
+    framed = api.opening_questions_v2(draft.proposal_id)
+    assert framed["proposal_ref"] == questions["proposal_ref"]
+    assert framed["list_sha256"] == questions["list_sha256"]
+    assert framed["subject_count"] == len(questions["subjects"]) == 2
+    assert [subject for page in framed["pages"] for subject in page["subjects"]] == (
+        questions["subjects"]
+    )
     by_kind = {s["kind"]: s for s in questions["subjects"]}
     q1 = port.deliver_opening_question(questions, "q1")
     income_answer = row_reply(port, "answer1", (by_kind["income"], "included"))
