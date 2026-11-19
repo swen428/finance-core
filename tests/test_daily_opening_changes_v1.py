@@ -137,7 +137,10 @@ def financial_rows(ledger):
 
 
 def test_question_page_format_binds_all_five_hundred_subjects():
-    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import question_pages_v2
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import (
+        question_pages_v2,
+        verify_question_pages_v2,
+    )
 
     subjects = [
         {
@@ -163,6 +166,14 @@ def test_question_page_format_binds_all_five_hundred_subjects():
     assert result["manifest_sha256"] == digest(
         {key: value for key, value in result.items() if key not in {"manifest_sha256", "pages"}}
     )
+    expected = {name: current[name] for name in ("proposal_ref", "list_sha256")}
+    assert verify_question_pages_v2(result, **expected) == tuple(subjects)
+    with pytest.raises(LifecycleError, match="complete original list|manifest differs"):
+        verify_question_pages_v2({**result, "pages": result["pages"][:-1]}, **expected)
+    with pytest.raises(LifecycleError, match="page identity differs"):
+        verify_question_pages_v2({**result, "pages": list(reversed(result["pages"]))}, **expected)
+    with pytest.raises(LifecycleError, match="manifest differs"):
+        verify_question_pages_v2(result, **(expected | {"proposal_ref": {"proposal_id": "other"}}))
 
 
 def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, request):

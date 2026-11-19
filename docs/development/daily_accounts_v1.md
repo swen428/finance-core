@@ -416,3 +416,19 @@ choice-code evidence; the current literal span link is not such evidence.
 Original opening instruction fields and their genuine reason retain their
 separate protocol and are not restricted to this answer syntax. The historical
 movement v1 compiler and its persisted bytes are unchanged by this extension.
+
+
+### Bounded presentation of complete opening questions
+
+`DailyOpeningChangeServiceV1.opening_questions_v2(proposal_id)` projects the
+same authenticated list into ordered pages. A page has at most 16 subjects and
+is shortened as needed to fit 64 KiB. The complete group permits up to 512
+subjects and 4 MiB of display data. The group and individual pages bind the
+original proposal and question-list hashes. `verify_question_pages_v2` uses the
+original proposal reference and list hash to reconstruct every question in
+order. A client should discard incomplete or mixed pages.
+
+This version covers transport of the already valid question inventory. The
+existing opening proposal, answer, dependency-map and confirmation rules
+continue to apply. Larger stored opening adjustments require their own
+versioned financial materials and acceptance.
