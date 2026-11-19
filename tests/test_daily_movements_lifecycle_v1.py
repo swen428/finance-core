@@ -175,6 +175,81 @@ def test_normal_income_expense_one_balance_and_original_receipts(live):
         )
 
 
+def test_held_copy_verifies_typed_history_with_exact_source_binding(live, tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from finance_core.instance_admission import (
+        InstanceAdmissionError,
+        acquire_production_owner,
+        inspect_instance_admission,
+    )
+    from finance_core.lifecycle_v2 import RuntimeBinding
+    from finance_core.lifecycle_v2.recovery import (
+        prepare_restored_profile,
+        verify_held_profile_evidence,
+        verify_snapshot_evidence,
+    )
+    from tests.instance_admission_support_v1 import synthetic_config
+
+    ledger, port, _, api, reader, account = prepare(live, opening="100", currency="SGD")
+    movement(
+        ledger, port, api, account, "expense", fields(account, "8", original="8", currency="SGD")
+    )
+    assert reader.collect().balances[0].balance_amount == "92.00"
+    snapshot = tmp_path / "typed-ledger.sqlite"
+    cut = ledger.seal_snapshot(snapshot)
+    expected = verify_snapshot_evidence(snapshot, port, ledger.binding, cut)
+    other = tmp_path / "other"
+    other.mkdir(mode=0o700)
+    with synthetic_config(other, monkeypatch, instance_id="new-typed-instance") as config:
+        target = RuntimeBinding(
+            config.instance_id,
+            "new-generation",
+            ledger.binding.principal_id,
+            ledger.binding.client_id,
+        )
+        restored = prepare_restored_profile(
+            config,
+            snapshot,
+            cut,
+            new_binding=target,
+            operation_id="typed-restore",
+            approval_ref="approved",
+        )
+        with pytest.raises(LifecycleError):
+            verify_held_profile_evidence(restored, port, target)
+        for source in (
+            replace(ledger.binding, generation="unrelated"),
+            replace(ledger.binding, client_id="unrelated"),
+            replace(ledger.binding, instance_id=target.instance_id),
+        ):
+            with pytest.raises(LifecycleError):
+                verify_held_profile_evidence(restored, port, target, source_runtime_binding=source)
+        with pytest.raises(LifecycleError):
+            verify_held_profile_evidence(
+                restored,
+                port,
+                replace(target, generation="different-target"),
+                source_runtime_binding=ledger.binding,
+            )
+        with pytest.raises((LifecycleError, InstanceAdmissionError)):
+            verify_held_profile_evidence(
+                replace(restored, restore_prepare_operation_id="different-preparation"),
+                port,
+                target,
+                source_runtime_binding=ledger.binding,
+            )
+        assert (
+            verify_held_profile_evidence(
+                restored, port, target, source_runtime_binding=ledger.binding
+            )
+            == expected
+        )
+        assert inspect_instance_admission(config)["state"] == "RESTORE_HELD"
+        with pytest.raises(InstanceAdmissionError):
+            acquire_production_owner(config)
+
+
 def test_equal_expenses_contribute_separate_record_versions_to_one_total(live):
     ledger, port, _, api, reader, account = prepare(live)
     _, _, first = movement(ledger, port, api, account, "first-coffee")

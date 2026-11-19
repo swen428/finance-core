@@ -809,10 +809,39 @@ def _held_read_connection(restored: RestoredProfile):
                         _MANAGED_SQLITE_LIFETIME_LOCK.__exit__()
 
 
-def verify_held_profile_evidence(restored: RestoredProfile, port, binding, legacy_verifier=None):
-    """Read-only diagnostic; no result grants later admission authority."""
+def verify_held_profile_evidence(
+    restored: RestoredProfile,
+    port,
+    binding,
+    legacy_verifier=None,
+    *,
+    source_runtime_binding: RuntimeBinding | None = None,
+):
+    """Read-only diagnostic on the exact prepared target.
+
+    A caller supplying the original runtime binding must authenticate it and
+    its evidence port against the selected source archive. Its history is
+    audited under that original identity while the target remains held.
+    The resulting evidence is diagnostic only. Admission uses its own checks.
+    """
     with _held_read_connection(restored) as conn:
-        return _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
+        if source_runtime_binding is None:
+            return _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
+        source = source_runtime_binding
+        if (
+            type(binding) is not RuntimeBinding
+            or binding != restored.new_binding
+            or type(source) is not RuntimeBinding
+            or (source.instance_id, source.generation)
+            != (restored.cut.instance_id, restored.cut.generation)
+            or (source.principal_id, source.client_id) != (binding.principal_id, binding.client_id)
+        ):
+            raise LifecycleError("Historical evidence binding differs from the held restore cut")
+        from .reader import audit_evidence_connection
+
+        result = audit_evidence_connection(conn, port, source, legacy_verifier)
+        _verify_cut_connection(conn, restored.cut)
+        return result
 
 
 def verify_snapshot_evidence(
