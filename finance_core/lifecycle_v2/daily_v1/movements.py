@@ -102,13 +102,24 @@ def _instruction_target(binding, source, instruction, record_id, kind, previous,
     )
 
 
-def _instruction_link(service, conn, instruction, target):
+def _instruction_link(service, conn, instruction, target, previous):
     fingerprint = _fingerprint(conn)
     actual = service.port.movement_instruction_link(conn, instruction["evidence_id"], target)
     if type(actual) is not VerifiedMovementInstructionLinkV1:
         raise LifecycleError("Exact independent movement instruction link required")
     value = asdict(actual)
-    decode_instruction_link(value, target)
+    link = decode_instruction_link(value, target)
+    question = link["question"]
+    if question is not None and question["purpose"] == "account_selection":
+        prior = strict_json(previous["values_json"])
+        if (
+            prior.get("format") != INCOMPLETE_FORMAT
+            or prior.get("missing_fields") != ["account_id"]
+            or prior["command"]["reason_span"] is not None
+            or canonical(prior["command"]["fields"])
+            != canonical(question["subject"]["draft_fields"])
+        ):
+            raise LifecycleError("Account question differs from the previous incomplete draft")
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Instruction link callback changed protected state")
     return value
@@ -206,7 +217,7 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq,
         previous,
         BundleFactRefV1(**expected.target_bundle_ref) if expected.target_bundle_ref else None,
     )
-    if _instruction_link(service, conn, instruction, target) != expected.instruction_link:
+    if _instruction_link(service, conn, instruction, target, previous) != expected.instruction_link:
         raise LifecycleError(
             "Authenticated movement instruction link differs from retained evidence"
         )
@@ -541,7 +552,7 @@ class DailyMovementServiceV1:
         target = _instruction_target(
             service.binding, source, instruction, record_id, kind, previous, ref
         )
-        link = _instruction_link(service, conn, instruction, target)
+        link = _instruction_link(service, conn, instruction, target, previous)
         return decode_expected(
             asdict(
                 ExpectedMovementInvocationV1(

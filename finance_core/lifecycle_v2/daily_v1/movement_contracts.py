@@ -9,9 +9,11 @@ from decimal import Decimal
 
 from finance_core.money import normalize_currency
 
-from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, digest
+from ..contracts import CommitReceipt, LifecycleError, RuntimeBinding, canonical, digest
 from .contracts import (
+    AccountDefinitionRefV1,
     BundleFactRefV1,
+    OpeningRefV1,
     _money,
     _reason,
     _reference,
@@ -19,6 +21,7 @@ from .contracts import (
     exact,
     instruction_ref,
     opening_ref,
+    positive,
     sha,
     strict_json,
     text,
@@ -124,12 +127,37 @@ def coverage_subject(values, account):
     }
 
 
+def _validate_account_question(subject, target):
+    if target["command_kind"] != "movement_create" or target["current_proposal"] is None:
+        raise LifecycleError("Account selection requires an unfinished movement creation")
+    exact(subject, {"draft_fields", "offered_accounts", "selected_account"}, "account question")
+    fields = subject["draft_fields"]
+    if (
+        type(fields) is not dict
+        or not fields.keys() <= FIELDS
+        or fields.get("kind") != "expense"
+        or fields.get("account_id") is not None
+        or fields.get("coverage") not in (None, {"answer": "unknown", "span": None})
+    ):
+        raise LifecycleError("Account selection requires an expense draft without an account")
+    if type(subject["offered_accounts"]) is not list or not subject["offered_accounts"]:
+        raise LifecycleError("Account question must offer actual accounts")
+    ref_fields = AccountDefinitionRefV1.__dataclass_fields__
+    offered = [
+        AccountDefinitionRefV1(**exact(ref, ref_fields, "offered account reference"))
+        for ref in subject["offered_accounts"]
+    ]
+    selected = AccountDefinitionRefV1(
+        **exact(subject["selected_account"], ref_fields, "selected account reference")
+    )
+    if len({ref.account_id for ref in offered}) != len(offered) or selected not in offered:
+        raise LifecycleError("Selected account must be one of the accounts offered")
+
+
 def decode_instruction_link(value, target=None):
     exact(value, {"evidence_id", "link_json"}, "verified movement instruction link")
     text(value["evidence_id"], "instruction link id")
     material = strict_json(value["link_json"])
-    from ..contracts import canonical
-
     if canonical(material) != value["link_json"]:
         raise LifecycleError("Canonical movement instruction link required")
     exact(material, {"format", "mode", "target", "association_ref", "question"}, "instruction link")
@@ -157,8 +185,6 @@ def decode_instruction_link(value, target=None):
     if previous is not None:
         exact(previous, {"proposal_id", "version", "proposal_sha256"}, "linked proposal")
         text(previous["proposal_id"], "linked proposal id")
-        from .contracts import positive
-
         positive(previous["version"])
         sha(previous["proposal_sha256"])
     if actual_target["target_fact_ref"] is not None:
@@ -180,22 +206,23 @@ def decode_instruction_link(value, target=None):
     question = material["question"]
     if material["mode"] == "question_reply":
         if actual_target["command_kind"] == "movement_void":
-            raise LifecycleError("opening_coverage question cannot instruct whole-event VOID")
+            raise LifecycleError("A movement question cannot instruct whole-event VOID")
         exact(
             question,
             {"question_id", "question_version", "delivery_ref", "purpose", "target", "subject"},
-            "opening coverage question",
+            "movement question",
         )
         text(question["question_id"], "question id")
-        from .contracts import positive
-
         positive(question["question_version"])
         _evidence_ref(question["delivery_ref"])
-        if question["purpose"] != "opening_coverage":
-            raise LifecycleError("unsupported_movement_question_purpose")
         if question["target"] != question_target(actual_target):
             raise LifecycleError("movement_question_target_mismatch")
         subject = question["subject"]
+        if question["purpose"] == "account_selection":
+            _validate_account_question(subject, actual_target)
+            return material
+        if question["purpose"] != "opening_coverage":
+            raise LifecycleError("unsupported_movement_question_purpose")
         exact(
             subject,
             {
@@ -211,8 +238,6 @@ def decode_instruction_link(value, target=None):
             },
             "opening coverage subject",
         )
-        from .contracts import AccountDefinitionRefV1, OpeningRefV1
-
         account = AccountDefinitionRefV1(**subject["account_ref"])
         if (
             subject["opening_ref"] is not None
@@ -278,8 +303,6 @@ def validate_before(value):
     from ..service import _money as legacy_money
 
     legacy_money(value)
-    from ..contracts import canonical
-
     _business_fields(canonical(value))
     return value
 
@@ -368,7 +391,7 @@ def _later(funds, boundary):
     return False
 
 
-def _coverage(command, expected, values, account):
+def _coverage(command, expected, values, account, question):
     opening = account["opening"]
     active = opening is not None and opening["status"] == "ACTIVE"
     supplied = command["fields"].get("coverage")
@@ -381,18 +404,20 @@ def _coverage(command, expected, values, account):
         }:
             raise LifecycleError("Unsupported opening coverage answer")
     answer = supplied["answer"] if supplied else "unknown"
-    link = decode_instruction_link(expected.instruction_link)
+    account_question = question is not None and question["purpose"] == "account_selection"
     accepted = {
         "included": {"included", "already included", "已包含", "已经包含"},
         "excluded": {"excluded", "not included", "尚未包含", "未包含"},
     }
     choices = {phrase: choice for choice, phrases in accepted.items() for phrase in phrases}
     raw = expected.instruction["raw_input"]
-    whole_choice = choices.get(raw.strip().casefold())
-    if whole_choice is not None and link["mode"] != "question_reply":
+    whole_choice = None if account_question else choices.get(raw.strip().casefold())
+    if whole_choice is not None and question is None:
         raise LifecycleError("Bare opening coverage reply requires actual linked question")
-    if link["mode"] == "question_reply" and link["question"]["subject"] != coverage_subject(
-        values, account
+    if (
+        question is not None
+        and not account_question
+        and question["subject"] != coverage_subject(values, account)
     ):
         return None
     reason = None
@@ -467,7 +492,6 @@ def compile_proposal(command, expected):
             raise LifecycleError("Whole-event VOID cannot modify business values")
         if before.get("format") != MOVEMENT_FORMAT:
             # A legacy unknown-account event has no account impact to undo.
-            from ..contracts import canonical
             from ..effective_v1 import _business_fields
 
             old = _business_fields(canonical(before))
@@ -503,6 +527,18 @@ def compile_proposal(command, expected):
             }
         )
     f = command["fields"]
+    link = decode_instruction_link(expected.instruction_link)
+    question = link["question"]
+    selection = (
+        question["subject"] if question and question["purpose"] == "account_selection" else None
+    )
+    if selection is not None:
+        selected_fields = {
+            **selection["draft_fields"],
+            "account_id": selection["selected_account"]["account_id"],
+        }
+        if canonical(f) != canonical(selected_fields) or command["reason_span"] is not None:
+            raise LifecycleError("Account reply can only set the account selected by the person")
     required = FIELDS - {"coverage", "original_amount", "original_currency"}
     missing = [k for k in sorted(required) if f.get(k) is None]
     if f.get("kind") is not None and (
@@ -531,6 +567,11 @@ def compile_proposal(command, expected):
     if account is None:
         raise LifecycleError("Exact current account selection required")
     currency = account["account"]["currency"]
+    if selection is not None and (
+        asdict(account_ref(account)) != selection["selected_account"]
+        or currency != f["original_currency"]
+    ):
+        raise LifecycleError("Account reply requires the current selected same-currency account")
     original_currency = f.get("original_currency") if f["kind"] == "expense" else currency
     if normalize_currency(original_currency) != original_currency:
         raise LifecycleError("Exact uppercase currency required")
@@ -568,7 +609,7 @@ def compile_proposal(command, expected):
         "instruction_ref": instruction_ref(expected.instruction),
         "reason_ref": reason,
     }
-    coverage = _coverage(command, expected, values, account)
+    coverage = _coverage(command, expected, values, account, question)
     if coverage is None:
         return {
             "format": INCOMPLETE_FORMAT,
