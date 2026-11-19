@@ -126,7 +126,7 @@ def _instruction_link(service, conn, instruction, target, previous):
 
 def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq, _rows=None):
     expected = decode_expected(asdict(expected))
-    source = service._source(conn, expected.source_id, allow_archived=True)
+    source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     if (
         expected.source_sha256 != source["source_sha256"]
         or expected.binding.instance_id != service.binding.instance_id

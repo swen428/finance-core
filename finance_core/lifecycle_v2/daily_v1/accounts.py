@@ -222,7 +222,7 @@ def needs_closure(values):
 def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq, _rows=None):
     """Rebuild the complete retained request from actual source/predecessors."""
     expected = decode_expected(asdict(expected))
-    source = service._source(conn, expected.source_id, allow_archived=True)
+    source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     if (
         expected.source_sha256 != source["source_sha256"]
         or expected.binding.instance_id != service.binding.instance_id

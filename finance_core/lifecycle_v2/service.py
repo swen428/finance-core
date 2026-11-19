@@ -247,11 +247,19 @@ class LedgerService:
         ):
             raise LifecycleError("Evidence actor/client mismatch")
 
-    def _source(self, conn, source_id, *, allow_archived=False):
-        row = _row(conn, "l2_sources", "source_id", source_id)
+    def _source(self, conn, source_id, *, allow_archived=False, _rows=None):
+        row = (
+            _rows.one(conn, "source", source_id)
+            if _rows is not None
+            else _row(conn, "l2_sources", "source_id", source_id)
+        )
+        if row is None:
+            raise LifecycleError("Missing l2_sources identity")
         if row["source_key"].startswith("legacy:"):
             from .legacy import verify_imported_source
 
+            if _rows is not None:
+                raise LifecycleError("Imported source requires original SQL verification")
             verify_imported_source(conn, row, self.binding, self.legacy_verifier)
             if not allow_archived and row["generation"] != self.binding.generation:
                 raise LifecycleError("Archived imported source has no current write authority")
@@ -272,9 +280,15 @@ class LedgerService:
             or hashlib.sha256(evidence.raw_input.encode()).hexdigest() != evidence.original_sha256
         ):
             raise LifecycleError("Source/original evidence changed")
-        captures = conn.execute(
-            "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?", (source_id,)
-        ).fetchall()
+        # This lookup follows the real evidence callback in both audit paths.
+        captures = (
+            _rows.project_many(conn, "entity_events", ("payload_json",), "capture", source_id)
+            if _rows is not None
+            else conn.execute(
+                "SELECT payload_json FROM l2_events WHERE kind='capture' AND entity_id=?",
+                (source_id,),
+            ).fetchall()
+        )
         if len(captures) != 1:
             raise LifecycleError("Source lacks its exact original capture event")
         generation = _capture_generation(row, captures[0][0])

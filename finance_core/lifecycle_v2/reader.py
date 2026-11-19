@@ -279,7 +279,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.accounts import verify_proposal as verify_daily_proposal
 
         return verify_daily_proposal(service, conn, proposal, _rows=_rows)
-    source = service._source(conn, proposal["source_id"], allow_archived=True)
+    source = service._source(conn, proposal["source_id"], allow_archived=True, _rows=_rows)
     raw_expected = dict(sealed["expected"])
     raw_expected["binding"] = RuntimeBinding(**raw_expected["binding"])
     expected = ExpectedInvocation(**raw_expected)
@@ -559,7 +559,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if review is None:
             raise LifecycleError("Record lacks original review")
         expected, delivery = verify_review(service, conn, review, _rows=_rows)
-        source = service._source(conn, expected.source_id, allow_archived=True)
+        source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
         if fact["source_id"] != expected.source_id or (
             version == 1 and fact["economic_event_id"] != source["source_key"]
         ):
@@ -641,10 +641,12 @@ class SnapshotEvidenceVerifier:
         ):
             raise LifecycleError("Snapshot source actor/client differs from admitted principal")
 
-    def _source(self, conn, source_id, *, allow_archived=True):
+    def _source(self, conn, source_id, *, allow_archived=True, _rows=None):
         from .service import LedgerService
 
-        return LedgerService._source(self, conn, source_id, allow_archived=allow_archived)
+        return LedgerService._source(
+            self, conn, source_id, allow_archived=allow_archived, _rows=_rows
+        )
 
 
 def _has_daily_values(conn):
@@ -714,7 +716,7 @@ def _audit_evidence_connection(
         else conn.execute("SELECT source_id FROM l2_sources")
     )
     for source in sources:
-        verifier._source(conn, source[0], allow_archived=True)
+        verifier._source(conn, source[0], allow_archived=True, _rows=_rows)
     proposals = (
         _rows.table(conn, "proposals")
         if _rows is not None
