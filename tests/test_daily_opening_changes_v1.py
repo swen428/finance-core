@@ -64,7 +64,18 @@ def opening_command(kind="opening_correct", amount="900", boundary=None, answers
 
 
 def opening_proposal(
-    ledger, port, api, source, previous, account, identity, cmd, original=None, question=None
+    ledger,
+    port,
+    api,
+    source,
+    previous,
+    account,
+    identity,
+    cmd,
+    original=None,
+    question=None,
+    *,
+    page_initial_dependencies=False,
 ):
     if identity not in port.sources:
         if original is not None:
@@ -92,6 +103,7 @@ def opening_proposal(
         reply_evidence_id=identity,
         command_kind=cmd["command_kind"],
         opening_instruction_evidence_id=original,
+        page_initial_dependencies=page_initial_dependencies,
     )
 
 
@@ -176,7 +188,8 @@ def test_question_page_format_binds_all_five_hundred_subjects():
         verify_question_pages_v2(result, **(expected | {"proposal_ref": {"proposal_id": "other"}}))
 
 
-def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, request):
+@pytest.mark.parametrize("paged", [False, True], ids=["scalar", "paged"])
+def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, request, paged):
     ledger, port, daily, movements, reader, api, source, initial, account, cfg = prepare_opening(
         live
     )
@@ -194,6 +207,7 @@ def test_nonempty_correction_partial_answers_rename_and_resolved_void(live, requ
         reader.get_account(account),
         "opening",
         opening_command(),
+        page_initial_dependencies=paged,
     )
     assert len(api.pending()[0]["values"]["missing_fields"]) == 2
     with pytest.raises(LifecycleError, match="incomplete_proposal"):
@@ -1704,3 +1718,124 @@ def test_opening_chain_normal_unknown_restart_confirmation_fresh_instruction_and
         )
     current = {r[:2]: r[2:] for r in financial_rows(ledger)}
     assert all(current[r[:2]] == r[2:] for r in originals)
+
+
+def test_owned_pending_opening_pages_survive_original_owner_and_immutable_cut(
+    live, tmp_path, request, monkeypatch
+):
+    import sqlite3
+    from copy import deepcopy
+    from dataclasses import asdict, replace
+
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.lifecycle_v2 import LedgerService
+    from finance_core.lifecycle_v2.daily_v1 import _opening_proposal_pages_v1 as pages
+    from finance_core.lifecycle_v2.daily_v1.contracts import strict_json
+    from finance_core.lifecycle_v2.reader import audit_evidence_connection
+
+    ledger, port, _, movements, reader, api, source, previous, account, cfg = prepare_opening(live)
+    movement(ledger, port, movements, account, "expense")
+    movement(ledger, port, movements, account, "income", fields(account, "2", "income"))
+    view = reader.get_account(account)
+    original_facts = financial_rows(ledger)
+    command = opening_command()
+
+    def register(identity, padding):
+        port.add_source(identity, "wrong opening; set 900 MYR " + "a" * padding)
+        port.register_opening(ledger.binding, source, view, previous, identity)
+        port.commands[identity] = command
+        return api.expected_opening_change_v2(account, view.bundle_ref, identity, "opening_correct")
+
+    probe = register("page-shape", 0)
+    probe_seal = {
+        "format": "finance-daily-opening-observation-v2",
+        "expected": asdict(probe),
+        "observation": asdict(port.opening_proposal_v2(None, "page-shape", probe)),
+    }
+    expected = register("page-start", (131072 + 1000 - len(canonical(probe_seal))) // 2)
+    args = account, "page-start", view.bundle_ref, "propose-page-start"
+    kwargs = {"reply_evidence_id": "page-start", "command_kind": "opening_correct"}
+    with pytest.raises(LifecycleError, match="Bounded exact JSON"):
+        api.propose_opening_change_v2(*args, **kwargs)
+    prior_event_count = ledger.reader().full_audit()["event_count"]
+    with monkeypatch.context() as limits:
+        limits.setattr(pages, "_CUT_BYTES", 131072)
+        with pytest.raises(LifecycleError, match="storage budget"):
+            api.propose_opening_change_v2(*args, **kwargs, page_initial_dependencies=True)
+    assert ledger.reader().full_audit()["event_count"] == prior_event_count
+    draft = api.propose_opening_change_v2(*args, **kwargs, page_initial_dependencies=True)
+    assert draft == api.propose_opening_change_v2(*args, **kwargs, page_initial_dependencies=True)
+    with lifecycle_read_operation(ledger.owner) as conn:
+        row = conn.execute(
+            "SELECT * FROM l2_proposals WHERE proposal_id=?", (draft.proposal_id,)
+        ).fetchone()
+        header = strict_json(row["observation_json"])
+        assert len(canonical(pages.read_sealed(row)).encode()) > 131072
+        assert len(row["observation_json"].encode()) <= 131072
+        manifest = header["expected"]["dependencies"]
+        assert manifest["owner"]["proposal_id"] == draft.proposal_id
+        assert manifest["closure_sha256"] == digest(expected.dependencies)
+        assert manifest["count"] == 2
+        assert pages.read_sealed(row)["expected"] == asdict(expected)
+        # Encoding scale only; the 100 distinct identifiers are synthetic codec inputs.
+        template = expected.dependencies[0]
+        shaped = [
+            {**template, "fact_ref": {**template["fact_ref"], "record_id": f"scale-{i:03}"}}
+            for i in range(100)
+        ]
+        scaled_header, scaled_values = pages.encode(
+            replace(expected, dependencies=shaped),
+            port.opening_observations["page-start"],
+            pages.read_values(row),
+            "scale-proposal",
+            16,
+            manifest["owner"]["previous_event_sha256"],
+        )
+        assert len(scaled_values["pages"]) >= 7
+        assert len(canonical(scaled_values).encode()) > 131072
+        assert (
+            pages.read_sealed(
+                {
+                    "observation_json": canonical(scaled_header),
+                    "values_json": canonical(scaled_values),
+                }
+            )["expected"]["dependencies"]
+            == shaped
+        )
+        for incomplete, message in (
+            (scaled_values["pages"][:-1], "Opening page group differs"),
+            (list(reversed(scaled_values["pages"])), "Opening dependency page differs"),
+        ):
+            with pytest.raises(LifecycleError, match=message):
+                pages.read_sealed(
+                    {
+                        "observation_json": canonical(scaled_header),
+                        "values_json": canonical({**scaled_values, "pages": incomplete}),
+                    }
+                )
+    with pytest.raises(LifecycleError, match="incomplete_proposal"):
+        api.prepare_review(draft.proposal_id, draft.version)
+    before = api.opening_questions_v2(draft.proposal_id)
+    binding = ledger.binding
+    ledger.owner.close()
+    owner = acquire_production_owner(cfg)
+    request.addfinalizer(owner.close)
+    ledger = LedgerService(owner, port, binding, clock=lambda: NOW)
+    api = DailyOpeningChangeServiceV1(ledger)
+    assert api.opening_questions_v2(draft.proposal_id) == before
+    assert len(api.pending()[0]["values"]["missing_fields"]) == 2
+    assert financial_rows(ledger) == original_facts
+    source_audit = ledger.reader().full_audit()
+    path = tmp_path / "paged-opening.sqlite"
+    cut = ledger.seal_snapshot(path)
+    with sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True) as copy:
+        copy.row_factory = sqlite3.Row
+        copy.execute("PRAGMA query_only=ON")
+        restored_port = deepcopy(port)
+        restored_port.commands.clear()
+        assert audit_evidence_connection(copy, restored_port, binding) == source_audit
+        with monkeypatch.context() as limits:
+            limits.setattr(pages, "_CUT_BYTES", 131072)
+            with pytest.raises(LifecycleError, match="storage budget"):
+                audit_evidence_connection(copy, restored_port, binding)
+    assert cut.commit_seq == source_audit["event_count"]

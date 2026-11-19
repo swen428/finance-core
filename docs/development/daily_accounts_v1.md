@@ -432,3 +432,32 @@ This version covers transport of the already valid question inventory. The
 existing opening proposal, answer, dependency-map and confirmation rules
 continue to apply. Larger stored opening adjustments require their own
 versioned financial materials and acceptance.
+
+### Stored dependency pages for a pending opening instruction
+
+In a synthetic binding, an initial call to `propose_opening_change_v2` can
+select `page_initial_dependencies=True` when a specified opening still
+requires at least one dependency decision. The proposal retains the full
+verified V2 request and provider output across the two append-only proposal
+columns. The observation carries the manifest and the pending values carry
+the actual pages. Each page binds the originating proposal, target account,
+instruction, predecessor, runtime binding and pre-proposal event cut through
+the manifest owner. The propose event also binds the stored values. Retrying
+the original operation requires the same storage selection.
+
+An individual page contains up to 16 ordered dependencies and fits 64 KiB.
+The observation stays within 128 KiB. The pending values and propose event
+each fit 1 MiB. Across all historical paged proposals, the observation,
+values and owning propose-event columns together fit 4 MiB. Writing checks
+the projected bytes before appending. Complete audit compares every page
+with the original evidence and the complete dependency closure at the original
+event cut. A later reply uses the ordinary independently delivered question
+and genuine reply evidence.
+
+This storage option accepts the V2 request's maximum of 128 dependencies.
+The original scalar representation remains the default. The separate limits
+on replies, complete maps, review cards and global ledger size still apply.
+If a reply or review exceeds its limit, the original unresolved proposal
+remains legible. Source and immutable-copy audits require the original
+opening instruction and provider evidence. Application backup and restore
+require a consumer that independently retains both evidence types.
