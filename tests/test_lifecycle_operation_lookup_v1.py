@@ -125,6 +125,31 @@ def test_larger_daily_audit_requires_protected_and_retained_synthetic_scope(look
         )
 
 
+def test_snapshot_readback_satisfies_guarded_evidence_connection(
+    lookup_case, tmp_path, monkeypatch
+):
+    service = lookup_case.service
+    _, _, review = ready(service)
+    receipt = service.confirm(review.review_id, "action1", "confirm1")
+    database = tmp_path / "snapshot.sqlite"
+    original_source = service.port.source
+    readback_calls = []
+
+    def guarded_source(connection, evidence_id):
+        assert connection.row_factory is sqlite3.Row
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        if Path(connection.execute("PRAGMA database_list").fetchone()[2]) == database:
+            assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+            readback_calls.append(evidence_id)
+        return original_source(connection, evidence_id)
+
+    monkeypatch.setattr(service.port, "source", guarded_source)
+    cut = service.seal_snapshot(database)
+
+    assert readback_calls
+    assert [record[0] for record in cut.facts] == [receipt.record_id]
+
+
 def test_lookup_unconfirmed_review_never_creates_a_fact(lookup_case):
     service = lookup_case.service
     _, _, review = ready(service)

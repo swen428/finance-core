@@ -24,6 +24,7 @@ from finance_core.instance_admission.sessions import (
 from finance_core.money import Money, canonical_money_str
 from finance_core.parser_proposals.currency_policy_v1 import normalize_currency_v1
 from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
+from finance_core.sqlite_connection import require_foreign_keys_enabled
 
 from .contracts import (
     CommitReceipt,
@@ -873,6 +874,10 @@ class LedgerService:
                 )
                 try:
                     readback.execute("PRAGMA query_only=ON")
+                    # Application evidence readers require the same connection-level
+                    # foreign-key enforcement on the immutable copy as on the live read.
+                    readback.execute("PRAGMA foreign_keys=ON")
+                    require_foreign_keys_enabled(readback)
                     validate_application_database(readback, migration, schema, sealed_ledger)
                     _snapshot_integrity(readback)
                     readback.row_factory = sqlite3.Row
