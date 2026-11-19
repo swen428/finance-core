@@ -26,6 +26,7 @@ from finance_core.intake.receipt_ocr_evidence import (
     ReceiptOcrEngineResult,
     ReceiptOcrExtractionStatus,
 )
+from tests.test_lifecycle_v2 import live as live
 
 
 class RecordingOcr:
@@ -109,6 +110,60 @@ def seam(tmp_path, monkeypatch):
         "received_via": "telegram_photo",
     }
     return processor, engine, request, source, evidence, raw, worker_calls
+
+
+def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, monkeypatch):
+    from finance_core.lifecycle_v2 import (
+        LifecycleError,
+        VerifiedReceiptSourceV1,
+        receipt_media_operation_id_v1,
+    )
+
+    processor, engine, request, _, _, original, _ = seam
+    service, port, _ = live
+
+    def extract(_source, *, limits, deadline):
+        lines = ("TEST SHOP", "Date 2026-10-01", "TOTAL RM 12.34")
+        blocks = tuple(
+            ReceiptOcrBlock(i, 0, 0, 0, i, 0, line, 0, 0, 2, 2, 4, 3, 9500)
+            for i, line in enumerate(lines)
+        )
+        return ReceiptOcrEngineResult(ReceiptOcrExtractionStatus.SUCCEEDED, blocks, "ok")
+
+    monkeypatch.setattr(engine, "extract", extract)
+
+    def receipt(conn, evidence_id):
+        return VerifiedReceiptSourceV1(
+            evidence_id,
+            "user",
+            "chat",
+            "receipt:v1:" + evidence_id,
+            "",
+            hashlib.sha256(original).hexdigest(),
+            1792800000,
+            len(original),
+            hashlib.sha256(evidence_id.encode()).hexdigest(),
+        )
+
+    port.receipt_source_v1 = receipt
+    first = service.capture_receipt_v1("message-1", "capture-receipt-1")
+    second = service.capture_receipt_v1("message-2", "capture-receipt-2")
+    reader = service.reader()
+    job = receipt_media_operation_id_v1(reader.receipt_source_v1(first.source_id))
+    captured = processor.process(**(request | {"operation_id": job}))
+    assert captured.reference is not None
+    result = reader.receipt_fields_v1(first.source_id, processor, captured.reference)
+    assert result.source_id == first.source_id
+    assert result.original_message_sha256 == receipt(None, "message-1").original_message_sha256
+    assert result.suggestions.reference == captured.reference
+    fields = result.suggestions.fields
+    assert fields.amount.value == "12.34" and fields.currency.value == "MYR"
+    assert fields.merchant.value == "TEST SHOP"
+    assert fields.transaction_date.value == "2026-10-01"
+    assert fields.amount.block_sequence_indexes == (2,)
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_fields_v1(second.source_id, processor, captured.reference)
+    assert reader.full_audit()["fact_version_count"] == 0
 
 
 def test_exact_png_ocr_reference_and_idempotent_replay(seam):

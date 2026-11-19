@@ -19,6 +19,7 @@ from .contracts import (
     VerifiedSource,
 )
 from .reader import LedgerReader
+from .receipt_fields_v1 import RecordedReceiptFieldsV1, receipt_media_operation_id_v1
 from .service import LedgerService
 
 __all__ = [
@@ -39,5 +40,7 @@ __all__ = [
     "VerifiedReceiptSourceV1",
     "VerifiedSource",
     "LedgerReader",
+    "RecordedReceiptFieldsV1",
+    "receipt_media_operation_id_v1",
     "LedgerService",
 ]

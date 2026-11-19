@@ -202,6 +202,13 @@ class LedgerReader:
             finally:
                 conn.rollback()
 
+    def receipt_fields_v1(self, source_id, processor, reference):
+        """Read original-linked OCR suggestions; this read grants no posting authority."""
+        from .receipt_fields_v1 import _read_recorded_fields
+
+        source = self.receipt_source_v1(source_id)
+        return _read_recorded_fields(source_id, source, processor, reference)
+
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
             raise LifecycleError("Bounded page size required")

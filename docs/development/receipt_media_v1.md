@@ -303,3 +303,12 @@ text proposal entry points require their original text source. Native legacy
 expense recovery material explicitly rejects ledgers with typed receipt sources.
 Archive composition must register the attachment and its original message
 evidence before enabling this entry point in an installed application.
+
+Use `receipt_media_operation_id_v1(source)` for OCR on a captured receipt. The
+operation ID binds the authenticated source, including its original message
+and the received image digest. `LedgerReader.receipt_fields_v1` first verifies
+that source and then checks the original downloaded digest and derived
+operation identity before reopening and parsing the media evidence. Two
+independent messages with byte-identical images keep separate OCR identities.
+The returned suggestions include their parser evidence and carry no write
+authority. OCR absence or ambiguity remains eligible for manual completion.
