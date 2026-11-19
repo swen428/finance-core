@@ -1320,9 +1320,16 @@ class ReceiptMediaProcessor:
             publication.release_storage_root_lock(root)
             root.close()
 
-    def read_total_fields_v1(self, reference: MediaOcrReference) -> ReceiptMediaTotalFieldsV1:
+    def read_total_fields_v1(
+        self, reference: MediaOcrReference, *, expected_original_size: int | None = None
+    ) -> ReceiptMediaTotalFieldsV1:
         """Read a total-level suggestion using the verified blocks' TSV hierarchy."""
         verified = self.read_verified(reference)
+        if expected_original_size is not None and (
+            type(expected_original_size) is not int
+            or expected_original_size != verified.manifest["original"]["size_bytes"]
+        ):
+            raise MediaIntegrityError("Verified original size differs from receipt evidence")
         # The evidence reader admits only succeeded with nonempty canonical blocks,
         # or no_text with an empty sequence.
         status = (

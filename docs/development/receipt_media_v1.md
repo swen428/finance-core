@@ -312,3 +312,13 @@ operation identity before reopening and parsing the media evidence. Two
 independent messages with byte-identical images keep separate OCR identities.
 The returned suggestions include their parser evidence and carry no write
 authority. OCR absence or ambiguity remains eligible for manual completion.
+
+The installed evidence port reads manual replies inside the same protected
+transaction as the original receipt. The draft retains the exact original
+and supplemental replies and points each current field to its reply and span.
+The payment handoff offers account choices only when the reported receipt
+total is positive and uses a valid precision for its currency. An invalid
+amount or unsupported currency leaves the receipt pending and returns its
+own state. An authenticated later reply can replace that unresolved value
+in the same draft. The earlier reply remains visible in the history. The
+draft progress and payment handoff create no account impact.

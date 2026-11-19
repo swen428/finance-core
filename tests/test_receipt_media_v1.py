@@ -161,6 +161,8 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     assert fields.merchant.value == "TEST SHOP"
     assert fields.transaction_date.value == "2026-10-01"
     assert fields.amount.block_sequence_indexes == (2,)
+    with pytest.raises(media.MediaIntegrityError, match="Verified original size differs"):
+        processor.read_total_fields_v1(captured.reference, expected_original_size=len(original) + 1)
     with pytest.raises(LifecycleError, match="different receipt source"):
         reader.receipt_fields_v1(second.source_id, processor, captured.reference)
     assert reader.full_audit()["fact_version_count"] == 0

@@ -35,5 +35,7 @@ def _read_recorded_fields(source_id, source, processor, reference):
         or reference.original_sha256 != source.original_sha256
     ):
         raise LifecycleError("Verified OCR belongs to a different receipt source")
-    suggestions = processor.read_total_fields_v1(reference)
+    suggestions = processor.read_total_fields_v1(
+        reference, expected_original_size=source.original_size_bytes
+    )
     return RecordedReceiptFieldsV1(source_id, source.original_message_sha256, suggestions)

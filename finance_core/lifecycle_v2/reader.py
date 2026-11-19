@@ -211,27 +211,23 @@ class LedgerReader:
 
     def receipt_manual_draft_v1(self, source_id):
         """Project a draft from exact source and manual reply on one read snapshot."""
-        with lifecycle_read_operation(self.service.owner) as conn:
+        from .daily_v1.accounts import _BoundService
+
+        service = _BoundService(self.service)
+        with lifecycle_read_operation(service.owner) as conn:
             conn.execute("BEGIN")
             try:
-                return self._receipt_manual_draft_snapshot_v1(conn, source_id)
+                return self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
             finally:
                 conn.rollback()
 
-    def _receipt_manual_draft_snapshot_v1(self, conn, source_id):
+    @staticmethod
+    def _receipt_manual_draft_snapshot_v1(service, conn, source_id):
         from .receipt_draft_v1 import _project_manual_draft
 
-        verify_history = getattr(self.service.port, "receipt_manual_replies_v1", None)
-        verify_first = getattr(self.service.port, "receipt_manual_reply_v1", None)
-        if not callable(verify_history) and not callable(verify_first):
-            raise LifecycleError("Installed evidence port lacks authenticated receipt replies")
-        source = self.service._receipt_source(conn, source_id, allow_archived=True)
-        if callable(verify_history):
-            replies = verify_history(conn, source)
-        else:
-            reply = verify_first(conn, source)
-            replies = () if reply is None else (reply,)
-        return None if replies == () else _project_manual_draft(source_id, source, replies)
+        source = service._receipt_source(conn, source_id, allow_archived=True)
+        replies = service.port.receipt_manual_replies_v1(conn, source)
+        return _project_manual_draft(source_id, source, replies) if replies else None
 
     def receipt_payment_handoff_v1(self, source_id):
         """Read one receipt and its payment choices under the same protected snapshot."""
@@ -239,22 +235,23 @@ class LedgerReader:
 
         from finance_core.instance_admission.authority import _logical_database_digest
 
-        from .daily_v1.accounts import _audit
+        from .daily_v1.accounts import _audit, _BoundService
         from .daily_v1.reader import DailyReadIdentityV1
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
         service = self.service
-        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
-            _require_runtime_scope(conn, service.binding, service.runtime_admission)
+        bound = _BoundService(service)
+        with service._runtime_scope(), lifecycle_read_operation(bound.owner) as conn:
+            _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
             conn.execute("BEGIN")
             try:
-                draft = self._receipt_manual_draft_snapshot_v1(conn, source_id)
+                draft = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
                 if draft is None or draft.missing_receipt_fields:
                     return None
-                audit = _audit(service, conn)
+                audit = _audit(bound, conn)
                 read_identity = DailyReadIdentityV1(
-                    digest(asdict(service.binding)),
-                    service.owner.config.binding_sha256,
+                    digest(asdict(bound.binding)),
+                    bound.owner.config.binding_sha256,
                     audit["event_count"],
                     audit["audit_sha256"],
                     _logical_database_digest(conn),

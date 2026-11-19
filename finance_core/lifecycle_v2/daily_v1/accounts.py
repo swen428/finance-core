@@ -629,6 +629,11 @@ class _EvidenceReadPort:
     def receipt_source_v1(self, conn, identity):
         return self._call("receipt_source_v1", VerifiedReceiptSourceV1, conn, identity)
 
+    def receipt_manual_replies_v1(self, conn, source):
+        from ..receipt_draft_v1 import _read_manual_replies
+
+        return _read_manual_replies(self._port, conn, source)
+
     def provider(self, conn, identity, expected):
         return self._call("provider", VerifiedObservation, conn, identity, expected)
 
