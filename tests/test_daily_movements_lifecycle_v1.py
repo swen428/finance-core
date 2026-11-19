@@ -12,7 +12,7 @@ from tests.test_daily_accounts_lifecycle_v1 import create, setup
 from tests.test_lifecycle_v2 import live as live
 
 
-def prepare(live, opening="1000", account_type="bank", currency="MYR"):
+def prepare(live, opening="1000", account_type="bank", currency="MYR", *, opening_as_of=None):
     ledger, port, daily, accounts, _ = setup(live)
     _, _, _, receipt = create(
         ledger,
@@ -23,7 +23,7 @@ def prepare(live, opening="1000", account_type="bank", currency="MYR"):
                 "name": "Bank",
                 "account_type": account_type,
                 "currency": currency,
-                "opening": {"amount": opening, "as_of": unknown_time()}
+                "opening": {"amount": opening, "as_of": opening_as_of or unknown_time()}
                 if opening is not None
                 else None,
             }
@@ -351,6 +351,164 @@ def test_exact_source_pending_lookup_survives_owner_reopen(live):
         assert api.pending_for_source(coffee_id) is None
         assert api.pending_for_source(lunch_id) == lunch
         assert DailyLedgerReaderV1(reopened).collect().expense_by_currency == (("MYR", "9.00"),)
+
+
+def save_accountless_expense(ledger, port, api, draft_fields):
+    original = "coffee-without-account"
+    port.add_source(original, "Coffee MYR 9 on November 17")
+    source = ledger.capture(original, "capture-coffee-without-account")
+    port.remember_movement_source(source, original)
+    port.register_movement_instruction(ledger.binding, source.source_id, original)
+    draft_command = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_create",
+        "fields": draft_fields,
+        "reason_span": None,
+    }
+    port.commands[original] = draft_command
+    proposal = api.propose_movement_create(source.source_id, original, 0, "propose-no-account")
+    port.remember_movement_proposal(proposal)
+    draft = api.pending_for_source(source.source_id)
+    assert draft["values"]["missing_fields"] == ["account_id"]
+    return source, draft_command, draft
+
+
+@pytest.mark.parametrize(
+    ("opening_known", "account_currency"),
+    [(True, "MYR"), (False, "MYR"), (True, "SGD")],
+    ids=["known-opening", "needs-coverage", "different-currency"],
+)
+def test_delivered_account_selection_reopens_draft_and_only_fills_chosen_account(
+    live, opening_known, account_currency
+):
+    from dataclasses import asdict
+
+    from finance_core.instance_admission import acquire_production_owner
+    from finance_core.lifecycle_v2 import LedgerService
+
+    opening_date = {**unknown_time(), "precision": "date", "local_date": "2026-11-16"}
+    ledger, port, _, api, reader, account = prepare(
+        live, currency=account_currency, opening_as_of=opening_date if opening_known else None
+    )
+    _, _, cfg = live
+    draft_fields = fields(None)
+    draft_fields["funds_time"] = {
+        **unknown_time(),
+        "precision": "date",
+        "local_date": "2026-11-17",
+    }
+    if opening_known:
+        del draft_fields["coverage"]
+    else:
+        draft_fields["coverage"] = {"answer": "unknown", "span": None}
+    source, draft_command, draft = save_accountless_expense(ledger, port, api, draft_fields)
+    account_ref = asdict(reader.get_account(account).account_ref)
+    question = port.register_movement_question(
+        ledger.binding,
+        source.source_id,
+        "coffee-account-question",
+        "account_selection",
+        {"draft_fields": draft_fields, "offered_accounts": [account_ref]},
+    )
+
+    ledger.owner.close()
+    with acquire_production_owner(cfg) as owner:
+        reopened = LedgerService(owner, port, ledger.binding, clock=ledger.clock)
+        api = DailyMovementServiceV1(reopened)
+        reader = DailyLedgerReaderV1(reopened)
+        assert api.pending_for_source(source.source_id) == draft
+        reply = "genuine-coffee-account-answer"
+        port.add_source(reply, "Use Bank")
+        port.register_movement_reply(question, reply, selected_account=account_ref)
+        chosen_fields = {**draft_fields, "account_id": account}
+        port.commands["changed-answer"] = {
+            **draft_command,
+            "fields": {**chosen_fields, "account_amount": "90"},
+        }
+        with pytest.raises(LifecycleError, match="can only set the account"):
+            api.propose_movement_create(
+                source.source_id, "changed-answer", 1, "bad-account-answer", reply_evidence_id=reply
+            )
+        assert api.pending_for_source(source.source_id) == draft
+        assert reader.collect().balances[0].balance_amount == "1000.00"
+        port.commands[reply] = {**draft_command, "fields": chosen_fields}
+        if account_currency != draft_fields["original_currency"]:
+            with pytest.raises(LifecycleError, match="same-currency account"):
+                api.propose_movement_create(
+                    source.source_id, reply, 1, "cross-currency-account", reply_evidence_id=reply
+                )
+            assert api.pending_for_source(source.source_id) == draft
+            assert reader.collect().expense_by_currency == ()
+            return
+        proposal = api.propose_movement_create(
+            source.source_id, reply, 1, "propose-selected-account", reply_evidence_id=reply
+        )
+        port.remember_movement_proposal(proposal)
+        if not opening_known:
+            pending = api.pending_for_source(source.source_id)
+            assert pending["values"]["missing_fields"] == ["opening_coverage"]
+            assert pending["values"]["command"]["fields"] == chosen_fields
+            with pytest.raises(LifecycleError, match="incomplete"):
+                api.prepare_review(proposal.proposal_id, proposal.version)
+            assert reader.collect().balances[0].balance_amount == "1000.00"
+            return
+        card = api.prepare_review(proposal.proposal_id, proposal.version)
+        assert card.material["after_values"]["account_id"] == account
+        assert card.material["after_values"]["account_amount"] == "9.00"
+        api.record_delivery(card.review_id, "selected-account-card-delivery")
+        assert reader.collect().balances[0].balance_amount == "1000.00"
+        receipt = api.confirm(card.review_id, "confirm-separate", "confirm-coffee-once")
+        assert api.confirm(card.review_id, "confirm-separate", "confirm-coffee-once") == receipt
+        result = reader.collect()
+        assert result.balances[0].balance_amount == "991.00"
+        assert result.expense_by_currency == (("MYR", "9.00"),)
+        assert api.pending_for_source(source.source_id) is None
+    with acquire_production_owner(cfg) as owner:
+        reopened = LedgerService(owner, port, ledger.binding, clock=ledger.clock)
+        assert DailyLedgerReaderV1(reopened).collect() == result
+
+
+@pytest.mark.parametrize("changed_question", [True, False], ids=["question", "proposal"])
+def test_account_selection_preserves_draft_field_types(live, changed_question):
+    from dataclasses import asdict
+
+    ledger, port, _, api, reader, account = prepare(live, opening=None)
+    draft_fields = fields(None)
+    del draft_fields["coverage"]
+    funds_time = {
+        **unknown_time(),
+        "precision": "instant",
+        "local_date": "2026-11-17",
+        "timestamp": 1794877210.0,
+    }
+    draft_fields["funds_time"] = funds_time
+    source, command, draft = save_accountless_expense(ledger, port, api, draft_fields)
+    corrected_fields = {
+        **draft_fields,
+        "funds_time": {**funds_time, "timestamp": 1794877210},
+    }
+    account_ref = asdict(reader.get_account(account).account_ref)
+    question = port.register_movement_question(
+        ledger.binding,
+        source.source_id,
+        "coffee-account-question",
+        "account_selection",
+        {
+            "draft_fields": corrected_fields if changed_question else draft_fields,
+            "offered_accounts": [account_ref],
+        },
+    )
+    reply = "coffee-account-choice"
+    port.add_source(reply, "Use Bank")
+    port.register_movement_reply(question, reply, selected_account=account_ref)
+    port.commands[reply] = {**command, "fields": {**corrected_fields, "account_id": account}}
+    expected = "previous incomplete draft" if changed_question else "can only set the account"
+    with pytest.raises(LifecycleError, match=expected):
+        api.propose_movement_create(
+            source.source_id, reply, 1, "propose-selected-account", reply_evidence_id=reply
+        )
+    assert api.pending_for_source(source.source_id) == draft
+    assert reader.collect().expense_by_currency == ()
 
 
 def test_account_reassignment_replaces_one_impact_and_duplicate_void_keeps_other(live, tmp_path):
@@ -1184,16 +1342,20 @@ def pure_coverage_values(raw):
     ],
 )
 def test_coverage_choice_preserves_whole_answer_and_negative_prefix(raw, choice, quote, valid):
-    from finance_core.lifecycle_v2.daily_v1.movement_contracts import _coverage
+    from finance_core.lifecycle_v2.daily_v1.movement_contracts import (
+        _coverage,
+        decode_instruction_link,
+    )
 
     expected, values, account = pure_coverage_values(raw)
     start = raw.index(quote)
     cmd = {"fields": {"coverage": {"answer": choice, "span": [start, start + len(quote)]}}}
+    question = decode_instruction_link(expected.instruction_link)["question"]
     if valid:
-        assert _coverage(cmd, expected, values, account)["treatment"] == choice
+        assert _coverage(cmd, expected, values, account, question)["treatment"] == choice
     else:
         with pytest.raises(LifecycleError):
-            _coverage(cmd, expected, values, account)
+            _coverage(cmd, expected, values, account, question)
 
 
 def test_genuine_negative_question_reply_refuses_positive_slice_and_posts_once(live):
