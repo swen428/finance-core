@@ -182,6 +182,26 @@ def test_receipt_capture_keeps_original_media_after_owner_reopen_and_copy(live, 
 
     port.receipt_source_v1 = receipt
     text = service.capture("source1", "text-capture")
+    caption = "Lunch"
+    presented_as_text = VerifiedSource(
+        "receipt-1",
+        "user",
+        "chat",
+        "receipt:v1:message-1",
+        caption,
+        hashlib.sha256(caption.encode()).hexdigest(),
+        1792800000,
+    )
+    port.sources["receipt-1"] = presented_as_text
+    with pytest.raises(LifecycleError, match="typed receipt entry point"):
+        service.capture("receipt-1", "wrong-route")
+    port.sources["receipt-1"] = replace(
+        receipt(None, "receipt-1"),
+        raw_input=caption,
+        original_sha256=presented_as_text.original_sha256,
+    )
+    with pytest.raises(LifecycleError, match="Exact text source evidence"):
+        service.capture("receipt-1", "wrong-evidence-type")
     first = service.capture_receipt_v1("receipt-1", "receipt-capture-1")
     second = service.capture_receipt_v1("receipt-2", "receipt-capture-2")
     assert service.capture_receipt_v1("receipt-1", "receipt-capture-1") == first

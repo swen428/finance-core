@@ -390,6 +390,8 @@ class LedgerService:
     def capture(self, source_evidence_id, operation_id):
         with self._write_operation() as conn:
             evidence = self.port.source(conn, source_evidence_id)
+            if type(evidence) is not VerifiedSource:
+                raise LifecycleError("Exact text source evidence required")
             self._actor(evidence)
             if (
                 evidence.evidence_id != source_evidence_id
@@ -428,6 +430,8 @@ class LedgerService:
             )
             authenticate(conn, existing["source_id"], allow_archived=True)
             return SourceRef(existing["source_id"], sha)
+        if capture_format != _RECEIPT_CAPTURE and evidence.source_key.startswith("receipt:v1:"):
+            raise LifecycleError("Receipt source requires the typed receipt entry point")
         source_id = _id("source")
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(

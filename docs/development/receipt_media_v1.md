@@ -294,7 +294,8 @@ with the adapter's evidence during protected audit and independent snapshot
 readback. `LedgerReader.receipt_source_v1(source_id)` returns the verified
 receipt origin. Exact replay returns the original source reference. Separate
 messages can carry identical image bytes and still have separate source
-references.
+references. New text captures reserve the receipt namespace for typed sources.
+Exact replay of a historical text capture still uses its original contract.
 
 Capturing a receipt adds no financial fact. Receipt-derived draft proposals and
 their verification are delivered in separate versioned entry points. Existing

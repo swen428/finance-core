@@ -595,7 +595,12 @@ class _EvidenceReadPort:
     def _call(self, name, dto_type, conn, identity, expected=None):
         with _evidence_read_callback(conn):
             before = canonical(asdict(expected)) if expected is not None else None
-            method = getattr(self._port, name)
+            if dto_type is VerifiedReceiptSourceV1:
+                method = getattr(self._port, name, None)
+                if not callable(method):
+                    raise LifecycleError("Original receipt evidence port is unavailable")
+            else:
+                method = getattr(self._port, name)
             actual = (
                 method(conn, identity) if expected is None else method(conn, identity, expected)
             )
@@ -622,8 +627,6 @@ class _EvidenceReadPort:
         return self._call("source", VerifiedSource, conn, identity)
 
     def receipt_source_v1(self, conn, identity):
-        if not callable(getattr(self._port, "receipt_source_v1", None)):
-            raise LifecycleError("Original receipt evidence port is unavailable")
         return self._call("receipt_source_v1", VerifiedReceiptSourceV1, conn, identity)
 
     def provider(self, conn, identity, expected):
