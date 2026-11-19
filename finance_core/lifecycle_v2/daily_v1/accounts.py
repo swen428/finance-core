@@ -88,13 +88,36 @@ def _source_instruction(source):
     )
 
 
-def _limits(conn):
-    counts = conn.execute("SELECT count(DISTINCT record_id),count(*) FROM l2_facts").fetchone()
-    if (
-        counts[0] > MAX_RECORDS
-        or counts[1] > MAX_FACT_VERSIONS
-        or conn.execute("SELECT count(*) FROM l2_proposals").fetchone()[0] > MAX_PROPOSALS
-    ):
+def _limits(conn, *, _rows=None):
+    if _rows is None:
+        records, versions = conn.execute(
+            "SELECT count(DISTINCT record_id),count(*) FROM l2_facts"
+        ).fetchone()
+    else:
+        records = len(_rows.vector(conn, "records"))
+        versions = len(_rows.table(conn, "facts"))
+    if records > MAX_RECORDS or versions > MAX_FACT_VERSIONS:
+        raise LifecycleError("complete_read_limit_exceeded")
+    proposals = (
+        len(_rows.table(conn, "proposals"))
+        if _rows is not None
+        else conn.execute("SELECT count(*) FROM l2_proposals").fetchone()[0]
+    )
+    if proposals > MAX_PROPOSALS:
+        raise LifecycleError("complete_read_limit_exceeded")
+
+
+def _require_fact_capacity(conn, *, new_record: bool) -> None:
+    """Check the projected inventory for either kind of daily confirmation."""
+    if new_record:
+        records, versions = conn.execute(
+            "SELECT count(DISTINCT record_id),count(*) FROM l2_facts"
+        ).fetchone()
+        at_record_limit = records >= MAX_RECORDS
+    else:
+        versions = conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0]
+        at_record_limit = False
+    if at_record_limit or versions >= MAX_FACT_VERSIONS:
         raise LifecycleError("complete_read_limit_exceeded")
 
 
@@ -120,7 +143,7 @@ def closure(conn, account_id, *, before_seq=None, before_values=None, _rows=None
     Caller supplies a commit/review prefix only for authenticated historical
     reconstruction. Current writes invoke a full evidence audit first.
     """
-    _limits(conn)
+    _limits(conn, _rows=_rows)
     if before_seq is None:
         before_seq = conn.execute("SELECT coalesce(max(seq),0)+1 FROM l2_events").fetchone()[0]
     if (
@@ -1308,18 +1331,11 @@ class DailyAccountServiceV1:
                     conn, expected.record_id, before_values=expected.before_values
                 ):
                     raise LifecycleError("Opening dependency closure changed")
-                if conn.execute("SELECT count(*) FROM l2_facts").fetchone()[0] >= MAX_FACT_VERSIONS:
-                    raise LifecycleError("complete_read_limit_exceeded")
                 predecessor = conn.execute(
                     "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
                     (expected.record_id,),
                 ).fetchone()
-                if (
-                    predecessor is None
-                    and conn.execute("SELECT count(DISTINCT record_id) FROM l2_facts").fetchone()[0]
-                    >= MAX_RECORDS
-                ):
-                    raise LifecycleError("complete_read_limit_exceeded")
+                _require_fact_capacity(conn, new_record=predecessor is None)
                 source = service._source(
                     conn, expected.source_id, allow_archived=predecessor is not None
                 )

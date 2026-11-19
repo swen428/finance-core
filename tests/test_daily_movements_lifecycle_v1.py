@@ -194,6 +194,37 @@ def test_equal_expenses_contribute_separate_record_versions_to_one_total(live):
     )
 
 
+def test_account_and_movement_share_confirmation_capacity(live, monkeypatch):
+    from finance_core.lifecycle_v2.daily_v1 import accounts
+
+    monkeypatch.setattr(accounts, "MAX_RECORDS", 2)
+    ledger, port, daily, api, reader, account = prepare(live)
+    _, _, expense = movement(ledger, port, api, account, "expense")
+
+    with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
+        movement(ledger, port, api, account, "over-capacity")
+    port.add_source("source2", "Create another bank account")
+    with pytest.raises(LifecycleError, match="complete_read_limit_exceeded"):
+        create(ledger, port, daily, suffix="2")
+
+    current = reader.detail(expense.receipt.record_id)
+    assert len(reader.collect().accounts) == 1
+    assert reader.collect().balances[0].balance_amount == "991.00"
+
+    movement(
+        ledger,
+        port,
+        api,
+        account,
+        "correct-at-capacity",
+        fields(account, "10"),
+        current,
+        "movement_correct",
+    )
+    assert len(reader.history(current.record_id)) == 2
+    assert reader.collect().balances[0].balance_amount == "990.00"
+
+
 def test_unknown_opening_reports_net_change_without_balance(live):
     ledger, port, _, api, reader, account = prepare(live, None)
     movement(ledger, port, api, account, "income", fields(account, "200", "income"))
