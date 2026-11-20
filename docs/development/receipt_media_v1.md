@@ -265,6 +265,33 @@ explicitly verify this reference and link its original source-event identity
 and exact normalized OCR result; it must not pretend the legacy OCR API
 consumed the PNG or alias the derivative as the received original.
 
+## Read-only receipt review preparation
+
+`ReceiptReviewReaderV1.prepare(source_id)` reads the original receipt and its
+manual draft on one protected ledger snapshot. The installed evidence port
+authenticates the reply choosing the payment account and the separate reply
+giving the amount actually debited. Core checks their order and links to the
+draft, compares the selected account and opening against the current ledger,
+and validates both the receipt total and actual debit in their own currencies.
+The account shown in the delivered debit question must match the account
+chosen in the earlier question.
+
+`completed(source_id)` adds the category from a separate authenticated reply.
+The evidence port derives the purpose and complete target from the original
+delivered question. Core compares it to the target of the current preparation.
+The port receives a receipt lookup identity and must authenticate the original
+question and reply before returning the target.
+
+Where there is an active opening, an explicitly stated debit date strictly
+after that opening determines that the debit was excluded. For an earlier or
+same-day debit, the reply must include the user's inclusion answer. When both
+are supplied, the review preserves the date and checks it against the answer
+and the earlier authenticated report of the completed debit. The printed
+receipt date alone does not determine the account's balance treatment.
+Unknown fields remain pending. These reads prepare review inputs.
+Posting still requires a separate delivered confirmation card and guarded
+finalization.
+
 ## Primary decoder contracts
 
 The [libheif API](https://raw.githubusercontent.com/strukturag/libheif/v1.17.6/libheif/heif.h)
