@@ -20,7 +20,7 @@ from .contracts import (
     digest,
     validate_daily_capacity,
 )
-from .service import _capture_generation, _fact_material
+from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 
 def _registered_values(value):
@@ -192,6 +192,74 @@ class LedgerReader:
             if digest(asdict(evidence)) != row["source_sha256"]:
                 raise LifecycleError("Authenticated source DTO differs from retained source")
             return evidence
+
+    def receipt_source_v1(self, source_id: str):
+        """Read the original receipt identity through its typed evidence port."""
+        with lifecycle_read_operation(self.service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                return self.service._receipt_source(conn, source_id, allow_archived=True)
+            finally:
+                conn.rollback()
+
+    def receipt_fields_v1(self, source_id, processor, reference):
+        """Read original-linked OCR suggestions; this read grants no posting authority."""
+        from .receipt_fields_v1 import _read_recorded_fields
+
+        source = self.receipt_source_v1(source_id)
+        return _read_recorded_fields(source_id, source, processor, reference)
+
+    def receipt_manual_draft_v1(self, source_id):
+        """Project a draft from exact source and manual reply on one read snapshot."""
+        from .daily_v1.accounts import _BoundService
+
+        base = self.service
+        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
+            service = _BoundService(base)
+            conn.execute("BEGIN")
+            try:
+                return self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
+            finally:
+                conn.rollback()
+
+    @staticmethod
+    def _receipt_manual_draft_snapshot_v1(service, conn, source_id):
+        from .receipt_draft_v1 import _project_manual_draft
+
+        source = service._receipt_source(conn, source_id, allow_archived=True)
+        replies = service.port.receipt_manual_replies_v1(conn, source)
+        return _project_manual_draft(source_id, source, replies) if replies else None
+
+    def receipt_payment_handoff_v1(self, source_id):
+        """Read one receipt and its payment choices under the same protected snapshot."""
+        from dataclasses import asdict
+
+        from finance_core.instance_admission.authority import _logical_database_digest
+
+        from .daily_v1.accounts import _audit, _BoundService
+        from .daily_v1.reader import DailyReadIdentityV1
+        from .receipt_payment_handoff_v1 import _receipt_payment_handoff
+
+        service = self.service
+        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
+            bound = _BoundService(service)
+            _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
+            conn.execute("BEGIN")
+            try:
+                draft = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
+                if draft is None or draft.missing_receipt_fields:
+                    return None
+                audit = _audit(bound, conn)
+                read_identity = DailyReadIdentityV1(
+                    digest(asdict(bound.binding)),
+                    bound.owner.config.binding_sha256,
+                    audit["event_count"],
+                    audit["audit_sha256"],
+                    _logical_database_digest(conn),
+                )
+                return _receipt_payment_handoff(conn, draft, read_identity)
+            finally:
+                conn.rollback()
 
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -672,11 +740,16 @@ class SnapshotEvidenceVerifier:
             self, conn, source_id, allow_archived=allow_archived, _rows=_rows
         )
 
+    def _receipt_source(self, conn, source_id, *, allow_archived=True):
+        from .service import LedgerService
+
+        return LedgerService._receipt_source(self, conn, source_id, allow_archived=allow_archived)
+
 
 def _has_daily_values(conn):
     from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
 
-    return any(
+    return bool(_receipt_capture_ids(conn)) or any(
         json.loads(row[0]).get("format")
         in {
             BUNDLE_FORMAT,
@@ -741,8 +814,12 @@ def _audit_evidence_connection(
         if _rows is not None
         else conn.execute("SELECT source_id FROM l2_sources")
     )
-    for source in sources:
-        verifier._source(conn, source[0], allow_archived=True, _rows=_rows)
+    receipts = _receipt_capture_ids(conn)
+    for (identity,) in sources:
+        if identity in receipts:
+            verifier._receipt_source(conn, identity, allow_archived=True)
+        else:
+            verifier._source(conn, identity, allow_archived=True, _rows=_rows)
     proposals = (
         _rows.table(conn, "proposals")
         if _rows is not None

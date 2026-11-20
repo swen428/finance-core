@@ -276,3 +276,49 @@ exposes ordered actual primary transformation properties. Real acceptance
 requires asymmetric pixel/geometry vectors, 10-bit readable-content evidence,
 actual local OCR, refusal/replay/resource/crash coverage and an exact installed
 Ubuntu worker run; an earlier CLI decoder proof is not this binding's proof.
+
+
+### Capture the original receipt in an admitted ledger
+
+`LedgerService.capture_receipt_v1(evidence_id, operation_id)` consumes an exact
+`VerifiedReceiptSourceV1` from the adapter's `receipt_source_v1(conn, evidence_id)`
+read callback. The adapter supplies the hash of the original message, a unique
+source key in the `receipt:v1:` namespace, the exact caption even when empty,
+the received attachment's byte count and SHA-256, and the original actor and
+timestamp. The adapter reopens its original message and attachment separately
+on verification. The caption and the attachment have separate identities,
+and OCR output does not serve as the original caption.
+
+Core stores the original receipt identity in the capture event and compares it
+with the adapter's evidence during protected audit and independent snapshot
+readback. `LedgerReader.receipt_source_v1(source_id)` returns the verified
+receipt origin. Exact replay returns the original source reference. Separate
+messages can carry identical image bytes and still have separate source
+references. New text captures reserve the receipt namespace for typed sources.
+Exact replay of a historical text capture still uses its original contract.
+
+Capturing a receipt adds no financial fact. Receipt-derived draft proposals and
+their verification are delivered in separate versioned entry points. Existing
+text proposal entry points require their original text source. Native legacy
+expense recovery material explicitly rejects ledgers with typed receipt sources.
+Archive composition must register the attachment and its original message
+evidence before enabling this entry point in an installed application.
+
+Use `receipt_media_operation_id_v1(source)` for OCR on a captured receipt. The
+operation ID binds the authenticated source, including its original message
+and the received image digest. `LedgerReader.receipt_fields_v1` first verifies
+that source and then checks the original downloaded digest and derived
+operation identity before reopening and parsing the media evidence. Two
+independent messages with byte-identical images keep separate OCR identities.
+The returned suggestions include their parser evidence and carry no write
+authority. OCR absence or ambiguity remains eligible for manual completion.
+
+The installed evidence port reads manual replies inside the same protected
+transaction as the original receipt. The draft retains the exact original
+and supplemental replies and points each current field to its reply and span.
+The payment handoff offers account choices only when the reported receipt
+total is positive and uses a valid precision for its currency. An invalid
+amount or unsupported currency leaves the receipt pending and returns its
+own state. An authenticated later reply can replace that unresolved value
+in the same draft. The earlier reply remains visible in the history. The
+draft progress and payment handoff create no account impact.

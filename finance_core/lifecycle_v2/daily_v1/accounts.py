@@ -21,6 +21,7 @@ from ..contracts import (
     VerifiedAction,
     VerifiedDelivery,
     VerifiedObservation,
+    VerifiedReceiptSourceV1,
     VerifiedSource,
     canonical,
     digest,
@@ -594,7 +595,12 @@ class _EvidenceReadPort:
     def _call(self, name, dto_type, conn, identity, expected=None):
         with _evidence_read_callback(conn):
             before = canonical(asdict(expected)) if expected is not None else None
-            method = getattr(self._port, name)
+            if dto_type is VerifiedReceiptSourceV1:
+                method = getattr(self._port, name, None)
+                if not callable(method):
+                    raise LifecycleError("Original receipt evidence port is unavailable")
+            else:
+                method = getattr(self._port, name)
             actual = (
                 method(conn, identity) if expected is None else method(conn, identity, expected)
             )
@@ -604,7 +610,10 @@ class _EvidenceReadPort:
             for field in fields(dto_type):
                 value = getattr(actual, field.name)
                 required_type = (
-                    int if dto_type is VerifiedSource and field.name == "source_timestamp" else str
+                    int
+                    if dto_type in {VerifiedSource, VerifiedReceiptSourceV1}
+                    and field.name in {"source_timestamp", "original_size_bytes"}
+                    else str
                 )
                 if type(value) is not required_type:
                     raise LifecycleError("Evidence fields require exact scalar values")
@@ -616,6 +625,14 @@ class _EvidenceReadPort:
 
     def source(self, conn, identity):
         return self._call("source", VerifiedSource, conn, identity)
+
+    def receipt_source_v1(self, conn, identity):
+        return self._call("receipt_source_v1", VerifiedReceiptSourceV1, conn, identity)
+
+    def receipt_manual_replies_v1(self, conn, source):
+        from ..receipt_draft_v1 import _read_manual_replies
+
+        return _read_manual_replies(self._port, conn, source)
 
     def provider(self, conn, identity, expected):
         return self._call("provider", VerifiedObservation, conn, identity, expected)
