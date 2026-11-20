@@ -27,14 +27,16 @@ from tests.test_receipt_payment_handoff_v1 import HandoffPort
 class PaymentPort(HandoffPort):
     payment = None
     review_reply = None
+    payment_inputs = None
 
     def receipt_review_payment_v1(self, conn, source, draft):
         assert conn.in_transaction
         assert source == self.receipt and draft.source_evidence_id == self.receipt.evidence_id
+        self.payment_inputs = (source, draft)
         return self.payment
 
-    def receipt_review_fields_reply_v1(self, conn, target):
-        assert conn.in_transaction
+    def receipt_review_fields_reply_v1(self, conn, source_evidence_id):
+        assert conn.in_transaction and source_evidence_id == self.receipt.evidence_id
         return self.review_reply
 
 
@@ -76,7 +78,7 @@ def setup_payment(live, *, opening=None):
         selection.response_id,
         selection.response_sha256,
         selection.reply_update_id,
-        "SGD",
+        handoff.account_options[0],
     )
     port.payment = payment
     return ledger, port, daily, source.source_id, payment
@@ -90,12 +92,22 @@ def test_receipt_preparation_preserves_both_original_amounts_and_requires_later_
     assert result.source == port.receipt and result.draft.manual_supplements == (port.replies[1],)
     assert result.draft.original_image_sha256 == port.receipt.original_sha256
     assert result.payment == payment
+    expected_source, expected_draft = port.payment_inputs
+    assert result.source == expected_source and result.source is not expected_source
+    assert result.draft == expected_draft and result.draft is not expected_draft
+    assert result.draft.fields[0] is not expected_draft.fields[0]
+    assert result.payment.account.account_ref is not payment.account.account_ref
     assert (result.merchant, result.business_date) == ("Sunny", "2026-11-20")
     assert (result.original_amount, result.original_currency) == ("8.00", "USD")
     assert (result.account_amount, result.account_currency) == ("10.37", "SGD")
     assert result.active_opening_ref is None
     assert result.missing_movement_fields == ("category",)
     assert reader.prepare(source_id).preparation_sha256 == result.preparation_sha256
+    port.payment = replace(
+        payment, option_number=13, selection=replace(payment.selection, raw_text="13")
+    )
+    assert reader.prepare(source_id).payment.option_number == 13
+    port.payment = payment
     assert ledger.reader().full_audit() == audit
     assert audit["fact_version_count"] == 1
     assert ledger.reader().pending() == []
@@ -128,6 +140,12 @@ def test_receipt_preparation_refuses_unlinked_or_invalid_replies_and_keeps_incom
     ledger, port, _, source_id, payment = setup_payment(live)
     reader = ReceiptReviewReaderV1(ledger)
     audit = ledger.reader().full_audit()
+    other_account = replace(
+        payment.account,
+        account_ref=replace(payment.account.account_ref, account_id="other-account"),
+        bundle_ref=replace(payment.account.bundle_ref, record_id="other-account"),
+        name="Other wallet",
+    )
     for wrong in (
         replace(payment, draft_sha256="5" * 64),
         replace(payment, principal_id="another-user"),
@@ -136,7 +154,7 @@ def test_receipt_preparation_refuses_unlinked_or_invalid_replies_and_keeps_incom
         replace(payment, debit=replace(payment.debit, raw_text="USD 10.37")),
         replace(payment, debit=replace(payment.debit, raw_text="SGD 10.371")),
         replace(payment, debit=replace(payment.debit, raw_text="SGD 0.00")),
-        replace(payment, debit_question_currency="USD"),
+        replace(payment, debit_question_account=other_account),
     ):
         port.payment = wrong
         with pytest.raises(LifecycleError, match="Receipt payment|Movement amounts"):
@@ -172,13 +190,15 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         question_timestamp + 1,
         "fields-poll",
         "6" * 64,
-        "分类：餐饮\n期初余额：未包含",
+        "分类：餐饮\n扣款日期：2026-11-17\n期初余额：未包含",
     )
     port.review_reply = VerifiedReceiptReviewFieldsReplyV1(target, reply, "user", "chat")
     audit = ledger.reader().full_audit()
     completed = reader.completed(source_id)
     assert completed.preparation == prepared
-    assert completed.category == "餐饮" and completed.actual_debit_date is None
+    assert completed.category == "餐饮" and completed.actual_debit_date == "2026-11-17"
+    assert completed.evidence.target.account_ref is not target.account_ref
+    assert completed.evidence.target.opening_ref is not target.opening_ref
     assert completed.opening_treatment == "excluded"
     assert (
         completed.opening_basis == "authenticated_reply" and completed.missing_movement_fields == ()
@@ -187,6 +207,16 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         port.review_reply, target=replace(target, debit_response_sha256="7" * 64)
     )
     with pytest.raises(LifecycleError, match="linked payment"):
+        reader.completed(source_id)
+    port.review_reply = replace(
+        completed.evidence, target=replace(target, source_evidence_id="another-receipt")
+    )
+    with pytest.raises(LifecycleError, match="linked payment"):
+        reader.completed(source_id)
+    port.review_reply = replace(
+        completed.evidence, reply=replace(reply, raw_text="分类：餐饮\n扣款日期：2026-11-19")
+    )
+    with pytest.raises(LifecycleError, match="after the authenticated amount reply"):
         reader.completed(source_id)
     port.review_reply = completed.evidence
     ledger.owner.close()
@@ -205,7 +235,14 @@ def test_receipt_actual_debit_date_must_be_explicit_and_strictly_after_opening()
     assert resolve_receipt_review_fields_v1(
         "分类：餐饮\n扣款日期：2026-11-20", reply_timestamp, opening
     ) == ("餐饮", "2026-11-20", "excluded", "strictly_later")
-    with pytest.raises(LifecycleError, match="after its reply"):
+    assert resolve_receipt_review_fields_v1(
+        "分类：餐饮\n扣款日期：2026-11-18\n期初余额：已包含", reply_timestamp, opening
+    ) == ("餐饮", "2026-11-18", "included", "authenticated_reply")
+    with pytest.raises(LifecycleError, match="contradicts"):
+        resolve_receipt_review_fields_v1(
+            "分类：餐饮\n扣款日期：2026-11-20\n期初余额：已包含", reply_timestamp, opening
+        )
+    with pytest.raises(LifecycleError, match="after the authenticated amount reply"):
         resolve_receipt_review_fields_v1(
             "分类：餐饮\n扣款日期：2026-11-22", reply_timestamp, opening
         )

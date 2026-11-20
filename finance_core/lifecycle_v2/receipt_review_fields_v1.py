@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -63,12 +63,27 @@ class ReceiptReviewFieldsTargetV1:
 
 @dataclass(frozen=True)
 class VerifiedReceiptReviewFieldsReplyV1:
-    """Original delivered question and accepted reply from the installed evidence port."""
+    """Original delivered question and accepted reply from the installed evidence port.
+
+    The port authenticates the original purpose and reconstructs the target
+    from the delivered question bound to the reply. The call receives only a
+    receipt lookup identity. Current Core values do not supply the target.
+    """
 
     target: ReceiptReviewFieldsTargetV1
     reply: VerifiedReceiptPaymentReplyV1
     principal_id: str
     client_id: str
+
+
+def _copy_review_fields_target(target):
+    target = replace(target)
+    return replace(
+        target,
+        account_ref=replace(target.account_ref),
+        bundle_ref=replace(target.bundle_ref),
+        opening_ref=replace(target.opening_ref) if target.opening_ref is not None else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -100,25 +115,28 @@ def receipt_review_fields_target_v1(preparation: ReceiptReviewPreparationV1):
 
 
 def parse_receipt_review_fields_v1(raw: str, reply_timestamp: int, *, has_opening: bool):
-    """Read the exact human category and one optional timing or coverage line."""
+    """Read an exact category and optional debit date and inclusion answers."""
     lines = raw.strip().splitlines()
-    if not 1 <= len(lines) <= 2 or (category := _CATEGORY.fullmatch(lines[0])) is None:
+    if not 1 <= len(lines) <= 3 or (category := _CATEGORY.fullmatch(lines[0])) is None:
         raise LifecycleError("Explicit receipt category line required")
     category_value = text(category[1], "receipt category")
-    if len(lines) == 1:
-        return category_value, None, None
-    if actual_day := _DATE.fullmatch(lines[1]):
-        local_day = _day(actual_day[1])
+    local_day = coverage = None
+    for line in lines[1:]:
+        date_match = _DATE.fullmatch(line)
+        if date_match is not None and local_day is None:
+            local_day = _day(date_match[1])
+        elif has_opening and line in _OPENING and coverage is None:
+            coverage = _OPENING[line]
+        else:
+            raise LifecycleError("Exact actual debit date or opening inclusion answer required")
+    if local_day is not None:
         try:
             observed_day = datetime.fromtimestamp(reply_timestamp, ZoneInfo("Asia/Singapore"))
         except (OverflowError, OSError, ValueError):
             raise LifecycleError("Invalid receipt reply timestamp") from None
         if local_day > observed_day.date().isoformat():
-            raise LifecycleError("Actual debit date is after its reply")
-        return category_value, local_day, None
-    if has_opening and lines[1] in _OPENING:
-        return category_value, None, _OPENING[lines[1]]
-    raise LifecycleError("Exact actual debit date or opening inclusion answer required")
+            raise LifecycleError("Actual debit date is after the authenticated amount reply")
+    return category_value, local_day, coverage
 
 
 def resolve_receipt_review_fields_v1(raw, reply_timestamp, opening_as_of):
@@ -128,8 +146,6 @@ def resolve_receipt_review_fields_v1(raw, reply_timestamp, opening_as_of):
     )
     if opening_as_of is None:
         return category, actual_day, "no_baseline", "no_active_opening"
-    if coverage is not None:
-        return category, actual_day, coverage, "authenticated_reply"
     if actual_day is not None and _later(
         validate_as_of(
             {
@@ -142,7 +158,11 @@ def resolve_receipt_review_fields_v1(raw, reply_timestamp, opening_as_of):
         ),
         validate_as_of(opening_as_of),
     ):
+        if coverage == "included":
+            raise LifecycleError("Coverage answer contradicts strictly later debit date")
         return category, actual_day, "excluded", "strictly_later"
+    if coverage is not None:
+        return category, actual_day, coverage, "authenticated_reply"
     return category, actual_day, None, None
 
 
@@ -173,7 +193,9 @@ def _complete_review_fields(preparation, evidence, opening):
     ):
         raise LifecycleError("Receipt review fields differ from the linked payment")
     category, actual_day, treatment, basis = resolve_receipt_review_fields_v1(
-        reply.raw_text, reply.reply_timestamp, opening["as_of"] if opening is not None else None
+        reply.raw_text,
+        payment.debit.reply_timestamp,
+        opening["as_of"] if opening is not None else None,
     )
     return ReceiptReviewFieldsV1(
         preparation,

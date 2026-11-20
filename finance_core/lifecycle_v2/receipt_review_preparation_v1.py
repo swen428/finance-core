@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -78,7 +79,8 @@ class VerifiedReceiptPaymentV1:
     The installed port authenticates known delivery, accepted native replies,
     actor/client, exact quoted questions and the selected first-question
     option. It derives the source/draft hashes from that retained question and
-    the selection references from the retained debit question.
+    the selection references and exact account from the retained debit question.
+    It reads that account from the delivered question itself.
     """
 
     source_evidence_id: str
@@ -93,7 +95,7 @@ class VerifiedReceiptPaymentV1:
     debit_question_selection_response_id: str
     debit_question_selection_response_sha256: str
     debit_question_selection_update_id: int
-    debit_question_currency: str
+    debit_question_account: ReceiptPaymentAccountOptionV1
 
     def __post_init__(self):
         for value in (
@@ -109,22 +111,26 @@ class VerifiedReceiptPaymentV1:
             self.debit_question_selection_response_sha256,
         ):
             sha(value)
-        text(self.debit_question_currency, "receipt debit question currency", 3)
         if (
             type(self.option_number) is not int
-            or not 1 <= self.option_number <= 12
+            or not 0 < self.option_number < 2**63
             or type(self.debit_question_selection_update_id) is not int
             or not 0 <= self.debit_question_selection_update_id < 2**63
-            or type(self.account) is not ReceiptPaymentAccountOptionV1
-            or type(self.account.account_ref) is not AccountDefinitionRefV1
-            or type(self.account.bundle_ref) is not BundleFactRefV1
             or type(self.selection) is not VerifiedReceiptPaymentReplyV1
             or type(self.debit) is not VerifiedReceiptPaymentReplyV1
         ):
             raise LifecycleError("Exact authenticated receipt payment required")
-        text(self.account.name, "receipt account name")
-        text(self.account.account_type, "receipt account type")
-        text(self.account.currency, "receipt account currency", 3)
+        for account in (self.account, self.debit_question_account):
+            if (
+                type(account) is not ReceiptPaymentAccountOptionV1
+                or type(account.account_ref) is not AccountDefinitionRefV1
+                or type(account.bundle_ref) is not BundleFactRefV1
+                or account.account_ref.account_id != account.bundle_ref.record_id
+            ):
+                raise LifecycleError("Exact original receipt payment account required")
+            text(account.name, "receipt account name")
+            text(account.account_type, "receipt account type")
+            text(account.currency, "receipt account currency", 3)
 
 
 @dataclass(frozen=True)
@@ -151,15 +157,28 @@ class ReceiptReviewPreparationV1:
         return digest(asdict(self))
 
 
+def _copy_account(account):
+    return replace(
+        account,
+        account_ref=replace(account.account_ref),
+        bundle_ref=replace(account.bundle_ref),
+    )
+
+
 def _receipt_payment(conn, port, source, draft):
+    expected_source = replace(source)
+    expected_draft = deepcopy(draft)
     draft_sha256 = digest(asdict(draft))
     source_sha256 = digest(asdict(source))
     with _evidence_read_callback(conn):
         verify = getattr(port, "receipt_review_payment_v1", None)
         if not callable(verify):
             raise LifecycleError("Installed evidence port lacks authenticated receipt payment")
-        payment = verify(conn, source, draft)
-        if digest(asdict(source)) != source_sha256 or digest(asdict(draft)) != draft_sha256:
+        payment = verify(conn, expected_source, expected_draft)
+        if (
+            digest(asdict(expected_source)) != source_sha256
+            or digest(asdict(expected_draft)) != draft_sha256
+        ):
             raise LifecycleError("Receipt callback changed its expected draft or source")
         if payment is None:
             return None
@@ -168,12 +187,13 @@ def _receipt_payment(conn, port, source, draft):
         payment = replace(payment)
         selection = replace(payment.selection)
         debit = replace(payment.debit)
-        account = replace(
-            payment.account,
-            account_ref=replace(payment.account.account_ref),
-            bundle_ref=replace(payment.account.bundle_ref),
+        payment = replace(
+            payment,
+            account=_copy_account(payment.account),
+            selection=selection,
+            debit=debit,
+            debit_question_account=_copy_account(payment.debit_question_account),
         )
-        payment = replace(payment, account=account, selection=selection, debit=debit)
     last_fields = draft.manual_supplements[-1] if draft.manual_supplements else draft.manual_reply
     payment_messages = {
         selection.question_message_id,
@@ -205,6 +225,7 @@ def _receipt_payment(conn, port, source, draft):
         or payment.debit_question_selection_response_id != selection.response_id
         or payment.debit_question_selection_response_sha256 != selection.response_sha256
         or payment.debit_question_selection_update_id != selection.reply_update_id
+        or payment.debit_question_account != payment.account
     ):
         raise LifecycleError("Receipt payment differs from original draft and linked replies")
     return payment
@@ -252,24 +273,20 @@ class ReceiptReviewReaderV1:
             ReceiptReviewFieldsTargetV1,
             VerifiedReceiptReviewFieldsReplyV1,
             _complete_review_fields,
-            receipt_review_fields_target_v1,
+            _copy_review_fields_target,
         )
 
         with self._boundary._read() as (service, conn):
             preparation, opening = self._prepare(service, conn, source_id)
             if preparation is None:
                 return None
-            target = receipt_review_fields_target_v1(preparation)
-            expected_sha256 = digest(asdict(target))
             with _evidence_read_callback(conn):
                 verify = getattr(service.port._port, "receipt_review_fields_reply_v1", None)
                 if not callable(verify):
                     raise LifecycleError(
                         "Installed evidence port lacks receipt review fields reply"
                     )
-                evidence = verify(conn, target)
-                if digest(asdict(target)) != expected_sha256:
-                    raise LifecycleError("Receipt review callback changed its expected target")
+                evidence = verify(conn, preparation.source.evidence_id)
                 if evidence is None:
                     return None
                 if (
@@ -281,7 +298,9 @@ class ReceiptReviewReaderV1:
                 ):
                     raise LifecycleError("Exact authenticated receipt review reply required")
                 evidence = replace(
-                    evidence, target=replace(evidence.target), reply=replace(evidence.reply)
+                    evidence,
+                    target=_copy_review_fields_target(evidence.target),
+                    reply=replace(evidence.reply),
                 )
             return _complete_review_fields(preparation, evidence, opening)
 
@@ -304,7 +323,6 @@ class ReceiptReviewReaderV1:
         debit = _DEBIT_AMOUNT.fullmatch(payment.debit.raw_text.strip())
         if (
             original_currency not in SUPPORTED_CURRENCIES
-            or payment.debit_question_currency != account.currency
             or debit is None
             or debit[1] not in {None, account.currency}
         ):

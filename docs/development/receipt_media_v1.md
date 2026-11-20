@@ -273,12 +273,22 @@ authenticates the reply choosing the payment account and the separate reply
 giving the amount actually debited. Core checks their order and links to the
 draft, compares the selected account and opening against the current ledger,
 and validates both the receipt total and actual debit in their own currencies.
+The account shown in the delivered debit question must match the account
+chosen in the earlier question.
 
 `completed(source_id)` adds the category from a separate authenticated reply.
-Where there is an active opening, it also requires the user's inclusion
-answer or an explicitly stated actual debit date strictly after that opening.
-The printed receipt date alone does not determine the account's balance
-treatment. Unknown fields remain pending. These reads prepare review inputs.
+The evidence port derives the purpose and complete target from the original
+delivered question. Core compares it to the target of the current preparation.
+The port receives a receipt lookup identity and must authenticate the original
+question and reply before returning the target.
+
+Where there is an active opening, an explicitly stated debit date strictly
+after that opening determines that the debit was excluded. For an earlier or
+same-day debit, the reply must include the user's inclusion answer. When both
+are supplied, the review preserves the date and checks it against the answer
+and the earlier authenticated report of the completed debit. The printed
+receipt date alone does not determine the account's balance treatment.
+Unknown fields remain pending. These reads prepare review inputs.
 Posting still requires a separate delivered confirmation card and guarded
 finalization.
 
