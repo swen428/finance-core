@@ -47,7 +47,7 @@ class NativeCandidateCollectionV1:
     read_identity: ReadIdentityV1
     candidates: tuple[NativeReconciliationCandidateV1, ...]
     format: str = field(default="finance-native-candidate-collection-v1", init=False)
-    scope: str = field(default="native-lifecycle-v2", init=False)
+    scope: str = field(default="native-lifecycle-v2", kw_only=True)
     complete: bool = field(default=True, init=False)
 
 
@@ -102,6 +102,7 @@ class NativeReconciliationAdapterV1:
             filters=collection.filters,
             read_identity=collection.read_identity,
             candidates=tuple(candidates),
+            scope=collection.scope,
         )
 
 
