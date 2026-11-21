@@ -200,6 +200,18 @@ protected inventory. Independent snapshot-copy audits and writer
 checks for the live target and dependencies use SQL. The private optimization
 has the same financial limits and complete-scope requirements as the SQL path.
 
+During `prepare_review` on an admitted single-host synthetic writer, a
+participating evidence adapter can call
+`review_history_scope_v1.authenticate_movement_review_history_namespaces_v1(connection,
+port, authenticate)` from its existing read-only evidence callback. Supply the
+exact adapter and a function that completes both namespace scans or raises.
+`False` delegates to the adapter's ordinary scans. `True` means those scans
+succeeded on the same protected historical audit. Each requested item is still
+authenticated against its original evidence. A scope mismatch or scan failure
+refuses preparation, including a failure caught within the adapter. The scope
+expires before the current proposal's separate validation and the review
+append. Other operations and adapters use their existing evidence path.
+
 `collect_with_contributions_v1()` supplies the existing account, movement and
 original-currency totals with the exact record versions and original amounts
 used for income and expense statistics. It returns resolved balance effects
