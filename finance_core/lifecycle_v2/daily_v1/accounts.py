@@ -327,7 +327,10 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq,
 def verify_proposal(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
-    if sealed.get("format") == "finance-daily-opening-observation-v2":
+    if sealed.get("format") in {
+        "finance-daily-opening-observation-v2",
+        "finance-daily-opening-paged-observation-v1",
+    }:
         from .opening_changes_v1 import verify_proposal as verify_opening_proposal
 
         return verify_opening_proposal(service, conn, proposal, _rows=_rows)

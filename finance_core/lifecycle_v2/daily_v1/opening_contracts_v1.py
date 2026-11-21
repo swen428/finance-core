@@ -221,11 +221,132 @@ def subject(dependency, candidate):
     }
 
 
+QUESTION_LIST_FORMAT = "finance-daily-opening-question-list-v1"
+_QUESTION_PAGE_FORMAT = "finance-daily-opening-question-page-v2"
+_QUESTION_PAGES_FORMAT = "finance-daily-opening-question-pages-v2"
+_MAX_QUESTION_SUBJECTS = 512
+_QUESTION_PAGE_SUBJECTS = 16
+_QUESTION_PAGE_BYTES = 64 * 1024
+_QUESTION_GROUP_BYTES = 4 * 1024 * 1024
+
+
 def list_material(dependencies, candidate):
     return {
-        "format": "finance-daily-opening-question-list-v1",
+        "format": QUESTION_LIST_FORMAT,
         "subjects": [subject(d, candidate) for d in dependencies],
     }
+
+
+def _question_page(proposal, list_sha256, index, subjects):
+    page = {
+        "format": _QUESTION_PAGE_FORMAT,
+        "proposal_ref": proposal,
+        "list_sha256": list_sha256,
+        "index": index,
+        "subjects": subjects,
+    }
+    return {**page, "page_sha256": digest(page)}
+
+
+def question_pages_v2(current: dict) -> dict:
+    """Frame one authenticated ordered question list as bounded presentation pages."""
+    proposal = current["proposal_ref"]
+    list_sha256 = current["list_sha256"]
+    subjects = current["subjects"]
+    if type(subjects) is not list or len(subjects) > _MAX_QUESTION_SUBJECTS:
+        raise LifecycleError("Complete opening question list exceeds page capacity")
+    if current["format"] != QUESTION_LIST_FORMAT or (
+        digest({"format": QUESTION_LIST_FORMAT, "subjects": subjects}) != list_sha256
+    ):
+        raise LifecycleError("Opening question list identity differs")
+
+    pages: list[dict] = []
+    start = 0
+    while start < len(subjects):
+        end = min(start + _QUESTION_PAGE_SUBJECTS, len(subjects))
+        while True:
+            page = _question_page(proposal, list_sha256, len(pages) + 1, subjects[start:end])
+            if len(canonical(page).encode()) <= _QUESTION_PAGE_BYTES:
+                break
+            if end == start + 1:
+                raise LifecycleError("Opening question subject exceeds page capacity")
+            end -= 1
+        pages.append(page)
+        start = end
+
+    manifest = {
+        "format": _QUESTION_PAGES_FORMAT,
+        "proposal_ref": proposal,
+        "list_sha256": list_sha256,
+        "subject_count": len(subjects),
+        "page_sha256": [page["page_sha256"] for page in pages],
+    }
+    framed = {**manifest, "manifest_sha256": digest(manifest), "pages": pages}
+    if len(canonical(framed).encode()) > _QUESTION_GROUP_BYTES:
+        raise LifecycleError("Opening question pages exceed complete display capacity")
+    return framed
+
+
+def verify_question_pages_v2(
+    packet: dict, *, proposal_ref: dict, list_sha256: str
+) -> tuple[dict, ...]:
+    """Reconstruct all original subjects from bounded, complete ordered pages."""
+    exact(
+        packet,
+        {
+            "format",
+            "proposal_ref",
+            "list_sha256",
+            "subject_count",
+            "page_sha256",
+            "manifest_sha256",
+            "pages",
+        },
+        "opening question pages",
+    )
+    if (
+        packet["format"] != _QUESTION_PAGES_FORMAT
+        or canonical(packet["proposal_ref"]) != canonical(proposal_ref)
+        or packet["list_sha256"] != sha(list_sha256)
+        or type(packet["subject_count"]) is not int
+        or not 0 <= packet["subject_count"] <= _MAX_QUESTION_SUBJECTS
+        or type(packet["pages"]) is not list
+        or type(packet["page_sha256"]) is not list
+        or len(packet["pages"]) != len(packet["page_sha256"])
+        or len(packet["pages"]) > packet["subject_count"]
+    ):
+        raise LifecycleError("Opening question page manifest differs")
+    if len(canonical(packet).encode()) > _QUESTION_GROUP_BYTES:
+        raise LifecycleError("Opening question pages exceed complete display capacity")
+    manifest = {
+        key: value for key, value in packet.items() if key not in {"manifest_sha256", "pages"}
+    }
+    if digest(manifest) != packet["manifest_sha256"]:
+        raise LifecycleError("Opening question page manifest differs")
+
+    subjects: list[dict] = []
+    for index, (page, checksum) in enumerate(zip(packet["pages"], packet["page_sha256"]), 1):
+        exact(
+            page,
+            {"format", "proposal_ref", "list_sha256", "index", "subjects", "page_sha256"},
+            "opening question page",
+        )
+        if (
+            type(page["subjects"]) is not list
+            or not 0 < len(page["subjects"]) <= _QUESTION_PAGE_SUBJECTS
+            or any(type(row) is not dict for row in page["subjects"])
+            or len(subjects) + len(page["subjects"]) > packet["subject_count"]
+            or len(canonical(page).encode()) > _QUESTION_PAGE_BYTES
+        ):
+            raise LifecycleError("Opening question page exceeds capacity")
+        expected = _question_page(proposal_ref, list_sha256, index, page["subjects"])
+        if canonical(page) != canonical(expected) or checksum != expected["page_sha256"]:
+            raise LifecycleError("Opening question page identity differs")
+        subjects.extend(page["subjects"])
+    material = {"format": QUESTION_LIST_FORMAT, "subjects": subjects}
+    if len(subjects) != packet["subject_count"] or digest(material) != list_sha256:
+        raise LifecycleError("Opening question pages do not contain the complete original list")
+    return tuple(subjects)
 
 
 def validate_map(value, bundle):

@@ -35,6 +35,13 @@ def _old_record(values):
 
 
 def audit_connection(conn, *, _rows=None):
+    from .daily_v1._opening_proposal_pages_v1 import preflight
+
+    preflight(conn)
+    return _audit_connection(conn, _rows=_rows)
+
+
+def _audit_connection(conn, *, _rows=None):
     previous = None
     expected_seq = 1
     for row in (
@@ -357,7 +364,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
                 "Synthetic daily capacity requires retained synthetic scope"
             ) from exc
         validate_daily_capacity(retained, capacity)
-    if sealed.get("format") == "finance-daily-opening-observation-v2":
+    if sealed.get("format") in {
+        "finance-daily-opening-observation-v2",
+        "finance-daily-opening-paged-observation-v1",
+    }:
         from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
 
         return verify_opening_proposal(service, conn, proposal, _rows=_rows)
@@ -756,19 +766,27 @@ class SnapshotEvidenceVerifier:
 
 
 def _has_daily_values(conn):
+    from .daily_v1._opening_proposal_pages_v1 import PAGED_PENDING
     from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
 
-    return bool(_receipt_capture_ids(conn)) or any(
-        json.loads(row[0]).get("format")
-        in {
-            BUNDLE_FORMAT,
-            "finance-daily-account-bundle-v2",
-            "finance-daily-opening-incomplete-v2",
-            INCOMPLETE_FORMAT,
-            "finance-daily-movement-v1",
-            "finance-daily-movement-incomplete-v1",
-        }
-        for row in conn.execute("SELECT values_json FROM l2_proposals")
+    # Select routing metadata only. The audit preflight rejects malformed cuts
+    # and applies the page budget before any proposal value reaches Python.
+    return bool(
+        _receipt_capture_ids(conn)
+        or conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM l2_proposals "
+            "WHERE CASE WHEN json_valid(values_json) THEN json_extract(values_json, '$.format') "
+            "END IN (?, ?, ?, ?, ?, ?, ?))",
+            (
+                BUNDLE_FORMAT,
+                "finance-daily-account-bundle-v2",
+                "finance-daily-opening-incomplete-v2",
+                PAGED_PENDING,
+                INCOMPLETE_FORMAT,
+                "finance-daily-movement-v1",
+                "finance-daily-movement-incomplete-v1",
+            ),
+        ).fetchone()[0]
     )
 
 
@@ -779,6 +797,9 @@ def audit_evidence_connection(
     from finance_core.instance_admission.sessions import _witness_for
 
     from ._audit_rows_v1 import audit_rows
+    from .daily_v1._opening_proposal_pages_v1 import preflight
+
+    preflight(conn)
 
     if _witness_for(conn) is not None and _has_daily_values(conn):
         from .daily_v1.accounts import _EvidenceReadPort
@@ -802,7 +823,7 @@ def _audit_evidence_connection(
     conn, port, binding, legacy_verifier=None, *, _rows=None, daily_capacity=None
 ):
     """Original SQL reference with optional private, audit-local raw lookups."""
-    result = audit_connection(conn, _rows=_rows)
+    result = _audit_connection(conn, _rows=_rows)
     verifier = SnapshotEvidenceVerifier(
         port, binding, legacy_verifier, daily_capacity=daily_capacity
     )

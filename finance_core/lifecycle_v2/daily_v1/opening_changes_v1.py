@@ -6,14 +6,17 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from finance_core.money import canonical_money_str
 
 from ..contracts import (
+    DailyCapacityV2,
     ExpectedDisplay,
     LifecycleError,
     ProposalRef,
     VerifiedSource,
     canonical,
     digest,
+    validate_daily_capacity,
 )
 from ..service import _event, _id, _row
+from . import _opening_proposal_pages_v1 as pages
 from ._impacts_v1 import opening_inventory, resolve_effect_v1
 from .accounts import (
     MAX_PROPOSALS,
@@ -26,6 +29,7 @@ from .accounts import (
     _require_prefix,
     _review_dto,
     _source_instruction,
+    _tail,
     bundle_ref,
 )
 from .contracts import (
@@ -51,6 +55,7 @@ from .opening_contracts_v1 import (
     decode_expected,
     decode_link,
     list_material,
+    question_pages_v2,
 )
 
 
@@ -126,12 +131,10 @@ def _compose(
     dependencies = opening_inventory(conn, ref.record_id, before_seq, _rows=_rows)
     retained, original_command = [], None
     if original_id != reply:
-        if (
-            previous is None
-            or strict_json(previous["observation_json"]).get("format") != OBSERVATION_FORMAT
-        ):
+        previous_sealed = pages.read_sealed(previous) if previous is not None else {}
+        if previous_sealed.get("format") != OBSERVATION_FORMAT:
             raise LifecycleError("Opening answers lack original proposal")
-        old = decode_expected(strict_json(previous["observation_json"])["expected"])
+        old = decode_expected(previous_sealed["expected"])
         if old.binding != binding:
             raise LifecycleError("stale_proposal_binding")
         if (
@@ -140,11 +143,9 @@ def _compose(
             or old.command_kind != kind
         ):
             raise LifecycleError("New target needs fresh opening instruction")
-        command = decode_command(
-            strict_json(previous["observation_json"])["observation"]["raw_proposal"]
-        )
+        command = decode_command(previous_sealed["observation"]["raw_proposal"])
         original_command = {k: command[k] for k in ("command_kind", "fields", "reason_span")}
-        old_values = strict_json(previous["values_json"])
+        old_values = pages.read_values(previous)
         if old.dependencies == dependencies:
             retained = (
                 old_values["answers"]
@@ -220,7 +221,7 @@ def _opening_proposal_chain(conn, proposal, *, _rows=None):
         if version > MAX_PROPOSALS or len(chain) >= MAX_PROPOSALS:
             raise LifecycleError("complete_read_limit_exceeded: opening proposal chain")
         identity = text(proposal["proposal_id"], "opening proposal id")
-        sealed = strict_json(proposal["observation_json"])
+        sealed = pages.read_sealed(proposal)
         exact(sealed, {"format", "expected", "observation"}, "opening observation")
         if sealed["format"] != OBSERVATION_FORMAT:
             raise LifecycleError("Unsupported opening observation")
@@ -272,7 +273,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def _verify_proposal_item(service, conn, proposal, *, _rows=None):
     fingerprint = _fingerprint(conn)
-    sealed = strict_json(proposal["observation_json"])
+    sealed = pages.read_sealed(proposal)
     exact(sealed, {"format", "expected", "observation"}, "opening observation")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported opening observation")
@@ -320,6 +321,17 @@ def _verify_proposal_item(service, conn, proposal, *, _rows=None):
     ):
         raise LifecycleError("Authenticated opening proposal differs")
     values = compile_opening(decode_command(actual.raw_proposal), expected)
+    if strict_json(proposal["observation_json"])["format"] == pages.PAGED_OBSERVATION:
+        header, values = pages.encode(
+            actual_expected,
+            actual,
+            values,
+            proposal["proposal_id"],
+            events[0]["seq"],
+            events[0]["previous_sha256"],
+        )
+        if canonical(header) != proposal["observation_json"]:
+            raise LifecycleError("Opening pages differ from their original event and owner")
     material = [
         proposal["source_id"],
         proposal["version"],
@@ -593,7 +605,10 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
         reply_evidence_id,
         command_kind,
         opening_instruction_evidence_id=None,
+        page_initial_dependencies=False,
     ):
+        if type(page_initial_dependencies) is not bool:
+            raise LifecycleError("Explicit opening page selection required")
         for value, label in (
             (observation_id, "opening observation"),
             (operation_id, "operation id"),
@@ -601,6 +616,8 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
         ):
             text(value, label)
         with self._write() as (service, conn):
+            if page_initial_dependencies:
+                validate_daily_capacity(service.binding, DailyCapacityV2.SYNTHETIC_512)
             _audit(service, conn)
             existing = conn.execute(
                 "SELECT * FROM l2_proposals WHERE observation_id=?", (observation_id,)
@@ -614,6 +631,11 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                     event is None
                     or event["kind"] != "propose"
                     or event["entity_id"] != existing["proposal_id"]
+                    or (
+                        strict_json(existing["observation_json"])["format"]
+                        == pages.PAGED_OBSERVATION
+                    )
+                    != page_initial_dependencies
                     or expected.record_id != account_id
                     or expected.target_bundle_ref != asdict(expected_bundle_ref)
                     or expected.reply_evidence_id != reply_evidence_id
@@ -664,6 +686,17 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
             _require_current(conn, expected)
             require_dependencies(conn, expected)
             version, proposal_id = expected.expected_proposal_version + 1, _id("opening-proposal")
+            if page_initial_dependencies:
+                seq, prior_sha = _tail(conn)
+                header, values = pages.encode(
+                    expected, actual, values, proposal_id, seq + 1, prior_sha
+                )
+            else:
+                header = {
+                    "format": OBSERVATION_FORMAT,
+                    "expected": asdict(expected),
+                    "observation": asdict(actual),
+                }
             material = [
                 expected.source_id,
                 version,
@@ -672,14 +705,10 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                 expected.expected_version,
                 expected.record_id,
             ]
-            sealed = canonical(
-                {
-                    "format": OBSERVATION_FORMAT,
-                    "expected": asdict(expected),
-                    "observation": asdict(actual),
-                }
-            )
+            sealed, values_json = canonical(header), canonical(values)
             strict_json(sealed)
+            if page_initial_dependencies:
+                pages.preflight(conn, (sealed, values_json, canonical(material)))
             conn.execute(
                 "INSERT INTO l2_proposals VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -689,7 +718,7 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                     observation_id,
                     expected.expected_version,
                     expected.record_id,
-                    canonical(values),
+                    values_json,
                     sealed,
                     digest(material),
                     service._now(),
@@ -706,7 +735,7 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
             _require_current_authority(service, conn, expected)
             _require_current(conn, expected, proposal=proposal)
             require_dependencies(conn, expected)
-            values = strict_json(proposal["values_json"])
+            values = pages.read_values(proposal)
             candidate = values["candidate"] if values["format"] == INCOMPLETE_FORMAT else values
             if candidate is None:
                 raise LifecycleError("Opening fields incomplete")
@@ -724,6 +753,10 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                 **material,
             }
 
+    def opening_questions_v2(self, proposal_id):
+        """Present the complete current questions without granting answer or commit authority."""
+        return question_pages_v2(self.opening_questions_v1(proposal_id))
+
     def prepare_review(self, proposal_id, expected_proposal_version):
         with self._write() as (service, conn):
             _audit(service, conn)
@@ -731,7 +764,7 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
             expected = verify_proposal(service, conn, proposal)
             if proposal["version"] != expected_proposal_version:
                 raise LifecycleError("stale_proposal_version")
-            values = strict_json(proposal["values_json"])
+            values = pages.read_values(proposal)
             if values["format"] == INCOMPLETE_FORMAT:
                 raise LifecycleError("incomplete_proposal: " + ",".join(values["missing_fields"]))
             existing = conn.execute(
@@ -770,12 +803,12 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
             _audit(service, conn)
             rows = conn.execute(
                 "SELECT p.* FROM l2_proposals p "
-                "WHERE json_extract(p.observation_json,'$.format')=? "
+                "WHERE json_extract(p.observation_json,'$.format') IN (?,?) "
                 "AND p.version=(SELECT max(version) FROM l2_proposals WHERE source_id=p.source_id) "
                 "AND NOT EXISTS(SELECT 1 FROM l2_reviews r JOIN l2_decisions d "
                 "ON d.review_id=r.review_id WHERE r.proposal_id=p.proposal_id) "
                 "ORDER BY p.created_at DESC,p.proposal_id LIMIT ?",
-                (OBSERVATION_FORMAT, limit),
+                (OBSERVATION_FORMAT, pages.PAGED_OBSERVATION, limit),
             ).fetchall()
             return tuple(
                 {
@@ -784,7 +817,7 @@ class DailyOpeningChangeServiceV1(DailyAccountServiceV1):
                             r["proposal_id"], r["source_id"], r["version"], r["proposal_sha256"]
                         )
                     ),
-                    "values": strict_json(r["values_json"]),
+                    "values": pages.read_values(r),
                 }
                 for r in rows
             )
@@ -814,7 +847,7 @@ def require_independent_action(conn, expected, proposal, action_id, *, _rows=Non
         envelope = strict_json(raw)
         prior = envelope.get("expected", {})
         if (
-            envelope.get("format") == OBSERVATION_FORMAT
+            envelope.get("format") in {OBSERVATION_FORMAT, pages.PAGED_OBSERVATION}
             and prior.get("instruction") == expected.instruction
         ):
             used.add(prior["reply_evidence_id"])
