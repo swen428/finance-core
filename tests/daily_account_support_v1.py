@@ -195,7 +195,13 @@ class DailyPort:
         )
 
     def register_movement_reply(
-        self, question, instruction_id, *, actual_delivery_id=None, selected_account=None
+        self,
+        question,
+        instruction_id,
+        *,
+        actual_delivery_id=None,
+        selected_account=None,
+        correction=None,
     ):
         from finance_core.lifecycle_v2.contracts import canonical
         from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref
@@ -218,6 +224,8 @@ class DailyPort:
                 **question,
                 "subject": {**question["subject"], "selected_account": selected_account},
             }
+        if correction is not None:
+            origin["correction"] = correction
         self.movement_link_origins[identity] = origin
         material = {
             "format": "finance-daily-movement-instruction-link-v1",
@@ -229,6 +237,9 @@ class DailyPort:
             "association_ref": {"evidence_id": identity, "sha256": digest(origin)},
             "question": question,
         }
+        if correction is not None:
+            material["format"] = "finance-daily-movement-instruction-link-v2"
+            material["correction"] = correction
         self.movement_links[instruction_id] = {
             "evidence_id": "instruction-link-" + instruction_id,
             "link_json": canonical(material),
@@ -269,6 +280,7 @@ class DailyPort:
                     or original["instruction_sha256"] != self.sources[identity].original_sha256
                     or question["delivery_ref"]["evidence_id"] != original["delivery_evidence_id"]
                     or digest(delivered) != question["delivery_ref"]["sha256"]
+                    or link.get("correction") != original.get("correction")
                 ):
                     raise LifecycleError(
                         "Synthetic actual question/delivery/reply association mismatch"
