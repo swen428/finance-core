@@ -1839,3 +1839,66 @@ def test_owned_pending_opening_pages_survive_original_owner_and_immutable_cut(
             with pytest.raises(LifecycleError, match="storage budget"):
                 audit_evidence_connection(copy, restored_port, binding)
     assert cut.commit_seq == source_audit["event_count"]
+
+
+def test_paged_opening_storage_counts_automatically_resolved_dependencies(live):
+    from dataclasses import asdict, replace
+
+    from finance_core.lifecycle_v2.daily_v1 import _opening_proposal_pages_v1 as pages
+    from finance_core.lifecycle_v2.daily_v1.opening_contracts_v1 import compile_opening
+
+    ledger, port, _, movements, reader, api, source, previous, account, _ = prepare_opening(
+        live, None
+    )
+    boundary = {
+        **unknown_time(),
+        "precision": "instant",
+        "timestamp": NOW,
+        "local_date": "2026-11-17",
+    }
+    movement(ledger, port, movements, account, "unknown-time")
+    later_fields = fields(account)
+    later_fields["funds_time"] = {**boundary, "timestamp": NOW + 10}
+    movement(ledger, port, movements, account, "known-later", later_fields)
+    view = reader.get_account(account)
+    identity = "set-mixed-opening"
+    command = opening_command("opening_set", "900", boundary)
+    port.add_source(identity, "set the opening to MYR 900")
+    port.commands[identity] = command
+    port.register_opening(ledger.binding, source, view, previous, identity, None, "opening_set")
+    expected = api.expected_opening_change_v2(account, view.bundle_ref, identity, "opening_set")
+    unresolved = next(
+        d for d in expected.dependencies if d["values"]["funds_time"] == unknown_time()
+    )
+    later = next(d for d in expected.dependencies if d is not unresolved)
+    # Exercise the compiler and storage shape without creating 126 additional ledger entries.
+    mixed = [
+        unresolved,
+        *[
+            {
+                **later,
+                "fact_ref": {**later["fact_ref"], "record_id": f"mixed-{i:03}"},
+                "economic_event_id": f"mixed-event-{i:03}",
+            }
+            for i in range(127)
+        ],
+    ]
+    expected = replace(expected, dependencies=mixed)
+    observation = port.opening_proposal_v2(None, identity, expected)
+    pending = compile_opening(command, expected)
+    assert len(pending["answers"]) == 127
+    assert len(pending["missing_fields"]) == 1
+    assert len(canonical(pending).encode("utf-8")) > 128 * 1024
+    header, stored = pages.encode(expected, observation, pending, "opening-mixed", 16, None)
+    event = [
+        expected.source_id,
+        expected.expected_proposal_version + 1,
+        asdict(observation),
+        stored,
+        expected.expected_version,
+        expected.record_id,
+    ]
+    cells = tuple(canonical(value) for value in (header, stored, event))
+    assert len(cells[0].encode("utf-8")) <= 128 * 1024
+    assert all(len(cell.encode("utf-8")) <= 1024 * 1024 for cell in cells[1:])
+    assert pages.read_values({"observation_json": cells[0], "values_json": cells[1]}) == pending

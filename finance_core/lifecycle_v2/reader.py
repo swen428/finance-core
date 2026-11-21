@@ -766,20 +766,27 @@ class SnapshotEvidenceVerifier:
 
 
 def _has_daily_values(conn):
+    from .daily_v1._opening_proposal_pages_v1 import PAGED_PENDING
     from .daily_v1.contracts import BUNDLE_FORMAT, INCOMPLETE_FORMAT
 
-    return bool(_receipt_capture_ids(conn)) or any(
-        json.loads(row[0]).get("format")
-        in {
-            BUNDLE_FORMAT,
-            "finance-daily-account-bundle-v2",
-            "finance-daily-opening-incomplete-v2",
-            "finance-daily-opening-paged-pending-v1",
-            INCOMPLETE_FORMAT,
-            "finance-daily-movement-v1",
-            "finance-daily-movement-incomplete-v1",
-        }
-        for row in conn.execute("SELECT values_json FROM l2_proposals")
+    # Select routing metadata only. The audit preflight rejects malformed cuts
+    # and applies the page budget before any proposal value reaches Python.
+    return bool(
+        _receipt_capture_ids(conn)
+        or conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM l2_proposals "
+            "WHERE CASE WHEN json_valid(values_json) THEN json_extract(values_json, '$.format') "
+            "END IN (?, ?, ?, ?, ?, ?, ?))",
+            (
+                BUNDLE_FORMAT,
+                "finance-daily-account-bundle-v2",
+                "finance-daily-opening-incomplete-v2",
+                PAGED_PENDING,
+                INCOMPLETE_FORMAT,
+                "finance-daily-movement-v1",
+                "finance-daily-movement-incomplete-v1",
+            ),
+        ).fetchone()[0]
     )
 
 

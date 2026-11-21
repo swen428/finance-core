@@ -1,6 +1,7 @@
 """Owned pages for an initial, unresolved opening proposal on the original 061 rows."""
 
 import json
+import sqlite3
 from dataclasses import asdict
 
 from ..contracts import DailyCapacityV2, LifecycleError, canonical, digest, validate_daily_capacity
@@ -22,24 +23,57 @@ def _size(text):
 
 def preflight(conn, added_cells=()):
     """Check retained and projected physical bytes before loading any new material."""
-    row = conn.execute(
-        "SELECT coalesce(max(length(CAST(p.observation_json AS BLOB))),0),"
-        "coalesce(max(length(CAST(p.values_json AS BLOB))),0),"
-        "coalesce(max(length(CAST(e.payload_json AS BLOB))),0),"
-        "coalesce(sum(length(CAST(p.observation_json AS BLOB)) + "
-        "length(CAST(p.values_json AS BLOB)) + length(CAST(e.payload_json AS BLOB))),0) "
-        "FROM l2_proposals p LEFT JOIN l2_events e "
-        "ON e.kind='propose' AND e.entity_id=p.proposal_id "
-        "WHERE json_extract(p.observation_json,'$.format')=?",
-        (PAGED_OBSERVATION,),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            """
+            WITH proposal_metadata AS (
+                SELECT proposal_id,
+                       json_extract(observation_json, '$.format') IS ? AS paged_observation,
+                       json_extract(values_json, '$.format') IS ? AS paged_values,
+                       coalesce(length(CAST(observation_json AS BLOB)), 0) AS observation_bytes,
+                       coalesce(length(CAST(values_json AS BLOB)), 0) AS values_bytes
+                FROM l2_proposals
+            ), page_metadata AS (
+                SELECT p.observation_bytes, p.values_bytes,
+                       p.paged_observation <> p.paged_values AS mismatched_formats,
+                       count(e.seq) AS owners,
+                       coalesce(max(length(CAST(e.payload_json AS BLOB))), 0) AS largest_event,
+                       coalesce(sum(length(CAST(e.payload_json AS BLOB))), 0) AS event_bytes,
+                       max(CASE WHEN e.seq IS NOT NULL AND length(CAST(e.payload_json AS BLOB)) <= ?
+                                THEN NOT json_valid(e.payload_json) ELSE 0 END) AS malformed_event
+                FROM proposal_metadata p LEFT JOIN l2_events e
+                     ON e.kind = 'propose' AND e.entity_id = p.proposal_id
+                WHERE p.paged_observation OR p.paged_values
+                GROUP BY p.proposal_id
+            )
+            SELECT coalesce(max(observation_bytes), 0), coalesce(max(values_bytes), 0),
+                   coalesce(max(largest_event), 0),
+                   coalesce(sum(observation_bytes + values_bytes + event_bytes), 0),
+                   coalesce(max(mismatched_formats), 0), coalesce(max(owners <> 1), 0),
+                   coalesce(max(malformed_event), 0)
+            FROM page_metadata
+            """,
+            (PAGED_OBSERVATION, PAGED_PENDING, _CELL_BYTES),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if str(exc) != "malformed JSON":
+            raise
+        raise LifecycleError("Malformed opening proposal page material") from exc
+
+    observation_bytes, values_bytes, event_bytes, cut_bytes, mismatched, unowned, malformed = row
     added = tuple(_size(cell) for cell in added_cells)
     if (
-        row[0] > 131072
-        or max(row[1], row[2], *added) > _CELL_BYTES
-        or row[3] + sum(added) > _CUT_BYTES
+        max((observation_bytes, *added[:1])) > 128 * 1024
+        or max(values_bytes, event_bytes, *added) > _CELL_BYTES
+        or cut_bytes + sum(added) > _CUT_BYTES
     ):
         raise LifecycleError("Opening proposal page material exceeds its storage budget")
+    if mismatched:
+        raise LifecycleError("Opening proposal page format markers differ")
+    if unowned:
+        raise LifecycleError("Opening proposal pages lack their exact owning propose event")
+    if malformed:
+        raise LifecycleError("Malformed opening proposal page material")
 
 
 def _page(owner_sha, index, items):
@@ -56,7 +90,8 @@ def encode(expected, observation, values, proposal_id, event_seq, previous_sha):
         or not any(v.startswith("coverage:") for v in values["missing_fields"])
     ):
         raise LifecycleError("Paged opening requires an original unresolved dependency list")
-    strict_json(canonical(values))
+    if _size(canonical(values)) > _CELL_BYTES:
+        raise LifecycleError("Opening proposal page material exceeds its storage budget")
     raw_expected = asdict(expected)
     dependencies = raw_expected.pop("dependencies")
     owner = {

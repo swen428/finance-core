@@ -454,8 +454,10 @@ with the original evidence and the complete dependency closure at the original
 event cut. A later reply uses the ordinary independently delivered question
 and genuine reply evidence.
 
-This storage option accepts the V2 request's maximum of 128 dependencies.
-The original scalar representation remains the default. The separate limits
+V2 requests allow up to 128 dependencies, subject to the byte limits above.
+The question display format can represent up to 512 items, while the service
+can only display the dependencies admitted by the request. The original scalar
+representation remains the default. The separate limits
 on replies, complete maps, review cards and global ledger size still apply.
 If a reply or review exceeds its limit, the original unresolved proposal
 remains legible. Source and immutable-copy audits require the original
