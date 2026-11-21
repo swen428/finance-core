@@ -351,9 +351,10 @@ def decode_instruction_link(value, target=None):
 
 
 def reuses_target_selection_evidence(expected, action_evidence_id):
-    """True if an action attempts to use the delivered menu or its choice again."""
+    """Refuse reuse of the instruction, delivered menu, or choice as confirmation."""
     material = strict_json(expected.instruction_link["link_json"])
     return material["format"] == TARGET_SELECTION_LINK and action_evidence_id in {
+        expected.instruction["evidence_id"],
         material["association_ref"]["evidence_id"],
         material["selection"]["reply_ref"]["evidence_id"],
     }

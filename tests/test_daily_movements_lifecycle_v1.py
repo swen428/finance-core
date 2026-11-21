@@ -186,8 +186,9 @@ def test_target_selection_retains_original_reversal_reason_and_needs_separate_co
     review = api.prepare_review(proposal.proposal_id, proposal.version)
     api.record_delivery(review.review_id, "delivered-complete-void-card")
     assert reader.collect().balances[0].balance_amount == "84.00"
-    with pytest.raises(LifecycleError, match="Daily action or callback state mismatch"):
-        api.confirm(review.review_id, reply, "selection-is-not-confirmation")
+    for reused in (original, association, reply):
+        with pytest.raises(LifecycleError, match="Daily action or callback state mismatch"):
+            api.confirm(review.review_id, reused, "separate-confirmation-required")
     assert reader.collect().balances[0].balance_amount == "84.00"
 
     receipt = api.confirm(review.review_id, "confirm-new-card", "confirmed-selected-void")
