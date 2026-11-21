@@ -340,7 +340,14 @@ def test_synthetic_capacity_profile_covers_write_lookup_and_snapshot(live, monke
     assert current == copied and len(cut.facts) == 3
 
 
-def test_unknown_opening_reports_net_change_without_balance(live):
+def test_unknown_opening_reports_net_change_without_balance(live, monkeypatch):
+    from finance_core.lifecycle_v2.daily_v1 import accounts
+    from finance_core.lifecycle_v2.effective_v1 import (
+        EffectiveFilterV1,
+        EffectiveLedgerReaderV1,
+        EffectiveReadError,
+    )
+
     ledger, port, _, api, reader, account = prepare(live, None)
     movement(ledger, port, api, account, "income", fields(account, "200", "income"))
     movement(ledger, port, api, account, "expense")
@@ -348,6 +355,10 @@ def test_unknown_opening_reports_net_change_without_balance(live):
     assert result.balances[0].balance_amount is None
     assert result.balances[0].recorded_net_change == "191.00"
     assert "unknown_opening" in result.completeness_gaps
+    monkeypatch.setattr(accounts, "MAX_RECORDS", 2)
+    with pytest.raises(EffectiveReadError) as limited:
+        EffectiveLedgerReaderV1.for_daily_ledger(ledger).collect(EffectiveFilterV1(currency="JPY"))
+    assert limited.value.code == "complete_read_limit_exceeded"
 
 
 def test_dual_amount_and_credit_debt(live):

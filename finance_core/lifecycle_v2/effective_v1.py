@@ -29,6 +29,7 @@ from .service import LedgerService
 MAX_COMPLETE_RECORDS_V1 = 10_000
 MAX_COMPLETE_FACT_VERSIONS_V1 = 100_000
 _SCOPE = "native-lifecycle-v2"
+_DAILY_EXPENSE_SCOPE = "native-lifecycle-v2-original-expenses"
 _BUSINESS_FIELDS = frozenset(
     {
         "intent",
@@ -254,7 +255,7 @@ class EffectiveCollectionV1:
     read_identity: ReadIdentityV1
     facts: tuple[EffectiveFactV1, ...]
     format: str = field(default="finance-effective-collection-v1", init=False)
-    scope: str = field(default=_SCOPE, init=False)
+    scope: str = field(default=_SCOPE, kw_only=True)
     complete: bool = field(default=True, init=False)
 
 
@@ -265,7 +266,7 @@ class FactHistoryV1:
     read_identity: ReadIdentityV1
     versions: tuple[FactVersionV1, ...]
     format: str = field(default="finance-fact-history-v1", init=False)
-    scope: str = field(default=_SCOPE, init=False)
+    scope: str = field(default=_SCOPE, kw_only=True)
     complete: bool = field(default=True, init=False)
 
 
@@ -282,7 +283,7 @@ class CurrencySummaryCollectionV1:
     read_identity: ReadIdentityV1
     items: tuple[CurrencySummaryV1, ...]
     format: str = field(default="finance-currency-summary-collection-v1", init=False)
-    scope: str = field(default=_SCOPE, init=False)
+    scope: str = field(default=_SCOPE, kw_only=True)
     complete: bool = field(default=True, init=False)
 
 
@@ -382,18 +383,22 @@ class EffectiveLedgerReaderV1:
         return reader
 
     def _read(self, filters=None, limits=None, *, history_id=None, source_id=None):
+        from .daily_v1.accounts import _audit, _BoundService
+
         filters = EffectiveFilterV1() if filters is None else filters
         limits = ReadLimitsV1() if limits is None else limits
         if type(filters) is not EffectiveFilterV1 or type(limits) is not ReadLimitsV1:
             raise _invalid("Exact versioned filter and limits required")
-        scope = self.service._runtime_scope() if self._daily_ledger else nullcontext()
-        with scope, lifecycle_read_operation(self.service.owner) as conn:
+        base = self.service
+        daily_ledger = self._daily_ledger
+        runtime = base._runtime_scope() if daily_ledger else nullcontext()
+        output_scope = _DAILY_EXPENSE_SCOPE if daily_ledger else _SCOPE
+        with runtime, lifecycle_read_operation(base.owner) as conn:
+            service = _BoundService(base) if daily_ledger else base
             conn.execute("BEGIN")
             try:
-                if self._daily_ledger:
-                    _require_runtime_scope(
-                        conn, self.service.binding, self.service.runtime_admission
-                    )
+                if daily_ledger:
+                    _require_runtime_scope(conn, service.binding, service.runtime_admission)
                 # Scope and inventory are global, regardless of requested filters.
                 if (
                     conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
@@ -416,39 +421,37 @@ class EffectiveLedgerReaderV1:
                     raise EffectiveReadError(
                         "complete_read_limit_exceeded", "Complete ledger exceeds read limits"
                     )
-                rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
-                values = (
-                    None
-                    if self._daily_ledger
-                    else [_business_fields(row["values_json"]) for row in rows]
-                )
+                fact_query = "SELECT * FROM l2_facts ORDER BY record_id,version"
+                if not daily_ledger:
+                    rows = conn.execute(fact_query).fetchall()
+                    values = [_business_fields(row["values_json"]) for row in rows]
+                    expense_rows = zip(rows, values, strict=True)
                 # This includes reverse event/decision inventory, all historical
                 # versions, dormant proposals, and authenticated external evidence.
                 with localcontext() as context:
                     context.prec = 1024
-                    audit = audit_evidence_connection(
-                        conn,
-                        self.service.port,
-                        self.service.binding,
-                        self.service.legacy_verifier,
-                        daily_capacity=self.service.daily_capacity if self._daily_ledger else None,
+                    audit = (
+                        _audit(service, conn)
+                        if daily_ledger
+                        else audit_evidence_connection(
+                            conn, service.port, service.binding, service.legacy_verifier
+                        )
                     )
+                if daily_ledger:
+                    expense_rows = _legacy_expense_rows(conn.execute(fact_query).fetchall())
                 read_identity = ReadIdentityV1(
-                    digest(asdict(self.service.binding)),
-                    self.service.owner.config.binding_sha256,
+                    digest(asdict(service.binding)),
+                    service.owner.config.binding_sha256,
                     audit["event_count"],
                     audit["audit_sha256"],
                 )
                 latest = {}
                 history = []
                 sources = {}
-                expense_rows = (
-                    _legacy_expense_rows(rows) if values is None else zip(rows, values, strict=True)
-                )
                 for row, business in expense_rows:
                     sid = row["source_id"]
                     if sid not in sources:
-                        sources[sid] = _source_dtos(self.service, conn, sid)[0]
+                        sources[sid] = _source_dtos(service, conn, sid)[0]
                     material = {
                         "record_id": row["record_id"],
                         "economic_event_id": row["economic_event_id"],
@@ -467,17 +470,33 @@ class EffectiveLedgerReaderV1:
                         key=lambda fact: (fact.transaction_date, fact.record_id),
                     )
                 )
-                collection = EffectiveCollectionV1(filters, read_identity, facts)
+                collection = EffectiveCollectionV1(
+                    filters, read_identity, facts, scope=output_scope
+                )
                 fact_history = (
-                    FactHistoryV1(history_id, history[-1].version, read_identity, tuple(history))
+                    FactHistoryV1(
+                        history_id,
+                        history[-1].version,
+                        read_identity,
+                        tuple(history),
+                        scope=output_scope,
+                    )
                     if history
                     else None
                 )
-                source = _source_dtos(self.service, conn, source_id)[1] if source_id else None
+                source = _source_dtos(service, conn, source_id)[1] if source_id else None
                 result = collection, fact_history, source
             except EffectiveReadError:
                 raise
             except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+                if (
+                    daily_ledger
+                    and isinstance(exc, LifecycleError)
+                    and str(exc) == "complete_read_limit_exceeded"
+                ):
+                    raise EffectiveReadError(
+                        "complete_read_limit_exceeded", "Complete ledger exceeds daily read limits"
+                    ) from exc
                 raise EffectiveReadError(
                     "fact_evidence_invalid", "Native ledger evidence is invalid"
                 ) from exc
@@ -519,7 +538,7 @@ class EffectiveLedgerReaderV1:
             amount = digits if scale == 0 else digits[:-scale] + "." + digits[-scale:]
             items.append(CurrencySummaryV1(currency, count, amount))
         return CurrencySummaryCollectionV1(
-            collection.filters, collection.read_identity, tuple(items)
+            collection.filters, collection.read_identity, tuple(items), scope=collection.scope
         )
 
     def export_json(self, filters=None, limits=None) -> str:

@@ -34,12 +34,19 @@ Call `EffectiveLedgerReaderV1.for_daily_ledger(service)` when an application
 offers the original expense views over a ledger with registered daily data.
 This reader authenticates the current runtime binding and audits the complete
 ledger in one protected read. Account and daily movement facts count toward the
-read limits and audit identity. The result uses the same expense DTOs and
-contains records whose current version belongs to the original expense domain.
+daily capacity, any lower requested read limits, and the audit identity. The
+same protected evidence port serves the audit and source values. Results use
+the original expense DTOs and the explicit
+`scope="native-lifecycle-v2-original-expenses"` in collection, summary,
+history, export and reconciliation candidate envelopes. Completeness refers to
+records whose current version belongs to the original expense domain.
 If a daily operation has reassigned or voided an old expense, its current
-record and complete history are available through the daily reader. Opening an
-account keeps existing original-expense lookups and correction targets
-available. The constructor shown above retains its original strict input scope.
+record and complete history are available through the daily reader.
+`get()` and `history()` return `None` when a record is absent from the
+selected projection. `source(source_id)` retrieves authenticated originals
+by their exact source identity. Opening an account keeps existing
+original-expense lookups and correction targets available. The constructor
+shown above retains its original strict input scope.
 
 ## Current facts, history and original evidence
 
