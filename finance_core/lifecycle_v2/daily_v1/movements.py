@@ -102,7 +102,7 @@ def _instruction_target(binding, source, instruction, record_id, kind, previous,
     )
 
 
-def _instruction_link(service, conn, instruction, target, previous):
+def _instruction_link(service, conn, instruction, target, previous, *, current=False):
     fingerprint = _fingerprint(conn)
     actual = service.port.movement_instruction_link(conn, instruction["evidence_id"], target)
     if type(actual) is not VerifiedMovementInstructionLinkV1:
@@ -147,6 +147,14 @@ def _instruction_link(service, conn, instruction, target, previous):
         ):
             raise LifecycleError("Opening supplement differs from the authenticated correction")
     question = link["question"]
+    if (
+        current
+        and target.command_kind == "movement_correct"
+        and question is not None
+        and question["purpose"] == "opening_coverage"
+        and "correction" not in link
+    ):
+        raise LifecycleError("Correction opening reply requires the original correction evidence")
     if question is not None and question["purpose"] == "account_selection":
         prior = strict_json(previous["values_json"])
         if (
@@ -580,7 +588,7 @@ class DailyMovementServiceV1:
         target = _instruction_target(
             service.binding, source, instruction, record_id, kind, previous, ref
         )
-        link = _instruction_link(service, conn, instruction, target, previous)
+        link = _instruction_link(service, conn, instruction, target, previous, current=True)
         return decode_expected(
             asdict(
                 ExpectedMovementInvocationV1(

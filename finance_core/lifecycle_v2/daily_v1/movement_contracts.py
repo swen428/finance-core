@@ -426,7 +426,7 @@ def _later(funds, boundary):
     return False
 
 
-def _coverage(command, expected, values, account, question):
+def _coverage(command, expected, values, account, question, *, require_whole_choice=False):
     opening = account["opening"]
     active = opening is not None and opening["status"] == "ACTIVE"
     supplied = command["fields"].get("coverage")
@@ -457,6 +457,8 @@ def _coverage(command, expected, values, account, question):
         return None
     reason = None
     if supplied and answer != "unknown":
+        if require_whole_choice and whole_choice != answer:
+            raise LifecycleError("Correction opening reply requires a complete coverage choice")
         reason = _reason(supplied["span"], expected, True)
         quote = reason["quote"].casefold()
         if quote not in accepted[answer] or (whole_choice is not None and whole_choice != answer):
@@ -664,7 +666,9 @@ def compile_proposal(command, expected):
         ),
         "reason_ref": reason,
     }
-    coverage = _coverage(command, expected, values, account, question)
+    coverage = _coverage(
+        command, expected, values, account, question, require_whole_choice=correction is not None
+    )
     if correction is not None:
         if coverage is None or coverage["basis"] != "authenticated_reply":
             raise LifecycleError("Correction opening reply must answer the exact current question")

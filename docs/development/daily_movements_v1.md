@@ -147,6 +147,9 @@ authenticates that earlier correction source and rebuilds the material from
 the preceding proposal at both submission and historical replay. The
 follow-up command supplies only the coverage choice and its span and has a
 null `reason_span`. Its financial fields must equal the pending proposal.
+The entire reply must resolve to an accepted coverage choice. A new linked
+correction opening answer requires this version. Historical v1 links retain
+their original reader behavior.
 
 The complete correction retains the first instruction and its reason. Its
 coverage binding uses the later reply and the

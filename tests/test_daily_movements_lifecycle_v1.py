@@ -1,5 +1,7 @@
 """Ordinary admitted public movement flows over genuine synthetic evidence."""
 
+from dataclasses import asdict
+
 import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError
@@ -481,14 +483,58 @@ def test_correction_keeps_reason_from_before_the_separate_opening_reply(
         kind="movement_correct",
         fact_ref=record.fact_ref,
     )
+    correction = {
+        "fields": corrected_fields,
+        "reason_ref": _reason(draft_command["reason_span"], original, True),
+    }
+    if answer == "尚未包含":
+
+        def submit_check(evidence_id, raw, quote, link_correction, *, changed=None):
+            port.add_source(evidence_id, raw)
+            port.register_movement_reply(delivered, evidence_id, correction=link_correction)
+            start = raw.index(quote)
+            span = [start, start + len(quote)]
+            port.commands[evidence_id] = {
+                **draft_command,
+                "fields": {
+                    **corrected_fields,
+                    **(changed or {}),
+                    "coverage": {
+                        "answer": "included" if quote == "已包含" else "excluded",
+                        "span": span,
+                    },
+                },
+                "reason_span": span if link_correction is None else None,
+            }
+            return api.propose_movement_change(
+                record.record_id,
+                evidence_id,
+                record.fact_ref,
+                "submit-" + evidence_id,
+                reply_evidence_id=evidence_id,
+                command_kind="movement_correct",
+            )
+
+        with pytest.raises(LifecycleError, match="complete coverage choice"):
+            submit_check("uncertain-coverage", "我不确定是否已包含", "已包含", correction)
+        with pytest.raises(LifecycleError, match="original correction evidence"):
+            submit_check("unversioned-coverage", "尚未包含", "尚未包含", None)
+        with pytest.raises(LifecycleError, match="only supply coverage"):
+            submit_check(
+                "other-category",
+                "尚未包含",
+                "尚未包含",
+                correction,
+                changed={"category": "different"},
+            )
+        assert api.pending_for_source(record.source_id)["proposal"] == asdict(draft)
+        assert reader.collect().balances[0].balance_amount == "92.00"
+
     port.add_source("later-coverage-reply", answer)
     port.register_movement_reply(
         delivered,
         "later-coverage-reply",
-        correction={
-            "fields": corrected_fields,
-            "reason_ref": _reason(draft_command["reason_span"], original, True),
-        },
+        correction=correction,
     )
     port.commands["later-coverage-reply"] = {
         **draft_command,
