@@ -58,6 +58,7 @@ from .movement_contracts import (
     decode_expected,
     decode_instruction_link,
     movement_record_id_v1,
+    reuses_target_selection_evidence,
     validate_before,
     validate_movement,
     without_coverage,
@@ -109,6 +110,16 @@ def _instruction_link(service, conn, instruction, target, previous, *, current=F
         raise LifecycleError("Exact independent movement instruction link required")
     value = asdict(actual)
     link = decode_instruction_link(value, target)
+    if "selection" in link:
+        selection = link["selection"]
+        reply = selection["reply_ref"]
+        selected = service.port.source(conn, reply["evidence_id"])
+        if (
+            type(selected) is not VerifiedSource
+            or instruction_ref(asdict(selected), target.binding) != reply
+            or selected.raw_input.strip() != str(selection["choice"])
+        ):
+            raise LifecycleError("Target selection differs from the authenticated reply")
     if "correction" in link:
         prior = strict_json(previous["values_json"])
         if prior.get("format") != INCOMPLETE_FORMAT or prior.get("missing_fields") != [
@@ -944,6 +955,7 @@ class DailyMovementServiceV1:
                         expected.instruction["evidence_id"],
                         values["instruction_ref"]["evidence_id"],
                     }
+                    or reuses_target_selection_evidence(expected, action_evidence_id)
                     or action.review_id != review_id
                     or action.review_sha256 != row["review_sha256"]
                     or action.delivery_evidence_id != delivery["evidence_id"]

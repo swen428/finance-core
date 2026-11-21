@@ -114,7 +114,7 @@ The canonical link JSON has exactly `format` (the
   controlled command, independently preserved by the adapter. It has no
   question. A bare included/excluded answer is insufficient for this mode.
 - `question_reply` binds an actual delivered question and the person's reply.
-  It cannot supply a whole-event VOID instruction. VOID requires a direct
+  It cannot supply a whole-event VOID instruction. VOID requires a separately
   targeted instruction and genuine reason. The question contains `question_id`,
   `question_version`, `delivery_ref`, `purpose`, `target` and `subject`. The
   question target contains the same source, binding, prior proposal and fact
@@ -168,6 +168,21 @@ for historical verification. Missing original relation evidence refuses complete
 reads and snapshots.
 The original issued-connection read-only callback scope and pure scalar copyout
 apply to this callback as to other daily evidence callbacks.
+
+For a correction or reversal that starts with an ambiguous target, the
+`finance-daily-movement-instruction-link-v3` link uses `target_selection`.
+The original instruction continues to supply the command and reason.
+`association_ref` identifies the preserved delivered menu. The adapter
+authenticates the actual delivery, the ordered list and original cut, and
+verifies the person's independently received reply against that menu.
+`question` is null. The new `selection` object contains `offered_facts`
+(two to eight ordered, distinct record references), `choice` (one-based),
+and `reply_ref` (the instruction reference for the actual selection message).
+Core rereads that reply, requires a numeric option matching the selected
+fact reference and exact version, and retains the original instruction as
+the source of the reason. Finalization requires a separate confirmation of
+the complete card. Historical audit rechecks the original menu and choice
+and rejects reuse of either as confirmation.
 
 Application integration still owns durable transport/question/provider journal wiring and its
 real service validation. This Core link contract and synthetic port do not

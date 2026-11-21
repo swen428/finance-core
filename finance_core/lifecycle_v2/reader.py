@@ -595,7 +595,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
     from dataclasses import asdict
 
     from .contracts import ExpectedAction
-    from .daily_v1.movement_contracts import CORRECTION_OPENING_BASIS
+    from .daily_v1.movement_contracts import (
+        CORRECTION_OPENING_BASIS,
+        reuses_target_selection_evidence,
+    )
 
     audit_record_inventory(conn, record_id, _rows=_rows)
     previous = None
@@ -712,6 +715,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
             in {values["instruction_ref"]["evidence_id"], expected.instruction["evidence_id"]}
         ):
             raise LifecycleError("Correction opening evidence cannot be its confirmation")
+        if values.get("format") == "finance-daily-movement-v1" and reuses_target_selection_evidence(
+            expected, action.evidence_id
+        ):
+            raise LifecycleError("Target selection evidence cannot be its confirmation")
         payload = json.loads(event["payload_json"])
         accepted_at = payload.get("accepted_at")
         review_material = json.loads(review["material_json"])

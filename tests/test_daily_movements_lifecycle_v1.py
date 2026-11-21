@@ -119,6 +119,87 @@ def movement(
     return proposal, review, receipt
 
 
+def test_target_selection_retains_original_reversal_reason_and_needs_separate_confirmation(live):
+    from finance_core.lifecycle_v2.contracts import canonical, digest
+    from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref, strict_json
+    from finance_core.lifecycle_v2.daily_v1.movement_contracts import TARGET_SELECTION_LINK
+
+    ledger, port, _, api, reader, account = prepare(live, opening="100", currency="SGD")
+    _, _, first = movement(
+        ledger,
+        port,
+        api,
+        account,
+        "coffee-first",
+        fields(account, "8", original="8", currency="SGD"),
+    )
+    _, _, second = movement(
+        ledger,
+        port,
+        api,
+        account,
+        "coffee-second",
+        fields(account, "8", original="8", currency="SGD"),
+    )
+    kept = reader.detail(first.receipt.record_id)
+    target = reader.detail(second.receipt.record_id)
+    original, reply = "ambiguous-reversal", "menu-reply"
+    reason = "duplicate coffee"
+    port.add_source(original, reason)
+    port.add_source(reply, "2")
+    port.commands[original] = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_void",
+        "fields": {},
+        "reason_span": [0, len(reason)],
+    }
+    port.register_movement_instruction(
+        ledger.binding, target.source_id, original, "movement_void", target.fact_ref
+    )
+    registered = port.movement_links[original]
+    link = strict_json(registered["link_json"])
+    selection = {
+        "reply_ref": instruction_ref(asdict(port.sources[reply])),
+        "offered_facts": [asdict(kept.fact_ref), asdict(target.fact_ref)],
+        "choice": 2,
+    }
+    association = link["association_ref"]["evidence_id"]
+    delivered = port.movement_link_origins[association]
+    delivered["selection"] = selection
+    link.update(
+        format=TARGET_SELECTION_LINK,
+        mode="target_selection",
+        selection=selection,
+        association_ref={"evidence_id": association, "sha256": digest(delivered)},
+    )
+    registered["link_json"] = canonical(link)
+
+    proposal = api.propose_movement_change(
+        target.record_id,
+        original,
+        target.fact_ref,
+        "propose-selected-void",
+        reply_evidence_id=original,
+        command_kind="movement_void",
+    )
+    port.remember_movement_proposal(proposal)
+    review = api.prepare_review(proposal.proposal_id, proposal.version)
+    api.record_delivery(review.review_id, "delivered-complete-void-card")
+    assert reader.collect().balances[0].balance_amount == "84.00"
+    with pytest.raises(LifecycleError, match="Daily action or callback state mismatch"):
+        api.confirm(review.review_id, reply, "selection-is-not-confirmation")
+    assert reader.collect().balances[0].balance_amount == "84.00"
+
+    receipt = api.confirm(review.review_id, "confirm-new-card", "confirmed-selected-void")
+    assert receipt.status == "VOID"
+    assert reader.detail(kept.record_id).values["status"] == "ACTIVE"
+    voided = reader.detail(target.record_id)
+    assert voided.values["status"] == "VOID"
+    assert voided.values["reason_ref"]["quote"] == reason
+    assert voided.values["instruction_ref"]["evidence_id"] == original
+    assert reader.collect().balances[0].balance_amount == "92.00"
+
+
 def test_normal_income_expense_one_balance_and_original_receipts(live):
     ledger, port, _, api, reader, account = prepare(live)
     _, review, first = movement(

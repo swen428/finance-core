@@ -35,6 +35,7 @@ REVIEW_FORMAT = "finance-daily-movement-review-v1"
 COMMAND_FORMAT = "finance-daily-movement-command-v1"
 INCOMPLETE_FORMAT = "finance-daily-movement-incomplete-v1"
 CORRECTION_OPENING_LINK = "finance-daily-movement-instruction-link-v2"
+TARGET_SELECTION_LINK = "finance-daily-movement-instruction-link-v3"
 CORRECTION_OPENING_BASIS = "authenticated_correction_opening_reply"
 COMMANDS = frozenset({"movement_create", "movement_correct", "movement_void"})
 FIELDS = frozenset(
@@ -156,6 +157,44 @@ def _validate_account_question(subject, target):
         raise LifecycleError("Selected account must be one of the accounts offered")
 
 
+def _validate_target_selection(selection, target, association):
+    if target["command_kind"] not in {"movement_correct", "movement_void"}:
+        raise LifecycleError("Target selection requires a movement correction or reversal")
+    exact(selection, {"reply_ref", "offered_facts", "choice"}, "movement target selection")
+    reply = selection["reply_ref"]
+    _reference(reply)
+    original = target["instruction_ref"]
+    captured = target["source_instruction_ref"]
+    if (
+        reply["evidence_id"] in {original["evidence_id"], captured["evidence_id"]}
+        or reply["source_key"] in {original["source_key"], captured["source_key"]}
+        or reply["principal_id"] != original["principal_id"]
+        or reply["client_id"] != original["client_id"]
+        or reply["source_timestamp"] < original["source_timestamp"]
+        or association["evidence_id"]
+        in {original["evidence_id"], captured["evidence_id"], reply["evidence_id"]}
+    ):
+        raise LifecycleError("Target selection requires a separate reply to a delivered menu")
+    offered = selection["offered_facts"]
+    choice = selection["choice"]
+    if (
+        type(offered) is not list
+        or not 2 <= len(offered) <= 8
+        or type(choice) is not int
+        or not 1 <= choice <= len(offered)
+    ):
+        raise LifecycleError("Target selection requires an exact choice from two to eight records")
+    refs = [
+        BundleFactRefV1(**exact(ref, BundleFactRefV1.__dataclass_fields__, "offered movement fact"))
+        for ref in offered
+    ]
+    if (
+        len({ref.record_id for ref in refs}) != len(refs)
+        or offered[choice - 1] != target["target_fact_ref"]
+    ):
+        raise LifecycleError("Selected movement differs from the offered fact version")
+
+
 def decode_instruction_link(value, target=None):
     exact(value, {"evidence_id", "link_json"}, "verified movement instruction link")
     text(value["evidence_id"], "instruction link id")
@@ -164,14 +203,24 @@ def decode_instruction_link(value, target=None):
         raise LifecycleError("Canonical movement instruction link required")
     keys = {"format", "mode", "target", "association_ref", "question"}
     supplement = type(material) is dict and material.get("format") == CORRECTION_OPENING_LINK
+    selecting = type(material) is dict and material.get("format") == TARGET_SELECTION_LINK
     if supplement:
         keys.add("correction")
+    if selecting:
+        keys.add("selection")
     exact(material, keys, "instruction link")
+    modes = (
+        {"target_selection"}
+        if selecting
+        else {"initial_instruction", "direct_targeted_instruction", "question_reply"}
+    )
     if (
-        (not supplement and material["format"] != "finance-daily-movement-instruction-link-v1")
+        (
+            not (supplement or selecting)
+            and material["format"] != "finance-daily-movement-instruction-link-v1"
+        )
         or type(material["mode"]) is not str
-        or material["mode"]
-        not in {"initial_instruction", "direct_targeted_instruction", "question_reply"}
+        or material["mode"] not in modes
     ):
         raise LifecycleError("Unsupported movement instruction association")
     actual_target = material["target"]
@@ -294,7 +343,20 @@ def decode_instruction_link(value, target=None):
         validate_as_of(subject["funds_time"])
     elif question is not None:
         raise LifecycleError("Direct/initial instruction cannot invent a question")
+    if selecting:
+        _validate_target_selection(
+            material["selection"], actual_target, material["association_ref"]
+        )
     return material
+
+
+def reuses_target_selection_evidence(expected, action_evidence_id):
+    """True if an action attempts to use the delivered menu or its choice again."""
+    material = strict_json(expected.instruction_link["link_json"])
+    return material["format"] == TARGET_SELECTION_LINK and action_evidence_id in {
+        material["association_ref"]["evidence_id"],
+        material["selection"]["reply_ref"]["evidence_id"],
+    }
 
 
 @dataclass(frozen=True)
