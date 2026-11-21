@@ -10,6 +10,8 @@ from finance_core.lifecycle_v2.reader import _has_daily_values, audit_connection
 
 _HEADER = canonical({"format": pages.PAGED_OBSERVATION})
 _VALUES = canonical({"format": pages.PAGED_PENDING})
+_PAGED_MATERIAL = ["source-0", 1, {}, {"format": pages.PAGED_PENDING}, 0, None]
+_PAGED_EVENT = canonical(_PAGED_MATERIAL)
 
 
 @pytest.fixture
@@ -57,9 +59,9 @@ def test_paged_copy_counts_proposal_bytes_when_owning_event_is_absent(immutable_
             audit_connection(conn)
 
 
-@pytest.mark.parametrize("row", [(_HEADER, "{}"), ("{}", _VALUES)])
+@pytest.mark.parametrize("row", [(_HEADER, "{}"), ("{}", _VALUES), ("{}", "{}")])
 def test_paged_copy_requires_both_format_markers(immutable_copy, row):
-    with immutable_copy([row], [(0, "[]")]) as conn:
+    with immutable_copy([row], [(0, _PAGED_EVENT)]) as conn:
         with pytest.raises(LifecycleError, match="page format markers differ"):
             audit_connection(conn)
 
@@ -69,6 +71,30 @@ def test_paged_values_marker_retains_the_event_budget(immutable_copy, monkeypatc
     oversized_event = canonical(["é" * 64])
     with immutable_copy([("{}", _VALUES)], [(0, oversized_event)]) as conn:
         with pytest.raises(LifecycleError, match="storage budget"):
+            audit_connection(conn)
+
+
+def test_paged_propose_event_requires_its_exact_owned_proposal(immutable_copy):
+    with immutable_copy([], [(0, _PAGED_EVENT)]) as conn:
+        with pytest.raises(LifecycleError, match="exact owned proposal"):
+            audit_connection(conn)
+
+
+@pytest.mark.parametrize("rows", [[], [("{}", "{}")]], ids=["absent", "unmarked"])
+def test_paged_event_marker_retains_the_event_budget(immutable_copy, monkeypatch, rows):
+    monkeypatch.setattr(pages, "_CELL_BYTES", 128)
+    oversized_event = canonical([*_PAGED_MATERIAL[:4], "é" * 64, None])
+    with immutable_copy(rows, [(0, oversized_event)]) as conn:
+        with pytest.raises(LifecycleError, match="storage budget"):
+            audit_connection(conn)
+
+
+@pytest.mark.parametrize(
+    "event", [canonical(_PAGED_MATERIAL[:4]), canonical(["source-0", 1, {}, {}, 0, None])]
+)
+def test_paged_copy_rejects_an_invalid_propose_event_shape(immutable_copy, event):
+    with immutable_copy([(_HEADER, _VALUES)], [(0, event)]) as conn:
+        with pytest.raises(LifecycleError, match="Malformed opening proposal page material"):
             audit_connection(conn)
 
 
@@ -100,5 +126,8 @@ def test_preflight_keeps_canonical_paged_and_legacy_scalar_sizes_separate(
 ):
     monkeypatch.setattr(pages, "_CELL_BYTES", 128)
     legacy_values = canonical({"text": "historical " * 128})
-    with immutable_copy([(_HEADER, _VALUES), ("{}", legacy_values)], [(0, "[]")]) as conn:
+    legacy_event = canonical(["source-1", 1, {}, {"text": "historical " * 128}, 0, None])
+    with immutable_copy(
+        [(_HEADER, _VALUES), ("{}", legacy_values)], [(0, _PAGED_EVENT), (1, legacy_event)]
+    ) as conn:
         pages.preflight(conn)

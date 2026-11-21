@@ -26,41 +26,66 @@ def preflight(conn, added_cells=()):
     try:
         row = conn.execute(
             """
-            WITH proposal_metadata AS (
-                SELECT proposal_id,
-                       json_extract(observation_json, '$.format') IS ? AS paged_observation,
-                       json_extract(values_json, '$.format') IS ? AS paged_values,
-                       coalesce(length(CAST(observation_json AS BLOB)), 0) AS observation_bytes,
-                       coalesce(length(CAST(values_json AS BLOB)), 0) AS values_bytes
+            WITH paged_owners AS (
+                SELECT proposal_id AS owner_id
                 FROM l2_proposals
+                WHERE json_extract(observation_json, '$.format') IS :observation_format
+                   OR json_extract(values_json, '$.format') IS :pending_format
+                UNION
+                SELECT entity_id
+                FROM l2_events
+                WHERE kind = 'propose' AND json_extract(payload_json, '$[3].format')
+                      IS :pending_format
             ), page_metadata AS (
-                SELECT p.observation_bytes, p.values_bytes,
-                       p.paged_observation <> p.paged_values AS mismatched_formats,
-                       count(e.seq) AS owners,
+                SELECT coalesce(length(CAST(p.observation_json AS BLOB)), 0) AS observation_bytes,
+                       coalesce(length(CAST(p.values_json AS BLOB)), 0) AS values_bytes,
+                       json_extract(p.observation_json, '$.format') IS NOT :observation_format
+                           OR json_extract(p.values_json, '$.format') IS NOT :pending_format
+                           AS mismatched_formats,
+                       p.proposal_id IS NULL AS missing_proposal,
+                       count(e.seq) AS event_count,
                        coalesce(max(length(CAST(e.payload_json AS BLOB))), 0) AS largest_event,
                        coalesce(sum(length(CAST(e.payload_json AS BLOB))), 0) AS event_bytes,
-                       max(CASE WHEN e.seq IS NOT NULL AND length(CAST(e.payload_json AS BLOB)) <= ?
-                                THEN NOT json_valid(e.payload_json) ELSE 0 END) AS malformed_event
-                FROM proposal_metadata p LEFT JOIN l2_events e
-                     ON e.kind = 'propose' AND e.entity_id = p.proposal_id
-                WHERE p.paged_observation OR p.paged_values
-                GROUP BY p.proposal_id
+                       max(CASE WHEN e.seq IS NOT NULL
+                                     AND length(CAST(e.payload_json AS BLOB)) <= :cell_bound
+                                THEN json_array_length(e.payload_json) IS NOT 6
+                                     OR json_extract(e.payload_json, '$[3].format')
+                                        IS NOT :pending_format
+                                ELSE 0 END) AS malformed_event
+                FROM paged_owners o
+                LEFT JOIN l2_proposals p ON p.proposal_id = o.owner_id
+                LEFT JOIN l2_events e ON e.kind = 'propose' AND e.entity_id = o.owner_id
+                GROUP BY o.owner_id
             )
             SELECT coalesce(max(observation_bytes), 0), coalesce(max(values_bytes), 0),
                    coalesce(max(largest_event), 0),
                    coalesce(sum(observation_bytes + values_bytes + event_bytes), 0),
-                   coalesce(max(mismatched_formats), 0), coalesce(max(owners <> 1), 0),
+                   coalesce(max(mismatched_formats), 0), coalesce(max(missing_proposal), 0),
+                   coalesce(max(event_count <> 1), 0),
                    coalesce(max(malformed_event), 0)
             FROM page_metadata
             """,
-            (PAGED_OBSERVATION, PAGED_PENDING, _CELL_BYTES),
+            {
+                "observation_format": PAGED_OBSERVATION,
+                "pending_format": PAGED_PENDING,
+                "cell_bound": _CELL_BYTES,
+            },
         ).fetchone()
     except sqlite3.OperationalError as exc:
         if str(exc) != "malformed JSON":
             raise
         raise LifecycleError("Malformed opening proposal page material") from exc
 
-    observation_bytes, values_bytes, event_bytes, cut_bytes, mismatched, unowned, malformed = row
+    (
+        observation_bytes,
+        values_bytes,
+        event_bytes,
+        cut_bytes,
+        mismatched,
+        no_proposal,
+        unowned,
+        malformed,
+    ) = row
     added = tuple(_size(cell) for cell in added_cells)
     if (
         max((observation_bytes, *added[:1])) > 128 * 1024
@@ -68,6 +93,8 @@ def preflight(conn, added_cells=()):
         or cut_bytes + sum(added) > _CUT_BYTES
     ):
         raise LifecycleError("Opening proposal page material exceeds its storage budget")
+    if no_proposal:
+        raise LifecycleError("Paged opening propose event lacks its exact owned proposal")
     if mismatched:
         raise LifecycleError("Opening proposal page format markers differ")
     if unowned:
