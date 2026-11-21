@@ -53,7 +53,7 @@ from .contracts import (
     validate_bundle,
 )
 
-MAX_RECORDS = 128
+MAX_RECORDS = 512
 MAX_FACT_VERSIONS = 2048
 MAX_PROPOSALS = 4096
 
