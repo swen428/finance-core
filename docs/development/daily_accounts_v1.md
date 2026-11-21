@@ -279,6 +279,7 @@ an earlier valid decision or its original receipt.
 | Old lookup selecting a daily record | Explicit unsupported-record error |
 | Old bounded recent/pending selection | Refuses a selected daily item; does not silently skip it |
 | Old complete effective-ledger reads, summaries, export and reconciliation | Refuses the complete request when a daily fact exists, before filtering |
+| Explicit `EffectiveLedgerReaderV1.for_daily_ledger(service)` | Audits the complete mixed ledger and returns the original expense views for records still in the original expense domain |
 | Registered full audit and snapshot sealing | Audits both registered old and daily formats; unknown formats fail |
 | Old prepared/native recovery material | Retains its original personal-expense domain, including refusal of pending-only daily material |
 

@@ -8,13 +8,18 @@ from __future__ import annotations
 
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from decimal import localcontext
-from typing import Any
+from itertools import groupby
+from typing import Any, Self
 
 from finance_core.instance_admission import ProductionOwner
-from finance_core.instance_admission.sessions import lifecycle_read_operation
+from finance_core.instance_admission.sessions import (
+    _require_runtime_scope,
+    lifecycle_read_operation,
+)
 from finance_core.money import Money, canonical_money_str, minor_units, normalize_currency
 
 from .contracts import LifecycleError, RuntimeBinding, VerifiedSource, canonical, digest
@@ -303,6 +308,23 @@ def _business_fields(raw: str) -> dict[str, Any]:
     }
 
 
+def _legacy_expense_rows(rows):
+    """Select the original expense domain after the complete ledger audit."""
+    from .daily_v1.contracts import BUNDLE_FORMATS
+    from .daily_v1.movement_contracts import MOVEMENT_FORMAT
+
+    # The current version selects the record's domain. A legacy expense that
+    # moved into the daily domain must never reappear at its former version.
+    for _, versions in groupby(rows, key=lambda row: row["record_id"]):
+        history = tuple(versions)
+        values = json.loads(history[-1]["values_json"])
+        schema = values.get("format") if type(values) is dict else None
+        if type(schema) is str and (schema in BUNDLE_FORMATS or schema == MOVEMENT_FORMAT):
+            continue
+        for row in history:
+            yield row, _business_fields(row["values_json"])
+
+
 def _source_dtos(service, conn, source_id: str) -> tuple[SourceIdentityV1, VerifiedSource]:
     row = service._source(conn, source_id, allow_archived=True)
     evidence = VerifiedSource(
@@ -350,15 +372,28 @@ class EffectiveLedgerReaderV1:
             raise _invalid("Actual matching LedgerService and production owner required")
         service.owner.assert_valid()
         self.service = service
+        self._daily_ledger = False
+
+    @classmethod
+    def for_daily_ledger(cls, service: LedgerService) -> Self:
+        """Project original native expenses from a fully audited daily ledger."""
+        reader = cls(service)
+        reader._daily_ledger = True
+        return reader
 
     def _read(self, filters=None, limits=None, *, history_id=None, source_id=None):
         filters = EffectiveFilterV1() if filters is None else filters
         limits = ReadLimitsV1() if limits is None else limits
         if type(filters) is not EffectiveFilterV1 or type(limits) is not ReadLimitsV1:
             raise _invalid("Exact versioned filter and limits required")
-        with lifecycle_read_operation(self.service.owner) as conn:
+        scope = self.service._runtime_scope() if self._daily_ledger else nullcontext()
+        with scope, lifecycle_read_operation(self.service.owner) as conn:
             conn.execute("BEGIN")
             try:
+                if self._daily_ledger:
+                    _require_runtime_scope(
+                        conn, self.service.binding, self.service.runtime_admission
+                    )
                 # Scope and inventory are global, regardless of requested filters.
                 if (
                     conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
@@ -382,13 +417,21 @@ class EffectiveLedgerReaderV1:
                         "complete_read_limit_exceeded", "Complete ledger exceeds read limits"
                     )
                 rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
-                values = [_business_fields(row["values_json"]) for row in rows]
+                values = (
+                    None
+                    if self._daily_ledger
+                    else [_business_fields(row["values_json"]) for row in rows]
+                )
                 # This includes reverse event/decision inventory, all historical
                 # versions, dormant proposals, and authenticated external evidence.
                 with localcontext() as context:
                     context.prec = 1024
                     audit = audit_evidence_connection(
-                        conn, self.service.port, self.service.binding, self.service.legacy_verifier
+                        conn,
+                        self.service.port,
+                        self.service.binding,
+                        self.service.legacy_verifier,
+                        daily_capacity=self.service.daily_capacity if self._daily_ledger else None,
                     )
                 read_identity = ReadIdentityV1(
                     digest(asdict(self.service.binding)),
@@ -399,7 +442,10 @@ class EffectiveLedgerReaderV1:
                 latest = {}
                 history = []
                 sources = {}
-                for row, business in zip(rows, values, strict=True):
+                expense_rows = (
+                    _legacy_expense_rows(rows) if values is None else zip(rows, values, strict=True)
+                )
+                for row, business in expense_rows:
                     sid = row["source_id"]
                     if sid not in sources:
                         sources[sid] = _source_dtos(self.service, conn, sid)[0]

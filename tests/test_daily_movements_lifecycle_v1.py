@@ -891,6 +891,7 @@ def test_account_reassignment_replaces_one_impact_and_duplicate_void_keeps_other
 
 
 def test_legacy_unassigned_is_counted_once_then_controlled_reassignment_keeps_receipt(live):
+    from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
     from tests.test_lifecycle_v2 import response
 
     ledger, port, _, api, reader, account = prepare(live)
@@ -904,6 +905,8 @@ def test_legacy_unassigned_is_counted_once_then_controlled_reassignment_keeps_re
     card = ledger.prepare_review(proposal.proposal_id, proposal.version)
     ledger.record_delivery(card.review_id, "delivery-legacy")
     original = ledger.confirm(card.review_id, "action-legacy", "confirm-legacy")
+    compatibility = EffectiveLedgerReaderV1.for_daily_ledger(ledger)
+    assert compatibility.get(original.record_id).amount == "12.00"
     result = reader.collect()
     assert result.unassigned_personal_expense_count == 1
     assert result.expense_by_currency == (("SGD", "12.00"),)
@@ -924,6 +927,9 @@ def test_legacy_unassigned_is_counted_once_then_controlled_reassignment_keeps_re
     assert result.expense_by_currency == (("SGD", "12.00"),)
     assert result.balances[0].balance_amount == "988.00"
     assert len(reader.history(original.record_id)) == 2
+    assert compatibility.get(original.record_id) is None
+    assert compatibility.history(original.record_id) is None
+    assert compatibility.summary().items == ()
     assert (
         ledger.lookup_commit_receipt(
             "confirm-legacy", review_id=card.review_id, action_evidence_id="action-legacy"

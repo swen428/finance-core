@@ -290,7 +290,7 @@ def test_action_callback_cannot_change_runtime_or_use_switched_port(live):
 
 
 def test_mixed_old_expense_stays_unassigned_and_complete_filter_cannot_hide_daily(live):
-    from finance_core.lifecycle_v2.effective_v1 import EffectiveFilterV1
+    from finance_core.lifecycle_v2.effective_v1 import EffectiveFilterV1, ReadLimitsV1
     from tests.test_lifecycle_v2 import response
 
     ledger, port, daily, reader, _ = setup(live)
@@ -302,6 +302,7 @@ def test_mixed_old_expense_stays_unassigned_and_complete_filter_cannot_hide_dail
     card = ledger.prepare_review(proposal.proposal_id, proposal.version)
     ledger.record_delivery(card.review_id, "old-delivery")
     old_receipt = ledger.confirm(card.review_id, "old-action", "old-confirm")
+    original = EffectiveLedgerReaderV1(ledger).collect()
     _, _, _, daily_receipt = create(ledger, port, daily)
     result = reader.collect_accounts()
     assert result.unassigned_personal_expense_count == 1
@@ -310,6 +311,44 @@ def test_mixed_old_expense_stays_unassigned_and_complete_filter_cannot_hide_dail
     assert ledger.reader().get(old_receipt.record_id)["values"]["currency"] == "SGD"
     with pytest.raises(EffectiveReadError, match="Unsupported"):
         EffectiveLedgerReaderV1(ledger).collect(EffectiveFilterV1(currency="SGD"))
+    compatibility = EffectiveLedgerReaderV1.for_daily_ledger(ledger)
+    observed = compatibility.collect()
+    assert observed.facts == original.facts
+    assert observed.read_identity.event_seq > original.read_identity.event_seq
+    assert compatibility.get(old_receipt.record_id) == original.facts[0]
+    assert compatibility.get(daily_receipt.receipt.record_id) is None
+    assert compatibility.source(old.source_id) == port.sources["old-source"]
+    assert compatibility.summary().items[0].total_amount == "12.00"
+    assert json.loads(compatibility.export_json())["facts"][0]["amount"] == "12.00"
+    with pytest.raises(EffectiveReadError) as limited:
+        compatibility.collect(EffectiveFilterV1(currency="SGD"), ReadLimitsV1(max_records=1))
+    assert limited.value.code == "complete_read_limit_exceeded"
+
+    reply = "change amount to SGD 15.00\n原因：记录有误"
+    port.add_source("amount-reply", reply)
+    port.native_raw["amount-observation"] = response(
+        reply, "reply", {"amount": "15.00", "currency": "SGD"}
+    )
+    target = compatibility.get(old_receipt.record_id)
+    corrected = ledger.prepare_correction(
+        target.record_id,
+        target.version,
+        "amount-observation",
+        "prepare-amount",
+        reply_evidence_id="amount-reply",
+        reason="记录有误",
+    )
+    ledger.record_delivery(corrected.review_id, "amount-delivery")
+    updated = ledger.confirm(corrected.review_id, "amount-action", "amount-confirm")
+    history = compatibility.history(old_receipt.record_id)
+    assert [(item.version, item.amount) for item in history.versions] == [
+        (1, "12.00"),
+        (2, "15.00"),
+    ]
+    assert history.versions[-1].fact_sha256 == updated.fact_sha256
+    assert compatibility.summary().items[0].total_amount == "15.00"
+    assert reader.collect_accounts().accounts[0].opening_amount == "12.30"
+
     with pytest.raises(LifecycleError, match="unsupported_record_format"):
         ledger.prepare_correction(
             daily_receipt.receipt.record_id,

@@ -30,6 +30,17 @@ evidence port. No arbitrary connection, cached fact or deserialized DTO supplies
 read verification or current write authority. Separate calls are separate read
 observations; a later correction can legitimately change their results.
 
+Call `EffectiveLedgerReaderV1.for_daily_ledger(service)` when an application
+offers the original expense views over a ledger with registered daily data.
+This reader authenticates the current runtime binding and audits the complete
+ledger in one protected read. Account and daily movement facts count toward the
+read limits and audit identity. The result uses the same expense DTOs and
+contains records whose current version belongs to the original expense domain.
+If a daily operation has reassigned or voided an old expense, its current
+record and complete history are available through the daily reader. Opening an
+account keeps existing original-expense lookups and correction targets
+available. The constructor shown above retains its original strict input scope.
+
 ## Current facts, history and original evidence
 
 `get(record_id)` returns `EffectiveFactV1` or `None` for an absent identity.
