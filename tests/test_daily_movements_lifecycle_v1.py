@@ -429,6 +429,112 @@ def test_opening_coverage_draft_then_separate_complete_card_and_nonempty_refusal
     assert reader.collect().balances[0].balance_amount == "1000.00"
 
 
+@pytest.mark.parametrize(("answer", "closing"), [("尚未包含", "90.00"), ("已包含", "100.00")])
+def test_correction_keeps_reason_from_before_the_separate_opening_reply(
+    live, tmp_path, answer, closing
+):
+    from finance_core.lifecycle_v2.daily_v1.contracts import _reason
+    from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
+
+    ledger, port, _, api, reader, account = prepare(live, "100", currency="SGD")
+    _, _, receipt = movement(
+        ledger, port, api, account, "original", fields(account, "8", original="8", currency="SGD")
+    )
+    record = reader.detail(receipt.receipt.record_id)
+    reason = "收据金额有误"
+    port.add_source("correction-request", reason)
+    port.register_movement_instruction(
+        ledger.binding, record.source_id, "correction-request", "movement_correct", record.fact_ref
+    )
+    original = api.expected_movement_change(
+        record.record_id, record.fact_ref, "correction-request", "movement_correct"
+    )
+    corrected_fields = fields(account, "10", original="10", currency="SGD")
+    del corrected_fields["coverage"]
+    draft_command = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_correct",
+        "fields": corrected_fields,
+        "reason_span": [0, len(reason)],
+    }
+    port.commands["correction-request"] = draft_command
+    draft = api.propose_movement_change(
+        record.record_id,
+        "correction-request",
+        record.fact_ref,
+        "submit-correction",
+        reply_evidence_id="correction-request",
+        command_kind="movement_correct",
+    )
+    port.remember_movement_proposal(draft)
+    assert api.pending_for_source(record.source_id)["values"]["missing_fields"] == [
+        "opening_coverage"
+    ]
+    with pytest.raises(LifecycleError, match="incomplete_proposal: opening_coverage"):
+        api.prepare_review(draft.proposal_id, draft.version)
+
+    delivered = port.register_opening_question(
+        ledger.binding,
+        record.source_id,
+        "corrected-debit-coverage",
+        opening_subject(corrected_fields, reader.get_account(account)),
+        kind="movement_correct",
+        fact_ref=record.fact_ref,
+    )
+    port.add_source("later-coverage-reply", answer)
+    port.register_movement_reply(
+        delivered,
+        "later-coverage-reply",
+        correction={
+            "fields": corrected_fields,
+            "reason_ref": _reason(draft_command["reason_span"], original, True),
+        },
+    )
+    port.commands["later-coverage-reply"] = {
+        **draft_command,
+        "fields": {
+            **corrected_fields,
+            "coverage": {
+                "answer": "included" if answer == "已包含" else "excluded",
+                "span": [0, len(answer)],
+            },
+        },
+        "reason_span": None,
+    }
+    submission = (record.record_id, "later-coverage-reply", record.fact_ref, "submit-coverage")
+    first = api.propose_movement_change(
+        *submission, reply_evidence_id="later-coverage-reply", command_kind="movement_correct"
+    )
+    assert first == api.propose_movement_change(
+        *submission, reply_evidence_id="later-coverage-reply", command_kind="movement_correct"
+    )
+    assert first.version == draft.version + 1
+    card = api.prepare_review(first.proposal_id, first.version)
+    assert card.material["reason_ref"]["quote"] == reason
+    assert card.material["reason_ref"]["instruction_ref"]["evidence_id"] == "correction-request"
+    coverage = card.material["after_values"]["coverage"]["reply_ref"]
+    assert coverage["quote"] == answer
+    assert coverage["instruction_ref"]["evidence_id"] == "later-coverage-reply"
+    assert reader.collect().balances[0].balance_amount == "92.00"
+
+    api.record_delivery(card.review_id, "delivery-corrected-after-coverage")
+    for evidence_id in ("correction-request", "later-coverage-reply"):
+        with pytest.raises(LifecycleError, match="Daily action"):
+            api.confirm(card.review_id, evidence_id, "not-confirm-" + evidence_id)
+    confirmation = (card.review_id, "confirm-both-sources", "confirm-corrected")
+    posted = api.confirm(*confirmation)
+    assert api.confirm(*confirmation) == posted
+    assert posted.receipt.record_id == record.record_id
+    assert posted.receipt.version == 2
+    result = reader.collect()
+    assert result.balances[0].balance_amount == closing
+    assert result.expense_by_currency == (("SGD", "10.00"),)
+    assert len(reader.history(record.record_id)) == 2
+    path = tmp_path.resolve() / "correction-with-separate-opening-reply.sqlite"
+    cut = ledger.seal_snapshot(path)
+    assert verify_snapshot_evidence(path, port, ledger.binding, cut) == ledger.reader().full_audit()
+
+
 def test_exact_source_pending_lookup_survives_owner_reopen(live):
     from finance_core.instance_admission import acquire_production_owner
     from finance_core.lifecycle_v2 import LedgerService

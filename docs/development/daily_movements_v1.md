@@ -138,6 +138,22 @@ The canonical link JSON has exactly `format` (the
   expense remains pending. A separate complete card and confirmation are
   required for posting.
 
+A pending `movement_correct` proposal missing only `opening_coverage` may use
+`finance-daily-movement-instruction-link-v2` inside the existing verified
+link envelope. This version requires `question_reply` and the exact pending
+correction and current fact. It adds `correction` with the original command
+fields excluding coverage and the genuine original `reason_ref`. Core
+authenticates that earlier correction source and rebuilds the material from
+the preceding proposal at both submission and historical replay. The
+follow-up command supplies only the coverage choice and its span and has a
+null `reason_span`. Its financial fields must equal the pending proposal.
+
+The complete correction retains the first instruction and its reason. Its
+coverage binding uses the later reply and the
+`authenticated_correction_opening_reply` basis. Both remain visible in the
+confirmed fact and the separately confirmed new card. An unresolved answer
+or a changed question subject leaves the original correction pending. The
+original link and coverage formats retain their validation and bytes.
 The adapter authenticates actual question version, delivery, reply-to or choice,
 actor/client, causal order and eligibility at the original instruction event.
 It rejects a superseded question at that point. Historical verification checks

@@ -60,6 +60,7 @@ from .movement_contracts import (
     movement_record_id_v1,
     validate_before,
     validate_movement,
+    without_coverage,
 )
 
 
@@ -108,6 +109,43 @@ def _instruction_link(service, conn, instruction, target, previous):
         raise LifecycleError("Exact independent movement instruction link required")
     value = asdict(actual)
     link = decode_instruction_link(value, target)
+    if "correction" in link:
+        prior = strict_json(previous["values_json"])
+        if prior.get("format") != INCOMPLETE_FORMAT or prior.get("missing_fields") != [
+            "opening_coverage"
+        ]:
+            raise LifecycleError("Opening supplement requires the pending correction")
+        command = decode_command(canonical(prior["command"]))
+        retained = strict_json(previous["observation_json"])
+        if retained.get("format") != OBSERVATION_FORMAT:
+            raise LifecycleError("Opening supplement requires a retained movement correction")
+        original = decode_expected(retained["expected"])
+        if (
+            original.command_kind != "movement_correct"
+            or command["command_kind"] != "movement_correct"
+            or original.binding != target.binding
+            or original.source_id != target.source_id
+            or original.source_sha256 != target.source_sha256
+            or original.target_bundle_ref != target.target_fact_ref
+            or original.reply_evidence_id is None
+            or original.reply_evidence_id == instruction["evidence_id"]
+        ):
+            raise LifecycleError("Opening supplement differs from the original correction target")
+        actual_reason_source = service.port.source(conn, original.reply_evidence_id)
+        if (
+            type(actual_reason_source) is not VerifiedSource
+            or actual_reason_source.evidence_id != original.reply_evidence_id
+            or asdict(actual_reason_source) != original.instruction
+            or prior["instruction_ref"] != instruction_ref(original.instruction, target.binding)
+            or canonical(link["correction"])
+            != canonical(
+                {
+                    "fields": without_coverage(command["fields"]),
+                    "reason_ref": _reason(command["reason_span"], original, True),
+                }
+            )
+        ):
+            raise LifecycleError("Opening supplement differs from the authenticated correction")
     question = link["question"]
     if question is not None and question["purpose"] == "account_selection":
         prior = strict_json(previous["values_json"])
@@ -339,10 +377,6 @@ def verify_review(service, conn, review, *, _rows=None):
     expected_closure = selected_dependency(expected, values)
     if len(events) == 1:
         require_accounts(conn, expected, values, events[0]["seq"], _rows=_rows)
-    command = decode_command(
-        strict_json(proposal["observation_json"])["observation"]["raw_proposal"]
-    )
-
     if (
         len(events) != 1
         or material["format"] != ("finance-daily-movement-review-v2" if v2 else REVIEW_FORMAT)
@@ -354,13 +388,8 @@ def verify_review(service, conn, review, *, _rows=None):
         or material["target_bundle_ref"] != expected.target_bundle_ref
         or material["before_values"] != expected.before_values
         or material["after_values"] != values
-        or material["instruction_ref"] != instruction_ref(expected.instruction)
-        or material["reason_ref"]
-        != _reason(
-            command["reason_span"],
-            expected,
-            expected.command_kind in {"movement_correct", "movement_void"},
-        )
+        or material["instruction_ref"] != values["instruction_ref"]
+        or material["reason_ref"] != values["reason_ref"]
         or material["account_impact_changes"]
         != (
             movement_review_effects(conn, expected, values, events[0]["seq"], _rows=_rows)[0]
@@ -785,10 +814,6 @@ class DailyMovementServiceV1:
                 now = service._now()
                 require_accounts(conn, expected, values)
                 dependency = selected_dependency(expected, values)
-                command = decode_command(
-                    strict_json(proposal["observation_json"])["observation"]["raw_proposal"]
-                )
-
                 material = {
                     "format": REVIEW_FORMAT,
                     "binding": asdict(service.binding),
@@ -799,12 +824,8 @@ class DailyMovementServiceV1:
                     "target_bundle_ref": expected.target_bundle_ref,
                     "before_values": expected.before_values,
                     "after_values": values,
-                    "instruction_ref": instruction_ref(expected.instruction),
-                    "reason_ref": _reason(
-                        command["reason_span"],
-                        expected,
-                        expected.command_kind in {"movement_correct", "movement_void"},
-                    ),
+                    "instruction_ref": values["instruction_ref"],
+                    "reason_ref": values["reason_ref"],
                     "account_dependencies": dependency,
                     "account_impact_changes": review_impact_changes(expected.before_values, values),
                     "created_at": now,
@@ -910,7 +931,11 @@ class DailyMovementServiceV1:
                 service._actor(action)
                 if (
                     action.evidence_id != action_evidence_id
-                    or action_evidence_id == expected.instruction["evidence_id"]
+                    or action_evidence_id
+                    in {
+                        expected.instruction["evidence_id"],
+                        values["instruction_ref"]["evidence_id"],
+                    }
                     or action.review_id != review_id
                     or action.review_sha256 != row["review_sha256"]
                     or action.delivery_evidence_id != delivery["evidence_id"]

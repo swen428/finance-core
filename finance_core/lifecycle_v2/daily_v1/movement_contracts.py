@@ -34,6 +34,8 @@ OBSERVATION_FORMAT = "finance-daily-movement-observation-v1"
 REVIEW_FORMAT = "finance-daily-movement-review-v1"
 COMMAND_FORMAT = "finance-daily-movement-command-v1"
 INCOMPLETE_FORMAT = "finance-daily-movement-incomplete-v1"
+CORRECTION_OPENING_LINK = "finance-daily-movement-instruction-link-v2"
+CORRECTION_OPENING_BASIS = "authenticated_correction_opening_reply"
 COMMANDS = frozenset({"movement_create", "movement_correct", "movement_void"})
 FIELDS = frozenset(
     {
@@ -160,9 +162,13 @@ def decode_instruction_link(value, target=None):
     material = strict_json(value["link_json"])
     if canonical(material) != value["link_json"]:
         raise LifecycleError("Canonical movement instruction link required")
-    exact(material, {"format", "mode", "target", "association_ref", "question"}, "instruction link")
+    keys = {"format", "mode", "target", "association_ref", "question"}
+    supplement = type(material) is dict and material.get("format") == CORRECTION_OPENING_LINK
+    if supplement:
+        keys.add("correction")
+    exact(material, keys, "instruction link")
     if (
-        material["format"] != "finance-daily-movement-instruction-link-v1"
+        (not supplement and material["format"] != "finance-daily-movement-instruction-link-v1")
         or type(material["mode"]) is not str
         or material["mode"]
         not in {"initial_instruction", "direct_targeted_instruction", "question_reply"}
@@ -189,6 +195,33 @@ def decode_instruction_link(value, target=None):
         sha(previous["proposal_sha256"])
     if actual_target["target_fact_ref"] is not None:
         BundleFactRefV1(**actual_target["target_fact_ref"])
+    if supplement:
+        if (
+            material["mode"] != "question_reply"
+            or actual_target["command_kind"] != "movement_correct"
+            or previous is None
+            or actual_target["target_fact_ref"] is None
+        ):
+            raise LifecycleError("Opening supplement requires an exact pending correction")
+        correction = material["correction"]
+        exact(correction, {"fields", "reason_ref"}, "opening correction source")
+        if (
+            type(correction["fields"]) is not dict
+            or not correction["fields"].keys() <= FIELDS - {"coverage"}
+            or correction["reason_ref"] is None
+        ):
+            raise LifecycleError("Opening supplement requires the original correction and reason")
+        _validate_reason_ref(correction["reason_ref"])
+        original = correction["reason_ref"]["instruction_ref"]
+        reply = actual_target["instruction_ref"]
+        if (
+            original["evidence_id"]
+            in {reply["evidence_id"], actual_target["source_instruction_ref"]["evidence_id"]}
+            or original["principal_id"] != reply["principal_id"]
+            or original["client_id"] != reply["client_id"]
+            or original["source_timestamp"] > reply["source_timestamp"]
+        ):
+            raise LifecycleError("Opening supplement requires separate authenticated instructions")
     if target is not None and actual_target != asdict(target):
         raise LifecycleError("movement_instruction_target_mismatch")
     _evidence_ref(material["association_ref"])
@@ -219,6 +252,8 @@ def decode_instruction_link(value, target=None):
             raise LifecycleError("movement_question_target_mismatch")
         subject = question["subject"]
         if question["purpose"] == "account_selection":
+            if supplement:
+                raise LifecycleError("Correction supplement requires an opening coverage question")
             _validate_account_question(subject, actual_target)
             return material
         if question["purpose"] != "opening_coverage":
@@ -471,18 +506,35 @@ def _coverage(command, expected, values, account, question):
     }
 
 
+def without_coverage(fields):
+    return {key: value for key, value in fields.items() if key != "coverage"}
+
+
 def compile_proposal(command, expected):
     if command["command_kind"] != expected.command_kind:
         raise LifecycleError("Movement command differs from request")
     before = expected.before_values
-    if command["reason_span"] is None and expected.command_kind != "movement_create":
+    link = decode_instruction_link(expected.instruction_link)
+    correction = link.get("correction")
+    if correction is not None:
+        if command["reason_span"] is not None or canonical(
+            without_coverage(command["fields"])
+        ) != canonical(correction["fields"]):
+            raise LifecycleError(
+                "Opening reply can only supply coverage for the pending correction"
+            )
+        reason = correction["reason_ref"]
+    elif command["reason_span"] is None and expected.command_kind != "movement_create":
         return {
             "format": INCOMPLETE_FORMAT,
             "missing_fields": ["reason_span"],
             "command": command,
             "instruction_ref": instruction_ref(expected.instruction),
         }
-    reason = _reason(command["reason_span"], expected, expected.command_kind != "movement_create")
+    else:
+        reason = _reason(
+            command["reason_span"], expected, expected.command_kind != "movement_create"
+        )
     if before and before.get("format") == MOVEMENT_FORMAT and before["status"] == "VOID":
         raise LifecycleError("movement_already_void")
     if expected.command_kind == "movement_void":
@@ -527,7 +579,6 @@ def compile_proposal(command, expected):
             }
         )
     f = command["fields"]
-    link = decode_instruction_link(expected.instruction_link)
     question = link["question"]
     selection = (
         question["subject"] if question and question["purpose"] == "account_selection" else None
@@ -606,10 +657,18 @@ def compile_proposal(command, expected):
         "opening_ref": asdict(opening_ref(account))
         if account["opening"] and account["opening"]["status"] == "ACTIVE"
         else None,
-        "instruction_ref": instruction_ref(expected.instruction),
+        "instruction_ref": (
+            reason["instruction_ref"]
+            if correction is not None
+            else instruction_ref(expected.instruction)
+        ),
         "reason_ref": reason,
     }
     coverage = _coverage(command, expected, values, account, question)
+    if correction is not None:
+        if coverage is None or coverage["basis"] != "authenticated_reply":
+            raise LifecycleError("Correction opening reply must answer the exact current question")
+        coverage["basis"] = CORRECTION_OPENING_BASIS
     if coverage is None:
         return {
             "format": INCOMPLETE_FORMAT,
@@ -745,22 +804,46 @@ def validate_movement(value):
         )
         if (
             c["treatment"] not in {"included", "excluded", "no_baseline"}
-            or c["basis"] not in {"no_active_opening", "strictly_later", "authenticated_reply"}
+            or c["basis"]
+            not in {
+                "no_active_opening",
+                "strictly_later",
+                "authenticated_reply",
+                CORRECTION_OPENING_BASIS,
+            }
             or digest(binding) != c["binding_sha256"]
             or any(binding[k] != value[k] for k in binding if k != "instruction_ref")
             or (
                 value["status"] == "ACTIVE"
+                and c["basis"] != CORRECTION_OPENING_BASIS
                 and binding["instruction_ref"] != value["instruction_ref"]
             )
             or (c["treatment"] == "no_baseline") != (value["opening_ref"] is None)
             or (c["basis"] == "no_active_opening") != (c["treatment"] == "no_baseline")
             or (c["basis"] == "strictly_later" and c["treatment"] != "excluded")
-            or (c["treatment"] == "included" and c["basis"] != "authenticated_reply")
+            or (
+                c["treatment"] == "included"
+                and c["basis"] not in {"authenticated_reply", CORRECTION_OPENING_BASIS}
+            )
         ):
             raise LifecycleError("Invalid coverage binding")
         _reference(binding["instruction_ref"])
         _validate_reason_ref(c["reply_ref"])
-        if c["basis"] == "authenticated_reply" and (
+        if (
+            c["basis"] == CORRECTION_OPENING_BASIS
+            and value["status"] == "ACTIVE"
+            and (
+                value["transition"] != "movement_correct"
+                or binding["instruction_ref"]["evidence_id"]
+                == value["instruction_ref"]["evidence_id"]
+                or any(
+                    binding["instruction_ref"][key] != value["instruction_ref"][key]
+                    for key in ("principal_id", "client_id")
+                )
+            )
+        ):
+            raise LifecycleError("Correction coverage must bind a separate reply")
+        if c["basis"] in {"authenticated_reply", CORRECTION_OPENING_BASIS} and (
             c["reply_ref"] is None
             or c["reply_ref"]["instruction_ref"] != binding["instruction_ref"]
         ):
