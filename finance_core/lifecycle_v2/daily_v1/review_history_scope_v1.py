@@ -68,7 +68,8 @@ def _movement_review_history_scope_v1(
     if binding.environment != "single-host-synthetic":
         yield
         return
-    if _CURRENT.get() is not None:
+    existing = _CURRENT.get()
+    if existing is not None and existing.active:
         raise LifecycleError("Nested review history scope refused")
     witness = _witness_for(conn)
     if (
@@ -114,7 +115,7 @@ def authenticate_movement_review_history_namespaces_v1(
     callable. Per-item evidence and admission checks remain the caller's job.
     """
     scope = _CURRENT.get()
-    if scope is None:
+    if scope is None or not scope.active:
         return False
     try:
         if scope.failed or scope.authenticating:
