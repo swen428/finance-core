@@ -350,16 +350,6 @@ def decode_instruction_link(value, target=None):
     return material
 
 
-def reuses_target_selection_evidence(expected, action_evidence_id):
-    """Refuse reuse of the instruction, delivered menu, or choice as confirmation."""
-    material = strict_json(expected.instruction_link["link_json"])
-    return material["format"] == TARGET_SELECTION_LINK and action_evidence_id in {
-        expected.instruction["evidence_id"],
-        material["association_ref"]["evidence_id"],
-        material["selection"]["reply_ref"]["evidence_id"],
-    }
-
-
 @dataclass(frozen=True)
 class VerifiedMovementProposalV1:
     evidence_id: str

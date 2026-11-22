@@ -45,9 +45,11 @@ from .contracts import (
 )
 from .movement_contracts import (
     COMMANDS,
+    CORRECTION_OPENING_LINK,
     INCOMPLETE_FORMAT,
     OBSERVATION_FORMAT,
     REVIEW_FORMAT,
+    TARGET_SELECTION_LINK,
     DailyMovementReceiptV1,
     ExpectedMovementInvocationV1,
     MovementInstructionTargetV1,
@@ -58,7 +60,6 @@ from .movement_contracts import (
     decode_expected,
     decode_instruction_link,
     movement_record_id_v1,
-    reuses_target_selection_evidence,
     validate_before,
     validate_movement,
     without_coverage,
@@ -346,6 +347,32 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Evidence callback changed protected state")
     return expected
+
+
+def reuses_target_selection_evidence(service, conn, expected, action_evidence_id, *, _rows=None):
+    """Keep the original target-selection messages distinct from a later confirmation."""
+    link = strict_json(expected.instruction_link["link_json"])
+    if link["format"] == CORRECTION_OPENING_LINK:
+        proposal_id = expected.current_proposal_id
+        prior = (
+            _rows.one(conn, "proposal", proposal_id)
+            if _rows is not None
+            else _row(conn, "l2_proposals", "proposal_id", proposal_id)
+        )
+        if (
+            prior is None
+            or prior["source_id"] != expected.source_id
+            or prior["record_id"] != expected.record_id
+            or prior["version"] != expected.expected_proposal_version
+        ):
+            raise LifecycleError("Opening supplement lacks its original correction proposal")
+        original = verify_proposal(service, conn, prior, _rows=_rows)
+        link = strict_json(original.instruction_link["link_json"])
+    return link["format"] == TARGET_SELECTION_LINK and action_evidence_id in {
+        link["target"]["instruction_ref"]["evidence_id"],
+        link["association_ref"]["evidence_id"],
+        link["selection"]["reply_ref"]["evidence_id"],
+    }
 
 
 def verify_review(service, conn, review, *, _rows=None):
@@ -955,7 +982,7 @@ class DailyMovementServiceV1:
                         expected.instruction["evidence_id"],
                         values["instruction_ref"]["evidence_id"],
                     }
-                    or reuses_target_selection_evidence(expected, action_evidence_id)
+                    or reuses_target_selection_evidence(service, conn, expected, action_evidence_id)
                     or action.review_id != review_id
                     or action.review_sha256 != row["review_sha256"]
                     or action.delivery_evidence_id != delivery["evidence_id"]

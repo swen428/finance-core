@@ -181,8 +181,9 @@ and `reply_ref` (the instruction reference for the actual selection message).
 Core rereads that reply, requires a numeric option matching the selected
 fact reference and exact version, and retains the original instruction as
 the source of the reason. Finalization requires a separate confirmation of
-the complete card. Historical audit rechecks the original menu and choice
-and rejects reuse of the instruction, menu, or choice as confirmation.
+the complete card. A later opening-coverage answer preserves that separation.
+Historical audit rechecks the original menu and choice and rejects reuse of
+the instruction, menu, or choice as confirmation.
 
 Application integration still owns durable transport/question/provider journal wiring and its
 real service validation. This Core link contract and synthetic port do not
