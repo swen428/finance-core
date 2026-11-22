@@ -11,6 +11,7 @@ from .daily_v1._impacts_v1 import account_inventory
 from .daily_v1.contracts import AccountDefinitionRefV1, BundleFactRefV1, account_ref
 from .daily_v1.reader import DailyReadIdentityV1
 from .receipt_draft_v1 import ReceiptManualDraftV1, _receipt_amount_is_valid
+from .receipt_fields_v1 import ReceiptWholeDraftV1
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,7 @@ class ReceiptPaymentAccountOptionV1:
 
 @dataclass(frozen=True)
 class ReceiptPaymentHandoffV1:
-    draft: ReceiptManualDraftV1
+    draft: ReceiptManualDraftV1 | ReceiptWholeDraftV1
     read_identity: DailyReadIdentityV1
     account_options: tuple[ReceiptPaymentAccountOptionV1, ...]
     state: Literal[

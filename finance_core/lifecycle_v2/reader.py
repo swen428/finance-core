@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
     from .receipt_fields_v1 import ReceiptWholeDraftV1
+    from .receipt_payment_handoff_v1 import ReceiptPaymentHandoffV1
 
 
 def _registered_values(value):
@@ -274,7 +275,13 @@ class LedgerReader:
         replies = service.port.receipt_manual_replies_v1(conn, source)
         return source, _project_manual_draft(source_id, source, replies) if replies else None
 
-    def receipt_payment_handoff_v1(self, source_id):
+    def receipt_payment_handoff_v1(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+    ) -> ReceiptPaymentHandoffV1 | None:
         """Read one receipt and its payment choices under the same protected snapshot."""
         from dataclasses import asdict
 
@@ -282,15 +289,18 @@ class LedgerReader:
 
         from .daily_v1.accounts import _audit, _BoundService
         from .daily_v1.reader import DailyReadIdentityV1
+        from .receipt_fields_v1 import _project_payment_draft, _read_optional_recorded_fields
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
+        recorded = _read_optional_recorded_fields(self, source_id, processor, reference)
         service = self.service
         with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
             bound = _BoundService(service)
             _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
             conn.execute("BEGIN")
             try:
-                _, draft = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
+                source, manual = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
+                draft = _project_payment_draft(source_id, source, manual, recorded)
                 if draft is None or draft.missing_receipt_fields:
                     return None
                 audit = _audit(bound, conn)

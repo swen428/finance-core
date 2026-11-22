@@ -282,6 +282,13 @@ delivered question. Core compares it to the target of the current preparation.
 The port receives a receipt lookup identity and must authenticate the original
 question and reply before returning the target.
 
+Both reads accept the same optional verified processor and reference as the
+payment handoff. Core reopens the OCR members before the protected transaction
+and checks the original again inside it. The retained account question must
+identify the exact whole draft, including its OCR and manual evidence. A later
+change to either source requires a new payment question. An OCR-only draft
+still needs the separately authenticated account selection, debit and category.
+
 Where there is an active opening, an explicitly stated debit date strictly
 after that opening determines that the debit was excluded. For an earlier or
 same-day debit, the reply must include the user's inclusion answer. When both
@@ -357,3 +364,10 @@ amount or unsupported currency leaves the receipt pending and returns its
 own state. An authenticated later reply can replace that unresolved value
 in the same draft. The earlier reply remains visible in the history. The
 draft progress and payment handoff create no account impact.
+
+Pass an exact media processor and its reference together to
+`LedgerReader.receipt_payment_handoff_v1` to use the verified whole draft for
+this read. The protected snapshot checks the captured original again before
+reading the authenticated manual fields, current eligible accounts and ledger
+identity. The handoff remains pending when a whole-draft field is unresolved.
+Calling without media keeps the existing manual handoff.

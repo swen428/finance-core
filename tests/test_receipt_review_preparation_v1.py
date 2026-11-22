@@ -7,6 +7,7 @@ import pytest
 from finance_core.instance_admission import acquire_production_owner
 from finance_core.lifecycle_v2.contracts import LifecycleError, digest
 from finance_core.lifecycle_v2.daily_v1 import DailyAccountReaderV1, DailyAccountServiceV1
+from finance_core.lifecycle_v2.receipt_fields_v1 import ReceiptWholeDraftV1
 from finance_core.lifecycle_v2.receipt_review_fields_v1 import (
     VerifiedReceiptReviewFieldsReplyV1,
     receipt_review_fields_target_v1,
@@ -31,7 +32,11 @@ class PaymentPort(HandoffPort):
 
     def receipt_review_payment_v1(self, conn, source, draft):
         assert conn.in_transaction
-        assert source == self.receipt and draft.source_evidence_id == self.receipt.evidence_id
+        assert source == self.receipt
+        if type(draft) is ReceiptWholeDraftV1:
+            assert draft.source == source
+        else:
+            assert draft.source_evidence_id == self.receipt.evidence_id
         self.payment_inputs = (source, draft)
         return self.payment
 
@@ -50,6 +55,12 @@ def setup_payment(live, *, opening=None):
     create(ledger, port, daily, command(fields=fields))
     port.replies = (port.answer, replace(port.supplement, raw_text="币种：USD"))
     handoff = ledger.reader().receipt_payment_handoff_v1(source.source_id)
+    payment = payment_for_handoff(source, handoff)
+    port.payment = payment
+    return ledger, port, daily, source.source_id, payment
+
+
+def payment_for_handoff(source, handoff):
     selection = VerifiedReceiptPaymentReplyV1(
         "payment-question", "1" * 64, 4002, NOW, 24, 92, NOW + 1, "selection-poll", "2" * 64, "1"
     )
@@ -65,7 +76,7 @@ def setup_payment(live, *, opening=None):
         "4" * 64,
         "SGD 10.37",
     )
-    payment = VerifiedReceiptPaymentV1(
+    return VerifiedReceiptPaymentV1(
         "receipt",
         source.source_sha256,
         digest(asdict(handoff.draft)),
@@ -80,8 +91,6 @@ def setup_payment(live, *, opening=None):
         selection.reply_update_id,
         handoff.account_options[0],
     )
-    port.payment = payment
-    return ledger, port, daily, source.source_id, payment
 
 
 def test_receipt_preparation_preserves_both_original_amounts_and_requires_later_review(live):

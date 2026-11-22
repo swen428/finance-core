@@ -9,7 +9,13 @@ from .contracts import LifecycleError, VerifiedReceiptSourceV1, digest
 from .receipt_draft_v1 import ReceiptManualDraftV1, _correctable_field
 
 if TYPE_CHECKING:
-    from finance_core.intake.receipt_media import ReceiptMediaTotalFieldsV1
+    from finance_core.intake.receipt_media import (
+        MediaOcrReference,
+        ReceiptMediaProcessor,
+        ReceiptMediaTotalFieldsV1,
+    )
+
+    from .reader import LedgerReader
 
 
 @dataclass(frozen=True)
@@ -88,3 +94,32 @@ def _read_recorded_fields(source_id, source, processor, reference):
         reference, expected_original_size=source.original_size_bytes
     )
     return RecordedReceiptFieldsV1(source_id, source.original_message_sha256, suggestions)
+
+
+def _read_optional_recorded_fields(
+    reader: LedgerReader,
+    source_id: str,
+    processor: ReceiptMediaProcessor | None,
+    reference: MediaOcrReference | None,
+) -> tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None:
+    if (processor is None) != (reference is None):
+        raise LifecycleError("Supply the exact receipt media processor and reference together")
+    if processor is None or reference is None:
+        return None
+    # Verify the immutable OCR member without holding the ledger transaction.
+    source = reader.receipt_source_v1(source_id)
+    return source, _read_recorded_fields(source_id, source, processor, reference)
+
+
+def _project_payment_draft(
+    source_id: str,
+    source: VerifiedReceiptSourceV1,
+    manual: ReceiptManualDraftV1 | None,
+    recorded: tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None,
+) -> ReceiptManualDraftV1 | ReceiptWholeDraftV1 | None:
+    if recorded is None:
+        return manual
+    original, fields = recorded
+    if original != source:
+        raise LifecycleError("Receipt source changed before the protected payment read")
+    return _whole_receipt_draft(source_id, source, fields, manual)
