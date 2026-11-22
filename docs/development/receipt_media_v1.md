@@ -340,6 +340,14 @@ independent messages with byte-identical images keep separate OCR identities.
 The returned suggestions include their parser evidence and carry no write
 authority. OCR absence or ambiguity remains eligible for manual completion.
 
+`LedgerReader.receipt_whole_draft_v1` reads those suggestions together with
+authenticated manual replies for that original message. It labels each displayed
+field with its source and retains the OCR block references and manual reply spans
+separately. An explicit manual value takes precedence for that field. The draft
+leaves unsupported currency or invalid amount precision unresolved, including
+when an explicit currency changes how an OCR amount can be interpreted. Media
+verification remains outside the protected SQLite read transaction.
+
 The installed evidence port reads manual replies inside the same protected
 transaction as the original receipt. The draft retains the exact original
 and supplemental replies and points each current field to its reply and span.

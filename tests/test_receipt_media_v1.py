@@ -13,7 +13,7 @@ import subprocess
 import sys
 import warnings
 import zlib
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import localcontext
 
 import pytest
@@ -118,6 +118,8 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
         VerifiedReceiptSourceV1,
         receipt_media_operation_id_v1,
     )
+    from finance_core.lifecycle_v2.contracts import digest
+    from finance_core.lifecycle_v2.receipt_draft_v1 import VerifiedReceiptManualReplyV1
 
     processor, engine, request, _, _, original, _ = seam
     service, port, _ = live
@@ -146,6 +148,13 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
         )
 
     port.receipt_source_v1 = receipt
+    manual_replies = ()
+
+    def receipt_replies(connection, source):
+        assert connection.in_transaction
+        return manual_replies if source.evidence_id == "message-1" else ()
+
+    port.receipt_manual_replies_v1 = receipt_replies
     first = service.capture_receipt_v1("message-1", "capture-receipt-1")
     second = service.capture_receipt_v1("message-2", "capture-receipt-2")
     reader = service.reader()
@@ -161,10 +170,73 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     assert fields.merchant.value == "TEST SHOP"
     assert fields.transaction_date.value == "2026-10-01"
     assert fields.amount.block_sequence_indexes == (2,)
+
+    missing = reader.receipt_whole_draft_v1(first.source_id)
+    assert missing.fields == ()
+    assert missing.missing_receipt_fields == ("merchant", "date", "amount", "currency")
+    proposed = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert proposed.ocr == result and proposed.manual is None
+    assert proposed.missing_receipt_fields == ()
+    assert [(f.name, f.value, f.origin) for f in proposed.fields] == [
+        ("merchant", "TEST SHOP", "ocr"),
+        ("date", "2026-10-01", "ocr"),
+        ("amount", "12.34", "ocr"),
+        ("currency", "MYR", "ocr"),
+    ]
+    manual_reply = VerifiedReceiptManualReplyV1(
+        "message-1",
+        digest(asdict(proposed.source)),
+        "user",
+        "chat",
+        "receipt-fields-1",
+        10,
+        11,
+        21,
+        1792800000,
+        "receipt-response-1",
+        "b" * 64,
+        "商家：Sunny Shop\n币种：JPY",
+    )
+    manual_replies = (manual_reply,)
+    awaiting = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert awaiting.missing_receipt_fields == ("amount",)
+    assert awaiting.manual.manual_reply == manual_reply
+    assert awaiting.ocr.suggestions.fields.amount.block_sequence_indexes == (2,)
+    supplement = replace(
+        manual_reply,
+        reply_message_id=12,
+        reply_update_id=22,
+        response_id="receipt-response-2",
+        response_sha256="c" * 64,
+        raw_text="总额：1200",
+    )
+    manual_replies = (manual_reply, supplement)
+    finished = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert finished.ocr == result and finished.manual.manual_supplements == (supplement,)
+    assert finished.missing_receipt_fields == ()
+    assert [(f.name, f.value, f.origin) for f in finished.fields] == [
+        ("merchant", "Sunny Shop", "manual"),
+        ("date", "2026-10-01", "ocr"),
+        ("amount", "1200", "manual"),
+        ("currency", "JPY", "manual"),
+    ]
+    assert reader.receipt_whole_draft_v1(first.source_id).missing_receipt_fields == ("date",)
     with pytest.raises(media.MediaIntegrityError, match="Verified original size differs"):
         processor.read_total_fields_v1(captured.reference, expected_original_size=len(original) + 1)
     with pytest.raises(LifecycleError, match="different receipt source"):
         reader.receipt_fields_v1(second.source_id, processor, captured.reference)
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_whole_draft_v1(
+            second.source_id, processor=processor, reference=captured.reference
+        )
+    with pytest.raises(LifecycleError, match="processor and reference together"):
+        reader.receipt_whole_draft_v1(first.source_id, reference=captured.reference)
     assert reader.full_audit()["fact_version_count"] == 0
 
 

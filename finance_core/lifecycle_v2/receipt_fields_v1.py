@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .contracts import LifecycleError, VerifiedReceiptSourceV1, digest
+from .receipt_draft_v1 import ReceiptManualDraftV1, _correctable_field
 
 if TYPE_CHECKING:
     from finance_core.intake.receipt_media import ReceiptMediaTotalFieldsV1
@@ -16,6 +17,54 @@ class RecordedReceiptFieldsV1:
     source_id: str
     original_message_sha256: str
     suggestions: ReceiptMediaTotalFieldsV1
+
+
+@dataclass(frozen=True)
+class ReceiptWholeDraftFieldV1:
+    """A displayed draft value, sourced from the matching retained evidence."""
+
+    name: str
+    value: str
+    origin: Literal["ocr", "manual"]
+
+
+@dataclass(frozen=True)
+class ReceiptWholeDraftV1:
+    """One original-linked view of the suggested and explicitly supplied fields."""
+
+    source_id: str
+    source: VerifiedReceiptSourceV1
+    ocr: RecordedReceiptFieldsV1 | None
+    manual: ReceiptManualDraftV1 | None
+    fields: tuple[ReceiptWholeDraftFieldV1, ...]
+    missing_receipt_fields: tuple[str, ...]
+
+
+_WHOLE_FIELDS = ("merchant", "date", "amount", "currency")
+
+
+def _whole_receipt_draft(source_id, source, ocr, manual):
+    values = {}
+    if ocr is not None:
+        suggestions = ocr.suggestions.fields
+        for name in _WHOLE_FIELDS:
+            proposed = getattr(suggestions, "transaction_date" if name == "date" else name)
+            if type(proposed.value) is str:
+                values[name] = ReceiptWholeDraftFieldV1(name, proposed.value, "ocr")
+    if manual is not None:
+        for field in manual.fields:
+            values[field.name] = ReceiptWholeDraftFieldV1(field.name, field.value, "manual")
+    unresolved = _correctable_field(values)
+    if unresolved is not None:
+        del values[unresolved]
+    return ReceiptWholeDraftV1(
+        source_id,
+        source,
+        ocr,
+        manual,
+        tuple(values[name] for name in _WHOLE_FIELDS if name in values),
+        tuple(name for name in _WHOLE_FIELDS if name not in values),
+    )
 
 
 def receipt_media_operation_id_v1(source: VerifiedReceiptSourceV1) -> str:

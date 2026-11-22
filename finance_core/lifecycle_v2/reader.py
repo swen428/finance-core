@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import nullcontext
+from typing import TYPE_CHECKING
 
 from finance_core.instance_admission.sessions import (
     _require_runtime_scope,
@@ -21,6 +22,11 @@ from .contracts import (
     validate_daily_capacity,
 )
 from .service import _capture_generation, _fact_material, _receipt_capture_ids
+
+if TYPE_CHECKING:
+    from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
+
+    from .receipt_fields_v1 import ReceiptWholeDraftV1
 
 
 def _registered_values(value):
@@ -225,9 +231,40 @@ class LedgerReader:
             service = _BoundService(base)
             conn.execute("BEGIN")
             try:
-                return self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
+                _, draft = self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
+                return draft
             finally:
                 conn.rollback()
+
+    def receipt_whole_draft_v1(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+    ) -> ReceiptWholeDraftV1:
+        """Read one original with authenticated manual fields and optional verified OCR."""
+        from .daily_v1.accounts import _BoundService
+        from .receipt_fields_v1 import _read_recorded_fields, _whole_receipt_draft
+
+        if (processor is None) != (reference is None):
+            raise LifecycleError("Supply the exact receipt media processor and reference together")
+        base = self.service
+        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
+            service = _BoundService(base)
+            conn.execute("BEGIN")
+            try:
+                source, manual = self._receipt_manual_draft_snapshot_v1(service, conn, source_id)
+            finally:
+                conn.rollback()
+        # The media reference binds immutable bytes to the captured original.
+        # Verify those bytes outside the SQLite transaction.
+        ocr = (
+            None
+            if processor is None or reference is None
+            else _read_recorded_fields(source_id, source, processor, reference)
+        )
+        return _whole_receipt_draft(source_id, source, ocr, manual)
 
     @staticmethod
     def _receipt_manual_draft_snapshot_v1(service, conn, source_id):
@@ -235,7 +272,7 @@ class LedgerReader:
 
         source = service._receipt_source(conn, source_id, allow_archived=True)
         replies = service.port.receipt_manual_replies_v1(conn, source)
-        return _project_manual_draft(source_id, source, replies) if replies else None
+        return source, _project_manual_draft(source_id, source, replies) if replies else None
 
     def receipt_payment_handoff_v1(self, source_id):
         """Read one receipt and its payment choices under the same protected snapshot."""
@@ -253,7 +290,7 @@ class LedgerReader:
             _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
             conn.execute("BEGIN")
             try:
-                draft = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
+                _, draft = self._receipt_manual_draft_snapshot_v1(bound, conn, source_id)
                 if draft is None or draft.missing_receipt_fields:
                     return None
                 audit = _audit(bound, conn)
