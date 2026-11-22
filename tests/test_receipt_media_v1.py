@@ -373,6 +373,45 @@ def test_exact_png_ocr_reference_and_idempotent_replay(seam):
     assert engine.calls == len(worker_calls) == 1
 
 
+def test_read_retained_fields_with_the_producer_and_decoder_unavailable(seam, monkeypatch):
+    processor, engine, request, source, evidence, raw, worker_calls = seam
+    reference = processor.process(**request).reference
+    assert reference is not None
+    expected = processor.read_total_fields_v1(reference, expected_original_size=len(raw))
+    staged = evidence.parent / "detached"
+    staged.mkdir(mode=0o700)
+    operation = staged / reference.operation_id
+    shutil.copytree(evidence / reference.operation_id, operation)
+    source.rename(source.with_name("source-removed"))
+    evidence.rename(evidence.with_name("producer-removed"))
+
+    def refuse_worker(*_args, **_kwargs):
+        raise AssertionError("Archive verification must not start a decoder")
+
+    monkeypatch.setattr(media, "_worker_run", refuse_worker)
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in operation.iterdir()
+    }
+    retained = media.read_retained_media_total_fields_v1(
+        staged, reference, expected_original_size=len(raw)
+    )
+    assert retained == expected
+    assert engine.calls == len(worker_calls) == 1
+    assert list(staged.iterdir()) == [operation]
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in operation.iterdir()
+    } == before
+    with pytest.raises(media.MediaIntegrityError, match="Verified original size differs"):
+        media.read_retained_media_total_fields_v1(
+            staged, reference, expected_original_size=len(raw) + 1
+        )
+    (operation / "ocr.json").unlink()
+    with pytest.raises(media.MediaIntegrityError, match="member is missing"):
+        media.read_retained_media_total_fields_v1(
+            staged, reference, expected_original_size=len(raw)
+        )
+
+
 @pytest.mark.parametrize(
     "sample",
     [

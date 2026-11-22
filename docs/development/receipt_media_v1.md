@@ -289,6 +289,12 @@ identify the exact whole draft, including its OCR and manual evidence. A later
 change to either source requires a new payment question. An OCR-only draft
 still needs the separately authenticated account selection, debit and category.
 
+For detached verification, `read_retained_media_total_fields_v1` reads the
+same six members from a private staged evidence root using the reference and
+original size selected by the authenticated archive cut. It verifies the member
+bytes and runs the same deterministic parser as the live read using the
+staged members and archived reference.
+
 Where there is an active opening, an explicitly stated debit date strictly
 after that opening determines that the debit was excluded. For an earlier or
 same-day debit, the reply must include the user's inclusion answer. When both
