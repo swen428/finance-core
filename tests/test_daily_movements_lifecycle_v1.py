@@ -119,6 +119,95 @@ def movement(
     return proposal, review, receipt
 
 
+def register_target_selection(ledger, port, original, reply, kind, target, offered, choice):
+    from finance_core.lifecycle_v2.contracts import canonical, digest
+    from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref, strict_json
+    from finance_core.lifecycle_v2.daily_v1.movement_contracts import TARGET_SELECTION_LINK
+
+    port.add_source(reply, str(choice))
+    port.register_movement_instruction(
+        ledger.binding, target.source_id, original, kind, target.fact_ref
+    )
+    registered = port.movement_links[original]
+    link = strict_json(registered["link_json"])
+    selection = {
+        "reply_ref": instruction_ref(asdict(port.sources[reply])),
+        "offered_facts": [asdict(item.fact_ref) for item in offered],
+        "choice": choice,
+    }
+    association = link["association_ref"]["evidence_id"]
+    delivered = port.movement_link_origins[association]
+    delivered["selection"] = selection
+    link.update(
+        format=TARGET_SELECTION_LINK,
+        mode="target_selection",
+        selection=selection,
+        association_ref={"evidence_id": association, "sha256": digest(delivered)},
+    )
+    registered["link_json"] = canonical(link)
+    return association
+
+
+def test_target_selection_retains_original_reversal_reason_and_needs_separate_confirmation(live):
+    ledger, port, _, api, reader, account = prepare(live, opening="100", currency="SGD")
+    _, _, first = movement(
+        ledger,
+        port,
+        api,
+        account,
+        "coffee-first",
+        fields(account, "8", original="8", currency="SGD"),
+    )
+    _, _, second = movement(
+        ledger,
+        port,
+        api,
+        account,
+        "coffee-second",
+        fields(account, "8", original="8", currency="SGD"),
+    )
+    kept = reader.detail(first.receipt.record_id)
+    target = reader.detail(second.receipt.record_id)
+    original, reply = "ambiguous-reversal", "menu-reply"
+    reason = "duplicate coffee"
+    port.add_source(original, reason)
+    port.commands[original] = {
+        "format": "finance-daily-movement-command-v1",
+        "command_kind": "movement_void",
+        "fields": {},
+        "reason_span": [0, len(reason)],
+    }
+    association = register_target_selection(
+        ledger, port, original, reply, "movement_void", target, (kept, target), 2
+    )
+
+    proposal = api.propose_movement_change(
+        target.record_id,
+        original,
+        target.fact_ref,
+        "propose-selected-void",
+        reply_evidence_id=original,
+        command_kind="movement_void",
+    )
+    port.remember_movement_proposal(proposal)
+    review = api.prepare_review(proposal.proposal_id, proposal.version)
+    api.record_delivery(review.review_id, "delivered-complete-void-card")
+    assert reader.collect().balances[0].balance_amount == "84.00"
+    for reused in (original, association, reply):
+        with pytest.raises(LifecycleError, match="Daily action or callback state mismatch"):
+            api.confirm(review.review_id, reused, "separate-confirmation-required")
+    assert reader.collect().balances[0].balance_amount == "84.00"
+
+    receipt = api.confirm(review.review_id, "confirm-new-card", "confirmed-selected-void")
+    assert receipt.status == "VOID"
+    assert reader.detail(kept.record_id).values["status"] == "ACTIVE"
+    voided = reader.detail(target.record_id)
+    assert voided.values["status"] == "VOID"
+    assert voided.values["reason_ref"]["quote"] == reason
+    assert voided.values["instruction_ref"]["evidence_id"] == original
+    assert reader.collect().balances[0].balance_amount == "92.00"
+
+
 def test_normal_income_expense_one_balance_and_original_receipts(live):
     ledger, port, _, api, reader, account = prepare(live)
     _, review, first = movement(
@@ -442,9 +531,12 @@ def test_opening_coverage_draft_then_separate_complete_card_and_nonempty_refusal
     assert reader.collect().balances[0].balance_amount == "1000.00"
 
 
-@pytest.mark.parametrize(("answer", "closing"), [("尚未包含", "90.00"), ("已包含", "100.00")])
+@pytest.mark.parametrize(
+    ("answer", "closing", "choose_target"),
+    [("尚未包含", "90.00", False), ("已包含", "100.00", False), ("尚未包含", "82.00", True)],
+)
 def test_correction_keeps_reason_from_before_the_separate_opening_reply(
-    live, tmp_path, answer, closing
+    live, tmp_path, answer, closing, choose_target
 ):
     from finance_core.lifecycle_v2.daily_v1.contracts import _reason
     from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
@@ -456,9 +548,27 @@ def test_correction_keeps_reason_from_before_the_separate_opening_reply(
     record = reader.detail(receipt.receipt.record_id)
     reason = "收据金额有误"
     port.add_source("correction-request", reason)
-    port.register_movement_instruction(
-        ledger.binding, record.source_id, "correction-request", "movement_correct", record.fact_ref
-    )
+    selection_evidence = ()
+    before_balance = "92.00"
+    if choose_target:
+        _, _, other = movement(
+            ledger, port, api, account, "other", fields(account, "8", original="8", currency="SGD")
+        )
+        offered = (reader.detail(other.receipt.record_id), record)
+        reply = "correction-menu-reply"
+        association = register_target_selection(
+            ledger, port, "correction-request", reply, "movement_correct", record, offered, 2
+        )
+        selection_evidence = (association, reply)
+        before_balance = "84.00"
+    else:
+        port.register_movement_instruction(
+            ledger.binding,
+            record.source_id,
+            "correction-request",
+            "movement_correct",
+            record.fact_ref,
+        )
     original = api.expected_movement_change(
         record.record_id, record.fact_ref, "correction-request", "movement_correct"
     )
@@ -539,7 +649,7 @@ def test_correction_keeps_reason_from_before_the_separate_opening_reply(
                 changed={"category": "different"},
             )
         assert api.pending_for_source(record.source_id)["proposal"] == asdict(draft)
-        assert reader.collect().balances[0].balance_amount == "92.00"
+        assert reader.collect().balances[0].balance_amount == before_balance
 
     port.add_source("later-coverage-reply", answer)
     port.register_movement_reply(
@@ -572,12 +682,13 @@ def test_correction_keeps_reason_from_before_the_separate_opening_reply(
     coverage = card.material["after_values"]["coverage"]["reply_ref"]
     assert coverage["quote"] == answer
     assert coverage["instruction_ref"]["evidence_id"] == "later-coverage-reply"
-    assert reader.collect().balances[0].balance_amount == "92.00"
+    assert reader.collect().balances[0].balance_amount == before_balance
 
     api.record_delivery(card.review_id, "delivery-corrected-after-coverage")
-    for evidence_id in ("correction-request", "later-coverage-reply"):
+    for evidence_id in ("correction-request", "later-coverage-reply", *selection_evidence):
         with pytest.raises(LifecycleError, match="Daily action"):
             api.confirm(card.review_id, evidence_id, "not-confirm-" + evidence_id)
+    assert reader.collect().balances[0].balance_amount == before_balance
     confirmation = (card.review_id, "confirm-both-sources", "confirm-corrected")
     posted = api.confirm(*confirmation)
     assert api.confirm(*confirmation) == posted
@@ -585,7 +696,7 @@ def test_correction_keeps_reason_from_before_the_separate_opening_reply(
     assert posted.receipt.version == 2
     result = reader.collect()
     assert result.balances[0].balance_amount == closing
-    assert result.expense_by_currency == (("SGD", "10.00"),)
+    assert result.expense_by_currency == (("SGD", "18.00" if choose_target else "10.00"),)
     assert len(reader.history(record.record_id)) == 2
     path = tmp_path.resolve() / "correction-with-separate-opening-reply.sqlite"
     cut = ledger.seal_snapshot(path)
