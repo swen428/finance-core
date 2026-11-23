@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -166,7 +166,7 @@ def _checked_json(raw: bytes) -> dict[str, Any]:
         if not isinstance(result, dict) or _canonical(result) != raw:
             raise MediaIntegrityError("Evidence JSON is not canonical")
         return result
-    except (ValueError, TypeError, UnicodeError) as exc:
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
         raise MediaIntegrityError("Evidence JSON is malformed") from exc
 
 
@@ -1050,20 +1050,23 @@ class ReceiptMediaProcessor:
     @staticmethod
     def _temporary_bound(directory: int) -> None:
         total = 0
-        for name in os.listdir(directory):
-            if name not in {
-                "intent.json",
-                "original.bin",
-                "declaration.json",
-                "normalized.png",
-                "ocr.json",
-                "result.json",
-            }:
-                raise MediaIntegrityError("Unexpected operation member is not covered by evidence")
-            value = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            if not stat.S_ISREG(value.st_mode):
-                raise MediaIntegrityError("Unexpected non-file operation member")
-            total += value.st_size
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name not in {
+                    "intent.json",
+                    "original.bin",
+                    "declaration.json",
+                    "normalized.png",
+                    "ocr.json",
+                    "result.json",
+                }:
+                    raise MediaIntegrityError(
+                        "Unexpected operation member is not covered by evidence"
+                    )
+                value = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(value.st_mode):
+                    raise MediaIntegrityError("Unexpected non-file operation member")
+                total += value.st_size
         if total > TEMP_BYTES:
             raise MediaIntegrityError("Aggregate temporary space exceeded its fixed bound")
 
@@ -1310,6 +1313,13 @@ class ReceiptMediaProcessor:
     ) -> VerifiedMediaOcrEvidence:
         intent_raw, intent_member = _read_member(directory, "intent.json", _MAX_JSON)
         terminal_raw, terminal_member = _read_member(directory, "result.json", _MAX_JSON)
+        if (
+            intent_member["sha256"] != reference.intent_sha256
+            or terminal_member["sha256"] != reference.manifest_sha256
+        ):
+            raise MediaIntegrityError(
+                "Media reference does not bind the exact successful operation"
+            )
         intent, result = _checked_json(intent_raw), _checked_json(terminal_raw)
         if (
             intent.get("contract") != CONTRACT
@@ -1344,16 +1354,16 @@ class ReceiptMediaProcessor:
 
 def _require_media_reference(reference: MediaOcrReference) -> None:
     if (
-        not isinstance(reference, MediaOcrReference)
+        type(reference) is not MediaOcrReference
         or type(reference.operation_id) is not str
         or _OPERATION.fullmatch(reference.operation_id) is None
-        or any(
-            not isinstance(value, str) or _HASH.fullmatch(value) is None
-            for key, value in asdict(reference).items()
-            if key != "operation_id"
-        )
     ):
         raise ReceiptMediaError("Media reference is malformed")
+    for field in fields(reference):
+        if field.name != "operation_id":
+            value = getattr(reference, field.name)
+            if type(value) is not str or _HASH.fullmatch(value) is None:
+                raise ReceiptMediaError("Media reference is malformed")
 
 
 def _read_verified_in_root(

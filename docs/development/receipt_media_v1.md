@@ -358,8 +358,13 @@ authenticated manual replies for that original message. It labels each displayed
 field with its source and retains the OCR block references and manual reply spans
 separately. An explicit manual value takes precedence for that field. The draft
 leaves unsupported currency or invalid amount precision unresolved, including
-when an explicit currency changes how an OCR amount can be interpreted. Media
-verification remains outside the protected SQLite read transaction.
+when an explicit currency changes how an OCR amount can be interpreted. When
+the verified OCR supplies the effective currency, a later authenticated
+reply can correct a manual amount that is invalid in that currency. The
+original reply remains in the draft history. An OCR merchant that cannot be
+used in an expense review remains unresolved until an authenticated reply
+supplies a valid merchant. The OCR value remains in the retained evidence.
+Media verification remains outside the protected SQLite read transaction.
 
 The installed evidence port reads manual replies inside the same protected
 transaction as the original receipt. The draft retains the exact original

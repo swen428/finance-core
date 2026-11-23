@@ -6,7 +6,13 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Literal
 
 from .contracts import LifecycleError, VerifiedReceiptSourceV1, digest
-from .receipt_draft_v1 import ReceiptManualDraftV1, _correctable_field
+from .daily_v1.contracts import text
+from .receipt_draft_v1 import (
+    ReceiptManualDraftV1,
+    VerifiedReceiptManualReplyV1,
+    _correctable_field,
+    _project_manual_draft,
+)
 
 if TYPE_CHECKING:
     from finance_core.intake.receipt_media import (
@@ -49,14 +55,31 @@ class ReceiptWholeDraftV1:
 _WHOLE_FIELDS = ("merchant", "date", "amount", "currency")
 
 
-def _whole_receipt_draft(source_id, source, ocr, manual):
+def _whole_receipt_draft(source_id, source, ocr, replies):
     values = {}
     if ocr is not None:
         suggestions = ocr.suggestions.fields
         for name in _WHOLE_FIELDS:
             proposed = getattr(suggestions, "transaction_date" if name == "date" else name)
-            if type(proposed.value) is str:
-                values[name] = ReceiptWholeDraftFieldV1(name, proposed.value, "ocr")
+            if type(proposed.value) is not str:
+                continue
+            if name == "merchant":
+                try:
+                    text(proposed.value, "description", 1024)
+                except LifecycleError:
+                    continue
+            values[name] = ReceiptWholeDraftFieldV1(name, proposed.value, "ocr")
+    currency = values.get("currency")
+    manual = (
+        _project_manual_draft(
+            source_id,
+            source,
+            replies,
+            fallback_currency=None if currency is None else currency.value,
+        )
+        if replies
+        else None
+    )
     if manual is not None:
         for field in manual.fields:
             values[field.name] = ReceiptWholeDraftFieldV1(field.name, field.value, "manual")
@@ -114,12 +137,12 @@ def _read_optional_recorded_fields(
 def _project_payment_draft(
     source_id: str,
     source: VerifiedReceiptSourceV1,
-    manual: ReceiptManualDraftV1 | None,
+    replies: tuple[VerifiedReceiptManualReplyV1, ...],
     recorded: tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None,
 ) -> ReceiptManualDraftV1 | ReceiptWholeDraftV1 | None:
     if recorded is None:
-        return manual
+        return _project_manual_draft(source_id, source, replies) if replies else None
     original, fields = recorded
     if original != source:
         raise LifecycleError("Receipt source changed before the protected payment read")
-    return _whole_receipt_draft(source_id, source, fields, manual)
+    return _whole_receipt_draft(source_id, source, fields, replies)

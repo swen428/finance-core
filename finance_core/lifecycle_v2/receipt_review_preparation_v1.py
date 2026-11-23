@@ -23,7 +23,7 @@ from .daily_v1.contracts import (
     text,
 )
 from .daily_v1.movement_contracts import _day, _positive_money
-from .receipt_draft_v1 import ReceiptManualDraftV1, _project_manual_draft
+from .receipt_draft_v1 import ReceiptManualDraftV1
 from .receipt_fields_v1 import (
     ReceiptWholeDraftV1,
     _project_payment_draft,
@@ -345,8 +345,7 @@ class ReceiptReviewReaderV1:
         _audit(service, conn)
         source = service._receipt_source(conn, source_id, allow_archived=False)
         replies = service.port.receipt_manual_replies_v1(conn, source)
-        manual = _project_manual_draft(source_id, source, replies) if replies else None
-        draft = _project_payment_draft(source_id, source, manual, recorded)
+        draft = _project_payment_draft(source_id, source, replies, recorded)
         if draft is None or draft.missing_receipt_fields:
             return None, None
         payment = _receipt_payment(conn, service.port._port, source, draft)
