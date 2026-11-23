@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 
+from finance_core.instance_admission.sessions import _witness_for
+
 from .._finalization_journal_v1 import _assert_unreserved
 from .._finalization_plan_v1 import _append_finalization, _FinalizationPlanV1
 from ..contracts import (
@@ -25,6 +27,7 @@ from .accounts import (
     MAX_PROPOSALS,
     DailyAccountServiceV1,
     _audit,
+    _EvidenceReadPort,
     _existing_receipt,
     _fingerprint,
     _require_current,
@@ -133,14 +136,31 @@ def _require_values(service, conn, expected, source, values, before_seq=None, *,
         instruction = asdict(actual)
     if instruction_ref(instruction, expected.binding) != values["instruction_ref"]:
         raise LifecycleError("Transfer draft differs from its authenticated instruction")
+    questions = []
+    link = None
     if values["status"] == "ACTIVE":
         require_active_transfer_openings_v1(conn, values, before_seq, _rows=_rows)
-        require_transfer_opening_replies_v1(service, conn, values, binding=expected.binding)
+        questions = require_transfer_opening_replies_v1(
+            service, conn, values, binding=expected.binding
+        )
     if expected.target_bundle_ref is not None:
-        return transfer_change_target_v1(
+        link = transfer_change_target_v1(
             service, conn, instruction, expected.binding, expected.target_bundle_ref, values
         )
-    return None
+    return questions, link
+
+
+def _require_retained_evidence(
+    service, conn, expected, source, proposal, cutoff=None, *, _rows=None
+):
+    questions, link = _require_values(
+        service, conn, expected, source, strict_json(proposal["values_json"]), cutoff, _rows=_rows
+    )
+    retained = strict_json(proposal["observation_json"])["observation"]["opening_questions"]
+    if questions != retained:
+        raise LifecycleError("Transfer opening questions differ from their original deliveries")
+    if isinstance(expected, _ExpectedTransferChange) and link != expected.link:
+        raise LifecycleError("Transfer change differs from its original association")
 
 
 def _material(proposal, sealed, values):
@@ -155,11 +175,17 @@ def _material(proposal, sealed, values):
 
 
 def verify_proposal(service, conn, proposal, *, _rows=None):
+    if _witness_for(conn) is not None and type(service.port) is not _EvidenceReadPort:
+        raise LifecycleError("unsupported_record_format: use the protected transfer API")
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
     exact(sealed, {"format", "expected", "observation"}, "transfer proposal envelope")
     observed = sealed["observation"]
-    exact(observed, {"evidence_id", "request_sha256"}, "transfer proposal identity")
+    exact(
+        observed,
+        {"evidence_id", "request_sha256", "opening_questions"},
+        "transfer proposal identity",
+    )
     raw = sealed["expected"]
     format = sealed["format"]
     if format == CHANGE_DRAFT_FORMAT:
@@ -199,9 +225,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     cutoff = _require_prefix(conn, expected, proposal, "proposal", _rows=_rows)
     source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     values = strict_json(proposal["values_json"])
-    link = _require_values(service, conn, expected, source, values, cutoff, _rows=_rows)
-    if isinstance(expected, _ExpectedTransferChange) and link != expected.link:
-        raise LifecycleError("Transfer change differs from its original association")
+    _require_retained_evidence(service, conn, expected, source, proposal, cutoff, _rows=_rows)
     event = (
         _rows.one(conn, "event", cutoff)
         if _rows is not None
@@ -370,23 +394,36 @@ def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None):
         raise LifecycleError("Transfer capture already has a posted fact")
 
 
-def _require_separate_action(material, expected, delivery_id, action_id):
-    retained = {delivery_id}
-    if isinstance(expected, _ExpectedTransferChange):
-        retained.add(expected.link["evidence_id"])
-    for values in (material.get("before_values"), material["after_values"]):
-        if values is None:
+def _require_separate_action(conn, proposal, action_id):
+    """Keep the new action distinct from all earlier evidence for this same event."""
+    rows = conn.execute(
+        "SELECT p.observation_json,p.values_json,d.evidence_id AS delivery_evidence_id "
+        "FROM l2_proposals p LEFT JOIN l2_reviews r USING (proposal_id) "
+        "LEFT JOIN l2_deliveries d USING (review_id) "
+        "WHERE p.source_id=? AND p.version<=?",
+        (proposal["source_id"], proposal["version"]),
+    )
+    for row in rows:
+        sealed = strict_json(row["observation_json"])
+        if sealed.get("format") not in {OBSERVATION_FORMAT, CHANGE_DRAFT_FORMAT}:
             continue
-        retained.add(values["instruction_ref"]["evidence_id"])
-        for effect in project_transfer_fact_v1(values).effects:
-            reply = effect["coverage"]["reply_ref"]
-            if reply is not None:
-                retained.add(reply["evidence_id"])
-    if action_id in retained:
-        raise LifecycleError("Transfer confirmation requires a separate human action")
+        observed = sealed["observation"]
+        values = strict_json(row["values_json"])
+        retained = {
+            row["delivery_evidence_id"],
+            observed["evidence_id"],
+            values["instruction_ref"]["evidence_id"],
+        }
+        if link := sealed["expected"].get("link"):
+            retained.add(link["evidence_id"])
+        for question in observed["opening_questions"]:
+            retained.add(question["reply_evidence_id"])
+            retained.add(question["question"]["delivery_id"])
+        if action_id in retained:
+            raise LifecycleError("Transfer confirmation requires a separate human action")
 
 
-def verify_confirmed_transfer(conn, fact, review, expected, delivery, action, *, _rows=None):
+def verify_confirmed_transfer(conn, fact, review, expected, action, *, _rows=None):
     material = strict_json(review["material_json"])
     if not isinstance(expected, _ExpectedTransferDraft) or type(action) is not VerifiedAction:
         raise LifecycleError("Transfer fact lacks its exact review and action")
@@ -416,7 +453,7 @@ def verify_confirmed_transfer(conn, fact, review, expected, delivery, action, *,
     _require_current_review(conn, proposal, expected, review, cutoff, _rows=_rows)
     if target is None:
         _require_unused_capture(conn, expected.source_id, cutoff, _rows=_rows)
-    _require_separate_action(material, expected, delivery["evidence_id"], action.evidence_id)
+    _require_separate_action(conn, proposal, action.evidence_id)
 
 
 def _transfer_receipt(fact):
@@ -502,7 +539,7 @@ class DailyTransferServiceV1:
                 if target_ref is None
                 else _ExpectedTransferChange(*args, target_ref, None)
             )
-            link = _require_values(service, conn, expected, source, values)
+            questions, link = _require_values(service, conn, expected, source, values)
             if isinstance(expected, _ExpectedTransferChange):
                 expected = replace(expected, link=link)
             _require_current(conn, expected)
@@ -525,6 +562,7 @@ class DailyTransferServiceV1:
                 "observation": {
                     "evidence_id": observation_id,
                     "request_sha256": digest(expected_material),
+                    "opening_questions": questions,
                 },
             }
             material = _material(row, sealed, values)
@@ -646,9 +684,8 @@ class DailyTransferServiceV1:
                 or not material["created_at"] <= now < material["expires_at"]
             ):
                 raise LifecycleError("Transfer review lacks current delivery, binding or expiry")
-            _require_separate_action(
-                material, expected, delivery["evidence_id"], action_evidence_id
-            )
+            proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
+            _require_separate_action(conn, proposal, action_evidence_id)
             fingerprint = _fingerprint(conn)
             action = service.port.action(
                 conn,
@@ -668,13 +705,9 @@ class DailyTransferServiceV1:
                 raise LifecycleError("Transfer action differs from the authenticated review")
             target = _target_row(conn, expected)
             source = service._source(conn, expected.source_id, allow_archived=target is not None)
-            if isinstance(expected, _ExpectedTransferChange):
-                link = _require_values(service, conn, expected, source, values)
-                if link != expected.link:
-                    raise LifecycleError("Transfer change target changed before confirmation")
+            _require_retained_evidence(service, conn, expected, source, proposal)
             if _fingerprint(conn) != fingerprint:
                 raise LifecycleError("Transfer evidence callback changed protected state")
-            proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
             _require_current(conn, expected, proposal=proposal)
             _require_current_review(conn, proposal, expected, row)
             if target is None:

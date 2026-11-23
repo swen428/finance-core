@@ -1,15 +1,20 @@
 """Transfer coverage can be read only from the exact delivered role question."""
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 
 import pytest
 
+from finance_core.instance_admission import InstanceAdmissionError
 from finance_core.lifecycle_v2 import LifecycleError, VerifiedSource
 from finance_core.lifecycle_v2.contracts import canonical, digest
-from finance_core.lifecycle_v2.daily_v1 import DailyTransferServiceV1
-from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1, instruction_ref
+from finance_core.lifecycle_v2.daily_v1 import DailyTransferServiceV1, transfer_drafts_v1
+from finance_core.lifecycle_v2.daily_v1.contracts import (
+    BundleFactRefV1,
+    instruction_ref,
+    strict_json,
+)
 from finance_core.lifecycle_v2.daily_v1.ledger_reader import (
     DailyLedgerReaderV1,
     _resolve_current_transfer,
@@ -261,7 +266,9 @@ def test_transfer_account_effects_report_fee_once_and_require_current_opening(li
         _resolve_current_transfer(transfer, ref, accounts())
 
 
-def test_commits_one_confirmed_transfer_with_both_legs_and_fee(live, transfer, tmp_path):
+def test_commits_one_confirmed_transfer_with_both_legs_and_fee(
+    live, transfer, tmp_path, monkeypatch
+):
     ledger, port, daily, _, out = _transfer_with_account_snapshots(live, transfer)
     capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "transfer-capture")
     service = DailyTransferServiceV1(ledger)
@@ -274,19 +281,61 @@ def test_commits_one_confirmed_transfer_with_both_legs_and_fee(live, transfer, t
         return service.confirm(review.review_id, action_id, operation_id)
 
     before = ledger.reader().full_audit()["fact_version_count"]
+    with monkeypatch.context() as denied_paths:
+        denied_paths.setattr(
+            port,
+            "transfer_opening_reply_v1",
+            lambda *_: pytest.fail("Native path reached a transfer evidence callback"),
+        )
+        with pytest.raises(LifecycleError, match="unsupported_record_format"):
+            ledger.propose(capture.source_id, "transfer-result", 0, "transfer-draft")
+        with pytest.raises(LifecycleError, match="unsupported_record_format"):
+            ledger.propose(capture.source_id, "native-result", 1, "native-draft")
     with pytest.raises(LifecycleError, match="current delivery"):
         confirm()
     service.record_delivery(review.review_id, "transfer-display")
-    with pytest.raises(LifecycleError, match="separate human action"):
-        confirm("answer-transfer_in")
+    for reused in ("answer-transfer_in", "delivery-answer-transfer_in"):
+        with pytest.raises(LifecycleError, match="separate human action"):
+            confirm(reused)
     port.bad_actor = True
     with pytest.raises(LifecycleError, match="action differs"):
         confirm("other-actor-action")
     port.bad_actor = False
     assert ledger.reader().full_audit()["fact_version_count"] == before
+    before_append = ledger.reader().full_audit()
+
+    def partial_append(conn, plan):
+        conn.execute("INSERT INTO l2_events VALUES(?,?,?,?,?,?,?)", plan.event)
+        raise RuntimeError("synthetic interruption after event append")
+
+    with monkeypatch.context() as failed_commit:
+        failed_commit.setattr(transfer_drafts_v1, "_append_finalization", partial_append)
+        with pytest.raises(RuntimeError, match="synthetic interruption"):
+            confirm()
+    assert ledger.reader().full_audit() == before_append
+
+    def persistent_action_write(conn, identity, expected):
+        with pytest.raises(InstanceAdmissionError):
+            conn.execute("CREATE TABLE transfer_test_forbidden(value INTEGER)")
+
+    with monkeypatch.context() as denied_action:
+        denied_action.setattr(port, "on_action", persistent_action_write)
+        with pytest.raises(InstanceAdmissionError):
+            confirm("callback-write")
+    assert ledger.reader().full_audit() == before_append
 
     receipt = confirm()
     assert receipt.version == 1
+    with monkeypatch.context() as denied_paths:
+        denied_paths.setattr(
+            port,
+            "transfer_opening_reply_v1",
+            lambda *_: pytest.fail("Native correction reached a transfer evidence callback"),
+        )
+        with pytest.raises(LifecycleError, match="unsupported_record_format"):
+            ledger.prepare_correction(
+                receipt.record_id, 1, "native-correction", "native-correction"
+            )
     assert confirm() == receipt
     with pytest.raises(LifecycleError, match="replay mismatch"):
         confirm("another-action")
@@ -433,7 +482,7 @@ def test_opening_revision_treats_two_transfer_roles_separately_and_survives_rena
 
 
 def test_whole_transfer_reversal_preserves_original_and_booking_once(live, transfer, tmp_path):
-    ledger, port, _, _, _ = _transfer_with_account_snapshots(live, transfer)
+    ledger, port, daily, _, out = _transfer_with_account_snapshots(live, transfer)
     capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "capture-transfer")
     service = DailyTransferServiceV1(ledger)
     proposed = service.propose_create(
@@ -506,6 +555,23 @@ def test_whole_transfer_reversal_preserves_original_and_booking_once(live, trans
     service.record_delivery(card.review_id, "void-display")
     with pytest.raises(LifecycleError, match="separate human action"):
         service.confirm(card.review_id, "selected-requested-reversal", "void-confirm")
+    rename = change(port, daily, out, "account_rename", {"name": "Updated bank"}, "renamed-bank")
+    with pytest.raises(
+        LifecycleError, match="review no longer describes the exact account effects"
+    ):
+        service.confirm(card.review_id, "stale-void-action", "stale-void-confirm")
+    assert ledger_reader.collect_with_transfers_v2().transfers[0].values == original.values
+    proposal_after_rename = service.propose_change(
+        capture.source_id,
+        previous,
+        values,
+        "new-void",
+        "propose-new-void",
+        expected_version=proposed.version,
+    )
+    card = service.prepare_review(proposal_after_rename.proposal_id, proposal_after_rename.version)
+    assert card.material["before_account_roles"][0]["account_ref"] == asdict(rename.account_ref)
+    service.record_delivery(card.review_id, "new-void-display")
     voided = service.confirm(card.review_id, "void-action", "void-confirm")
     assert (voided.record_id, voided.version) == (posted.record_id, 2)
     assert service.confirm(card.review_id, "void-action", "void-confirm") == voided
@@ -592,7 +658,8 @@ def test_correcting_both_transfer_legs_requires_new_opening_replies(live, transf
             }
         ),
     )
-    port.transfer_change_target_v1 = lambda _conn, eid: {response.evidence_id: actual}[eid]
+    correction_links = {response.evidence_id: actual}
+    port.transfer_change_target_v1 = lambda _conn, eid: correction_links[eid]
     proposed = service.propose_change(
         capture.source_id,
         previous,
@@ -617,6 +684,68 @@ def test_correcting_both_transfer_legs_requires_new_opening_replies(live, transf
         "SGD": "-15.00",
         "MYR": "100.00",
     }
+
+    old_read_target = port.transfer_change_target_v1
+    reason = "duplicated entry"
+    response = port.add_source("second-change", "Reverse this " + reason)
+    ref = instruction_ref(asdict(response), ledger.binding)
+    span = [len("Reverse this "), len(response.raw_input)]
+    reversal = {
+        **changed,
+        "transition": "transfer_void",
+        "status": "VOID",
+        "instruction_ref": ref,
+        "reason_ref": {
+            "format": "finance-daily-reason-ref-v1",
+            "instruction_ref": ref,
+            "span": span,
+            "quote": reason,
+            "quote_sha256": sha256(reason.encode()).hexdigest(),
+        },
+    }
+    target = result.transfers[0].fact_ref
+    association = VerifiedTransferChangeTargetV1(
+        "second-change-selection",
+        canonical(
+            {
+                "format": CHANGE_TARGET_FORMAT,
+                "instruction_ref": ref,
+                "target_fact_ref": asdict(target),
+                "transition": "transfer_void",
+                "reason_span": span,
+            }
+        ),
+    )
+
+    def both_targets(conn, evidence_id):
+        return (
+            association
+            if evidence_id == response.evidence_id
+            else old_read_target(conn, evidence_id)
+        )
+
+    port.transfer_change_target_v1 = both_targets
+    reverse = service.propose_change(
+        capture.source_id,
+        target,
+        reversal,
+        "last-draft",
+        "last-propose",
+        expected_version=proposed.version,
+    )
+    card = service.prepare_review(reverse.proposal_id, reverse.version)
+    service.record_delivery(card.review_id, "last-display")
+    for earlier in ("original-transfer", "answer-transfer_in", "delivery-answer-fee_debit"):
+        with pytest.raises(LifecycleError, match="separate human action"):
+            service.confirm(card.review_id, earlier, "last-confirm")
+    last = service.confirm(card.review_id, "last-action", "last-confirm")
+    assert (last.record_id, last.version) == (first.record_id, 3)
+    history = DailyLedgerReaderV1(ledger).transfer_history_v1(last.record_id)
+    assert [row.fact_ref.fact_sha256 for row in history] == [
+        first.fact_sha256,
+        receipt.fact_sha256,
+        last.fact_sha256,
+    ]
 
 
 def test_credit_card_repayment_moves_cash_and_reduces_debt_without_an_expense(live, transfer):
@@ -674,3 +803,40 @@ def test_credit_card_repayment_moves_cash_and_reduces_debt_without_an_expense(li
     assert balances[card.account_id].balance_amount == "-30.00"
     assert balances[card.account_id].credit_card_debt == "30.00"
     assert not result.collection.income_by_currency and not result.collection.expense_by_currency
+
+
+@pytest.mark.parametrize("field", ["delivery_id", "delivered_at"])
+def test_full_audit_refuses_changed_opening_question_after_transfer_proposal(
+    live, transfer, monkeypatch, field
+):
+    ledger, port, _, _, _ = _transfer_with_account_snapshots(live, transfer)
+    capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "sealed-transfer")
+    service = DailyTransferServiceV1(ledger)
+    service.propose_create(capture.source_id, transfer, "sealed-values", "sealed-draft")
+    verified = ledger.reader().full_audit()
+    original = port.transfer_opening_reply_v1
+
+    def rewritten(conn, identity):
+        answer = original(conn, identity)
+        if identity == "answer-transfer_in":
+            question = strict_json(answer.question_json)
+            question[field] = (
+                "different-earlier-question" if field == "delivery_id" else question[field] + 1
+            )
+            return replace(answer, question_json=canonical(question))
+        return answer
+
+    with monkeypatch.context() as replaced:
+        replaced.setattr(port, "transfer_opening_reply_v1", rewritten)
+        with pytest.raises(LifecycleError, match="questions differ from their original deliveries"):
+            ledger.reader().full_audit()
+    assert ledger.reader().full_audit() == verified
+
+
+def test_one_delivered_transfer_question_cannot_cover_multiple_roles(live, transfer):
+    ledger, port, daily, _, _ = setup(live)
+    questions = _retained_questions(ledger, port, transfer)
+    questions["answer-fee_debit"]["delivery_id"] = questions["answer-transfer_in"]["delivery_id"]
+    with daily._read() as (service, conn):
+        with pytest.raises(LifecycleError, match="distinct original question deliveries"):
+            require_transfer_opening_replies_v1(service, conn, transfer)

@@ -376,6 +376,7 @@ def resolve_transfer_effect_v1(
         raise LifecycleError("Transfer role lacks coverage for its current opening")
     return {
         "format": "finance-daily-transfer-effect-v1",
+        "account_ref": asdict(account_ref(account)),
         "transfer_fact_ref": fact_ref,
         "account_id": impact["account_id"],
         "impact_role": impact["role"],

@@ -193,6 +193,16 @@ def project_transfer_fact_v1(value: dict[str, Any]) -> TransferProjectionV1:
             exact(charge_data, _AMOUNT_FIELDS, "transfer charge in an existing account role")
             charge = _amount(charge_data)
     amounts = TransferAmountsV1(outgoing, incoming, TransferFeeV1(mode, charge))
+    replies = [
+        leg["coverage"]["reply_ref"]
+        for leg in roles.values()
+        if leg["coverage"]["reply_ref"] is not None
+    ]
+    if any(
+        len({reply[key] for reply in replies}) != len(replies)
+        for key in ("evidence_id", "source_key")
+    ):
+        raise LifecycleError("Transfer roles require independent authenticated replies")
     if wanted_status == "VOID":
         return TransferProjectionV1((), ())
     effects = tuple(

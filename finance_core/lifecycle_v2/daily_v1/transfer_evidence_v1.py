@@ -85,7 +85,7 @@ def _require_reply(
     coverage: dict[str, Any],
     response: VerifiedSource,
     delivered: VerifiedTransferOpeningReplyV1,
-) -> None:
+) -> dict[str, Any]:
     if (
         type(response) is not VerifiedSource
         or type(delivered) is not VerifiedTransferOpeningReplyV1
@@ -119,6 +119,7 @@ def _require_reply(
         or _CHOICES.get(response.raw_input.strip().casefold()) != coverage["treatment"]
     ):
         raise LifecycleError("Transfer opening reply differs from its exact delivered question")
+    return retained
 
 
 def require_transfer_opening_replies_v1(service, conn, value, *, binding=None):
@@ -129,14 +130,24 @@ def require_transfer_opening_replies_v1(service, conn, value, *, binding=None):
     port = service.port
     binding = service.binding if binding is None else binding
     terms_sha256 = _transfer_terms_digest(value)
+    evidence = []
     for effect in projection.effects:
         coverage = effect["coverage"]
         if coverage["basis"] == "authenticated_reply":
             identity = coverage["reply_ref"]["evidence_id"]
-            _require_reply(
+            question = _require_reply(
                 binding,
                 terms_sha256,
                 coverage,
                 port.source(conn, identity),
                 port.transfer_opening_reply_v1(conn, identity),
             )
+            evidence.append(
+                {"role": effect["role"], "reply_evidence_id": identity, "question": question}
+            )
+    delivery_ids = {entry["question"]["delivery_id"] for entry in evidence}
+    if len(delivery_ids) != len(evidence) or any(
+        entry["reply_evidence_id"] in delivery_ids for entry in evidence
+    ):
+        raise LifecycleError("Transfer roles require distinct original question deliveries")
+    return evidence

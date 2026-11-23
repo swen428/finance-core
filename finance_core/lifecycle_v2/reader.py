@@ -803,7 +803,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if values.get("format") == "finance-daily-transfer-v1":
             from .daily_v1.transfer_drafts_v1 import verify_confirmed_transfer
 
-            verify_confirmed_transfer(conn, fact, review, expected, delivery, action, _rows=_rows)
+            verify_confirmed_transfer(conn, fact, review, expected, action, _rows=_rows)
         payload = json.loads(event["payload_json"])
         accepted_at = payload.get("accepted_at")
         review_material = json.loads(review["material_json"])

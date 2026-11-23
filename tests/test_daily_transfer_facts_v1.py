@@ -150,3 +150,11 @@ def test_transfer_answer_needs_a_distinct_source_even_if_evidence_id_differs(tra
     reply_ref["source_key"] = transfer["instruction_ref"]["source_key"]
     with pytest.raises(LifecycleError, match="independent authenticated reply"):
         project_transfer_fact_v1(transfer)
+
+
+@pytest.mark.parametrize("identity", ["source_key", "evidence_id"])
+def test_transfer_opening_roles_cannot_reuse_one_actual_reply(transfer, identity):
+    original = transfer["incoming"]["coverage"]["reply_ref"]
+    transfer["fee"]["charge"]["coverage"]["reply_ref"][identity] = original[identity]
+    with pytest.raises(LifecycleError, match="roles require independent authenticated replies"):
+        project_transfer_fact_v1(transfer)
