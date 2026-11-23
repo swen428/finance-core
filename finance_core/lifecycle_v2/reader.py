@@ -24,6 +24,8 @@ from .contracts import (
 from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
     from .receipt_fields_v1 import ReceiptWholeDraftV1
@@ -222,6 +224,15 @@ class LedgerReader:
 
         source = self.receipt_source_v1(source_id)
         return _read_recorded_fields(source_id, source, processor, reference)
+
+    def receipt_retained_fields_v1(
+        self, source_id: str, evidence_root: str | Path, reference: MediaOcrReference
+    ):
+        """Read an authenticated archive reference against its original captured receipt."""
+        from .receipt_fields_v1 import _read_retained_recorded_fields
+
+        source = self.receipt_source_v1(source_id)
+        return _read_retained_recorded_fields(source_id, source, evidence_root, reference)
 
     def receipt_manual_draft_v1(self, source_id):
         """Project a draft from exact source and manual reply on one read snapshot."""

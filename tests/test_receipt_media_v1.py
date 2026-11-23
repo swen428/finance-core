@@ -132,7 +132,7 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     from finance_core.lifecycle_v2.contracts import digest
     from finance_core.lifecycle_v2.receipt_draft_v1 import VerifiedReceiptManualReplyV1
 
-    processor, engine, request, _, _, original, _ = seam
+    processor, engine, request, source_root, evidence_root, original, _ = seam
     service, port, _ = live
 
     monkeypatch.setattr(engine, "extract", _complete_ocr_result)
@@ -263,6 +263,16 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
         )
     with pytest.raises(LifecycleError, match="processor and reference together"):
         reader.receipt_whole_draft_v1(first.source_id, reference=captured.reference)
+    archive_root = evidence_root.parent / "retained"
+    archive_root.mkdir(mode=0o700)
+    shutil.copytree(evidence_root / job, archive_root / job)
+    evidence_root.rename(evidence_root.with_name("disconnected-evidence"))
+    source_root.rename(source_root.with_name("disconnected-original"))
+    assert reader.receipt_retained_fields_v1(first.source_id, archive_root, captured.reference) == (
+        result
+    )
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_retained_fields_v1(second.source_id, archive_root, captured.reference)
     assert reader.full_audit() == audit and audit["fact_version_count"] == 0
 
 
