@@ -8,6 +8,7 @@ from finance_core.lifecycle_v2.contracts import digest
 from finance_core.lifecycle_v2.daily_v1.transfer_facts_v1 import (
     TRANSFER_FORMAT,
     project_transfer_fact_v1,
+    require_transfer_predecessor_v1,
 )
 
 
@@ -134,4 +135,18 @@ def test_transfer_fact_void_has_no_effect_but_retains_each_original_role(transfe
     )
     projection = project_transfer_fact_v1(void)
     assert projection.effects == () and projection.expenses_by_currency == ()
-    assert all(void[role] == transfer[role] for role in ("outgoing", "incoming", "fee"))
+    require_transfer_predecessor_v1(transfer, void)
+    with pytest.raises(LifecycleError, match="requires its exact active predecessor"):
+        require_transfer_predecessor_v1(None, void)
+    with pytest.raises(LifecycleError, match="active predecessor and a change"):
+        require_transfer_predecessor_v1(void, transfer)
+    void["description"] = "Different event"
+    with pytest.raises(LifecycleError, match="retain all original business values"):
+        require_transfer_predecessor_v1(transfer, void)
+
+
+def test_transfer_answer_needs_a_distinct_source_even_if_evidence_id_differs(transfer):
+    reply_ref = transfer["incoming"]["coverage"]["reply_ref"]
+    reply_ref["source_key"] = transfer["instruction_ref"]["source_key"]
+    with pytest.raises(LifecycleError, match="independent authenticated reply"):
+        project_transfer_fact_v1(transfer)

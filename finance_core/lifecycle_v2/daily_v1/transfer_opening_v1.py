@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
 from ..contracts import LifecycleError, canonical
 from ..service import LedgerService
-from .contracts import OpeningRefV1, exact, validate_as_of
+from ._impacts_v1 import account_inventory
+from .contracts import OpeningRefV1, account_ref, exact, opening_ref, validate_as_of
 from .movement_contracts import _later
 from .reader import DailyAccountReaderV1, DailyReadIdentityV1, DailyReadLimitsV1
 from .transfer_amounts_v1 import TransferAccountImpactV1, TransferAmountsV1, TransferRole
+from .transfer_facts_v1 import project_transfer_fact_v1
 
 OpeningRequirement = Literal["no_active_opening", "strictly_later", "authenticated_reply_required"]
 
@@ -28,6 +30,19 @@ class TransferOpeningRoleV1:
 class TransferOpeningRequirementsV1:
     read_identity: DailyReadIdentityV1
     roles: tuple[TransferOpeningRoleV1, ...]
+
+
+def _requirement(
+    funds_time: dict[str, Any], account: dict[str, Any]
+) -> tuple[OpeningRefV1 | None, dict[str, Any] | None, OpeningRequirement]:
+    opening = account["opening"]
+    if opening is None or opening["status"] != "ACTIVE":
+        return None, None, "no_active_opening"
+    boundary = opening["as_of"]
+    requirement: OpeningRequirement = (
+        "strictly_later" if _later(funds_time, boundary) else "authenticated_reply_required"
+    )
+    return opening_ref(account), boundary, requirement
 
 
 def read_transfer_opening_requirements_v1(
@@ -54,25 +69,46 @@ def read_transfer_opening_requirements_v1(
         if impact.currency != account.currency:
             raise LifecycleError("Transfer role currency differs from its current account")
         funds_time = times[impact.role]
-        if account.opening_status == "ACTIVE":
-            opening = account.values["opening"]
-            as_of = opening["as_of"]
-            requirement: OpeningRequirement = (
-                "strictly_later" if _later(funds_time, as_of) else "authenticated_reply_required"
+        reference, as_of, requirement = _requirement(funds_time, account.values)
+        roles.append(
+            TransferOpeningRoleV1(
+                impact,
+                canonical(funds_time),
+                reference,
+                None if as_of is None else canonical(as_of),
+                requirement,
             )
-            roles.append(
-                TransferOpeningRoleV1(
-                    impact,
-                    canonical(funds_time),
-                    account.opening_ref,
-                    canonical(as_of),
-                    requirement,
-                )
-            )
-        else:
-            roles.append(
-                TransferOpeningRoleV1(
-                    impact, canonical(funds_time), None, None, "no_active_opening"
-                )
-            )
+        )
     return TransferOpeningRequirementsV1(snapshot.read_identity, tuple(roles))
+
+
+def require_active_transfer_openings_v1(conn, value, before_seq=None, *, _rows=None):
+    """Check an active candidate against the account versions in the applicable ledger prefix.
+
+    The caller owns the protected transaction and authenticates each selected
+    reply. This check determines which sort of proof can apply to each role.
+    """
+    projection = project_transfer_fact_v1(value)
+    if value["status"] != "ACTIVE":
+        raise LifecycleError("Only an active transfer can establish new opening coverage")
+    accounts = {
+        item["values"]["account"]["account_id"]: item["values"]
+        for item in account_inventory(conn, before_seq, _rows=_rows)
+    }
+    for effect in projection.effects:
+        coverage = effect["coverage"]
+        account = accounts.get(effect["account_id"])
+        if account is None or asdict(account_ref(account)) != coverage["binding"]["account_ref"]:
+            raise LifecycleError("Transfer role account reference is missing or stale")
+        if effect["currency"] != account["account"]["currency"]:
+            raise LifecycleError("Transfer role currency differs from its current account")
+        opening, _, required_basis = _requirement(effect["funds_time"], account)
+        if effect["opening_ref"] != (None if opening is None else asdict(opening)):
+            raise LifecycleError("Transfer role opening reference is stale")
+        basis = (
+            "authenticated_reply"
+            if required_basis == "authenticated_reply_required"
+            else required_basis
+        )
+        if coverage["basis"] != basis:
+            raise LifecycleError("Transfer role coverage does not match its actual opening time")

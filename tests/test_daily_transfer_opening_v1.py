@@ -1,8 +1,12 @@
 """Opening requirements on an actual audited and admitted daily ledger."""
 
+from dataclasses import asdict
+
 import pytest
 
+from finance_core.instance_admission.sessions import lifecycle_read_operation
 from finance_core.lifecycle_v2 import LifecycleError
+from finance_core.lifecycle_v2.contracts import digest
 from finance_core.lifecycle_v2.daily_v1.contracts import AccountDefinitionRefV1
 from finance_core.lifecycle_v2.daily_v1.transfer_amounts_v1 import (
     TransferAccountAmountV1,
@@ -11,9 +15,12 @@ from finance_core.lifecycle_v2.daily_v1.transfer_amounts_v1 import (
 )
 from finance_core.lifecycle_v2.daily_v1.transfer_opening_v1 import (
     read_transfer_opening_requirements_v1,
+    require_active_transfer_openings_v1,
 )
 from tests.daily_account_support_v1 import command, unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import change, create, setup
+from tests.test_daily_transfer_facts_v1 import instruction
+from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_lifecycle_v2 import live as live
 
 
@@ -124,3 +131,44 @@ def test_missing_role_time_or_account_and_currency_mismatch_fail_closed(live):
         read_transfer_opening_requirements_v1(
             ledger, TransferAmountsV1(out, missing_account, fee), times
         )
+
+
+def test_confirmation_checks_opening_time_in_its_current_and_original_prefix(live, transfer):
+    ledger, port, daily, reader, _ = setup(live)
+    debit = _account(ledger, port, daily, reader, "SGD", "1", _on("2026-11-21"))
+    credit = _account(ledger, port, daily, reader, "MYR", "2", unknown_time())
+    prior_seq = reader.collect_accounts().read_identity.event_seq + 1
+    transfer["fee"] = {"mode": "none", "charge": None}
+    for name, current in (("outgoing", debit), ("incoming", credit)):
+        leg = transfer[name]
+        leg["opening_ref"] = asdict(current.opening_ref)
+        leg["account_ref"] = asdict(current.account_ref)
+        binding = leg["coverage"]["binding"]
+        binding.update(opening_ref=leg["opening_ref"], account_ref=leg["account_ref"])
+        leg["coverage"]["binding_sha256"] = digest(binding)
+
+    change(
+        port,
+        daily,
+        debit,
+        "opening_correct",
+        {"amount": "100", "as_of": _on("2026-11-22")},
+        "opening",
+        "wrong opening time",
+    )
+    new_opening = reader.get_account(debit.account_id).opening_ref
+    outgoing = transfer["outgoing"]
+    with lifecycle_read_operation(ledger.owner) as conn:
+        require_active_transfer_openings_v1(conn, transfer, prior_seq)
+        with pytest.raises(LifecycleError, match="opening reference is stale"):
+            require_active_transfer_openings_v1(conn, transfer)
+        outgoing["opening_ref"] = asdict(new_opening)
+        binding = outgoing["coverage"]["binding"]
+        binding["opening_ref"] = outgoing["opening_ref"]
+        outgoing["coverage"]["binding_sha256"] = digest(binding)
+        with pytest.raises(LifecycleError, match="actual opening time"):
+            require_active_transfer_openings_v1(conn, transfer)
+        outgoing["coverage"].update(
+            basis="authenticated_reply", reply_ref=instruction("answer-transfer-out")
+        )
+        require_active_transfer_openings_v1(conn, transfer)

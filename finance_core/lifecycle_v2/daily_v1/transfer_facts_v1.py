@@ -105,7 +105,7 @@ def _require_coverage(
         if (
             treatment not in {"included", "excluded"}
             or any(reply[key] != instruction[key] for key in ("principal_id", "client_id"))
-            or reply["evidence_id"] == instruction["evidence_id"]
+            or any(reply[key] == instruction[key] for key in ("evidence_id", "source_key"))
             or reply["source_timestamp"] < instruction["source_timestamp"]
         ):
             raise LifecycleError("Transfer coverage must retain an independent authenticated reply")
@@ -208,3 +208,35 @@ def project_transfer_fact_v1(value: dict[str, Any]) -> TransferProjectionV1:
         for impact in amounts.account_impacts()
     )
     return TransferProjectionV1(effects, amounts.expense_by_currency())
+
+
+def require_transfer_predecessor_v1(before: dict[str, Any] | None, after: dict[str, Any]) -> None:
+    """Require the lifecycle transition to preserve the predecessor's whole economic event."""
+    project_transfer_fact_v1(after)
+    if before is None:
+        if after["transition"] != "transfer_create":
+            raise LifecycleError("A transfer change requires its exact active predecessor")
+        return
+
+    project_transfer_fact_v1(before)
+    if before["status"] != "ACTIVE" or after["transition"] == "transfer_create":
+        raise LifecycleError("An existing transfer requires an active predecessor and a change")
+    before_instruction = before["instruction_ref"]
+    after_instruction = after["instruction_ref"]
+    if (
+        any(
+            before_instruction[key] != after_instruction[key]
+            for key in ("principal_id", "client_id")
+        )
+        or any(
+            before_instruction[key] == after_instruction[key]
+            for key in ("evidence_id", "source_key")
+        )
+        or after_instruction["source_timestamp"] < before_instruction["source_timestamp"]
+    ):
+        raise LifecycleError("Transfer change must have a new instruction from its owner")
+    if after["transition"] == "transfer_void" and any(
+        before[key] != after[key]
+        for key in ("business_date", "description", "outgoing", "incoming", "fee")
+    ):
+        raise LifecycleError("Transfer reversal must retain all original business values")
