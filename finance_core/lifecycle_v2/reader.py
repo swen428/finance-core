@@ -304,8 +304,9 @@ class LedgerReader:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ) -> ReceiptPaymentHandoffV1 | None:
-        """Read one receipt and its payment choices under the same protected snapshot."""
+        """Read payment choices with live OCR or the verified original archive reference."""
         from dataclasses import asdict
 
         from finance_core.instance_admission.authority import _logical_database_digest
@@ -315,7 +316,9 @@ class LedgerReader:
         from .receipt_fields_v1 import _project_payment_draft, _read_optional_recorded_fields
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
-        recorded = _read_optional_recorded_fields(self, source_id, processor, reference)
+        recorded = _read_optional_recorded_fields(
+            self, source_id, processor, reference, retained_evidence_root=retained_evidence_root
+        )
         service = self.service
         with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
             bound = _BoundService(service)

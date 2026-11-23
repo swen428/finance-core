@@ -151,7 +151,16 @@ def _read_optional_recorded_fields(
     source_id: str,
     processor: ReceiptMediaProcessor | None,
     reference: MediaOcrReference | None,
+    *,
+    retained_evidence_root: str | Path | None = None,
 ) -> tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None:
+    if retained_evidence_root is not None:
+        if processor is not None or reference is None:
+            raise LifecycleError("Supply only the retained receipt evidence and exact reference")
+        source = reader.receipt_source_v1(source_id)
+        return source, _read_retained_recorded_fields(
+            source_id, source, retained_evidence_root, reference
+        )
     if (processor is None) != (reference is None):
         raise LifecycleError("Supply the exact receipt media processor and reference together")
     if processor is None or reference is None:

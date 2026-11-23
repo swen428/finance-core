@@ -32,6 +32,8 @@ from .receipt_fields_v1 import (
 from .receipt_payment_handoff_v1 import ReceiptPaymentAccountOptionV1
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
     from .service import LedgerService
@@ -285,10 +287,15 @@ class ReceiptReviewReaderV1:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ) -> ReceiptReviewPreparationV1 | None:
         """Read a complete payment from original evidence on one protected transaction."""
         recorded = _read_optional_recorded_fields(
-            self._boundary._service.reader(), source_id, processor, reference
+            self._boundary._service.reader(),
+            source_id,
+            processor,
+            reference,
+            retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
             preparation, _ = self._prepare(service, conn, source_id, recorded)
@@ -300,6 +307,7 @@ class ReceiptReviewReaderV1:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ):
         """Read the separately observed review fields without creating a review or fact."""
         from .receipt_review_fields_v1 import (
@@ -310,7 +318,11 @@ class ReceiptReviewReaderV1:
         )
 
         recorded = _read_optional_recorded_fields(
-            self._boundary._service.reader(), source_id, processor, reference
+            self._boundary._service.reader(),
+            source_id,
+            processor,
+            reference,
+            retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
             preparation, opening = self._prepare(service, conn, source_id, recorded)
