@@ -24,6 +24,8 @@ from .contracts import (
 from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
     from .receipt_fields_v1 import ReceiptWholeDraftV1
@@ -223,6 +225,15 @@ class LedgerReader:
         source = self.receipt_source_v1(source_id)
         return _read_recorded_fields(source_id, source, processor, reference)
 
+    def receipt_retained_fields_v1(
+        self, source_id: str, evidence_root: str | Path, reference: MediaOcrReference
+    ):
+        """Read an authenticated archive reference against its original captured receipt."""
+        from .receipt_fields_v1 import _read_retained_recorded_fields
+
+        source = self.receipt_source_v1(source_id)
+        return _read_retained_recorded_fields(source_id, source, evidence_root, reference)
+
     def receipt_manual_draft_v1(self, source_id):
         """Project a draft from exact source and manual reply on one read snapshot."""
         from .daily_v1.accounts import _BoundService
@@ -246,19 +257,11 @@ class LedgerReader:
         reference: MediaOcrReference | None = None,
     ) -> ReceiptWholeDraftV1:
         """Read one original with authenticated manual fields and optional verified OCR."""
-        from .daily_v1.accounts import _BoundService
         from .receipt_fields_v1 import _read_recorded_fields, _whole_receipt_draft
 
         if (processor is None) != (reference is None):
             raise LifecycleError("Supply the exact receipt media processor and reference together")
-        base = self.service
-        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
-            service = _BoundService(base)
-            conn.execute("BEGIN")
-            try:
-                source, replies = self._receipt_reply_snapshot_v1(service, conn, source_id)
-            finally:
-                conn.rollback()
+        source, replies = self._read_receipt_draft_evidence_v1(source_id)
         # The media reference binds immutable bytes to the captured original.
         # Verify those bytes outside the SQLite transaction.
         ocr = (
@@ -267,6 +270,28 @@ class LedgerReader:
             else _read_recorded_fields(source_id, source, processor, reference)
         )
         return _whole_receipt_draft(source_id, source, ocr, replies)
+
+    def receipt_retained_whole_draft_v1(
+        self, source_id: str, evidence_root: str | Path, reference: MediaOcrReference
+    ) -> ReceiptWholeDraftV1:
+        """Reconstruct a draft from the captured replies and an authenticated archive reference."""
+        from .receipt_fields_v1 import _read_retained_recorded_fields, _whole_receipt_draft
+
+        source, replies = self._read_receipt_draft_evidence_v1(source_id)
+        recorded = _read_retained_recorded_fields(source_id, source, evidence_root, reference)
+        return _whole_receipt_draft(source_id, source, recorded, replies)
+
+    def _read_receipt_draft_evidence_v1(self, source_id):
+        from .daily_v1.accounts import _BoundService
+
+        base = self.service
+        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
+            service = _BoundService(base)
+            conn.execute("BEGIN")
+            try:
+                return self._receipt_reply_snapshot_v1(service, conn, source_id)
+            finally:
+                conn.rollback()
 
     @staticmethod
     def _receipt_reply_snapshot_v1(service, conn, source_id):
@@ -279,8 +304,9 @@ class LedgerReader:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ) -> ReceiptPaymentHandoffV1 | None:
-        """Read one receipt and its payment choices under the same protected snapshot."""
+        """Read payment choices with live OCR or the verified original archive reference."""
         from dataclasses import asdict
 
         from finance_core.instance_admission.authority import _logical_database_digest
@@ -290,7 +316,9 @@ class LedgerReader:
         from .receipt_fields_v1 import _project_payment_draft, _read_optional_recorded_fields
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
-        recorded = _read_optional_recorded_fields(self, source_id, processor, reference)
+        recorded = _read_optional_recorded_fields(
+            self, source_id, processor, reference, retained_evidence_root=retained_evidence_root
+        )
         service = self.service
         with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
             bound = _BoundService(service)

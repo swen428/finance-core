@@ -15,6 +15,8 @@ from .receipt_draft_v1 import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from finance_core.intake.receipt_media import (
         MediaOcrReference,
         ReceiptMediaProcessor,
@@ -103,18 +105,43 @@ def receipt_media_operation_id_v1(source: VerifiedReceiptSourceV1) -> str:
     return "media_receipt_" + digest(["daily-receipt-ocr-v1", asdict(source)])
 
 
-def _read_recorded_fields(source_id, source, processor, reference):
-    from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
+def _require_source_media_reference(
+    source: VerifiedReceiptSourceV1, reference: MediaOcrReference
+) -> None:
+    from finance_core.intake.receipt_media import MediaOcrReference
 
-    if type(processor) is not ReceiptMediaProcessor or type(reference) is not MediaOcrReference:
+    if type(reference) is not MediaOcrReference:
         raise LifecycleError("Exact verified receipt media reference is required")
     if (
         reference.operation_id != receipt_media_operation_id_v1(source)
         or reference.original_sha256 != source.original_sha256
     ):
         raise LifecycleError("Verified OCR belongs to a different receipt source")
+
+
+def _read_recorded_fields(source_id, source, processor, reference):
+    from finance_core.intake.receipt_media import ReceiptMediaProcessor
+
+    if type(processor) is not ReceiptMediaProcessor:
+        raise LifecycleError("Exact receipt media processor required")
+    _require_source_media_reference(source, reference)
     suggestions = processor.read_total_fields_v1(
         reference, expected_original_size=source.original_size_bytes
+    )
+    return RecordedReceiptFieldsV1(source_id, source.original_message_sha256, suggestions)
+
+
+def _read_retained_recorded_fields(
+    source_id: str,
+    source: VerifiedReceiptSourceV1,
+    evidence_root: str | Path,
+    reference: MediaOcrReference,
+) -> RecordedReceiptFieldsV1:
+    from finance_core.intake.receipt_media import read_retained_media_total_fields_v1
+
+    _require_source_media_reference(source, reference)
+    suggestions = read_retained_media_total_fields_v1(
+        evidence_root, reference, expected_original_size=source.original_size_bytes
     )
     return RecordedReceiptFieldsV1(source_id, source.original_message_sha256, suggestions)
 
@@ -124,7 +151,16 @@ def _read_optional_recorded_fields(
     source_id: str,
     processor: ReceiptMediaProcessor | None,
     reference: MediaOcrReference | None,
+    *,
+    retained_evidence_root: str | Path | None = None,
 ) -> tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None:
+    if retained_evidence_root is not None:
+        if processor is not None or reference is None:
+            raise LifecycleError("Supply only the retained receipt evidence and exact reference")
+        source = reader.receipt_source_v1(source_id)
+        return source, _read_retained_recorded_fields(
+            source_id, source, retained_evidence_root, reference
+        )
     if (processor is None) != (reference is None):
         raise LifecycleError("Supply the exact receipt media processor and reference together")
     if processor is None or reference is None:

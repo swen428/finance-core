@@ -295,6 +295,24 @@ original size selected by the authenticated archive cut. It verifies the member
 bytes and runs the same deterministic parser as the live read using the
 staged members and archived reference.
 
+`LedgerReader.receipt_retained_fields_v1(source_id, evidence_root, reference)`
+binds those members to the authenticated captured message. Use
+`receipt_retained_whole_draft_v1` with the same inputs to recover the original
+manual replies alongside OCR. The application must supply the reference and
+staging root selected by its verified archive. Core checks the derived operation
+ID, original image digest and size before combining evidence. It refuses a
+reference belonging to another message, even if the image bytes are identical.
+
+The payment handoff and `ReceiptReviewReaderV1` accept
+`retained_evidence_root` with the exact archived reference for the same
+preparation. The processor and archive input are mutually exclusive. With a
+complete authenticated fields reply, `expense_candidate` links the original
+receipt and rendered movement values to the exact payment preparation and
+reply. Receipt total and actual debit retain their own currencies. The
+candidate leaves actual debit time unknown when no debit date was supplied.
+The operation is read-only. A separately delivered review and its independent
+confirmation are required before posting.
+
 Where there is an active opening, an explicitly stated debit date strictly
 after that opening determines that the debit was excluded. For an earlier or
 same-day debit, the reply must include the user's inclusion answer. When both

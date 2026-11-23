@@ -32,8 +32,11 @@ from .receipt_fields_v1 import (
 from .receipt_payment_handoff_v1 import ReceiptPaymentAccountOptionV1
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
+    from .receipt_expense_candidate_v1 import ReceiptExpenseCandidateV1
     from .service import LedgerService
 
 _DEBIT_AMOUNT = re.compile(r"(?:([A-Z]{3}) )?((?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?)")
@@ -285,10 +288,15 @@ class ReceiptReviewReaderV1:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ) -> ReceiptReviewPreparationV1 | None:
         """Read a complete payment from original evidence on one protected transaction."""
         recorded = _read_optional_recorded_fields(
-            self._boundary._service.reader(), source_id, processor, reference
+            self._boundary._service.reader(),
+            source_id,
+            processor,
+            reference,
+            retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
             preparation, _ = self._prepare(service, conn, source_id, recorded)
@@ -300,6 +308,7 @@ class ReceiptReviewReaderV1:
         *,
         processor: ReceiptMediaProcessor | None = None,
         reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
     ):
         """Read the separately observed review fields without creating a review or fact."""
         from .receipt_review_fields_v1 import (
@@ -310,7 +319,11 @@ class ReceiptReviewReaderV1:
         )
 
         recorded = _read_optional_recorded_fields(
-            self._boundary._service.reader(), source_id, processor, reference
+            self._boundary._service.reader(),
+            source_id,
+            processor,
+            reference,
+            retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
             preparation, opening = self._prepare(service, conn, source_id, recorded)
@@ -339,6 +352,27 @@ class ReceiptReviewReaderV1:
                     reply=replace(evidence.reply),
                 )
             return _complete_review_fields(preparation, evidence, opening)
+
+    def expense_candidate(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
+    ) -> ReceiptExpenseCandidateV1 | None:
+        """Compile reviewed receipt fields for a subsequent independent confirmation."""
+        from .receipt_expense_candidate_v1 import _compile_receipt_expense_candidate
+
+        fields = self.completed(
+            source_id,
+            processor=processor,
+            reference=reference,
+            retained_evidence_root=retained_evidence_root,
+        )
+        if fields is None or fields.missing_movement_fields:
+            return None
+        return _compile_receipt_expense_candidate(fields)
 
     @staticmethod
     def _prepare(service, conn, source_id, recorded=None):

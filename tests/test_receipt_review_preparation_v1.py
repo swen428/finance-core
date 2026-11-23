@@ -1,5 +1,6 @@
 """Receipt preparation through the existing admitted read owner, with a synthetic evidence port."""
 
+import json
 from dataclasses import asdict, replace
 
 import pytest
@@ -188,6 +189,7 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
     prepared = reader.prepare(source_id)
     target = receipt_review_fields_target_v1(prepared)
     assert reader.completed(source_id) is None
+    assert reader.expense_candidate(source_id) is None
     question_timestamp = NOW + 4 * 86400
     reply = VerifiedReceiptPaymentReplyV1(
         "fields-question",
@@ -199,8 +201,13 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         question_timestamp + 1,
         "fields-poll",
         "6" * 64,
-        "分类：餐饮\n扣款日期：2026-11-17\n期初余额：未包含",
+        "分类：餐饮\r\n扣款日期：2026-11-17\u2028期初余额：未包含",
     )
+    port.review_reply = VerifiedReceiptReviewFieldsReplyV1(
+        target, replace(reply, raw_text="分类：餐饮"), "user", "chat"
+    )
+    assert reader.completed(source_id).missing_movement_fields == ("opening_coverage",)
+    assert reader.expense_candidate(source_id) is None
     port.review_reply = VerifiedReceiptReviewFieldsReplyV1(target, reply, "user", "chat")
     audit = ledger.reader().full_audit()
     completed = reader.completed(source_id)
@@ -212,6 +219,15 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
     assert (
         completed.opening_basis == "authenticated_reply" and completed.missing_movement_fields == ()
     )
+    candidate = reader.expense_candidate(source_id)
+    values = json.loads(candidate.values_json)
+    assert candidate.source_id == source_id
+    assert candidate.original_media_sha256 == prepared.source.original_sha256
+    assert values["funds_time"]["local_date"] == "2026-11-17"
+    coverage = values["coverage"]["reply_ref"]
+    assert coverage["instruction_ref"] == values["instruction_ref"]
+    start, end = coverage["span"]
+    assert reply.raw_text[start:end] == "期初余额：未包含"
     port.review_reply = replace(
         port.review_reply, target=replace(target, debit_response_sha256="7" * 64)
     )
@@ -232,6 +248,7 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
     with acquire_production_owner(live[2]) as owner:
         reopened = LedgerService(owner, port, ledger.binding, ledger.clock)
         assert ReceiptReviewReaderV1(reopened).completed(source_id) == completed
+        assert ReceiptReviewReaderV1(reopened).expense_candidate(source_id) == candidate
         assert reopened.reader().full_audit() == audit
         assert reopened.reader().pending() == []
 

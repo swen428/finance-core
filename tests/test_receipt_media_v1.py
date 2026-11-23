@@ -132,7 +132,7 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     from finance_core.lifecycle_v2.contracts import digest
     from finance_core.lifecycle_v2.receipt_draft_v1 import VerifiedReceiptManualReplyV1
 
-    processor, engine, request, _, _, original, _ = seam
+    processor, engine, request, source_root, evidence_root, original, _ = seam
     service, port, _ = live
 
     monkeypatch.setattr(engine, "extract", _complete_ocr_result)
@@ -263,6 +263,22 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
         )
     with pytest.raises(LifecycleError, match="processor and reference together"):
         reader.receipt_whole_draft_v1(first.source_id, reference=captured.reference)
+    archive_root = evidence_root.parent / "retained"
+    archive_root.mkdir(mode=0o700)
+    shutil.copytree(evidence_root / job, archive_root / job)
+    evidence_root.rename(evidence_root.with_name("disconnected-evidence"))
+    source_root.rename(source_root.with_name("disconnected-original"))
+    assert reader.receipt_retained_fields_v1(first.source_id, archive_root, captured.reference) == (
+        result
+    )
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_retained_fields_v1(second.source_id, archive_root, captured.reference)
+    assert (
+        reader.receipt_retained_whole_draft_v1(first.source_id, archive_root, captured.reference)
+        == finished
+    )
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_retained_whole_draft_v1(second.source_id, archive_root, captured.reference)
     assert reader.full_audit() == audit and audit["fact_version_count"] == 0
 
 
@@ -282,7 +298,7 @@ def test_receipt_review_binds_payment_to_the_exact_verified_whole_draft(seam, li
     from tests.test_daily_accounts_lifecycle_v1 import create
     from tests.test_receipt_review_preparation_v1 import PaymentPort, payment_for_handoff
 
-    processor, engine, request, _, _, original, _ = seam
+    processor, engine, request, source_root, evidence_root, original, _ = seam
     monkeypatch.setattr(engine, "extract", _complete_ocr_result)
     ledger, _, _ = live
     port = ledger.port = PaymentPort()
@@ -332,6 +348,30 @@ def test_receipt_review_binds_payment_to_the_exact_verified_whole_draft(seam, li
     assert completed.preparation == prepared and completed.category == "餐饮"
     assert completed.missing_movement_fields == ()
 
+    archive_root = evidence_root.parent / "retained-payment"
+    archive_root.mkdir(mode=0o700)
+    shutil.copytree(evidence_root / operation, archive_root / operation)
+    evidence_root.rename(evidence_root.with_name("disconnected-payment-evidence"))
+    source_root.rename(source_root.with_name("disconnected-payment-original"))
+    archive_input = {"retained_evidence_root": archive_root, "reference": reference}
+    with pytest.raises(LifecycleError, match="only the retained receipt evidence"):
+        read.prepare(source.source_id, retained_evidence_root=archive_root, **media_input)
+    with pytest.raises(LifecycleError, match="only the retained receipt evidence"):
+        read.prepare(source.source_id, retained_evidence_root=archive_root)
+    assert ledger.reader().receipt_payment_handoff_v1(source.source_id, **archive_input) == handoff
+    assert read.prepare(source.source_id, **archive_input) == prepared
+    assert read.completed(source.source_id, **archive_input) == completed
+    candidate = read.expense_candidate(source.source_id, **archive_input)
+    assert candidate.original_media_sha256 == reference.original_sha256
+    assert candidate.original_message_sha256 == prepared.source.original_message_sha256
+    assert candidate.source_sha256 == digest(asdict(prepared.source))
+    assert candidate.preparation_sha256 == prepared.preparation_sha256
+    assert candidate.fields_reply_sha256 == digest(asdict(completed.evidence))
+    values = json.loads(candidate.values_json)
+    assert (values["original_amount"], values["original_currency"]) == ("12.34", "MYR")
+    assert (values["account_amount"], values["account_currency"]) == ("10.37", "SGD")
+    assert values["category"] == "餐饮" and values["funds_time"]["precision"] == "unknown"
+
     port.replies = (
         replace(
             port.answer,
@@ -340,7 +380,7 @@ def test_receipt_review_binds_payment_to_the_exact_verified_whole_draft(seam, li
         ),
     )
     with pytest.raises(LifecycleError, match="differs from original draft"):
-        read.prepare(source.source_id, **media_input)
+        read.prepare(source.source_id, **archive_input)
     assert ledger.reader().full_audit() == audit and audit["fact_version_count"] == 1
 
 
