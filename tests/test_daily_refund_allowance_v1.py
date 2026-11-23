@@ -73,6 +73,16 @@ def test_only_the_exact_current_original_consumption_is_refundable(live):
     target = read_refundable_expense_v1(ledger, original.fact_ref)
     assert (target.original_currency, target.original_amount) == ("JPY", "1000")
     assert target.economic_event_id == original.economic_event_id
+    credit = AccountDefinitionRefV1(**original.values["account_ref"])
+    terms = RefundTermsV1("JPY", "1000", credit, "SGD", "9.20")
+    assert read_refundable_expense_v1(ledger, original.fact_ref, terms=terms) == target
+    for incorrect in (
+        replace(terms, credit_currency="MYR"),
+        replace(terms, credit_account=replace(credit, definition_sha256="f" * 64)),
+        replace(terms, credit_account=replace(credit, account_id="unknown-credit")),
+    ):
+        with pytest.raises(LifecycleError, match="current account and currency"):
+            read_refundable_expense_v1(ledger, original.fact_ref, terms=incorrect)
     assert ledger.reader().full_audit() == before
     movement(
         ledger, port, movements, account, "void-purchase", {}, target=original, kind="movement_void"

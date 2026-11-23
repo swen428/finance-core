@@ -9,7 +9,15 @@ from finance_core.money import SUPPORTED_CURRENCIES, MoneyValidationError, canon
 
 from ..contracts import LifecycleError, digest
 from .accounts import MAX_RECORDS, DailyAccountServiceV1, _audit, bundle_ref
-from .contracts import AccountDefinitionRefV1, BundleFactRefV1, _money, strict_json, text
+from .contracts import (
+    BUNDLE_FORMATS,
+    AccountDefinitionRefV1,
+    BundleFactRefV1,
+    _money,
+    account_ref,
+    strict_json,
+    text,
+)
 from .movement_contracts import MOVEMENT_FORMAT
 
 
@@ -111,10 +119,14 @@ def compile_refund_allowance_v1(
         )
 
 
-def read_refundable_expense_v1(service, selected: BundleFactRefV1) -> RefundExpenseV1:
-    """Qualify one exact current consumption fact before a linked refund can be prepared."""
+def read_refundable_expense_v1(
+    service, selected: BundleFactRefV1, *, terms: RefundTermsV1 | None = None
+) -> RefundExpenseV1:
+    """Qualify the current expense and any proposed credit in the same protected read."""
     if type(selected) is not BundleFactRefV1:
         raise LifecycleError("Exact selected expense fact required")
+    if terms is not None and type(terms) is not RefundTermsV1:
+        raise LifecycleError("Exact refund terms required")
     with DailyAccountServiceV1(service)._read() as (bound, conn):
         _audit(bound, conn)
         row = conn.execute(
@@ -137,6 +149,20 @@ def read_refundable_expense_v1(service, selected: BundleFactRefV1) -> RefundExpe
             amount, currency = original["amount"], original["currency"]
         else:
             raise LifecycleError("Linked refund requires a current active expense")
+        if terms is not None:
+            if terms.original_currency != currency:
+                raise LifecycleError("Refund must use the expense's original currency")
+            credit_row = conn.execute(
+                "SELECT values_json FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+                (terms.credit_account.account_id,),
+            ).fetchone()
+            credit = strict_json(credit_row["values_json"]) if credit_row is not None else {}
+            if (
+                credit.get("format") not in BUNDLE_FORMATS
+                or account_ref(credit) != terms.credit_account
+                or credit["account"]["currency"] != terms.credit_currency
+            ):
+                raise LifecycleError("Refund credit requires the current account and currency")
         return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
 
 
