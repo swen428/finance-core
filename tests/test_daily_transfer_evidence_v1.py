@@ -8,6 +8,7 @@ import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError, VerifiedSource
 from finance_core.lifecycle_v2.contracts import canonical, digest
+from finance_core.lifecycle_v2.daily_v1 import DailyTransferServiceV1
 from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1, instruction_ref
 from finance_core.lifecycle_v2.daily_v1.ledger_reader import (
     DailyLedgerReaderV1,
@@ -15,25 +16,31 @@ from finance_core.lifecycle_v2.daily_v1.ledger_reader import (
 )
 from finance_core.lifecycle_v2.daily_v1.movements import DailyMovementServiceV1
 from finance_core.lifecycle_v2.daily_v1.opening_changes_v1 import DailyOpeningChangeServiceV1
-from finance_core.lifecycle_v2.daily_v1.transfer_drafts_v1 import DailyTransferDraftServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
+    CHANGE_TARGET_FORMAT,
     QUESTION_FORMAT,
+    VerifiedTransferChangeTargetV1,
     VerifiedTransferOpeningReplyV1,
     _transfer_terms_digest,
     require_transfer_opening_replies_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.transfer_review_v1 import read_transfer_create_preview_v1
-from tests.daily_account_support_v1 import OpeningPort, unknown_time
-from tests.test_daily_accounts_lifecycle_v1 import change, setup
+from tests.daily_account_support_v1 import OpeningPort, command, unknown_time
+from tests.test_daily_accounts_lifecycle_v1 import change, create, setup
 from tests.test_daily_opening_changes_v1 import finish, opening_command, opening_proposal, row_reply
 from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_daily_transfer_opening_v1 import _account, _on
 from tests.test_lifecycle_v2 import live as live
 
 
-def _retained_questions(ledger, port, transfer):
+def _retained_questions(
+    ledger,
+    port,
+    transfer,
+    *,
+    raw_instruction="Transfer actual SGD 100.00 to MYR 330.00 with an additional SGD 1.00 fee",
+):
     original = transfer["instruction_ref"]
-    raw_instruction = "Transfer actual SGD 100.00 to MYR 330.00 with an additional SGD 1.00 fee"
     source = VerifiedSource(
         original["evidence_id"],
         ledger.binding.principal_id,
@@ -81,7 +88,11 @@ def _retained_questions(ledger, port, transfer):
                 "role_binding_sha256": coverage["binding_sha256"],
             }
 
-    def read_question(_conn, identity):
+    prior = getattr(port, "transfer_opening_reply_v1", None)
+
+    def read_question(conn, identity):
+        if identity not in questions and prior is not None:
+            return prior(conn, identity)
         return VerifiedTransferOpeningReplyV1(identity, canonical(questions[identity]))
 
     port.transfer_opening_reply_v1 = read_question
@@ -153,7 +164,7 @@ def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
 ):
     ledger, port, daily, reader, out = _transfer_with_account_snapshots(live, transfer)
     captured = ledger.capture(transfer["instruction_ref"]["evidence_id"], "capture-transfer")
-    service = DailyTransferDraftServiceV1(ledger)
+    service = DailyTransferServiceV1(ledger)
     proposal = service.propose_create(captured.source_id, transfer, "result-1", "draft-transfer-1")
     assert proposal.version == 1
     assert (
@@ -253,7 +264,7 @@ def test_transfer_account_effects_report_fee_once_and_require_current_opening(li
 def test_commits_one_confirmed_transfer_with_both_legs_and_fee(live, transfer, tmp_path):
     ledger, port, daily, _, out = _transfer_with_account_snapshots(live, transfer)
     capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "transfer-capture")
-    service = DailyTransferDraftServiceV1(ledger)
+    service = DailyTransferServiceV1(ledger)
     proposed = service.propose_create(
         capture.source_id, transfer, "transfer-result", "transfer-draft"
     )
@@ -323,7 +334,7 @@ def test_opening_revision_treats_two_transfer_roles_separately_and_survives_rena
     account_source = ledger.capture("source1", "capture1")
     account_proposal = daily.propose_account_create(account_source.source_id, "obs1", 0, "propose1")
     captured = ledger.capture(transfer["instruction_ref"]["evidence_id"], "payment-capture")
-    transfers = DailyTransferDraftServiceV1(ledger)
+    transfers = DailyTransferServiceV1(ledger)
     draft = transfers.propose_create(
         captured.source_id, transfer, "payment-draft", "payment-propose"
     )
@@ -419,3 +430,247 @@ def test_opening_revision_treats_two_transfer_roles_separately_and_survives_rena
         == transfer_receipt
     )
     assert len(ledger.seal_snapshot(tmp_path / "opening-map-transfer.sqlite").facts) == 3
+
+
+def test_whole_transfer_reversal_preserves_original_and_booking_once(live, transfer, tmp_path):
+    ledger, port, _, _, _ = _transfer_with_account_snapshots(live, transfer)
+    capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "capture-transfer")
+    service = DailyTransferServiceV1(ledger)
+    proposed = service.propose_create(
+        capture.source_id, transfer, "proposed-transfer", "propose-op"
+    )
+    first_card = service.prepare_review(proposed.proposal_id, proposed.version)
+    service.record_delivery(first_card.review_id, "original-display")
+    posted = service.confirm(first_card.review_id, "original-action", "original-confirm")
+    previous = BundleFactRefV1(
+        posted.record_id, posted.version, posted.fact_sha256, posted.commit_seq
+    )
+    ledger_reader = DailyLedgerReaderV1(ledger)
+    original = ledger_reader.collect_with_transfers_v2().transfers[0]
+
+    reason = "duplicate transfer"
+    raw = "Reverse both legs and fee because of a " + reason
+    quote = [raw.index(reason), len(raw)]
+    response = port.add_source("requested-reversal", raw)
+    original_ref = instruction_ref(asdict(response), ledger.binding)
+    values = {
+        **original.values,
+        "instruction_ref": original_ref,
+        "transition": "transfer_void",
+        "status": "VOID",
+        "reason_ref": {
+            "format": "finance-daily-reason-ref-v1",
+            "instruction_ref": original_ref,
+            "span": quote,
+            "quote": reason,
+            "quote_sha256": sha256(reason.encode()).hexdigest(),
+        },
+    }
+    association = {
+        "format": CHANGE_TARGET_FORMAT,
+        "instruction_ref": original_ref,
+        "target_fact_ref": asdict(previous),
+        "transition": "transfer_void",
+        "reason_span": quote,
+    }
+    port.transfer_change_target_v1 = lambda _conn, eid: VerifiedTransferChangeTargetV1(
+        "selected-" + eid, canonical(association)
+    )
+    association["transition"] = "transfer_correct"
+    with pytest.raises(LifecycleError, match="retained target or reason"):
+        service.propose_change(
+            capture.source_id,
+            previous,
+            values,
+            "void",
+            "propose-void",
+            expected_version=proposed.version,
+        )
+    association["transition"] = "transfer_void"
+    proposed = service.propose_change(
+        capture.source_id,
+        previous,
+        values,
+        "void",
+        "propose-void",
+        expected_version=proposed.version,
+    )
+    card = service.prepare_review(proposed.proposal_id, proposed.version)
+    changes = card.material["account_impact_changes"]
+    assert {row["currency"]: row["balance_change"] for row in changes} == {
+        "SGD": "100.00",
+        "MYR": "0.00",
+    }
+    assert card.material["before_expense_by_currency"] == [["SGD", "1.00"]]
+    assert card.material["expense_by_currency"] == []
+    service.record_delivery(card.review_id, "void-display")
+    with pytest.raises(LifecycleError, match="separate human action"):
+        service.confirm(card.review_id, "selected-requested-reversal", "void-confirm")
+    voided = service.confirm(card.review_id, "void-action", "void-confirm")
+    assert (voided.record_id, voided.version) == (posted.record_id, 2)
+    assert service.confirm(card.review_id, "void-action", "void-confirm") == voided
+    assert service.confirm(first_card.review_id, "original-action", "original-confirm") == posted
+    assert (
+        service.lookup_commit_receipt(
+            "original-confirm", review_id=first_card.review_id, action_evidence_id="original-action"
+        )
+        == posted
+    )
+    history = ledger_reader.transfer_history_v1(posted.record_id)
+    assert [view.fact_ref.fact_sha256 for view in history] == [
+        posted.fact_sha256,
+        voided.fact_sha256,
+    ]
+    assert [view.values["status"] for view in history] == ["ACTIVE", "VOID"]
+    result = ledger_reader.collect_with_transfers_v2()
+    assert len(result.transfers) == 1
+    assert result.transfers[0].economic_event_id == original.economic_event_id
+    assert result.transfers[0].source_id == original.source_id
+    assert result.transfers[0].values == values
+    assert not result.effects and not result.collection.expense_by_currency
+    assert {b.currency: b.balance_amount for b in result.collection.balances} == {
+        "SGD": "100.00",
+        "MYR": "100.00",
+    }
+    snapshot = ledger.seal_snapshot(tmp_path / "voided-transfer.sqlite")
+    assert (voided.record_id, 2, voided.fact_sha256) in snapshot.facts
+
+
+def test_correcting_both_transfer_legs_requires_new_opening_replies(live, transfer):
+    ledger, port, _, _, _ = _transfer_with_account_snapshots(live, transfer)
+    capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "transfer-origin")
+    service = DailyTransferServiceV1(ledger)
+    initial = service.propose_create(capture.source_id, transfer, "initial-model", "initial-draft")
+    first_card = service.prepare_review(initial.proposal_id, initial.version)
+    service.record_delivery(first_card.review_id, "initial-display")
+    first = service.confirm(first_card.review_id, "initial-action", "initial-confirm")
+    previous = BundleFactRefV1(first.record_id, first.version, first.fact_sha256, first.commit_seq)
+    reason = "wrong amounts"
+    raw = "Correct the transfer to SGD 115.00 and MYR 348.00 due to " + reason
+    response = port.add_source("transfer-correction", raw)
+    ref = instruction_ref(asdict(response), ledger.binding)
+    span = [raw.index(reason), len(raw)]
+    changed = {**deepcopy(transfer), "transition": "transfer_correct", "instruction_ref": ref}
+    changed["reason_ref"] = {
+        "format": "finance-daily-reason-ref-v1",
+        "instruction_ref": ref,
+        "span": span,
+        "quote": reason,
+        "quote_sha256": sha256(reason.encode()).hexdigest(),
+    }
+    changed["outgoing"]["amount"] = "115.00"
+    changed["incoming"]["amount"] = "348.00"
+    legs = (changed["outgoing"], changed["incoming"], changed["fee"]["charge"])
+    for leg in legs:
+        coverage = leg["coverage"]
+        coverage["binding"].update(amount=leg["amount"], instruction_ref=ref)
+        coverage["binding_sha256"] = digest(coverage["binding"])
+    with pytest.raises(LifecycleError, match="independent authenticated reply"):
+        service.propose_change(
+            capture.source_id,
+            previous,
+            changed,
+            "old-answers",
+            "old-answers",
+            expected_version=initial.version,
+        )
+    for leg in legs:
+        prior = leg["coverage"]["reply_ref"]
+        if prior is not None:
+            prior["evidence_id"] += "-corrected"
+            prior["source_key"] += "-corrected"
+    _retained_questions(ledger, port, changed, raw_instruction=raw)
+    actual = VerifiedTransferChangeTargetV1(
+        "corrected-transfer-target",
+        canonical(
+            {
+                "format": CHANGE_TARGET_FORMAT,
+                "instruction_ref": ref,
+                "target_fact_ref": asdict(previous),
+                "transition": "transfer_correct",
+                "reason_span": span,
+            }
+        ),
+    )
+    port.transfer_change_target_v1 = lambda _conn, eid: {response.evidence_id: actual}[eid]
+    proposed = service.propose_change(
+        capture.source_id,
+        previous,
+        changed,
+        "corrected-model",
+        "corrected-draft",
+        expected_version=initial.version,
+    )
+    card = service.prepare_review(proposed.proposal_id, proposed.version)
+    assert {
+        row["currency"]: row["balance_change"] for row in card.material["account_impact_changes"]
+    } == {"SGD": "-15.00", "MYR": "0.00"}
+    assert card.material["before_expense_by_currency"] == card.material["expense_by_currency"]
+    service.record_delivery(card.review_id, "corrected-display")
+    receipt = service.confirm(card.review_id, "corrected-action", "corrected-confirm")
+    assert (receipt.record_id, receipt.version) == (first.record_id, 2)
+    assert service.confirm(card.review_id, "corrected-action", "corrected-confirm") == receipt
+    result = DailyLedgerReaderV1(ledger).collect_with_transfers_v2()
+    assert len(result.transfers) == 1 and result.transfers[0].values == changed
+    assert result.collection.expense_by_currency == (("SGD", "1.00"),)
+    assert {b.currency: b.balance_amount for b in result.collection.balances} == {
+        "SGD": "-15.00",
+        "MYR": "100.00",
+    }
+
+
+def test_credit_card_repayment_moves_cash_and_reduces_debt_without_an_expense(live, transfer):
+    ledger, port, daily, reader, _ = setup(live)
+    boundary = _on("2026-11-21")
+    bank = _account(ledger, port, daily, reader, "SGD", "1", boundary)
+    port.add_source("source2", "Credit card opening debt of SGD 80.00")
+    _, _, _, card_receipt = create(
+        ledger,
+        port,
+        daily,
+        command(
+            fields={
+                "name": "Credit card",
+                "account_type": "credit_card",
+                "currency": "SGD",
+                "opening": {"amount": "-80.00", "as_of": boundary},
+            }
+        ),
+        suffix="2",
+    )
+    card = reader.get_account(card_receipt.account_ref.account_id)
+    source = port.add_source("repayment", "Pay SGD 50.00 from the bank to the credit card")
+    ref = instruction_ref(asdict(source), ledger.binding)
+    transfer.update(instruction_ref=ref, fee={"mode": "none", "charge": None})
+    for leg, account in ((transfer["outgoing"], bank), (transfer["incoming"], card)):
+        leg.update(
+            currency="SGD",
+            amount="50.00",
+            account_ref=asdict(account.account_ref),
+            opening_ref=asdict(account.opening_ref),
+        )
+        coverage = leg["coverage"]
+        coverage["binding"].update(
+            {key: leg[key] for key in ("currency", "amount", "account_ref", "opening_ref")},
+            instruction_ref=ref,
+        )
+        coverage.update(
+            treatment="excluded",
+            basis="strictly_later",
+            reply_ref=None,
+            binding_sha256=digest(coverage["binding"]),
+        )
+    capture = ledger.capture(source.evidence_id, "capture-repayment")
+    transfers = DailyTransferServiceV1(ledger)
+    draft = transfers.propose_create(
+        capture.source_id, transfer, "repayment-values", "repayment-draft"
+    )
+    review = transfers.prepare_review(draft.proposal_id, draft.version)
+    transfers.record_delivery(review.review_id, "repayment-display")
+    transfers.confirm(review.review_id, "repayment-action", "repayment-confirm")
+    result = DailyLedgerReaderV1(ledger).collect_with_transfers_v2()
+    balances = {item.account_id: item for item in result.collection.balances}
+    assert balances[bank.account_id].balance_amount == "50.00"
+    assert balances[card.account_id].balance_amount == "-30.00"
+    assert balances[card.account_id].credit_card_debt == "30.00"
+    assert not result.collection.income_by_currency and not result.collection.expense_by_currency

@@ -139,6 +139,7 @@ def _audit_connection(conn, *, _rows=None):
             "finance-daily-opening-review-v2",
             "finance-daily-opening-review-v3",
             "finance-daily-transfer-review-v1",
+            "finance-daily-transfer-change-review-v1",
         }:
             raise LifecycleError("Unsupported review format")
         values_key = "after_values" if "format" in material else "values"
@@ -436,7 +437,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.opening_changes_v1 import verify_proposal as verify_opening_proposal
 
         return verify_opening_proposal(service, conn, proposal, _rows=_rows)
-    if sealed.get("format") == "finance-daily-transfer-draft-v1":
+    if sealed.get("format") in {
+        "finance-daily-transfer-draft-v1",
+        "finance-daily-transfer-change-draft-v1",
+    }:
         from .daily_v1.transfer_drafts_v1 import verify_proposal as verify_transfer_proposal
 
         return verify_transfer_proposal(service, conn, proposal, _rows=_rows)
@@ -578,7 +582,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
-    if material.get("format") == "finance-daily-transfer-review-v1":
+    if material.get("format") in {
+        "finance-daily-transfer-review-v1",
+        "finance-daily-transfer-change-review-v1",
+    }:
         from .daily_v1.transfer_drafts_v1 import verify_review as verify_transfer_review
 
         return verify_transfer_review(service, conn, review, _rows=_rows)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from .._finalization_journal_v1 import _assert_unreserved
 from .._finalization_plan_v1 import _append_finalization, _FinalizationPlanV1
@@ -15,10 +15,12 @@ from ..contracts import (
     RuntimeBinding,
     VerifiedAction,
     VerifiedDelivery,
+    VerifiedSource,
     canonical,
     digest,
 )
 from ..service import _event, _fact_material, _id, _row
+from ._impacts_v1 import account_inventory, resolve_transfer_effect_v1
 from .accounts import (
     MAX_PROPOSALS,
     DailyAccountServiceV1,
@@ -31,19 +33,22 @@ from .accounts import (
     _review_dto,
     _source_instruction,
     _tail,
+    bundle_ref,
 )
-from .contracts import exact, instruction_ref, strict_json, text
-from .transfer_evidence_v1 import require_transfer_opening_replies_v1
+from .contracts import BundleFactRefV1, exact, instruction_ref, strict_json, text
+from .transfer_evidence_v1 import require_transfer_opening_replies_v1, transfer_change_target_v1
 from .transfer_facts_v1 import (
     TRANSFER_FORMAT,
     project_transfer_fact_v1,
     require_transfer_predecessor_v1,
 )
 from .transfer_opening_v1 import require_active_transfer_openings_v1
-from .transfer_review_v1 import _balance_changes
+from .transfer_review_v1 import _balance_changes, _change_totals
 
 OBSERVATION_FORMAT = "finance-daily-transfer-draft-v1"
+CHANGE_DRAFT_FORMAT = "finance-daily-transfer-change-draft-v1"
 REVIEW_FORMAT = "finance-daily-transfer-review-v1"
+CHANGE_REVIEW_FORMAT = "finance-daily-transfer-change-review-v1"
 
 
 @dataclass(frozen=True)
@@ -60,6 +65,16 @@ class _ExpectedTransferDraft:
         return None
 
 
+@dataclass(frozen=True)
+class _ExpectedTransferChange(_ExpectedTransferDraft):
+    target: dict
+    link: dict | None
+
+    @property
+    def target_bundle_ref(self):
+        return self.target
+
+
 def _record_id(source_id):
     return "transfer-" + digest([OBSERVATION_FORMAT, source_id])
 
@@ -74,22 +89,58 @@ def _load_predecessor(conn, source_id, version, *, _rows=None):
             "SELECT * FROM l2_proposals WHERE source_id=? AND version=?", (source_id, version)
         ).fetchone()
     )
-    if prior is None or strict_json(prior["observation_json"]).get("format") != OBSERVATION_FORMAT:
+    if prior is None or strict_json(prior["observation_json"]).get("format") not in {
+        OBSERVATION_FORMAT,
+        CHANGE_DRAFT_FORMAT,
+    }:
         raise LifecycleError("Transfer draft requires its exact prior transfer proposal")
     return prior["proposal_id"]
 
 
+def _target_row(conn, expected, *, _rows=None):
+    target = expected.target_bundle_ref
+    if target is None:
+        return None
+    row = (
+        _rows.one(conn, "fact_version", target["record_id"], target["version"])
+        if _rows is not None
+        else conn.execute(
+            "SELECT * FROM l2_facts WHERE record_id=? AND version=?",
+            (target["record_id"], target["version"]),
+        ).fetchone()
+    )
+    if row is None or asdict(bundle_ref(row)) != target:
+        raise LifecycleError("Transfer change requires its exact retained predecessor")
+    return row
+
+
 def _require_values(service, conn, expected, source, values, before_seq=None, *, _rows=None):
-    require_transfer_predecessor_v1(None, values)
-    if (
-        source["source_sha256"] != expected.source_sha256
-        or source["generation"] != expected.binding.generation
-        or instruction_ref(_source_instruction(source), expected.binding)
-        != values["instruction_ref"]
-    ):
+    previous = _target_row(conn, expected, _rows=_rows)
+    before = strict_json(previous["values_json"]) if previous is not None else None
+    require_transfer_predecessor_v1(before, values)
+    if source["source_sha256"] != expected.source_sha256:
         raise LifecycleError("Transfer draft differs from its authenticated capture")
-    require_active_transfer_openings_v1(conn, values, before_seq, _rows=_rows)
-    require_transfer_opening_replies_v1(service, conn, values, binding=expected.binding)
+    if previous is None:
+        if source["generation"] != expected.binding.generation:
+            raise LifecycleError("Transfer draft differs from its capture generation")
+        instruction = _source_instruction(source)
+    else:
+        if previous["source_id"] != expected.source_id:
+            raise LifecycleError("Transfer predecessor belongs to another capture")
+        actual = service.port.source(conn, values["instruction_ref"]["evidence_id"])
+        if type(actual) is not VerifiedSource:
+            raise LifecycleError("Exact authenticated transfer change instruction required")
+        instruction = asdict(actual)
+    if instruction_ref(instruction, expected.binding) != values["instruction_ref"]:
+        raise LifecycleError("Transfer draft differs from its authenticated instruction")
+    if values["status"] == "ACTIVE":
+        require_active_transfer_openings_v1(conn, values, before_seq, _rows=_rows)
+        require_transfer_opening_replies_v1(service, conn, values, binding=expected.binding)
+    if expected.target_bundle_ref is not None:
+        return transfer_change_target_v1(
+            service, conn, instruction, expected.binding, expected.target_bundle_ref, values
+        )
+    return None
 
 
 def _material(proposal, sealed, values):
@@ -110,20 +161,33 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     observed = sealed["observation"]
     exact(observed, {"evidence_id", "request_sha256"}, "transfer proposal identity")
     raw = sealed["expected"]
-    exact(raw, _ExpectedTransferDraft.__dataclass_fields__, "transfer proposal request")
+    format = sealed["format"]
+    if format == CHANGE_DRAFT_FORMAT:
+        expected_type = _ExpectedTransferChange
+    elif format == OBSERVATION_FORMAT:
+        expected_type = _ExpectedTransferDraft
+    else:
+        raise LifecycleError("Unsupported transfer proposal format")
+    exact(raw, expected_type.__dataclass_fields__, "transfer proposal request")
     exact(raw["binding"], RuntimeBinding.__dataclass_fields__, "transfer proposal binding")
-    expected = _ExpectedTransferDraft(**{**raw, "binding": RuntimeBinding(**raw["binding"])})
+    expected = expected_type(**{**raw, "binding": RuntimeBinding(**raw["binding"])})
+    target = expected.target_bundle_ref
+    record_id = (
+        BundleFactRefV1(**target).record_id
+        if target is not None
+        else _record_id(proposal["source_id"])
+    )
     if (
-        sealed["format"] != OBSERVATION_FORMAT
+        (isinstance(expected, _ExpectedTransferChange) and target is None)
         or observed["evidence_id"] != proposal["observation_id"]
         or observed["request_sha256"] != digest(raw)
         or type(expected.expected_proposal_version) is not int
         or not 0 <= expected.expected_proposal_version < MAX_PROPOSALS
         or expected.expected_proposal_version + 1 != proposal["version"]
-        or expected.record_id != _record_id(proposal["source_id"])
+        or expected.record_id != record_id
         or expected.record_id != proposal["record_id"]
         or expected.source_id != proposal["source_id"]
-        or proposal["expected_version"] != 0
+        or proposal["expected_version"] != (target["version"] if target is not None else 0)
         or expected.binding.instance_id != service.binding.instance_id
         or expected.current_proposal_id
         != _load_predecessor(
@@ -135,7 +199,9 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     cutoff = _require_prefix(conn, expected, proposal, "proposal", _rows=_rows)
     source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
     values = strict_json(proposal["values_json"])
-    _require_values(service, conn, expected, source, values, cutoff, _rows=_rows)
+    link = _require_values(service, conn, expected, source, values, cutoff, _rows=_rows)
+    if isinstance(expected, _ExpectedTransferChange) and link != expected.link:
+        raise LifecycleError("Transfer change differs from its original association")
     event = (
         _rows.one(conn, "event", cutoff)
         if _rows is not None
@@ -156,9 +222,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def _review_material(conn, proposal, expected, review_id, created_at, cutoff=None, *, _rows=None):
     values = strict_json(proposal["values_json"])
-    require_active_transfer_openings_v1(conn, values, cutoff, _rows=_rows)
+    if values["status"] == "ACTIVE":
+        require_active_transfer_openings_v1(conn, values, cutoff, _rows=_rows)
     projection = project_transfer_fact_v1(values)
-    return {
+    material = {
         "format": REVIEW_FORMAT,
         "binding": asdict(expected.binding),
         "review_id": review_id,
@@ -174,6 +241,51 @@ def _review_material(conn, proposal, expected, review_id, created_at, cutoff=Non
         "created_at": created_at,
         "expires_at": created_at + 600,
     }
+    target = _target_row(conn, expected, _rows=_rows)
+    if target is not None:
+        before_values = strict_json(target["values_json"])
+        before = project_transfer_fact_v1(before_values)
+        accounts = {
+            row["fact_ref"]["record_id"]: row["values"]
+            for row in account_inventory(conn, cutoff, _rows=_rows)
+        }
+        previous_roles = [
+            resolve_transfer_effect_v1(
+                conn,
+                role,
+                expected.target_bundle_ref,
+                accounts[role["account_id"]],
+                cutoff,
+                _rows=_rows,
+            )
+            for role in before.effects
+        ]
+        next_roles = [
+            resolve_transfer_effect_v1(
+                conn, role, None, accounts[role["account_id"]], cutoff, _rows=_rows
+            )
+            for role in projection.effects
+        ]
+        material.update(
+            format=CHANGE_REVIEW_FORMAT,
+            target_fact_ref=expected.target_bundle_ref,
+            before_values=before_values,
+            before_account_roles=previous_roles,
+            after_account_roles=next_roles,
+            before_expense_by_currency=[list(entry) for entry in before.expenses_by_currency],
+            account_impact_changes=[
+                asdict(change) for change in _change_totals(previous_roles, next_roles)
+            ],
+        )
+    return material
+
+
+def _require_current_review(conn, proposal, expected, review, cutoff=None, *, _rows=None):
+    material = _review_material(
+        conn, proposal, expected, review["review_id"], review["created_at"], cutoff, _rows=_rows
+    )
+    if canonical(material) != review["material_json"]:
+        raise LifecycleError("Transfer review no longer describes the exact account effects")
 
 
 def _verified_delivery(service, conn, expected, review, evidence_id):
@@ -215,7 +327,7 @@ def verify_review(service, conn, review, *, _rows=None):
         else conn.execute("SELECT * FROM l2_events WHERE seq=?", (cutoff,)).fetchone()
     )
     if (
-        review["expected_version"] != 0
+        review["expected_version"] != proposal["expected_version"]
         or review["record_id"] != expected.record_id
         or review["values_json"] != proposal["values_json"]
         or review["material_json"] != canonical(material)
@@ -234,7 +346,7 @@ def verify_review(service, conn, review, *, _rows=None):
         cutoff = _require_prefix(
             conn, expected, proposal, "delivery", review_id=review_id, _rows=_rows
         )
-        require_active_transfer_openings_v1(conn, material["after_values"], cutoff, _rows=_rows)
+        _require_current_review(conn, proposal, expected, review, cutoff, _rows=_rows)
         actual = _verified_delivery(service, conn, expected, review, delivery["evidence_id"])
         if canonical(actual) != delivery["material_json"]:
             raise LifecycleError("Transfer delivery differs from its original evidence")
@@ -258,26 +370,35 @@ def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None):
         raise LifecycleError("Transfer capture already has a posted fact")
 
 
-def _require_separate_action(values, delivery_id, action_id):
-    retained = {values["instruction_ref"]["evidence_id"], delivery_id}
-    for effect in project_transfer_fact_v1(values).effects:
-        reply = effect["coverage"]["reply_ref"]
-        if reply is not None:
-            retained.add(reply["evidence_id"])
+def _require_separate_action(material, expected, delivery_id, action_id):
+    retained = {delivery_id}
+    if isinstance(expected, _ExpectedTransferChange):
+        retained.add(expected.link["evidence_id"])
+    for values in (material.get("before_values"), material["after_values"]):
+        if values is None:
+            continue
+        retained.add(values["instruction_ref"]["evidence_id"])
+        for effect in project_transfer_fact_v1(values).effects:
+            reply = effect["coverage"]["reply_ref"]
+            if reply is not None:
+                retained.add(reply["evidence_id"])
     if action_id in retained:
         raise LifecycleError("Transfer confirmation requires a separate human action")
 
 
 def verify_confirmed_transfer(conn, fact, review, expected, delivery, action, *, _rows=None):
     material = strict_json(review["material_json"])
+    if not isinstance(expected, _ExpectedTransferDraft) or type(action) is not VerifiedAction:
+        raise LifecycleError("Transfer fact lacks its exact review and action")
+    target = _target_row(conn, expected, _rows=_rows)
+    version = target["version"] + 1 if target is not None else 1
     if (
-        type(expected) is not _ExpectedTransferDraft
-        or type(action) is not VerifiedAction
-        or material.get("format") != REVIEW_FORMAT
-        or fact["version"] != 1
+        material.get("format") != (CHANGE_REVIEW_FORMAT if target is not None else REVIEW_FORMAT)
+        or fact["version"] != version
         or fact["record_id"] != expected.record_id
+        or (target is not None and fact["predecessor_sha256"] != target["fact_sha256"])
     ):
-        raise LifecycleError("Transfer fact lacks its exact create review")
+        raise LifecycleError("Transfer fact lacks its exact review and predecessor")
     proposal = (
         _rows.one(conn, "proposal", review["proposal_id"])
         if _rows is not None
@@ -292,10 +413,10 @@ def verify_confirmed_transfer(conn, fact, review, expected, delivery, action, *,
         commit_seq=fact["commit_seq"],
         _rows=_rows,
     )
-    values = strict_json(fact["values_json"])
-    require_active_transfer_openings_v1(conn, values, cutoff, _rows=_rows)
-    _require_unused_capture(conn, expected.source_id, cutoff, _rows=_rows)
-    _require_separate_action(values, delivery["evidence_id"], action.evidence_id)
+    _require_current_review(conn, proposal, expected, review, cutoff, _rows=_rows)
+    if target is None:
+        _require_unused_capture(conn, expected.source_id, cutoff, _rows=_rows)
+    _require_separate_action(material, expected, delivery["evidence_id"], action.evidence_id)
 
 
 def _transfer_receipt(fact):
@@ -307,20 +428,33 @@ def _transfer_receipt(fact):
     )
 
 
-class DailyTransferDraftServiceV1:
+class DailyTransferServiceV1:
     """Use the protected daily owner to stage and independently confirm a transfer."""
 
     def __init__(self, service):
         self._boundary = DailyAccountServiceV1(service)
 
     def propose_create(self, source_id, value, observation_id, operation_id, *, expected_version=0):
+        return self._propose(source_id, None, value, observation_id, operation_id, expected_version)
+
+    def propose_change(
+        self, source_id, target, value, observation_id, operation_id, *, expected_version
+    ):
+        if type(target) is not BundleFactRefV1:
+            raise LifecycleError("Exact prior transfer fact required")
+        return self._propose(
+            source_id, target, value, observation_id, operation_id, expected_version
+        )
+
+    def _propose(self, source_id, target, value, observation_id, operation_id, expected_version):
         text(source_id, "transfer source id")
         text(observation_id, "transfer proposal evidence")
         text(operation_id, "transfer proposal operation")
         if type(expected_version) is not int or not 0 <= expected_version < MAX_PROPOSALS:
             raise LifecycleError("Exact previous transfer proposal version required")
-        require_transfer_predecessor_v1(None, value)
         values = strict_json(canonical(value))
+        target_ref = asdict(target) if target is not None else None
+        format = CHANGE_DRAFT_FORMAT if target is not None else OBSERVATION_FORMAT
         with self._boundary._write() as (service, conn):
             _audit(service, conn)
             existing = conn.execute(
@@ -335,6 +469,7 @@ class DailyTransferDraftServiceV1:
                     event is None
                     or tuple(event) != ("propose", existing["proposal_id"])
                     or retained.source_id != source_id
+                    or retained.target_bundle_ref != target_ref
                     or retained.expected_proposal_version != expected_version
                     or canonical(values) != existing["values_json"]
                     or retained.binding != service.binding
@@ -353,31 +488,39 @@ class DailyTransferDraftServiceV1:
             if conn.execute("SELECT count(*) FROM l2_proposals").fetchone()[0] >= MAX_PROPOSALS:
                 raise LifecycleError("complete_read_limit_exceeded")
             fingerprint = _fingerprint(conn)
-            source = service._source(conn, source_id)
-            expected = _ExpectedTransferDraft(
+            source = service._source(conn, source_id, allow_archived=target is not None)
+            args = (
                 service.binding,
                 source_id,
                 source["source_sha256"],
-                _record_id(source_id),
+                target.record_id if target is not None else _record_id(source_id),
                 _load_predecessor(conn, source_id, expected_version),
                 expected_version,
             )
-            _require_values(service, conn, expected, source, values)
+            expected = (
+                _ExpectedTransferDraft(*args)
+                if target_ref is None
+                else _ExpectedTransferChange(*args, target_ref, None)
+            )
+            link = _require_values(service, conn, expected, source, values)
+            if isinstance(expected, _ExpectedTransferChange):
+                expected = replace(expected, link=link)
             _require_current(conn, expected)
             if _fingerprint(conn) != fingerprint:
                 raise LifecycleError("Transfer evidence callback changed protected state")
-            _require_unused_capture(conn, source_id)
+            if target is None:
+                _require_unused_capture(conn, source_id)
 
             proposal_id = _id("daily-transfer-proposal")
             row = {
                 "source_id": source_id,
                 "version": expected_version + 1,
-                "expected_version": 0,
+                "expected_version": target.version if target is not None else 0,
                 "record_id": expected.record_id,
             }
             expected_material = asdict(expected)
             sealed = {
-                "format": OBSERVATION_FORMAT,
+                "format": format,
                 "expected": expected_material,
                 "observation": {
                     "evidence_id": observation_id,
@@ -395,7 +538,7 @@ class DailyTransferDraftServiceV1:
                     source_id,
                     row["version"],
                     observation_id,
-                    0,
+                    row["expected_version"],
                     expected.record_id,
                     canonical(values),
                     observation_json,
@@ -433,7 +576,7 @@ class DailyTransferDraftServiceV1:
                 (
                     review_id,
                     proposal_id,
-                    0,
+                    proposal["expected_version"],
                     expected.record_id,
                     proposal["values_json"],
                     canonical(material),
@@ -462,7 +605,7 @@ class DailyTransferDraftServiceV1:
             material = _verified_delivery(service, conn, expected, review, evidence_id)
             proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
             _require_current(conn, expected, proposal=proposal)
-            require_active_transfer_openings_v1(conn, strict_json(review["values_json"]))
+            _require_current_review(conn, proposal, expected, review)
             if _fingerprint(conn) != fingerprint:
                 raise LifecycleError("Transfer evidence callback changed protected state")
             if service._now() >= strict_json(review["material_json"])["expires_at"]:
@@ -503,7 +646,9 @@ class DailyTransferDraftServiceV1:
                 or not material["created_at"] <= now < material["expires_at"]
             ):
                 raise LifecycleError("Transfer review lacks current delivery, binding or expiry")
-            _require_separate_action(values, delivery["evidence_id"], action_evidence_id)
+            _require_separate_action(
+                material, expected, delivery["evidence_id"], action_evidence_id
+            )
             fingerprint = _fingerprint(conn)
             action = service.port.action(
                 conn,
@@ -521,22 +666,36 @@ class DailyTransferDraftServiceV1:
                 service.binding.client_id,
             ):
                 raise LifecycleError("Transfer action differs from the authenticated review")
-            source = service._source(conn, expected.source_id)
+            target = _target_row(conn, expected)
+            source = service._source(conn, expected.source_id, allow_archived=target is not None)
+            if isinstance(expected, _ExpectedTransferChange):
+                link = _require_values(service, conn, expected, source, values)
+                if link != expected.link:
+                    raise LifecycleError("Transfer change target changed before confirmation")
             if _fingerprint(conn) != fingerprint:
                 raise LifecycleError("Transfer evidence callback changed protected state")
             proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
             _require_current(conn, expected, proposal=proposal)
-            require_active_transfer_openings_v1(conn, values)
-            _require_unused_capture(conn, expected.source_id)
-            _require_fact_capacity(conn, new_record=True, daily_capacity=service.daily_capacity)
+            _require_current_review(conn, proposal, expected, row)
+            if target is None:
+                _require_unused_capture(conn, expected.source_id)
+            _require_fact_capacity(
+                conn, new_record=target is None, daily_capacity=service.daily_capacity
+            )
             accepted_at = service._now()
             if not material["created_at"] <= now <= accepted_at < material["expires_at"]:
                 raise LifecycleError("Transfer review expired before confirmation")
 
             record_id = expected.record_id
-            economic_id = source["source_key"]
+            version = target["version"] + 1 if target is not None else 1
+            economic_id = (
+                target["economic_event_id"] if target is not None else source["source_key"]
+            )
+            predecessor = target["fact_sha256"] if target is not None else None
             sha = digest(
-                _fact_material(record_id, 1, economic_id, expected.source_id, values, None)
+                _fact_material(
+                    record_id, version, economic_id, expected.source_id, values, predecessor
+                )
             )
             tail_seq, tail_sha = _tail(conn)
             seq = tail_seq + 1
@@ -545,18 +704,18 @@ class DailyTransferDraftServiceV1:
                 "review_id": review_id,
                 "action": decision_material,
                 "fact_sha256": sha,
-                "version": 1,
+                "version": version,
                 "accepted_at": accepted_at,
             }
             plan = _FinalizationPlanV1(
                 (
                     record_id,
-                    1,
+                    version,
                     economic_id,
                     expected.source_id,
                     review_id,
                     canonical(values),
-                    None,
+                    predecessor,
                     sha,
                     seq,
                 ),
@@ -565,7 +724,7 @@ class DailyTransferDraftServiceV1:
                     review_id,
                     operation_id,
                     record_id,
-                    1,
+                    version,
                     canonical(decision_material),
                 ),
                 (
@@ -579,3 +738,19 @@ class DailyTransferDraftServiceV1:
                 ),
             )
             return _append_finalization(conn, plan)
+
+    def lookup_commit_receipt(self, operation_id, *, review_id, action_evidence_id):
+        """Observe an existing exact commitment without running confirmation again."""
+        text(operation_id, "transfer confirm operation")
+        text(review_id, "transfer review id")
+        text(action_evidence_id, "transfer action evidence")
+        with self._boundary._read() as (service, conn):
+            _audit(service, conn)
+            return _existing_receipt(
+                service,
+                conn,
+                review_id,
+                action_evidence_id,
+                operation_id,
+                receipt=_transfer_receipt,
+            )

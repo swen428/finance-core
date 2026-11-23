@@ -6,10 +6,11 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from ..contracts import LifecycleError, RuntimeBinding, VerifiedSource, canonical, digest
-from .contracts import exact, instruction_ref, strict_json, text
+from .contracts import BundleFactRefV1, exact, instruction_ref, strict_json, text
 from .transfer_facts_v1 import project_transfer_fact_v1
 
 QUESTION_FORMAT = "finance-daily-transfer-opening-question-v1"
+CHANGE_TARGET_FORMAT = "finance-daily-transfer-change-target-v1"
 _CHOICES = {
     "included": "included",
     "excluded": "excluded",
@@ -24,6 +25,43 @@ class VerifiedTransferOpeningReplyV1:
 
     reply_evidence_id: str
     question_json: str
+
+
+@dataclass(frozen=True)
+class VerifiedTransferChangeTargetV1:
+    """Authenticated association from a human instruction to one retained transfer version."""
+
+    evidence_id: str
+    target_json: str
+
+
+def transfer_change_target_v1(service, conn, source, binding, target, values):
+    """Read the original target association without giving the port an expected answer."""
+    original = values["instruction_ref"]
+    reason = values["reason_ref"]
+    link = service.port.transfer_change_target_v1(conn, source["evidence_id"])
+    if type(link) is not VerifiedTransferChangeTargetV1:
+        raise LifecycleError("Exact independently retained transfer target required")
+    text(link.evidence_id, "transfer change association")
+    raw = strict_json(link.target_json)
+    start, end = reason["span"]
+    if (
+        link.target_json != canonical(raw)
+        or raw
+        != {
+            "format": CHANGE_TARGET_FORMAT,
+            "instruction_ref": original,
+            "target_fact_ref": asdict(BundleFactRefV1(**target)),
+            "transition": values["transition"],
+            "reason_span": reason["span"],
+        }
+        or original["principal_id"] != binding.principal_id
+        or original["client_id"] != binding.client_id
+        or source["evidence_id"] != original["evidence_id"]
+        or source["raw_input"][start:end] != reason["quote"]
+    ):
+        raise LifecycleError("Transfer change differs from the retained target or reason")
+    return asdict(link)
 
 
 def _transfer_terms_digest(value: dict[str, Any]) -> str:

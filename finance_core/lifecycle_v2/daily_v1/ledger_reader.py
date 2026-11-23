@@ -331,6 +331,13 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         )
         return DailyLedgerWithTransfersV2(collection, transfers, contributions, effects)
 
+    def transfer_history_v1(self, record_id, *, limits=None):
+        """Read all verified versions of a transfer from one complete snapshot."""
+        history = self._ledger(limits, include_transfers=True)[1].get(record_id, ())
+        if history and history[0].values.get("format") != TRANSFER_FORMAT:
+            raise LifecycleError("Expected a transfer record")
+        return tuple(history)
+
     def detail(self, record_id, *, limits=None):
         history = self._ledger(limits)[1].get(record_id, ())
         return history[-1] if history else None

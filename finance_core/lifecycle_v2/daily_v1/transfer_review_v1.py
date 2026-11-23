@@ -57,6 +57,35 @@ def _balance_changes(effects):
         )
 
 
+def _change_totals(before, after):
+    totals = {}
+    with localcontext(Context(prec=256, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999)):
+        for roles, subtract in ((before, True), (after, False)):
+            for role in roles:
+                key = (role["account_id"], role["currency"])
+                has_opening = role["opening_ref"] is not None
+                recorded, balance = totals.get(
+                    key, (Decimal(0), Decimal(0) if has_opening else None)
+                )
+                raw = Decimal(role["recorded_change"])
+                impact = Decimal(role["balance_impact"])
+                totals[key] = (
+                    recorded + (raw.copy_negate() if subtract else raw),
+                    None
+                    if balance is None
+                    else balance + (impact.copy_negate() if subtract else impact),
+                )
+        return tuple(
+            TransferAccountChangeV1(
+                account_id,
+                currency,
+                canonical_money_str(recorded, currency),
+                None if balance is None else canonical_money_str(balance, currency),
+            )
+            for (account_id, currency), (recorded, balance) in sorted(totals.items())
+        )
+
+
 def read_transfer_create_preview_v1(
     service: LedgerService, value: dict[str, Any]
 ) -> TransferCreatePreviewV1:
