@@ -196,6 +196,8 @@ def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
     change(port, daily, out, "account_rename", {"name": "Renamed"}, "rename")
     assert reader.collect_accounts().accounts
     assert service.prepare_review(revised.proposal_id, revised.version) == delivered
+    with pytest.raises(LifecycleError, match="account reference is missing or stale"):
+        service.confirm(review.review_id, "stale-action", "stale-confirm")
     assert ledger.reader().full_audit()["fact_version_count"] == 3
     snapshot = ledger.seal_snapshot(tmp_path / "transfer-draft.sqlite")
     assert len(snapshot.facts) == 2
@@ -242,3 +244,67 @@ def test_transfer_account_effects_report_fee_once_and_require_current_opening(li
     )
     with pytest.raises(LifecycleError, match="coverage for its current opening"):
         _resolve_current_transfer(transfer, ref, accounts())
+
+
+def test_commits_one_confirmed_transfer_with_both_legs_and_fee(live, transfer, tmp_path):
+    ledger, port, daily, _, out = _transfer_with_account_snapshots(live, transfer)
+    capture = ledger.capture(transfer["instruction_ref"]["evidence_id"], "transfer-capture")
+    service = DailyTransferDraftServiceV1(ledger)
+    proposed = service.propose_create(
+        capture.source_id, transfer, "transfer-result", "transfer-draft"
+    )
+    review = service.prepare_review(proposed.proposal_id, proposed.version)
+
+    def confirm(action_id="transfer-action", operation_id="transfer-confirm"):
+        return service.confirm(review.review_id, action_id, operation_id)
+
+    before = ledger.reader().full_audit()["fact_version_count"]
+    with pytest.raises(LifecycleError, match="current delivery"):
+        confirm()
+    service.record_delivery(review.review_id, "transfer-display")
+    with pytest.raises(LifecycleError, match="separate human action"):
+        confirm("answer-transfer_in")
+    port.bad_actor = True
+    with pytest.raises(LifecycleError, match="action differs"):
+        confirm("other-actor-action")
+    port.bad_actor = False
+    assert ledger.reader().full_audit()["fact_version_count"] == before
+
+    receipt = confirm()
+    assert receipt.version == 1
+    assert confirm() == receipt
+    with pytest.raises(LifecycleError, match="replay mismatch"):
+        confirm("another-action")
+    with pytest.raises(LifecycleError):
+        confirm("another-action", "another-operation")
+    assert ledger.reader().full_audit()["fact_version_count"] == before + 1
+
+    ledger_reader = DailyLedgerReaderV1(ledger)
+    with pytest.raises(LifecycleError, match="use the transfer ledger"):
+        ledger_reader.collect_with_contributions_v1()
+    result = ledger_reader.collect_with_transfers_v2()
+    assert len(result.transfers) == 1 and result.transfers[0].values == transfer
+    assert result.collection.income_by_currency == ()
+    assert result.collection.expense_by_currency == (("SGD", "1.00"),)
+    assert len(result.contributions) == 1
+    assert {
+        b.currency: (b.recorded_net_change, b.balance_amount) for b in result.collection.balances
+    } == {"MYR": ("330.00", "100.00"), "SGD": ("-101.00", "0.00")}
+    with pytest.raises(LifecycleError, match="unsupported_transfer_opening_dependencies"):
+        change(
+            port,
+            daily,
+            out,
+            "opening_correct",
+            {"amount": "125.00", "as_of": _on("2026-11-22")},
+            "later-opening",
+            reason="Correct the opening amount",
+        )
+    assert (
+        ledger_reader.collect_with_transfers_v2().collection.balances == result.collection.balances
+    )
+    snapshot = ledger.seal_snapshot(tmp_path / "confirmed-transfer.sqlite")
+    assert len(snapshot.facts) == before + 1
+    assert any(
+        row[0] == receipt.record_id and row[2] == receipt.fact_sha256 for row in snapshot.facts
+    )

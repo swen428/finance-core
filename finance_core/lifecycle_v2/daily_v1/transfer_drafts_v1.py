@@ -1,32 +1,44 @@
-"""Retain complete transfer candidates without granting posting authority."""
+"""Stage, display and independently confirm complete transfers."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from .._finalization_journal_v1 import _assert_unreserved
+from .._finalization_plan_v1 import _append_finalization, _FinalizationPlanV1
 from ..contracts import (
+    CommitReceipt,
+    ExpectedAction,
     ExpectedDisplay,
     LifecycleError,
     ProposalRef,
     RuntimeBinding,
+    VerifiedAction,
     VerifiedDelivery,
     canonical,
     digest,
 )
-from ..service import _event, _id, _row
+from ..service import _event, _fact_material, _id, _row
 from .accounts import (
     MAX_PROPOSALS,
     DailyAccountServiceV1,
     _audit,
+    _existing_receipt,
     _fingerprint,
     _require_current,
+    _require_fact_capacity,
     _require_prefix,
     _review_dto,
     _source_instruction,
+    _tail,
 )
 from .contracts import exact, instruction_ref, strict_json, text
 from .transfer_evidence_v1 import require_transfer_opening_replies_v1
-from .transfer_facts_v1 import project_transfer_fact_v1, require_transfer_predecessor_v1
+from .transfer_facts_v1 import (
+    TRANSFER_FORMAT,
+    project_transfer_fact_v1,
+    require_transfer_predecessor_v1,
+)
 from .transfer_opening_v1 import require_active_transfer_openings_v1
 from .transfer_review_v1 import _balance_changes
 
@@ -231,8 +243,72 @@ def verify_review(service, conn, review, *, _rows=None):
     return expected, delivery
 
 
+def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None):
+    if _rows is None:
+        used = conn.execute(
+            "SELECT 1 FROM l2_facts WHERE source_id=? AND (? IS NULL OR commit_seq<?) LIMIT 1",
+            (source_id, before_seq, before_seq),
+        ).fetchone()
+    else:
+        used = any(
+            before_seq is None or row["commit_seq"] < before_seq
+            for row in _rows.many(conn, "source_facts", source_id)
+        )
+    if used:
+        raise LifecycleError("Transfer capture already has a posted fact")
+
+
+def _require_separate_action(values, delivery_id, action_id):
+    retained = {values["instruction_ref"]["evidence_id"], delivery_id}
+    for effect in project_transfer_fact_v1(values).effects:
+        reply = effect["coverage"]["reply_ref"]
+        if reply is not None:
+            retained.add(reply["evidence_id"])
+    if action_id in retained:
+        raise LifecycleError("Transfer confirmation requires a separate human action")
+
+
+def verify_confirmed_transfer(conn, fact, review, expected, delivery, action, *, _rows=None):
+    material = strict_json(review["material_json"])
+    if (
+        type(expected) is not _ExpectedTransferDraft
+        or type(action) is not VerifiedAction
+        or material.get("format") != REVIEW_FORMAT
+        or fact["version"] != 1
+        or fact["record_id"] != expected.record_id
+    ):
+        raise LifecycleError("Transfer fact lacks its exact create review")
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    )
+    cutoff = _require_prefix(
+        conn,
+        expected,
+        proposal,
+        "confirm",
+        review_id=review["review_id"],
+        commit_seq=fact["commit_seq"],
+        _rows=_rows,
+    )
+    values = strict_json(fact["values_json"])
+    require_active_transfer_openings_v1(conn, values, cutoff, _rows=_rows)
+    _require_unused_capture(conn, expected.source_id, cutoff, _rows=_rows)
+    _require_separate_action(values, delivery["evidence_id"], action.evidence_id)
+
+
+def _transfer_receipt(fact):
+    values = strict_json(fact["values_json"])
+    if values.get("format") != TRANSFER_FORMAT:
+        raise LifecycleError("Commit belongs to another record format")
+    return CommitReceipt(
+        fact["record_id"], fact["version"], fact["fact_sha256"], fact["commit_seq"]
+    )
+
+
 class DailyTransferDraftServiceV1:
-    """Stage an original-linked candidate for a separate guarded transfer confirmation."""
+    """Use the protected daily owner to stage and independently confirm a transfer."""
 
     def __init__(self, service):
         self._boundary = DailyAccountServiceV1(service)
@@ -290,8 +366,7 @@ class DailyTransferDraftServiceV1:
             _require_current(conn, expected)
             if _fingerprint(conn) != fingerprint:
                 raise LifecycleError("Transfer evidence callback changed protected state")
-            if conn.execute("SELECT 1 FROM l2_facts WHERE source_id=?", (source_id,)).fetchone():
-                raise LifecycleError("Transfer capture already has a posted fact")
+            _require_unused_capture(conn, source_id)
 
             proposal_id = _id("daily-transfer-proposal")
             row = {
@@ -398,3 +473,109 @@ class DailyTransferDraftServiceV1:
             )
             _event(conn, "delivery-" + evidence_id, "delivery", review_id, material)
             return _review_dto(conn, review)
+
+    def confirm(self, review_id, action_evidence_id, operation_id):
+        """Append one whole transfer and its decision under the protected owner lock."""
+        text(review_id, "transfer review id")
+        text(action_evidence_id, "transfer action evidence")
+        text(operation_id, "transfer confirm operation")
+        with self._boundary._write() as (service, conn):
+            _audit(service, conn)
+            existing = _existing_receipt(
+                service,
+                conn,
+                review_id,
+                action_evidence_id,
+                operation_id,
+                receipt=_transfer_receipt,
+            )
+            if existing is not None:
+                return existing
+            _assert_unreserved(conn, review_id, action_evidence_id, operation_id)
+            row = _row(conn, "l2_reviews", "review_id", review_id)
+            expected, delivery = verify_review(service, conn, row)
+            material = strict_json(row["material_json"])
+            values = material["after_values"]
+            now = service._now()
+            if (
+                delivery is None
+                or expected.binding != service.binding
+                or not material["created_at"] <= now < material["expires_at"]
+            ):
+                raise LifecycleError("Transfer review lacks current delivery, binding or expiry")
+            _require_separate_action(values, delivery["evidence_id"], action_evidence_id)
+            fingerprint = _fingerprint(conn)
+            action = service.port.action(
+                conn,
+                action_evidence_id,
+                ExpectedAction(
+                    service.binding, review_id, row["review_sha256"], delivery["evidence_id"]
+                ),
+            )
+            if type(action) is not VerifiedAction or action != VerifiedAction(
+                action_evidence_id,
+                review_id,
+                row["review_sha256"],
+                delivery["evidence_id"],
+                service.binding.principal_id,
+                service.binding.client_id,
+            ):
+                raise LifecycleError("Transfer action differs from the authenticated review")
+            source = service._source(conn, expected.source_id)
+            if _fingerprint(conn) != fingerprint:
+                raise LifecycleError("Transfer evidence callback changed protected state")
+            proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
+            _require_current(conn, expected, proposal=proposal)
+            require_active_transfer_openings_v1(conn, values)
+            _require_unused_capture(conn, expected.source_id)
+            _require_fact_capacity(conn, new_record=True, daily_capacity=service.daily_capacity)
+            accepted_at = service._now()
+            if not material["created_at"] <= now <= accepted_at < material["expires_at"]:
+                raise LifecycleError("Transfer review expired before confirmation")
+
+            record_id = expected.record_id
+            economic_id = source["source_key"]
+            sha = digest(
+                _fact_material(record_id, 1, economic_id, expected.source_id, values, None)
+            )
+            tail_seq, tail_sha = _tail(conn)
+            seq = tail_seq + 1
+            decision_material = asdict(action)
+            payload = {
+                "review_id": review_id,
+                "action": decision_material,
+                "fact_sha256": sha,
+                "version": 1,
+                "accepted_at": accepted_at,
+            }
+            plan = _FinalizationPlanV1(
+                (
+                    record_id,
+                    1,
+                    economic_id,
+                    expected.source_id,
+                    review_id,
+                    canonical(values),
+                    None,
+                    sha,
+                    seq,
+                ),
+                (
+                    action_evidence_id,
+                    review_id,
+                    operation_id,
+                    record_id,
+                    1,
+                    canonical(decision_material),
+                ),
+                (
+                    seq,
+                    operation_id,
+                    "confirm",
+                    record_id,
+                    canonical(payload),
+                    tail_sha,
+                    digest([seq, operation_id, "confirm", record_id, payload, tail_sha]),
+                ),
+            )
+            return _append_finalization(conn, plan)

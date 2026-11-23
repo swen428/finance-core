@@ -52,6 +52,7 @@ from .contracts import (
     text,
     validate_bundle,
 )
+from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
 MAX_RECORDS = 512
 MAX_FACT_VERSIONS = 2048
@@ -135,6 +136,9 @@ def registered_values(value):
 
         if value["format"] == MOVEMENT_FORMAT:
             return validate_movement(value)
+        if value["format"] == TRANSFER_FORMAT:
+            project_transfer_fact_v1(value)
+            return value
         if value["format"] not in BUNDLE_FORMATS:
             raise LifecycleError("unsupported_record_format")
         return validate_bundle(value)
@@ -185,8 +189,8 @@ def closure(
                 owner = opening_owners.setdefault(identity, fact["record_id"])
                 if owner != fact["record_id"]:
                     raise LifecycleError("Opening identity has multiple owners")
-        elif values.get("format") == "finance-daily-movement-v1":
-            pass  # Exact movement already validated by registered_values.
+        elif values.get("format") in {"finance-daily-movement-v1", TRANSFER_FORMAT}:
+            pass  # Exact daily fact already validated by registered_values.
         else:
             # This is the exact old native expense domain, with unknown account.
             from ..effective_v1 import _business_fields
@@ -872,7 +876,7 @@ def _receipt(fact):
     )
 
 
-def _existing_receipt(service, conn, review_id, action_id, operation_id):
+def _existing_receipt(service, conn, review_id, action_id, operation_id, *, receipt=_receipt):
     decision = conn.execute(
         "SELECT * FROM l2_decisions WHERE operation_id=?", (operation_id,)
     ).fetchone()
@@ -897,7 +901,7 @@ def _existing_receipt(service, conn, review_id, action_id, operation_id):
     ).fetchone()
     if fact is None:
         raise LifecycleError("Original committed fact is absent")
-    return _receipt(fact)
+    return receipt(fact)
 
 
 class DailyAccountServiceV1:

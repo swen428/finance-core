@@ -13,6 +13,7 @@ from .contracts import (
     validate_bundle,
 )
 from .movement_contracts import MOVEMENT_FORMAT
+from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
 
 def _inventory(facts, *, daily_only=False):
@@ -31,7 +32,7 @@ def _inventory(facts, *, daily_only=False):
             if value["account"]["account_id"] != row["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
             accounts[row["record_id"]] = (bundle_ref(row), row)
-        elif value.get("format") != MOVEMENT_FORMAT:
+        elif value.get("format") not in {MOVEMENT_FORMAT, TRANSFER_FORMAT}:
             _business_fields(canonical(value))
         current[row["record_id"]] = row
     return (
@@ -372,6 +373,10 @@ def opening_inventory(conn, account_id, before_seq=None, *, _rows=None):
     result = []
     for row in current:
         values = strict_json(row["values_json"])
+        if values.get("format") == TRANSFER_FORMAT and any(
+            role["account_id"] == account_id for role in project_transfer_fact_v1(values).effects
+        ):
+            raise LifecycleError("unsupported_transfer_opening_dependencies")
         impact = effect(values)
         if impact and impact["account_id"] == account_id:
             ref = asdict(bundle_ref(row))

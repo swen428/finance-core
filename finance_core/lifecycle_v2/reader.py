@@ -789,6 +789,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
             service, conn, expected, action.evidence_id, _rows=_rows
         ):
             raise LifecycleError("Target selection evidence cannot be its confirmation")
+        if values.get("format") == "finance-daily-transfer-v1":
+            from .daily_v1.transfer_drafts_v1 import verify_confirmed_transfer
+
+            verify_confirmed_transfer(conn, fact, review, expected, delivery, action, _rows=_rows)
         payload = json.loads(event["payload_json"])
         accepted_at = payload.get("accepted_at")
         review_material = json.loads(review["material_json"])
