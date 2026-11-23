@@ -137,19 +137,10 @@ def _audit_connection(conn, *, _rows=None):
             "finance-daily-movement-review-v1",
             "finance-daily-movement-review-v2",
             "finance-daily-opening-review-v2",
+            "finance-daily-transfer-review-v1",
         }:
             raise LifecycleError("Unsupported review format")
-        values_key = (
-            "after_values"
-            if material.get("format")
-            in {
-                "finance-daily-review-v1",
-                "finance-daily-movement-review-v1",
-                "finance-daily-movement-review-v2",
-                "finance-daily-opening-review-v2",
-            }
-            else "values"
-        )
+        values_key = "after_values" if "format" in material else "values"
         if (
             digest(material) != row["review_sha256"]
             or canonical(material[values_key]) != row["values_json"]
@@ -586,6 +577,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
+    if material.get("format") == "finance-daily-transfer-review-v1":
+        from .daily_v1.transfer_drafts_v1 import verify_review as verify_transfer_review
+
+        return verify_transfer_review(service, conn, review, _rows=_rows)
     if material.get("format") == "finance-daily-opening-review-v2":
         from .daily_v1.opening_changes_v1 import verify_review as verify_opening_review
 

@@ -158,11 +158,33 @@ def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
         service.propose_create(captured.source_id, transfer, "result-2", "draft-transfer-2")
     with pytest.raises(LifecycleError, match="Unsupported daily observation"):
         DailyMovementServiceV1(ledger).prepare_review(proposal.proposal_id, proposal.version)
+    revised = service.propose_create(
+        captured.source_id, transfer, "result-2", "draft-transfer-2", expected_version=1
+    )
+    with pytest.raises(LifecycleError):
+        service.prepare_review(proposal.proposal_id, proposal.version)
+    review = service.prepare_review(revised.proposal_id, revised.version)
+    assert service.prepare_review(revised.proposal_id, revised.version) == review
+    assert review.material["after_values"] == transfer
+    assert {role["role"] for role in review.material["account_roles"]} == {
+        "transfer_out",
+        "transfer_in",
+        "fee_debit",
+    }
+    assert {
+        row["currency"]: row["balance_change"] for row in review.material["account_impact_changes"]
+    } == {"SGD": "-100.00", "MYR": "0.00"}
+    assert review.material["expense_by_currency"] == [["SGD", "1.00"]]
+    with pytest.raises(LifecycleError):
+        ledger.record_delivery(review.review_id, "legacy-delivery")
+    with pytest.raises(LifecycleError):
+        ledger.confirm(review.review_id, "legacy-action", "legacy-transfer-confirm")
     assert ledger.reader().full_audit()["fact_version_count"] == 2
 
     # A later account change does not invalidate the historical proposal in the full audit.
     change(port, daily, out, "account_rename", {"name": "Renamed"}, "rename")
     assert reader.collect_accounts().accounts
+    assert service.prepare_review(revised.proposal_id, revised.version) == review
     assert ledger.reader().full_audit()["fact_version_count"] == 3
     snapshot = ledger.seal_snapshot(tmp_path / "transfer-draft.sqlite")
     assert len(snapshot.facts) == 2

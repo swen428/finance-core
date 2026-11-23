@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from ..contracts import LifecycleError, ProposalRef, RuntimeBinding, canonical, digest
-from ..service import _event, _id
+from ..service import _event, _id, _row
 from .accounts import (
     MAX_PROPOSALS,
     DailyAccountServiceV1,
@@ -13,14 +13,17 @@ from .accounts import (
     _fingerprint,
     _require_current,
     _require_prefix,
+    _review_dto,
     _source_instruction,
 )
 from .contracts import exact, instruction_ref, strict_json, text
 from .transfer_evidence_v1 import require_transfer_opening_replies_v1
-from .transfer_facts_v1 import require_transfer_predecessor_v1
+from .transfer_facts_v1 import project_transfer_fact_v1, require_transfer_predecessor_v1
 from .transfer_opening_v1 import require_active_transfer_openings_v1
+from .transfer_review_v1 import _balance_changes
 
 OBSERVATION_FORMAT = "finance-daily-transfer-draft-v1"
+REVIEW_FORMAT = "finance-daily-transfer-review-v1"
 
 
 @dataclass(frozen=True)
@@ -131,8 +134,68 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     return expected
 
 
-class DailyTransferDraftServiceV1(DailyAccountServiceV1):
+def _review_material(conn, proposal, expected, review_id, created_at, cutoff=None, *, _rows=None):
+    values = strict_json(proposal["values_json"])
+    require_active_transfer_openings_v1(conn, values, cutoff, _rows=_rows)
+    projection = project_transfer_fact_v1(values)
+    return {
+        "format": REVIEW_FORMAT,
+        "binding": asdict(expected.binding),
+        "review_id": review_id,
+        "proposal_id": proposal["proposal_id"],
+        "proposal_sha256": proposal["proposal_sha256"],
+        "record_id": expected.record_id,
+        "after_values": values,
+        "account_roles": list(projection.effects),
+        "account_impact_changes": [
+            asdict(change) for change in _balance_changes(projection.effects)
+        ],
+        "expense_by_currency": [list(entry) for entry in projection.expenses_by_currency],
+        "created_at": created_at,
+        "expires_at": created_at + 600,
+    }
+
+
+def verify_review(service, conn, review, *, _rows=None):
+    proposal = (
+        _rows.one(conn, "proposal", review["proposal_id"])
+        if _rows is not None
+        else _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+    )
+    if proposal is None:
+        raise LifecycleError("Transfer review lacks its original proposal")
+    expected = verify_proposal(service, conn, proposal, _rows=_rows)
+    review_id = review["review_id"]
+    cutoff = _require_prefix(conn, expected, proposal, "review", review_id=review_id, _rows=_rows)
+    material = _review_material(
+        conn, proposal, expected, review_id, review["created_at"], cutoff, _rows=_rows
+    )
+    event = (
+        _rows.one(conn, "event", cutoff)
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_events WHERE seq=?", (cutoff,)).fetchone()
+    )
+    if (
+        review["expected_version"] != 0
+        or review["record_id"] != expected.record_id
+        or review["values_json"] != proposal["values_json"]
+        or review["material_json"] != canonical(material)
+        or review["review_sha256"] != digest(material)
+        or event is None
+        or event["operation_id"] != "prepare-" + review_id
+        or event["payload_json"] != review["material_json"]
+        or conn.execute("SELECT 1 FROM l2_deliveries WHERE review_id=?", (review_id,)).fetchone()
+        is not None
+    ):
+        raise LifecycleError("Transfer review differs from its original proposal and ledger state")
+    return expected, None
+
+
+class DailyTransferDraftServiceV1:
     """Stage an original-linked candidate for a separate guarded transfer confirmation."""
+
+    def __init__(self, service):
+        self._boundary = DailyAccountServiceV1(service)
 
     def propose_create(self, source_id, value, observation_id, operation_id, *, expected_version=0):
         text(source_id, "transfer source id")
@@ -142,7 +205,7 @@ class DailyTransferDraftServiceV1(DailyAccountServiceV1):
             raise LifecycleError("Exact previous transfer proposal version required")
         require_transfer_predecessor_v1(None, value)
         values = strict_json(canonical(value))
-        with self._write() as (service, conn):
+        with self._boundary._write() as (service, conn):
             _audit(service, conn)
             existing = conn.execute(
                 "SELECT * FROM l2_proposals WHERE observation_id=?", (observation_id,)
@@ -227,3 +290,41 @@ class DailyTransferDraftServiceV1(DailyAccountServiceV1):
             )
             _event(conn, operation_id, "propose", proposal_id, material)
             return ProposalRef(proposal_id, source_id, row["version"], sha)
+
+    def prepare_review(self, proposal_id, expected_proposal_version):
+        text(proposal_id, "transfer proposal id")
+        if type(expected_proposal_version) is not int or expected_proposal_version < 1:
+            raise LifecycleError("Exact transfer proposal version required")
+        with self._boundary._write() as (service, conn):
+            _audit(service, conn)
+            proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
+            expected = verify_proposal(service, conn, proposal)
+            if proposal["version"] != expected_proposal_version:
+                raise LifecycleError("stale_proposal_version")
+            existing = conn.execute(
+                "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
+            ).fetchone()
+            if existing is not None:
+                verify_review(service, conn, existing)
+                return _review_dto(conn, existing)
+            if expected.binding != service.binding:
+                raise LifecycleError("stale_proposal_binding")
+            _require_current(conn, expected, proposal=proposal)
+            review_id = _id("daily-transfer-review")
+            created_at = service._now()
+            material = _review_material(conn, proposal, expected, review_id, created_at)
+            conn.execute(
+                "INSERT INTO l2_reviews VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    review_id,
+                    proposal_id,
+                    0,
+                    expected.record_id,
+                    proposal["values_json"],
+                    canonical(material),
+                    digest(material),
+                    created_at,
+                ),
+            )
+            _event(conn, "prepare-" + review_id, "review", review_id, material)
+            return _review_dto(conn, _row(conn, "l2_reviews", "review_id", review_id))
