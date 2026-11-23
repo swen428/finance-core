@@ -273,6 +273,12 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     )
     with pytest.raises(LifecycleError, match="different receipt source"):
         reader.receipt_retained_fields_v1(second.source_id, archive_root, captured.reference)
+    assert (
+        reader.receipt_retained_whole_draft_v1(first.source_id, archive_root, captured.reference)
+        == finished
+    )
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_retained_whole_draft_v1(second.source_id, archive_root, captured.reference)
     assert reader.full_audit() == audit and audit["fact_version_count"] == 0
 
 
