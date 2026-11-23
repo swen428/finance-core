@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 
     from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
 
+    from .receipt_expense_candidate_v1 import ReceiptExpenseCandidateV1
     from .service import LedgerService
 
 _DEBIT_AMOUNT = re.compile(r"(?:([A-Z]{3}) )?((?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?)")
@@ -351,6 +352,27 @@ class ReceiptReviewReaderV1:
                     reply=replace(evidence.reply),
                 )
             return _complete_review_fields(preparation, evidence, opening)
+
+    def expense_candidate(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+        retained_evidence_root: str | Path | None = None,
+    ) -> ReceiptExpenseCandidateV1 | None:
+        """Compile reviewed receipt fields for a subsequent independent confirmation."""
+        from .receipt_expense_candidate_v1 import _compile_receipt_expense_candidate
+
+        fields = self.completed(
+            source_id,
+            processor=processor,
+            reference=reference,
+            retained_evidence_root=retained_evidence_root,
+        )
+        if fields is None or fields.missing_movement_fields:
+            return None
+        return _compile_receipt_expense_candidate(fields)
 
     @staticmethod
     def _prepare(service, conn, source_id, recorded=None):

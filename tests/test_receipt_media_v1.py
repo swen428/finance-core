@@ -361,6 +361,13 @@ def test_receipt_review_binds_payment_to_the_exact_verified_whole_draft(seam, li
     assert ledger.reader().receipt_payment_handoff_v1(source.source_id, **archive_input) == handoff
     assert read.prepare(source.source_id, **archive_input) == prepared
     assert read.completed(source.source_id, **archive_input) == completed
+    candidate = read.expense_candidate(source.source_id, **archive_input)
+    assert candidate.original_media_sha256 == reference.original_sha256
+    assert candidate.original_message_sha256 == prepared.source.original_message_sha256
+    values = json.loads(candidate.values_json)
+    assert (values["original_amount"], values["original_currency"]) == ("12.34", "MYR")
+    assert (values["account_amount"], values["account_currency"]) == ("10.37", "SGD")
+    assert values["category"] == "餐饮" and values["funds_time"]["precision"] == "unknown"
 
     port.replies = (
         replace(
