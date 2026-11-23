@@ -203,6 +203,11 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         "6" * 64,
         "分类：餐饮\r\n扣款日期：2026-11-17\u2028期初余额：未包含",
     )
+    port.review_reply = VerifiedReceiptReviewFieldsReplyV1(
+        target, replace(reply, raw_text="分类：餐饮"), "user", "chat"
+    )
+    assert reader.completed(source_id).missing_movement_fields == ("opening_coverage",)
+    assert reader.expense_candidate(source_id) is None
     port.review_reply = VerifiedReceiptReviewFieldsReplyV1(target, reply, "user", "chat")
     audit = ledger.reader().full_audit()
     completed = reader.completed(source_id)
