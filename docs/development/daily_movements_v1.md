@@ -45,8 +45,9 @@ float, implicit rounding or guessed FX. Expense impacts are negative and
 income positive in net-asset terms. JPY 1000 consumption / SGD 9 actual debit
 contributes JPY 1000 expense and SGD -9 account change. Credit-card -300 plus
 expense 9 produces debt 309; positive balances display overpayment.
-Transfers, refunds, separately encoded fees and repayments are unsupported
-and must use their future typed workflow rather than ordinary income/expense.
+Ordinary income and expense support the two movement kinds in the table. Use
+`DailyTransferServiceV1` for transfers, credit-card repayments, and the fees
+attached to those transfers. Linked refunds require their own contract.
 
 Without an active opening, impact is `no_baseline`, current balance is null,
 and recorded net change remains available. With an opening, only a funds time
@@ -243,3 +244,29 @@ legacy expenses contribute to expense totals and retain their completeness
 warning. A correction contributes its current version, and a voided movement
 has no current contribution. Consumers can use the read identity to decide
 whether a follow-up still describes the same snapshot.
+
+
+## Transfers and repayments
+
+`DailyTransferServiceV1.propose_create` takes the exact captured instruction,
+complete actual debit and credit, fee treatment, and opening coverage for
+each affected role. Read `prepare_review` for the complete card. Retain its
+verified `record_delivery` before `confirm` accepts a separate human action.
+Both legs and any fee share the same fact, decision and audit commit.
+
+`propose_change` takes the original capture, exact active fact reference,
+current proposal version and the complete replacement or whole reversal. The
+evidence port independently retrieves the later instruction and the exact
+`VerifiedTransferChangeTargetV1` by its instruction evidence ID. A correction
+with changed terms requires newly bound opening evidence. A reversal keeps the
+old amounts, links and fees in history and removes their current effects.
+`lookup_commit_receipt` reads the original commitment by exact operation,
+review and action identity.
+
+`DailyLedgerReaderV1.collect_with_transfers_v2` returns transfers, account
+balances, fees counted once, and currency-specific statistics in one audited
+snapshot. Principal enters account balances. `transfer_history_v1` returns
+the complete version history, including the separately retained correction or
+reversal instruction. An opening correction with transfer dependencies uses a
+versioned map with one entry per exact fact and balance role. An account rename
+carries that map and its original confirmation identity.

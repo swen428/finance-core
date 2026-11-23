@@ -919,6 +919,74 @@ def _probe_installed_daily(runtime_python, install_dir, outside_dir):
     return payload
 
 
+def _probe_installed_transfers(install_dir, outside_dir):
+    """Run the protected transfer and credit-card repayment against installed Core only."""
+    fixture = outside_dir / "transfer-fixtures"
+    tests = fixture / "tests"
+    if not tests.exists():
+        tests.mkdir(parents=True)
+        (tests / "__init__.py").touch()
+        for name in (
+            "daily_account_support_v1.py",
+            "instance_admission_support_v1.py",
+            "test_daily_accounts_lifecycle_v1.py",
+            "test_daily_movements_lifecycle_v1.py",
+            "test_daily_opening_changes_v1.py",
+            "test_daily_transfer_evidence_v1.py",
+            "test_daily_transfer_facts_v1.py",
+            "test_daily_transfer_opening_v1.py",
+            "test_lifecycle_v2.py",
+        ):
+            shutil.copyfile(REPOSITORY_ROOT / "tests" / name, tests / name)
+    probe = textwrap.dedent(
+        """
+        import sys
+        from pathlib import Path
+        import pytest
+
+        installed, fixture, checkout = map(Path, sys.argv[1:])
+        tests = fixture / 'tests'
+        sys.path[:0] = [str(installed), str(fixture), str(tests)]
+        case = str(tests / 'test_daily_transfer_evidence_v1.py')
+        result = pytest.main([
+            '-q', '-p', 'no:cacheprovider', '--import-mode=importlib',
+            '--basetemp=' + str(fixture / installed.name),
+            case + '::test_commits_one_confirmed_transfer_with_both_legs_and_fee',
+            case + '::test_credit_card_repayment_moves_cash_and_reduces_debt_without_an_expense',
+        ])
+        paths = [
+            Path(module.__file__).resolve()
+            for name, module in sys.modules.items()
+            if (name == 'finance_core' or name.startswith('finance_core.'))
+            and getattr(module, '__file__', None)
+        ]
+        assert paths and all(path.is_relative_to(installed) for path in paths)
+        assert checkout not in {Path(p or '.').resolve() for p in sys.path}
+        raise SystemExit(result)
+        """
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            probe,
+            str(install_dir),
+            str(fixture),
+            str(REPOSITORY_ROOT),
+        ],
+        check=False,
+        cwd=outside_dir,
+        env={"PATH": os.environ.get("PATH", ""), "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    print(f"INSTALLED_DAILY_TRANSFERS_PROOF {install_dir.name} {completed.stdout.strip()}")
+
+
 def _probe_installed_lifecycle(
     runtime_python: Path, install_dir: Path, outside_dir: Path
 ) -> dict[str, object]:
@@ -2750,6 +2818,7 @@ def test_built_wheel_installs_and_runs_without_the_source_checkout(tmp_path: Pat
     for install_dir in (wheel_install_dir, sdist_install_dir):
         payload = _probe_installed_package(runtime_python, install_dir, outside_dir, runtime_root)
         _probe_installed_daily(runtime_python, install_dir, outside_dir)
+        _probe_installed_transfers(install_dir, outside_dir)
         lifecycle = _probe_installed_lifecycle(runtime_python, install_dir, outside_dir)
         material = _probe_installed_native_recovery_material(
             runtime_python, install_dir, outside_dir

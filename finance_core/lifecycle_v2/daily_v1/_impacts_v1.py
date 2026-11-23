@@ -13,6 +13,7 @@ from .contracts import (
     validate_bundle,
 )
 from .movement_contracts import MOVEMENT_FORMAT
+from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
 
 def _inventory(facts, *, daily_only=False):
@@ -31,7 +32,7 @@ def _inventory(facts, *, daily_only=False):
             if value["account"]["account_id"] != row["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
             accounts[row["record_id"]] = (bundle_ref(row), row)
-        elif value.get("format") != MOVEMENT_FORMAT:
+        elif value.get("format") not in {MOVEMENT_FORMAT, TRANSFER_FORMAT}:
             _business_fields(canonical(value))
         current[row["record_id"]] = row
     return (
@@ -193,9 +194,17 @@ def map_owner(conn, account, before_seq=None, *, _rows=None):
 
 def _map_owner_fact(conn, account, rows, *, _rows=None):
     from .accounts import bundle_ref
-    from .opening_contracts_v1 import REVIEW_FORMAT, subject
+    from .opening_contracts_v1 import (
+        REVIEW_FORMAT,
+        TRANSFER_MAP_FORMAT,
+        TRANSFER_REVIEW_FORMAT,
+        subject,
+    )
 
     mapping = account["opening_dependency_map"]
+    review_format = (
+        TRANSFER_REVIEW_FORMAT if mapping["format"] == TRANSFER_MAP_FORMAT else REVIEW_FORMAT
+    )
     predecessor = mapping["predecessor_bundle_ref"]
     if len(rows) <= predecessor["version"]:
         raise LifecycleError("Opening map original owner absent")
@@ -245,7 +254,7 @@ def _map_owner_fact(conn, account, rows, *, _rows=None):
         or decision is None
         or event is None
         or review["values_json"] != owner["values_json"]
-        or strict_json(review["material_json"]).get("format") != REVIEW_FORMAT
+        or strict_json(review["material_json"]).get("format") != review_format
         or decision["review_id"] != owner["review_id"]
         or event["kind"] != "confirm"
         or event["entity_id"] != owner["record_id"]
@@ -274,6 +283,8 @@ def _map_owner_fact(conn, account, rows, *, _rows=None):
             "economic_event_id": fact["economic_event_id"],
             "values": strict_json(fact["values_json"]),
         }
+        if dependency["values"].get("format") == TRANSFER_FORMAT:
+            dependency["impact_role"] = entry["impact_role"]
         if subject(dependency, owner_values) != entry["subject"]:
             raise LifecycleError("Opening map subject differs from original fact")
     return owner
@@ -335,7 +346,53 @@ def resolve_effect_v1(
     }
 
 
-def opening_inventory(conn, account_id, before_seq=None, *, _rows=None):
+def resolve_transfer_effect_v1(
+    conn, impact, fact_ref, account, before_seq=None, *, _proposed=False, _rows=None
+):
+    definition = account["account"]
+    if (definition["account_id"], definition["currency"]) != (
+        impact["account_id"],
+        impact["currency"],
+    ):
+        raise LifecycleError("Transfer role refers to an absent or incompatible account")
+    opening = account["opening"]
+    active = opening is not None and opening["status"] == "ACTIVE"
+    current = asdict(opening_ref(account)) if active else None
+    treatment, owner, source = impact["coverage"]["treatment"], None, "direct"
+    mapping = account.get("opening_dependency_map")
+    if mapping is not None:
+        entry = next(
+            (
+                row
+                for row in mapping["entries"]
+                if row["movement_fact_ref"] == fact_ref and row["impact_role"] == impact["role"]
+            ),
+            None,
+        )
+        if entry is not None:
+            owner = None if _proposed else map_owner(conn, account, before_seq, _rows=_rows)
+            treatment, source = entry["treatment"], "map"
+    if source == "direct" and current != impact["opening_ref"]:
+        raise LifecycleError("Transfer role lacks coverage for its current opening")
+    return {
+        "format": "finance-daily-transfer-effect-v1",
+        "account_ref": asdict(account_ref(account)),
+        "transfer_fact_ref": fact_ref,
+        "account_id": impact["account_id"],
+        "impact_role": impact["role"],
+        "currency": impact["currency"],
+        "source": source,
+        "opening_ref": current,
+        "map_owner_fact_ref": owner,
+        "treatment": treatment,
+        "recorded_change": impact["amount"],
+        "balance_impact": _effect_money(
+            Decimal(0) if treatment == "included" else Decimal(impact["amount"]), impact["currency"]
+        ),
+    }
+
+
+def opening_inventory(conn, account_id, before_seq=None, *, include_transfers=False, _rows=None):
     """Complete current active rows, including included and no-baseline rows."""
     from .accounts import bundle_ref, registered_values
 
@@ -372,6 +429,26 @@ def opening_inventory(conn, account_id, before_seq=None, *, _rows=None):
     result = []
     for row in current:
         values = strict_json(row["values_json"])
+        if values.get("format") == TRANSFER_FORMAT:
+            roles = sorted(project_transfer_fact_v1(values).effects, key=lambda role: role["role"])
+            for role in roles:
+                if role["account_id"] != account_id:
+                    continue
+                if not include_transfers:
+                    raise LifecycleError("unsupported_transfer_opening_dependencies")
+                ref = asdict(bundle_ref(row))
+                result.append(
+                    {
+                        "fact_ref": ref,
+                        "economic_event_id": row["economic_event_id"],
+                        "values": values,
+                        "impact_role": role["role"],
+                        "resolved_effect": resolve_transfer_effect_v1(
+                            conn, role, ref, accounts[account_id], before_seq, _rows=_rows
+                        ),
+                    }
+                )
+            continue
         impact = effect(values)
         if impact and impact["account_id"] == account_id:
             ref = asdict(bundle_ref(row))
