@@ -83,20 +83,22 @@ def _require_reply(
         raise LifecycleError("Transfer opening reply differs from its exact delivered question")
 
 
-def require_transfer_opening_replies_v1(service, conn, value):
+def require_transfer_opening_replies_v1(service, conn, value, *, binding=None):
     """Replay actual delivered questions by reply identity inside the owner's read boundary."""
     projection = project_transfer_fact_v1(value)
     if value["status"] != "ACTIVE":
         raise LifecycleError("A reversal must retain its already verified predecessor coverage")
+    port = service.port
+    binding = service.binding if binding is None else binding
     terms_sha256 = _transfer_terms_digest(value)
     for effect in projection.effects:
         coverage = effect["coverage"]
         if coverage["basis"] == "authenticated_reply":
             identity = coverage["reply_ref"]["evidence_id"]
             _require_reply(
-                service.binding,
+                binding,
                 terms_sha256,
                 coverage,
-                service.port.source(conn, identity),
-                service.port.transfer_opening_reply_v1(conn, identity),
+                port.source(conn, identity),
+                port.transfer_opening_reply_v1(conn, identity),
             )

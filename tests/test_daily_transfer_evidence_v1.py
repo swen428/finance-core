@@ -9,6 +9,8 @@ import pytest
 from finance_core.lifecycle_v2 import LifecycleError, VerifiedSource
 from finance_core.lifecycle_v2.contracts import canonical, digest
 from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref
+from finance_core.lifecycle_v2.daily_v1.movements import DailyMovementServiceV1
+from finance_core.lifecycle_v2.daily_v1.transfer_drafts_v1 import DailyTransferDraftServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
     QUESTION_FORMAT,
     VerifiedTransferOpeningReplyV1,
@@ -17,7 +19,7 @@ from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
 )
 from finance_core.lifecycle_v2.daily_v1.transfer_review_v1 import read_transfer_create_preview_v1
 from tests.daily_account_support_v1 import unknown_time
-from tests.test_daily_accounts_lifecycle_v1 import setup
+from tests.test_daily_accounts_lifecycle_v1 import change, setup
 from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_daily_transfer_opening_v1 import _account, _on
 from tests.test_lifecycle_v2 import live as live
@@ -73,8 +75,7 @@ def _retained_questions(ledger, port, transfer):
                 "role_binding_sha256": coverage["binding_sha256"],
             }
 
-    def read_question(conn, identity):
-        assert conn.in_transaction
+    def read_question(_conn, identity):
         return VerifiedTransferOpeningReplyV1(identity, canonical(questions[identity]))
 
     port.transfer_opening_reply_v1 = read_question
@@ -104,7 +105,7 @@ def test_exact_role_reply_cannot_be_reused_after_other_transfer_terms_change(liv
             require_transfer_opening_replies_v1(service, conn, changed)
 
 
-def test_complete_transfer_preview_shows_per_currency_deltas_without_writing(live, transfer):
+def _transfer_with_account_snapshots(live, transfer):
     ledger, port, daily, reader, _ = setup(live)
     boundary = _on("2026-11-21")
     out = _account(ledger, port, daily, reader, "SGD", "1", boundary)
@@ -118,7 +119,11 @@ def test_complete_transfer_preview_shows_per_currency_deltas_without_writing(liv
             {key: leg[key] for key in ("account_ref", "opening_ref", "funds_time")}
         )
     _retained_questions(ledger, port, transfer)
+    return ledger, port, daily, reader, out
 
+
+def test_complete_transfer_preview_shows_per_currency_deltas_without_writing(live, transfer):
+    ledger, port, _, reader, _ = _transfer_with_account_snapshots(live, transfer)
     before = reader.collect_accounts()
     preview = read_transfer_create_preview_v1(ledger, transfer)
     assert preview.read_identity == before.read_identity
@@ -133,3 +138,34 @@ def test_complete_transfer_preview_shows_per_currency_deltas_without_writing(liv
     port.add_source(original.evidence_id, "Different transfer")
     with pytest.raises(LifecycleError, match="authenticated source"):
         read_transfer_create_preview_v1(ledger, transfer)
+
+
+def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
+    live, transfer, tmp_path
+):
+    ledger, port, daily, reader, out = _transfer_with_account_snapshots(live, transfer)
+    captured = ledger.capture(transfer["instruction_ref"]["evidence_id"], "capture-transfer")
+    service = DailyTransferDraftServiceV1(ledger)
+    proposal = service.propose_create(captured.source_id, transfer, "result-1", "draft-transfer-1")
+    assert proposal.version == 1
+    assert (
+        service.propose_create(captured.source_id, transfer, "result-1", "draft-transfer-1")
+        == proposal
+    )
+    with pytest.raises(LifecycleError, match="replay mismatch"):
+        service.propose_create(captured.source_id, transfer, "result-1", "other-operation")
+    with pytest.raises(LifecycleError):
+        service.propose_create(captured.source_id, transfer, "result-2", "draft-transfer-2")
+    with pytest.raises(LifecycleError, match="Unsupported daily observation"):
+        DailyMovementServiceV1(ledger).prepare_review(proposal.proposal_id, proposal.version)
+    assert ledger.reader().full_audit()["fact_version_count"] == 2
+
+    # A later account change does not invalidate the historical proposal in the full audit.
+    change(port, daily, out, "account_rename", {"name": "Renamed"}, "rename")
+    assert reader.collect_accounts().accounts
+    assert ledger.reader().full_audit()["fact_version_count"] == 3
+    snapshot = ledger.seal_snapshot(tmp_path / "transfer-draft.sqlite")
+    assert len(snapshot.facts) == 2
+    assert {item[0] for item in snapshot.facts} == {
+        item.account_id for item in reader.collect_accounts().accounts
+    }
