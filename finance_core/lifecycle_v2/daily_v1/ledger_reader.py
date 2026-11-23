@@ -14,9 +14,10 @@ from finance_core.money import canonical_money_str
 from ..contracts import LifecycleError, VerifiedSource, canonical, digest
 from ._impacts_v1 import effect, resolve_effect_v1
 from .accounts import _audit, _BoundService, bundle_ref
-from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
+from .contracts import BUNDLE_FORMATS, BundleFactRefV1, opening_ref, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
 from .reader import DailyAccountReaderV1, DailyReadIdentityV1, _read_limits, _view
+from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
 
 @dataclass(frozen=True)
@@ -101,8 +102,59 @@ class DailyLedgerWithContributionsV1:
         return self.collection.read_identity
 
 
+@dataclass(frozen=True)
+class DailyLedgerWithTransfersV2:
+    collection: DailyLedgerCollectionV1
+    transfers: tuple[DailyMovementViewV1, ...]
+    contributions: tuple[DailyStatisticContributionV1, ...]
+    effects: tuple[DailyResolvedEffectV1, ...]
+    format: str = "finance-daily-ledger-with-transfers-v2"
+
+    @property
+    def read_identity(self):
+        return self.collection.read_identity
+
+
+def _resolve_current_transfer(values, fact_ref, accounts):
+    """Resolve one exact current fact against each relevant account opening."""
+    projection = project_transfer_fact_v1(values)
+    resolved = []
+    for impact in projection.effects:
+        account = accounts.get(impact["account_id"])
+        if account is None or account.currency != impact["currency"]:
+            raise LifecycleError("Transfer role refers to an absent or incompatible account")
+        bundle = account.values
+        opening = bundle["opening"]
+        current = (
+            asdict(opening_ref(bundle))
+            if opening is not None and opening["status"] == "ACTIVE"
+            else None
+        )
+        if current != impact["opening_ref"]:
+            raise LifecycleError("Transfer role lacks coverage for its current opening")
+        treatment = impact["coverage"]["treatment"]
+        resolved.append(
+            {
+                "format": "finance-daily-transfer-effect-v1",
+                "transfer_fact_ref": asdict(fact_ref),
+                "account_id": impact["account_id"],
+                "impact_role": impact["role"],
+                "currency": impact["currency"],
+                "opening_ref": current,
+                "treatment": treatment,
+                "recorded_change": impact["amount"],
+                "balance_impact": (
+                    canonical_money_str(Decimal(0), impact["currency"])
+                    if treatment == "included"
+                    else impact["amount"]
+                ),
+            }
+        )
+    return projection.expenses_by_currency, resolved
+
+
 class DailyLedgerReaderV1(DailyAccountReaderV1):
-    def _ledger(self, limits=None, *, include_contributions=False):
+    def _ledger(self, limits=None, *, include_contributions=False, include_transfers=False):
         base = self._service
         max_records, max_versions = _read_limits(limits, base.daily_capacity)
         with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
@@ -125,7 +177,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     )
                     current[row["record_id"]] = view
                     history.setdefault(row["record_id"], []).append(view)
-                accounts, movements, legacy = {}, [], []
+                accounts, movements, transfers, legacy = {}, [], [], []
                 for identity in sorted(current):
                     view = current[identity]
                     values = view.values
@@ -135,6 +187,12 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         )
                     elif values.get("format") == MOVEMENT_FORMAT:
                         movements.append(view)
+                    elif values.get("format") == TRANSFER_FORMAT:
+                        if not include_transfers:
+                            raise LifecycleError(
+                                "unsupported_record_format: use the transfer ledger"
+                            )
+                        transfers.append(view)
                     else:
                         legacy.append(view)
                 income, expense = {}, {}
@@ -177,6 +235,19 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                                 values["business_date"],
                                 view.fact_ref,
                             )
+                    for view in transfers:
+                        values = view.values
+                        charges, effects = _resolve_current_transfer(
+                            values, view.fact_ref, accounts
+                        )
+                        for impact in effects:
+                            key = impact["account_id"]
+                            net[key] += Decimal(impact["recorded_change"])
+                            delta[key] += Decimal(impact["balance_impact"])
+                            resolved_effects.append(DailyResolvedEffectV1(canonical(impact)))
+                        business_date = values["business_date"]
+                        for currency, amount in charges:
+                            add_total("expense", currency, amount, business_date, view.fact_ref)
                     from ..effective_v1 import _business_fields
 
                     for view in legacy:
@@ -252,8 +323,19 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         pending,
                         gaps,
                         len(rows),
+                        scope=(
+                            "registered-account-opening-income-expense-transfer-v2"
+                            if include_transfers
+                            else "registered-account-opening-income-expense-v1"
+                        ),
                     )
-                return collection, history, tuple(resolved_effects), tuple(contributions)
+                return (
+                    collection,
+                    history,
+                    tuple(resolved_effects),
+                    tuple(contributions),
+                    tuple(transfers),
+                )
             finally:
                 conn.rollback()
 
@@ -261,12 +343,18 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         return self._ledger(limits)[0]
 
     def collect_with_effects_v1(self, *, limits=None):
-        collection, _, effects, _ = self._ledger(limits)
+        collection, _, effects, _, _ = self._ledger(limits)
         return DailyLedgerWithEffectsV1(collection, effects)
 
     def collect_with_contributions_v1(self, *, limits=None):
-        collection, _, effects, contributions = self._ledger(limits, include_contributions=True)
+        collection, _, effects, contributions, _ = self._ledger(limits, include_contributions=True)
         return DailyLedgerWithContributionsV1(collection, contributions, effects)
+
+    def collect_with_transfers_v2(self, *, limits=None):
+        collection, _, effects, contributions, transfers = self._ledger(
+            limits, include_contributions=True, include_transfers=True
+        )
+        return DailyLedgerWithTransfersV2(collection, transfers, contributions, effects)
 
     def detail(self, record_id, *, limits=None):
         history = self._ledger(limits)[1].get(record_id, ())

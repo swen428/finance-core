@@ -8,7 +8,11 @@ import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError, VerifiedSource
 from finance_core.lifecycle_v2.contracts import canonical, digest
-from finance_core.lifecycle_v2.daily_v1.contracts import instruction_ref
+from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1, instruction_ref
+from finance_core.lifecycle_v2.daily_v1.ledger_reader import (
+    DailyLedgerReaderV1,
+    _resolve_current_transfer,
+)
 from finance_core.lifecycle_v2.daily_v1.movements import DailyMovementServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_drafts_v1 import DailyTransferDraftServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
@@ -198,3 +202,43 @@ def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
     assert {item[0] for item in snapshot.facts} == {
         item.account_id for item in reader.collect_accounts().accounts
     }
+
+
+def test_transfer_account_effects_report_fee_once_and_require_current_opening(live, transfer):
+    ledger, port, daily, reader, out = _transfer_with_account_snapshots(live, transfer)
+    ledger_reader = DailyLedgerReaderV1(ledger)
+    prior = ledger_reader.collect_with_contributions_v1()
+    with_transfers = ledger_reader.collect_with_transfers_v2()
+    assert with_transfers.transfers == ()
+    assert with_transfers.collection.balances == prior.collection.balances
+    assert with_transfers.contributions == prior.contributions
+    assert with_transfers.read_identity == prior.read_identity
+
+    def accounts():
+        return {account.account_id: account for account in reader.collect_accounts().accounts}
+
+    # The pure projector consumes a synthetic reviewed reference and real protected account views.
+    # No transfer fact is inserted before the guarded writer is available.
+    ref = BundleFactRefV1("test-transfer", 1, digest(transfer), 20)
+    cost, effects = _resolve_current_transfer(transfer, ref, accounts())
+    assert cost == (("SGD", "1.00"),)
+    assert [
+        (row["impact_role"], row["recorded_change"], row["balance_impact"]) for row in effects
+    ] == [
+        ("transfer_out", "-100.00", "-100.00"),
+        ("transfer_in", "330.00", "0.00"),
+        ("fee_debit", "-1.00", "0.00"),
+    ]
+    assert all(row["transfer_fact_ref"] == asdict(ref) for row in effects)
+
+    change(
+        port,
+        daily,
+        out,
+        "opening_correct",
+        {"amount": "15.50", "as_of": _on("2026-11-22")},
+        "fix",
+        reason="Correct opening date and amount",
+    )
+    with pytest.raises(LifecycleError, match="coverage for its current opening"):
+        _resolve_current_transfer(transfer, ref, accounts())
