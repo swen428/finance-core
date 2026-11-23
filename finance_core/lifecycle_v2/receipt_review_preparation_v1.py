@@ -23,10 +23,17 @@ from .daily_v1.contracts import (
     text,
 )
 from .daily_v1.movement_contracts import _day, _positive_money
-from .receipt_draft_v1 import ReceiptManualDraftV1, _project_manual_draft
+from .receipt_draft_v1 import ReceiptManualDraftV1
+from .receipt_fields_v1 import (
+    ReceiptWholeDraftV1,
+    _project_payment_draft,
+    _read_optional_recorded_fields,
+)
 from .receipt_payment_handoff_v1 import ReceiptPaymentAccountOptionV1
 
 if TYPE_CHECKING:
+    from finance_core.intake.receipt_media import MediaOcrReference, ReceiptMediaProcessor
+
     from .service import LedgerService
 
 _DEBIT_AMOUNT = re.compile(r"(?:([A-Z]{3}) )?((?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?)")
@@ -139,7 +146,7 @@ class ReceiptReviewPreparationV1:
 
     binding: RuntimeBinding
     source: VerifiedReceiptSourceV1
-    draft: ReceiptManualDraftV1
+    draft: ReceiptManualDraftV1 | ReceiptWholeDraftV1
     payment: VerifiedReceiptPaymentV1
     business_date: str
     merchant: str
@@ -194,7 +201,12 @@ def _receipt_payment(conn, port, source, draft):
             debit=debit,
             debit_question_account=_copy_account(payment.debit_question_account),
         )
-    last_fields = draft.manual_supplements[-1] if draft.manual_supplements else draft.manual_reply
+    manual = draft.manual if type(draft) is ReceiptWholeDraftV1 else draft
+    last_fields = None
+    if manual is not None:
+        last_fields = (
+            manual.manual_supplements[-1] if manual.manual_supplements else manual.manual_reply
+        )
     payment_messages = {
         selection.question_message_id,
         selection.reply_message_id,
@@ -216,10 +228,16 @@ def _receipt_payment(conn, port, source, draft):
         or selection.raw_text.strip() != str(payment.option_number)
         or len(payment_messages) != 4
         or len(payment_responses) != 4
-        or last_fields.question_message_id in payment_messages
-        or last_fields.reply_message_id in payment_messages
-        or selection.question_timestamp < last_fields.reply_timestamp
-        or selection.reply_update_id <= last_fields.reply_update_id
+        or selection.question_timestamp < source.source_timestamp
+        or (
+            last_fields is not None
+            and (
+                last_fields.question_message_id in payment_messages
+                or last_fields.reply_message_id in payment_messages
+                or selection.question_timestamp < last_fields.reply_timestamp
+                or selection.reply_update_id <= last_fields.reply_update_id
+            )
+        )
         or debit.question_timestamp < selection.reply_timestamp
         or debit.reply_update_id <= selection.reply_update_id
         or payment.debit_question_selection_response_id != selection.response_id
@@ -261,13 +279,28 @@ class ReceiptReviewReaderV1:
     def __init__(self, service: LedgerService):
         self._boundary = DailyAccountServiceV1(service)
 
-    def prepare(self, source_id: str) -> ReceiptReviewPreparationV1 | None:
+    def prepare(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+    ) -> ReceiptReviewPreparationV1 | None:
         """Read a complete payment from original evidence on one protected transaction."""
+        recorded = _read_optional_recorded_fields(
+            self._boundary._service.reader(), source_id, processor, reference
+        )
         with self._boundary._read() as (service, conn):
-            preparation, _ = self._prepare(service, conn, source_id)
+            preparation, _ = self._prepare(service, conn, source_id, recorded)
             return preparation
 
-    def completed(self, source_id: str):
+    def completed(
+        self,
+        source_id: str,
+        *,
+        processor: ReceiptMediaProcessor | None = None,
+        reference: MediaOcrReference | None = None,
+    ):
         """Read the separately observed review fields without creating a review or fact."""
         from .receipt_review_fields_v1 import (
             ReceiptReviewFieldsTargetV1,
@@ -276,8 +309,11 @@ class ReceiptReviewReaderV1:
             _copy_review_fields_target,
         )
 
+        recorded = _read_optional_recorded_fields(
+            self._boundary._service.reader(), source_id, processor, reference
+        )
         with self._boundary._read() as (service, conn):
-            preparation, opening = self._prepare(service, conn, source_id)
+            preparation, opening = self._prepare(service, conn, source_id, recorded)
             if preparation is None:
                 return None
             with _evidence_read_callback(conn):
@@ -305,14 +341,12 @@ class ReceiptReviewReaderV1:
             return _complete_review_fields(preparation, evidence, opening)
 
     @staticmethod
-    def _prepare(service, conn, source_id):
+    def _prepare(service, conn, source_id, recorded=None):
         _audit(service, conn)
         source = service._receipt_source(conn, source_id, allow_archived=False)
         replies = service.port.receipt_manual_replies_v1(conn, source)
-        if not replies:
-            return None, None
-        draft = _project_manual_draft(source_id, source, replies)
-        if draft.missing_receipt_fields:
+        draft = _project_payment_draft(source_id, source, replies, recorded)
+        if draft is None or draft.missing_receipt_fields:
             return None, None
         payment = _receipt_payment(conn, service.port._port, source, draft)
         if payment is None:

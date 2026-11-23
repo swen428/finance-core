@@ -13,7 +13,7 @@ import subprocess
 import sys
 import warnings
 import zlib
-from dataclasses import replace
+from dataclasses import asdict, replace
 from decimal import localcontext
 
 import pytest
@@ -112,25 +112,30 @@ def seam(tmp_path, monkeypatch):
     return processor, engine, request, source, evidence, raw, worker_calls
 
 
+def _complete_ocr_result(
+    _source, *, limits, deadline, merchant="TEST SHOP", total="TOTAL RM 12.34"
+):
+    lines = (merchant, "Date 2026-10-01", total)
+    blocks = tuple(
+        ReceiptOcrBlock(i, 0, 0, 0, i, 0, line, 0, 0, 2, 2, 4, 3, 9500)
+        for i, line in enumerate(lines)
+    )
+    return ReceiptOcrEngineResult(ReceiptOcrExtractionStatus.SUCCEEDED, blocks, "ok")
+
+
 def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, monkeypatch):
     from finance_core.lifecycle_v2 import (
         LifecycleError,
         VerifiedReceiptSourceV1,
         receipt_media_operation_id_v1,
     )
+    from finance_core.lifecycle_v2.contracts import digest
+    from finance_core.lifecycle_v2.receipt_draft_v1 import VerifiedReceiptManualReplyV1
 
     processor, engine, request, _, _, original, _ = seam
     service, port, _ = live
 
-    def extract(_source, *, limits, deadline):
-        lines = ("TEST SHOP", "Date 2026-10-01", "TOTAL RM 12.34")
-        blocks = tuple(
-            ReceiptOcrBlock(i, 0, 0, 0, i, 0, line, 0, 0, 2, 2, 4, 3, 9500)
-            for i, line in enumerate(lines)
-        )
-        return ReceiptOcrEngineResult(ReceiptOcrExtractionStatus.SUCCEEDED, blocks, "ok")
-
-    monkeypatch.setattr(engine, "extract", extract)
+    monkeypatch.setattr(engine, "extract", _complete_ocr_result)
 
     def receipt(conn, evidence_id):
         return VerifiedReceiptSourceV1(
@@ -146,6 +151,13 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
         )
 
     port.receipt_source_v1 = receipt
+    manual_replies = ()
+
+    def receipt_replies(connection, source):
+        assert connection.in_transaction
+        return manual_replies if source.evidence_id == "message-1" else ()
+
+    port.receipt_manual_replies_v1 = receipt_replies
     first = service.capture_receipt_v1("message-1", "capture-receipt-1")
     second = service.capture_receipt_v1("message-2", "capture-receipt-2")
     reader = service.reader()
@@ -161,11 +173,262 @@ def test_recorded_receipt_fields_are_bound_to_one_original_message(seam, live, m
     assert fields.merchant.value == "TEST SHOP"
     assert fields.transaction_date.value == "2026-10-01"
     assert fields.amount.block_sequence_indexes == (2,)
+
+    missing = reader.receipt_whole_draft_v1(first.source_id)
+    assert missing.fields == ()
+    assert missing.missing_receipt_fields == ("merchant", "date", "amount", "currency")
+    proposed = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert proposed.ocr == result and proposed.manual is None
+    assert proposed.missing_receipt_fields == ()
+    assert [(f.name, f.value, f.origin) for f in proposed.fields] == [
+        ("merchant", "TEST SHOP", "ocr"),
+        ("date", "2026-10-01", "ocr"),
+        ("amount", "12.34", "ocr"),
+        ("currency", "MYR", "ocr"),
+    ]
+    audit = reader.full_audit()
+    assert reader.receipt_payment_handoff_v1(first.source_id) is None
+    handoff = reader.receipt_payment_handoff_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert handoff.state == "NO_ACCOUNT_OPTIONS"
+    assert handoff.missing_payment_fields == ("account_id", "account_amount")
+    assert handoff.draft == proposed
+    manual_reply = VerifiedReceiptManualReplyV1(
+        "message-1",
+        digest(asdict(proposed.source)),
+        "user",
+        "chat",
+        "receipt-fields-1",
+        10,
+        11,
+        21,
+        1792800000,
+        "receipt-response-1",
+        "b" * 64,
+        "商家：Sunny Shop\n币种：JPY",
+    )
+    manual_replies = (manual_reply,)
+    awaiting = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert awaiting.missing_receipt_fields == ("amount",)
+    assert awaiting.manual.manual_reply == manual_reply
+    assert awaiting.ocr.suggestions.fields.amount.block_sequence_indexes == (2,)
+    assert (
+        reader.receipt_payment_handoff_v1(
+            first.source_id, processor=processor, reference=captured.reference
+        )
+        is None
+    )
+    supplement = replace(
+        manual_reply,
+        reply_message_id=12,
+        reply_update_id=22,
+        response_id="receipt-response-2",
+        response_sha256="c" * 64,
+        raw_text="总额：1200",
+    )
+    manual_replies = (manual_reply, supplement)
+    finished = reader.receipt_whole_draft_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert finished.ocr == result and finished.manual.manual_supplements == (supplement,)
+    assert finished.missing_receipt_fields == ()
+    assert [(f.name, f.value, f.origin) for f in finished.fields] == [
+        ("merchant", "Sunny Shop", "manual"),
+        ("date", "2026-10-01", "ocr"),
+        ("amount", "1200", "manual"),
+        ("currency", "JPY", "manual"),
+    ]
+    supplemented = reader.receipt_payment_handoff_v1(
+        first.source_id, processor=processor, reference=captured.reference
+    )
+    assert supplemented.draft == finished
+    assert supplemented.read_identity == handoff.read_identity
+    assert reader.receipt_whole_draft_v1(first.source_id).missing_receipt_fields == ("date",)
     with pytest.raises(media.MediaIntegrityError, match="Verified original size differs"):
         processor.read_total_fields_v1(captured.reference, expected_original_size=len(original) + 1)
     with pytest.raises(LifecycleError, match="different receipt source"):
         reader.receipt_fields_v1(second.source_id, processor, captured.reference)
-    assert reader.full_audit()["fact_version_count"] == 0
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_whole_draft_v1(
+            second.source_id, processor=processor, reference=captured.reference
+        )
+    with pytest.raises(LifecycleError, match="different receipt source"):
+        reader.receipt_payment_handoff_v1(
+            second.source_id, processor=processor, reference=captured.reference
+        )
+    with pytest.raises(LifecycleError, match="processor and reference together"):
+        reader.receipt_whole_draft_v1(first.source_id, reference=captured.reference)
+    assert reader.full_audit() == audit and audit["fact_version_count"] == 0
+
+
+def test_receipt_review_binds_payment_to_the_exact_verified_whole_draft(seam, live, monkeypatch):
+    from finance_core.lifecycle_v2 import LifecycleError, receipt_media_operation_id_v1
+    from finance_core.lifecycle_v2.contracts import digest
+    from finance_core.lifecycle_v2.daily_v1 import DailyAccountServiceV1
+    from finance_core.lifecycle_v2.receipt_review_fields_v1 import (
+        VerifiedReceiptReviewFieldsReplyV1,
+        receipt_review_fields_target_v1,
+    )
+    from finance_core.lifecycle_v2.receipt_review_preparation_v1 import (
+        ReceiptReviewReaderV1,
+        VerifiedReceiptPaymentReplyV1,
+    )
+    from tests.daily_account_support_v1 import NOW, command
+    from tests.test_daily_accounts_lifecycle_v1 import create
+    from tests.test_receipt_review_preparation_v1 import PaymentPort, payment_for_handoff
+
+    processor, engine, request, _, _, original, _ = seam
+    monkeypatch.setattr(engine, "extract", _complete_ocr_result)
+    ledger, _, _ = live
+    port = ledger.port = PaymentPort()
+    port.receipt = replace(
+        port.receipt,
+        original_sha256=hashlib.sha256(original).hexdigest(),
+        original_size_bytes=len(original),
+    )
+    port.replies = ()
+    ledger.clock = lambda: NOW
+    source = ledger.capture_receipt_v1("receipt", "capture-receipt")
+    daily = DailyAccountServiceV1(ledger)
+    fields = {"name": "Wallet", "account_type": "cash", "currency": "SGD", "opening": None}
+    create(ledger, port, daily, command(fields=fields))
+    operation = receipt_media_operation_id_v1(port.receipt)
+    reference = processor.process(**(request | {"operation_id": operation})).reference
+    assert reference is not None
+    media_input = {"processor": processor, "reference": reference}
+    read = ReceiptReviewReaderV1(ledger)
+    audit = ledger.reader().full_audit()
+    assert read.prepare(source.source_id, **media_input) is None
+    handoff = ledger.reader().receipt_payment_handoff_v1(source.source_id, **media_input)
+    assert handoff.draft.manual is None
+    port.payment = payment_for_handoff(source, handoff)
+    prepared = read.prepare(source.source_id, **media_input)
+    assert prepared.draft == handoff.draft
+    assert prepared.draft.ocr.suggestions.reference == reference
+    assert (prepared.original_amount, prepared.original_currency) == ("12.34", "MYR")
+    assert (prepared.account_amount, prepared.account_currency) == ("10.37", "SGD")
+    assert read.prepare(source.source_id) is None
+    reply = VerifiedReceiptPaymentReplyV1(
+        "category-question",
+        "5" * 64,
+        4004,
+        NOW + 2,
+        27,
+        94,
+        NOW + 3,
+        "category-poll",
+        "6" * 64,
+        "分类：餐饮",
+    )
+    port.review_reply = VerifiedReceiptReviewFieldsReplyV1(
+        receipt_review_fields_target_v1(prepared), reply, "user", "chat"
+    )
+    completed = read.completed(source.source_id, **media_input)
+    assert completed.preparation == prepared and completed.category == "餐饮"
+    assert completed.missing_movement_fields == ()
+
+    port.replies = (
+        replace(
+            port.answer,
+            source_sha256=digest(asdict(port.receipt)),
+            raw_text="商家：Corrected Shop",
+        ),
+    )
+    with pytest.raises(LifecycleError, match="differs from original draft"):
+        read.prepare(source.source_id, **media_input)
+    assert ledger.reader().full_audit() == audit and audit["fact_version_count"] == 1
+
+
+def test_ocr_draft_allows_manual_repair_before_payment_and_review(seam, live, monkeypatch):
+    from functools import partial
+
+    from finance_core.lifecycle_v2 import receipt_media_operation_id_v1
+    from finance_core.lifecycle_v2.contracts import digest
+    from finance_core.lifecycle_v2.daily_v1 import DailyAccountServiceV1
+    from finance_core.lifecycle_v2.receipt_review_preparation_v1 import ReceiptReviewReaderV1
+    from tests.daily_account_support_v1 import NOW, command
+    from tests.test_daily_accounts_lifecycle_v1 import create
+    from tests.test_receipt_review_preparation_v1 import PaymentPort, payment_for_handoff
+
+    processor, engine, request, _, _, original, _ = seam
+    merchant = "SHOP\u200dNAME"
+    monkeypatch.setattr(
+        engine,
+        "extract",
+        partial(_complete_ocr_result, merchant=merchant, total="TOTAL JPY 1200"),
+    )
+    ledger, _, _ = live
+    port = ledger.port = PaymentPort()
+    port.receipt = replace(
+        port.receipt,
+        original_sha256=hashlib.sha256(original).hexdigest(),
+        original_size_bytes=len(original),
+    )
+    port.replies = ()
+    ledger.clock = lambda: NOW
+    source = ledger.capture_receipt_v1("receipt", "capture-receipt")
+    daily = DailyAccountServiceV1(ledger)
+    fields = {"name": "Wallet", "account_type": "cash", "currency": "SGD", "opening": None}
+    create(ledger, port, daily, command(fields=fields))
+    operation = receipt_media_operation_id_v1(port.receipt)
+    reference = processor.process(**(request | {"operation_id": operation})).reference
+    assert reference is not None
+    media_input = {"processor": processor, "reference": reference}
+    reader = ledger.reader()
+    review = ReceiptReviewReaderV1(ledger)
+
+    original_draft = reader.receipt_whole_draft_v1(source.source_id, **media_input)
+    assert original_draft.ocr.suggestions.fields.merchant.value == merchant
+    assert original_draft.missing_receipt_fields == ("merchant",)
+    assert reader.receipt_payment_handoff_v1(source.source_id, **media_input) is None
+
+    first_reply = replace(
+        port.answer,
+        source_sha256=digest(asdict(port.receipt)),
+        raw_text="商家：Sunny Shop\n总额：12.34",
+    )
+    port.replies = (first_reply,)
+    incomplete = reader.receipt_whole_draft_v1(source.source_id, **media_input)
+    assert incomplete.missing_receipt_fields == ("amount",)
+    assert reader.receipt_payment_handoff_v1(source.source_id, **media_input) is None
+    assert review.prepare(source.source_id, **media_input) is None
+
+    corrected_reply = replace(
+        first_reply,
+        reply_message_id=first_reply.reply_message_id + 1,
+        reply_update_id=first_reply.reply_update_id + 1,
+        response_id="receipt-corrected-amount",
+        response_sha256="e" * 64,
+        raw_text="总额：1200",
+    )
+    port.replies = (first_reply, corrected_reply)
+    combined = reader.receipt_whole_draft_v1(source.source_id, **media_input)
+    assert combined.ocr == original_draft.ocr
+    assert combined.manual.manual_reply == first_reply
+    assert combined.manual.manual_supplements == (corrected_reply,)
+    assert combined.missing_receipt_fields == ()
+    assert [
+        (field.name, field.value, field.origin)
+        for field in combined.fields
+        if field.name in {"amount", "currency"}
+    ] == [("amount", "1200", "manual"), ("currency", "JPY", "ocr")]
+    handoff = reader.receipt_payment_handoff_v1(source.source_id, **media_input)
+    assert handoff.draft == combined
+    port.payment = payment_for_handoff(source, handoff)
+    prepared = review.prepare(source.source_id, **media_input)
+    assert prepared.draft == combined
+    assert (prepared.merchant, prepared.original_amount, prepared.original_currency) == (
+        "Sunny Shop",
+        "1200",
+        "JPY",
+    )
+    assert (prepared.account_amount, prepared.account_currency) == ("10.37", "SGD")
+    assert reader.full_audit()["fact_version_count"] == 1
 
 
 def test_exact_png_ocr_reference_and_idempotent_replay(seam):
@@ -197,6 +460,77 @@ def test_exact_png_ocr_reference_and_idempotent_replay(seam):
     assert second.reference == first.reference
     assert second.persistence_idempotent
     assert engine.calls == len(worker_calls) == 1
+
+
+def test_read_retained_fields_with_the_producer_and_decoder_unavailable(seam, monkeypatch):
+    processor, engine, request, source, evidence, raw, worker_calls = seam
+    reference = processor.process(**request).reference
+    assert reference is not None
+    expected = processor.read_total_fields_v1(reference, expected_original_size=len(raw))
+    staged = evidence.parent / "detached"
+    staged.mkdir(mode=0o700)
+    operation = staged / reference.operation_id
+    shutil.copytree(evidence / reference.operation_id, operation)
+    source.rename(source.with_name("source-removed"))
+    evidence.rename(evidence.with_name("producer-removed"))
+
+    def refuse_worker(*_args, **_kwargs):
+        raise AssertionError("Archive verification must not start a decoder")
+
+    monkeypatch.setattr(media, "_worker_run", refuse_worker)
+    before = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in operation.iterdir()
+    }
+    retained = media.read_retained_media_total_fields_v1(
+        staged, reference, expected_original_size=len(raw)
+    )
+    assert retained == expected
+    assert engine.calls == len(worker_calls) == 1
+    assert list(staged.iterdir()) == [operation]
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in operation.iterdir()
+    } == before
+    with pytest.raises(media.MediaIntegrityError, match="Verified original size differs"):
+        media.read_retained_media_total_fields_v1(
+            staged, reference, expected_original_size=len(raw) + 1
+        )
+    (operation / "ocr.json").unlink()
+    with pytest.raises(media.MediaIntegrityError, match="member is missing"):
+        media.read_retained_media_total_fields_v1(
+            staged, reference, expected_original_size=len(raw)
+        )
+
+
+def test_media_reads_reject_inexact_references_and_staged_manifest_tampering(seam):
+    processor, _, request, _, evidence, raw, _ = seam
+    reference = processor.process(**request).reference
+    assert reference is not None
+
+    class ReferenceSubclass(media.MediaOcrReference):
+        pass
+
+    class HashSubclass(str):
+        pass
+
+    for malformed in (
+        ReferenceSubclass(**asdict(reference)),
+        replace(reference, manifest_sha256=HashSubclass(reference.manifest_sha256)),
+    ):
+        with pytest.raises(media.ReceiptMediaError, match="Media reference is malformed"):
+            processor.read_verified(malformed)
+        with pytest.raises(media.ReceiptMediaError, match="Media reference is malformed"):
+            media.read_retained_media_total_fields_v1(
+                evidence, malformed, expected_original_size=len(raw)
+            )
+
+    manifest = evidence / reference.operation_id / "result.json"
+    manifest.chmod(0o600)
+    manifest.write_bytes(b'{"nested":' + b"[" * 1200 + b"0" + b"]" * 1200 + b"}")
+    manifest.chmod(0o400)
+    with pytest.raises(media.MediaIntegrityError, match="does not bind"):
+        media.read_retained_media_total_fields_v1(
+            evidence, reference, expected_original_size=len(raw)
+        )
 
 
 @pytest.mark.parametrize(

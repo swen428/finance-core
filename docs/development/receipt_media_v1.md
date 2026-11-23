@@ -282,6 +282,19 @@ delivered question. Core compares it to the target of the current preparation.
 The port receives a receipt lookup identity and must authenticate the original
 question and reply before returning the target.
 
+Both reads accept the same optional verified processor and reference as the
+payment handoff. Core reopens the OCR members before the protected transaction
+and checks the original again inside it. The retained account question must
+identify the exact whole draft, including its OCR and manual evidence. A later
+change to either source requires a new payment question. An OCR-only draft
+still needs the separately authenticated account selection, debit and category.
+
+For detached verification, `read_retained_media_total_fields_v1` reads the
+same six members from a private staged evidence root using the reference and
+original size selected by the authenticated archive cut. It verifies the member
+bytes and runs the same deterministic parser as the live read using the
+staged members and archived reference.
+
 Where there is an active opening, an explicitly stated debit date strictly
 after that opening determines that the debit was excluded. For an earlier or
 same-day debit, the reply must include the user's inclusion answer. When both
@@ -340,6 +353,19 @@ independent messages with byte-identical images keep separate OCR identities.
 The returned suggestions include their parser evidence and carry no write
 authority. OCR absence or ambiguity remains eligible for manual completion.
 
+`LedgerReader.receipt_whole_draft_v1` reads those suggestions together with
+authenticated manual replies for that original message. It labels each displayed
+field with its source and retains the OCR block references and manual reply spans
+separately. An explicit manual value takes precedence for that field. The draft
+leaves unsupported currency or invalid amount precision unresolved, including
+when an explicit currency changes how an OCR amount can be interpreted. When
+the verified OCR supplies the effective currency, a later authenticated
+reply can correct a manual amount that is invalid in that currency. The
+original reply remains in the draft history. An OCR merchant that cannot be
+used in an expense review remains unresolved until an authenticated reply
+supplies a valid merchant. The OCR value remains in the retained evidence.
+Media verification remains outside the protected SQLite read transaction.
+
 The installed evidence port reads manual replies inside the same protected
 transaction as the original receipt. The draft retains the exact original
 and supplemental replies and points each current field to its reply and span.
@@ -349,3 +375,10 @@ amount or unsupported currency leaves the receipt pending and returns its
 own state. An authenticated later reply can replace that unresolved value
 in the same draft. The earlier reply remains visible in the history. The
 draft progress and payment handoff create no account impact.
+
+Pass an exact media processor and its reference together to
+`LedgerReader.receipt_payment_handoff_v1` to use the verified whole draft for
+this read. The protected snapshot checks the captured original again before
+reading the authenticated manual fields, current eligible accounts and ledger
+identity. The handoff remains pending when a whole-draft field is unresolved.
+Calling without media keeps the existing manual handoff.

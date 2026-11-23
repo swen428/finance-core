@@ -103,7 +103,7 @@ def receipt_review_fields_target_v1(preparation: ReceiptReviewPreparationV1):
     return ReceiptReviewFieldsTargetV1(
         preparation.draft.source_id,
         preparation.source.evidence_id,
-        preparation.draft.source_sha256,
+        payment.source_sha256,
         payment.draft_sha256,
         payment.debit.response_id,
         payment.debit.response_sha256,

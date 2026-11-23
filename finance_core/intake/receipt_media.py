@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -166,7 +166,7 @@ def _checked_json(raw: bytes) -> dict[str, Any]:
         if not isinstance(result, dict) or _canonical(result) != raw:
             raise MediaIntegrityError("Evidence JSON is not canonical")
         return result
-    except (ValueError, TypeError, UnicodeError) as exc:
+    except (ValueError, TypeError, UnicodeError, RecursionError) as exc:
         raise MediaIntegrityError("Evidence JSON is malformed") from exc
 
 
@@ -1050,20 +1050,23 @@ class ReceiptMediaProcessor:
     @staticmethod
     def _temporary_bound(directory: int) -> None:
         total = 0
-        for name in os.listdir(directory):
-            if name not in {
-                "intent.json",
-                "original.bin",
-                "declaration.json",
-                "normalized.png",
-                "ocr.json",
-                "result.json",
-            }:
-                raise MediaIntegrityError("Unexpected operation member is not covered by evidence")
-            value = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            if not stat.S_ISREG(value.st_mode):
-                raise MediaIntegrityError("Unexpected non-file operation member")
-            total += value.st_size
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name not in {
+                    "intent.json",
+                    "original.bin",
+                    "declaration.json",
+                    "normalized.png",
+                    "ocr.json",
+                    "result.json",
+                }:
+                    raise MediaIntegrityError(
+                        "Unexpected operation member is not covered by evidence"
+                    )
+                value = os.stat(entry.name, dir_fd=directory, follow_symlinks=False)
+                if not stat.S_ISREG(value.st_mode):
+                    raise MediaIntegrityError("Unexpected non-file operation member")
+                total += value.st_size
         if total > TEMP_BYTES:
             raise MediaIntegrityError("Aggregate temporary space exceeded its fixed bound")
 
@@ -1152,8 +1155,9 @@ class ReceiptMediaProcessor:
         except (KeyError, TypeError) as exc:
             raise MediaIntegrityError("Successful terminal reference is incomplete") from exc
 
+    @classmethod
     def _verify_completed_normalization(
-        self,
+        cls,
         directory: int,
         intent: dict[str, Any],
         result: dict[str, Any],
@@ -1183,8 +1187,8 @@ class ReceiptMediaProcessor:
         normalization = result["normalization"]
         if not isinstance(normalization, dict):
             raise MediaIntegrityError("Recorded normalization stage is malformed")
-        self._validate_normalization(normalization.get("metadata"))
-        self._verify_png_header(png_raw, normalization["metadata"])
+        cls._validate_normalization(normalization.get("metadata"))
+        cls._verify_png_header(png_raw, normalization["metadata"])
         if (
             original != result["original"]
             or original != normalization["original"]
@@ -1204,8 +1208,8 @@ class ReceiptMediaProcessor:
             raise MediaIntegrityError("Normalization identity differs from admitted operation")
         return declaration_member, png
 
+    @staticmethod
     def _verify_completed_ocr(
-        self,
         directory: int,
         intent: dict[str, Any],
         result: dict[str, Any],
@@ -1290,85 +1294,32 @@ class ReceiptMediaProcessor:
             ) from exc
 
     def read_verified(self, reference: MediaOcrReference) -> VerifiedMediaOcrEvidence:
-        if (
-            not isinstance(reference, MediaOcrReference)
-            or _OPERATION.fullmatch(reference.operation_id) is None
-            or any(
-                not isinstance(value, str) or _HASH.fullmatch(value) is None
-                for key, value in asdict(reference).items()
-                if key != "operation_id"
-            )
-        ):
-            raise ReceiptMediaError("Media reference is malformed")
+        _require_media_reference(reference)
         root = self._open_root(1)
-        directory = -1
         try:
-            publication.acquire_storage_root_lock(
-                root, deadline=time.monotonic() + NORMALIZATION_SECONDS, clock=time.monotonic
-            )
-            directory = _open_operation(root, reference.operation_id)
-            result = self._read_verified(directory, reference)
-            _assert_operation(root, reference.operation_id, directory)
-            return result
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            raise MediaIntegrityError(
-                "A required exact media bundle member is missing or unsafe"
-            ) from exc
+            return _read_verified_in_root(root, reference, self._read_verified)
         finally:
-            if directory >= 0:
-                os.close(directory)
-            publication.release_storage_root_lock(root)
             root.close()
 
     def read_total_fields_v1(
         self, reference: MediaOcrReference, *, expected_original_size: int | None = None
     ) -> ReceiptMediaTotalFieldsV1:
         """Read a total-level suggestion using the verified blocks' TSV hierarchy."""
-        verified = self.read_verified(reference)
-        if expected_original_size is not None and (
-            type(expected_original_size) is not int
-            or expected_original_size != verified.manifest["original"]["size_bytes"]
-        ):
-            raise MediaIntegrityError("Verified original size differs from receipt evidence")
-        # The evidence reader admits only succeeded with nonempty canonical blocks,
-        # or no_text with an empty sequence.
-        status = (
-            ReceiptOcrExtractionStatus.SUCCEEDED
-            if verified.blocks
-            else ReceiptOcrExtractionStatus.NO_TEXT
-        )
-        blocks = tuple(
-            ParserOcrBlock(
-                sequence_index=block.sequence_index,
-                page_index=block.page_index,
-                text=block.text,
-                left=block.left,
-                top=block.top,
-                engine_line_index=block.engine_line_index,
-                confidence_scaled=block.confidence_scaled,
-                engine_block_index=block.engine_block_index,
-                engine_paragraph_index=block.engine_paragraph_index,
-                height=block.height,
-            )
-            for block in verified.blocks
-        )
-        try:
-            fields = parse_receipt_total(
-                blocks,
-                extraction_status=status.value,
-                parser_version=PARSER_VERSION_MEDIA_FIELDS_V1,
-            )
-        except ValueError as exc:
-            raise ReceiptMediaError("Verified OCR evidence has no complete TSV layout") from exc
-        return ReceiptMediaTotalFieldsV1(
-            verified.reference, status, PARSER_VERSION_MEDIA_FIELDS_V1, fields
-        )
+        return _total_fields_from_verified(self.read_verified(reference), expected_original_size)
 
+    @classmethod
     def _read_verified(
-        self, directory: int, reference: MediaOcrReference
+        cls, directory: int, reference: MediaOcrReference
     ) -> VerifiedMediaOcrEvidence:
         intent_raw, intent_member = _read_member(directory, "intent.json", _MAX_JSON)
         terminal_raw, terminal_member = _read_member(directory, "result.json", _MAX_JSON)
+        if (
+            intent_member["sha256"] != reference.intent_sha256
+            or terminal_member["sha256"] != reference.manifest_sha256
+        ):
+            raise MediaIntegrityError(
+                "Media reference does not bind the exact successful operation"
+            )
         intent, result = _checked_json(intent_raw), _checked_json(terminal_raw)
         if (
             intent.get("contract") != CONTRACT
@@ -1377,16 +1328,16 @@ class ReceiptMediaProcessor:
             or result.get("operation_id") != reference.operation_id
             or result.get("status") != "succeeded"
             or result.get("intent_sha256") != _digest(intent)
-            or self._reference(intent, result, terminal_member["sha256"]) != reference
+            or cls._reference(intent, result, terminal_member["sha256"]) != reference
         ):
             raise MediaIntegrityError(
                 "Media reference does not bind the exact successful operation"
             )
         original_raw, original = _read_member(directory, "original.bin", SOURCE_BYTES)
-        declaration_member, png = self._verify_completed_normalization(
+        declaration_member, png = cls._verify_completed_normalization(
             directory, intent, result, original
         )
-        payload, ocr_member, blocks = self._verify_completed_ocr(
+        payload, ocr_member, blocks = cls._verify_completed_ocr(
             directory, intent, result, original, png
         )
         if payload["status"] not in {
@@ -1397,8 +1348,105 @@ class ReceiptMediaProcessor:
         if hashlib.sha256(original_raw).hexdigest() != reference.original_sha256:
             raise MediaIntegrityError("Original hash differs from requested reference")
         inventory = (intent_member, original, declaration_member, png, ocr_member, terminal_member)
-        self._temporary_bound(directory)
+        cls._temporary_bound(directory)
         return VerifiedMediaOcrEvidence(reference, result, blocks, inventory)
+
+
+def _require_media_reference(reference: MediaOcrReference) -> None:
+    if (
+        type(reference) is not MediaOcrReference
+        or type(reference.operation_id) is not str
+        or _OPERATION.fullmatch(reference.operation_id) is None
+    ):
+        raise ReceiptMediaError("Media reference is malformed")
+    for field in fields(reference):
+        if field.name != "operation_id":
+            value = getattr(reference, field.name)
+            if type(value) is not str or _HASH.fullmatch(value) is None:
+                raise ReceiptMediaError("Media reference is malformed")
+
+
+def _read_verified_in_root(
+    root: publication.StorageRootHandle,
+    reference: MediaOcrReference,
+    read_operation: Callable[[int, MediaOcrReference], VerifiedMediaOcrEvidence],
+) -> VerifiedMediaOcrEvidence:
+    directory = -1
+    try:
+        publication.acquire_storage_root_lock(
+            root, deadline=time.monotonic() + NORMALIZATION_SECONDS, clock=time.monotonic
+        )
+        directory = _open_operation(root, reference.operation_id)
+        result = read_operation(directory, reference)
+        _assert_operation(root, reference.operation_id, directory)
+        return result
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise MediaIntegrityError(
+            "A required exact media bundle member is missing or unsafe"
+        ) from exc
+    finally:
+        if directory >= 0:
+            os.close(directory)
+        publication.release_storage_root_lock(root)
+
+
+def _total_fields_from_verified(
+    verified: VerifiedMediaOcrEvidence, expected_original_size: int | None
+) -> ReceiptMediaTotalFieldsV1:
+    if expected_original_size is not None and (
+        type(expected_original_size) is not int
+        or expected_original_size != verified.manifest["original"]["size_bytes"]
+    ):
+        raise MediaIntegrityError("Verified original size differs from receipt evidence")
+    status = (
+        ReceiptOcrExtractionStatus.SUCCEEDED
+        if verified.blocks
+        else ReceiptOcrExtractionStatus.NO_TEXT
+    )
+    blocks = tuple(
+        ParserOcrBlock(
+            sequence_index=block.sequence_index,
+            page_index=block.page_index,
+            text=block.text,
+            left=block.left,
+            top=block.top,
+            engine_line_index=block.engine_line_index,
+            confidence_scaled=block.confidence_scaled,
+            engine_block_index=block.engine_block_index,
+            engine_paragraph_index=block.engine_paragraph_index,
+            height=block.height,
+        )
+        for block in verified.blocks
+    )
+    try:
+        fields = parse_receipt_total(
+            blocks,
+            extraction_status=status.value,
+            parser_version=PARSER_VERSION_MEDIA_FIELDS_V1,
+        )
+    except ValueError as exc:
+        raise ReceiptMediaError("Verified OCR evidence has no complete TSV layout") from exc
+    return ReceiptMediaTotalFieldsV1(
+        verified.reference, status, PARSER_VERSION_MEDIA_FIELDS_V1, fields
+    )
+
+
+def read_retained_media_total_fields_v1(
+    evidence_root: str | Path,
+    reference: MediaOcrReference,
+    *,
+    expected_original_size: int,
+) -> ReceiptMediaTotalFieldsV1:
+    """Verify and parse an already authenticated reference from a staged archive cut."""
+    _require_media_reference(reference)
+    if type(expected_original_size) is not int or not 0 < expected_original_size <= SOURCE_BYTES:
+        raise ReceiptMediaError("Exact expected original size is required")
+    root = publication.open_storage_root(evidence_root)
+    try:
+        verified = _read_verified_in_root(root, reference, ReceiptMediaProcessor._read_verified)
+        return _total_fields_from_verified(verified, expected_original_size)
+    finally:
+        root.close()
 
 
 __all__ = [
@@ -1411,4 +1459,5 @@ __all__ = [
     "MediaProcessingResult",
     "VerifiedMediaOcrEvidence",
     "ReceiptMediaTotalFieldsV1",
+    "read_retained_media_total_fields_v1",
 ]

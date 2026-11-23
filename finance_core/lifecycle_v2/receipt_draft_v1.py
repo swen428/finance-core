@@ -162,10 +162,10 @@ def _receipt_amount_is_valid(amount, currency):
             return False
 
 
-def _correctable_field(fields):
-    if "currency" not in fields:
+def _correctable_field(fields, *, fallback_currency=None):
+    currency = fields["currency"].value if "currency" in fields else fallback_currency
+    if currency is None:
         return None
-    currency = fields["currency"].value
     if currency not in SUPPORTED_CURRENCIES:
         return "currency"
     if "amount" in fields and not _receipt_amount_is_valid(fields["amount"].value, currency):
@@ -173,7 +173,7 @@ def _correctable_field(fields):
     return None
 
 
-def _project_manual_draft(source_id, source, replies):
+def _project_manual_draft(source_id, source, replies, *, fallback_currency=None):
     if type(replies) is not tuple or not 1 <= len(replies) <= MAX_RECEIPT_MANUAL_REPLIES_V1:
         raise LifecycleError("Exact bounded receipt reply history required")
     source_sha256 = digest(asdict(source))
@@ -192,7 +192,7 @@ def _project_manual_draft(source_id, source, replies):
             raise LifecycleError("Manual receipt supplement is outside its original reply history")
         new_fields = _manual_fields(reply.raw_text)
         overlap = fields.keys() & new_fields.keys()
-        if overlap and overlap != {_correctable_field(fields)}:
+        if overlap and overlap != {_correctable_field(fields, fallback_currency=fallback_currency)}:
             raise LifecycleError("Manual receipt supplement overlaps valid retained fields")
         fields.update(
             (name, replace(field, reply_update_id=reply.reply_update_id))

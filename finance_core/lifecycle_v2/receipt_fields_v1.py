@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .contracts import LifecycleError, VerifiedReceiptSourceV1, digest
+from .daily_v1.contracts import text
+from .receipt_draft_v1 import (
+    ReceiptManualDraftV1,
+    VerifiedReceiptManualReplyV1,
+    _correctable_field,
+    _project_manual_draft,
+)
 
 if TYPE_CHECKING:
-    from finance_core.intake.receipt_media import ReceiptMediaTotalFieldsV1
+    from finance_core.intake.receipt_media import (
+        MediaOcrReference,
+        ReceiptMediaProcessor,
+        ReceiptMediaTotalFieldsV1,
+    )
+
+    from .reader import LedgerReader
 
 
 @dataclass(frozen=True)
@@ -16,6 +29,71 @@ class RecordedReceiptFieldsV1:
     source_id: str
     original_message_sha256: str
     suggestions: ReceiptMediaTotalFieldsV1
+
+
+@dataclass(frozen=True)
+class ReceiptWholeDraftFieldV1:
+    """A displayed draft value, sourced from the matching retained evidence."""
+
+    name: str
+    value: str
+    origin: Literal["ocr", "manual"]
+
+
+@dataclass(frozen=True)
+class ReceiptWholeDraftV1:
+    """One original-linked view of the suggested and explicitly supplied fields."""
+
+    source_id: str
+    source: VerifiedReceiptSourceV1
+    ocr: RecordedReceiptFieldsV1 | None
+    manual: ReceiptManualDraftV1 | None
+    fields: tuple[ReceiptWholeDraftFieldV1, ...]
+    missing_receipt_fields: tuple[str, ...]
+
+
+_WHOLE_FIELDS = ("merchant", "date", "amount", "currency")
+
+
+def _whole_receipt_draft(source_id, source, ocr, replies):
+    values = {}
+    if ocr is not None:
+        suggestions = ocr.suggestions.fields
+        for name in _WHOLE_FIELDS:
+            proposed = getattr(suggestions, "transaction_date" if name == "date" else name)
+            if type(proposed.value) is not str:
+                continue
+            if name == "merchant":
+                try:
+                    text(proposed.value, "description", 1024)
+                except LifecycleError:
+                    continue
+            values[name] = ReceiptWholeDraftFieldV1(name, proposed.value, "ocr")
+    currency = values.get("currency")
+    manual = (
+        _project_manual_draft(
+            source_id,
+            source,
+            replies,
+            fallback_currency=None if currency is None else currency.value,
+        )
+        if replies
+        else None
+    )
+    if manual is not None:
+        for field in manual.fields:
+            values[field.name] = ReceiptWholeDraftFieldV1(field.name, field.value, "manual")
+    unresolved = _correctable_field(values)
+    if unresolved is not None:
+        del values[unresolved]
+    return ReceiptWholeDraftV1(
+        source_id,
+        source,
+        ocr,
+        manual,
+        tuple(values[name] for name in _WHOLE_FIELDS if name in values),
+        tuple(name for name in _WHOLE_FIELDS if name not in values),
+    )
 
 
 def receipt_media_operation_id_v1(source: VerifiedReceiptSourceV1) -> str:
@@ -39,3 +117,32 @@ def _read_recorded_fields(source_id, source, processor, reference):
         reference, expected_original_size=source.original_size_bytes
     )
     return RecordedReceiptFieldsV1(source_id, source.original_message_sha256, suggestions)
+
+
+def _read_optional_recorded_fields(
+    reader: LedgerReader,
+    source_id: str,
+    processor: ReceiptMediaProcessor | None,
+    reference: MediaOcrReference | None,
+) -> tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None:
+    if (processor is None) != (reference is None):
+        raise LifecycleError("Supply the exact receipt media processor and reference together")
+    if processor is None or reference is None:
+        return None
+    # Verify the immutable OCR member without holding the ledger transaction.
+    source = reader.receipt_source_v1(source_id)
+    return source, _read_recorded_fields(source_id, source, processor, reference)
+
+
+def _project_payment_draft(
+    source_id: str,
+    source: VerifiedReceiptSourceV1,
+    replies: tuple[VerifiedReceiptManualReplyV1, ...],
+    recorded: tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None,
+) -> ReceiptManualDraftV1 | ReceiptWholeDraftV1 | None:
+    if recorded is None:
+        return _project_manual_draft(source_id, source, replies) if replies else None
+    original, fields = recorded
+    if original != source:
+        raise LifecycleError("Receipt source changed before the protected payment read")
+    return _whole_receipt_draft(source_id, source, fields, replies)
