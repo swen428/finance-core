@@ -179,12 +179,19 @@ def test_transfer_draft_keeps_the_original_values_and_replays_without_posting(
         ledger.record_delivery(review.review_id, "legacy-delivery")
     with pytest.raises(LifecycleError):
         ledger.confirm(review.review_id, "legacy-action", "legacy-transfer-confirm")
+    with pytest.raises(LifecycleError, match="authenticated review"):
+        service.record_delivery(review.review_id, "delivery1")
+    delivered = service.record_delivery(review.review_id, "transfer-display")
+    assert delivered.delivery_evidence_id == "transfer-display"
+    assert service.record_delivery(review.review_id, "transfer-display") == delivered
+    with pytest.raises(LifecycleError, match="replay mismatch"):
+        service.record_delivery(review.review_id, "other-display")
     assert ledger.reader().full_audit()["fact_version_count"] == 2
 
     # A later account change does not invalidate the historical proposal in the full audit.
     change(port, daily, out, "account_rename", {"name": "Renamed"}, "rename")
     assert reader.collect_accounts().accounts
-    assert service.prepare_review(revised.proposal_id, revised.version) == review
+    assert service.prepare_review(revised.proposal_id, revised.version) == delivered
     assert ledger.reader().full_audit()["fact_version_count"] == 3
     snapshot = ledger.seal_snapshot(tmp_path / "transfer-draft.sqlite")
     assert len(snapshot.facts) == 2

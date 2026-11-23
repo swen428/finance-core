@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from ..contracts import LifecycleError, ProposalRef, RuntimeBinding, canonical, digest
+from ..contracts import (
+    ExpectedDisplay,
+    LifecycleError,
+    ProposalRef,
+    RuntimeBinding,
+    VerifiedDelivery,
+    canonical,
+    digest,
+)
 from ..service import _event, _id, _row
 from .accounts import (
     MAX_PROPOSALS,
@@ -156,7 +164,26 @@ def _review_material(conn, proposal, expected, review_id, created_at, cutoff=Non
     }
 
 
+def _verified_delivery(service, conn, expected, review, evidence_id):
+    actual = service.port.delivery(
+        conn,
+        evidence_id,
+        ExpectedDisplay(expected.binding, review["review_id"], review["review_sha256"]),
+    )
+    if (
+        type(actual) is not VerifiedDelivery
+        or actual.evidence_id != evidence_id
+        or actual.review_id != review["review_id"]
+        or actual.display_sha256 != review["review_sha256"]
+        or actual.principal_id != expected.binding.principal_id
+        or actual.client_id != expected.binding.client_id
+    ):
+        raise LifecycleError("Transfer delivery differs from the authenticated review")
+    return asdict(actual)
+
+
 def verify_review(service, conn, review, *, _rows=None):
+    fingerprint = _fingerprint(conn)
     proposal = (
         _rows.one(conn, "proposal", review["proposal_id"])
         if _rows is not None
@@ -184,11 +211,24 @@ def verify_review(service, conn, review, *, _rows=None):
         or event is None
         or event["operation_id"] != "prepare-" + review_id
         or event["payload_json"] != review["material_json"]
-        or conn.execute("SELECT 1 FROM l2_deliveries WHERE review_id=?", (review_id,)).fetchone()
-        is not None
     ):
         raise LifecycleError("Transfer review differs from its original proposal and ledger state")
-    return expected, None
+    delivery = (
+        _rows.one(conn, "delivery", review_id)
+        if _rows is not None
+        else conn.execute("SELECT * FROM l2_deliveries WHERE review_id=?", (review_id,)).fetchone()
+    )
+    if delivery is not None:
+        cutoff = _require_prefix(
+            conn, expected, proposal, "delivery", review_id=review_id, _rows=_rows
+        )
+        require_active_transfer_openings_v1(conn, material["after_values"], cutoff, _rows=_rows)
+        actual = _verified_delivery(service, conn, expected, review, delivery["evidence_id"])
+        if canonical(actual) != delivery["material_json"]:
+            raise LifecycleError("Transfer delivery differs from its original evidence")
+    if _fingerprint(conn) != fingerprint:
+        raise LifecycleError("Transfer evidence callback changed protected state")
+    return expected, delivery
 
 
 class DailyTransferDraftServiceV1:
@@ -328,3 +368,33 @@ class DailyTransferDraftServiceV1:
             )
             _event(conn, "prepare-" + review_id, "review", review_id, material)
             return _review_dto(conn, _row(conn, "l2_reviews", "review_id", review_id))
+
+    def record_delivery(self, review_id, evidence_id):
+        """Retain actual display of an exact transfer review before financial confirmation."""
+        text(review_id, "transfer review id")
+        text(evidence_id, "transfer delivery evidence")
+        with self._boundary._write() as (service, conn):
+            _audit(service, conn)
+            review = _row(conn, "l2_reviews", "review_id", review_id)
+            expected, retained = verify_review(service, conn, review)
+            if retained is not None:
+                if retained["evidence_id"] != evidence_id:
+                    raise LifecycleError("Transfer delivery replay mismatch")
+                return _review_dto(conn, review)
+            if expected.binding != service.binding:
+                raise LifecycleError("stale_proposal_binding")
+            fingerprint = _fingerprint(conn)
+            material = _verified_delivery(service, conn, expected, review, evidence_id)
+            proposal = _row(conn, "l2_proposals", "proposal_id", review["proposal_id"])
+            _require_current(conn, expected, proposal=proposal)
+            require_active_transfer_openings_v1(conn, strict_json(review["values_json"]))
+            if _fingerprint(conn) != fingerprint:
+                raise LifecycleError("Transfer evidence callback changed protected state")
+            if service._now() >= strict_json(review["material_json"])["expires_at"]:
+                raise LifecycleError("Transfer review expired before delivery")
+            conn.execute(
+                "INSERT INTO l2_deliveries VALUES(?,?,?)",
+                (review_id, evidence_id, canonical(material)),
+            )
+            _event(conn, "delivery-" + evidence_id, "delivery", review_id, material)
+            return _review_dto(conn, review)
