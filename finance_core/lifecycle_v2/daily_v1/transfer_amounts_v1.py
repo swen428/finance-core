@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Context, Decimal, localcontext
-from typing import Literal
+from typing import Literal, cast, get_args
 
 from finance_core.money import SUPPORTED_CURRENCIES, MoneyValidationError
 
@@ -13,6 +13,13 @@ from .contracts import AccountDefinitionRefV1, _money
 
 TransferFeeMode = Literal["none", "separate_debit", "included_in_out", "withheld_from_in"]
 TransferRole = Literal["transfer_out", "transfer_in", "fee_debit"]
+_FEE_MODES = frozenset(get_args(TransferFeeMode))
+
+
+def _fee_mode(value: object) -> TransferFeeMode:
+    if type(value) is not str or value not in _FEE_MODES:
+        raise LifecycleError("Exact transfer fee treatment required")
+    return cast(TransferFeeMode, value)
 
 
 @dataclass(frozen=True)
@@ -43,13 +50,7 @@ class TransferFeeV1:
     charge: TransferAccountAmountV1 | None = None
 
     def __post_init__(self) -> None:
-        if type(self.mode) is not str or self.mode not in {
-            "none",
-            "separate_debit",
-            "included_in_out",
-            "withheld_from_in",
-        }:
-            raise LifecycleError("Exact transfer fee treatment required")
+        _fee_mode(self.mode)
         if self.mode == "none":
             if self.charge is not None:
                 raise LifecycleError("A transfer without fees cannot carry a fee debit")
