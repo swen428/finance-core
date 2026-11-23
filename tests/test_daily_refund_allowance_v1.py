@@ -11,7 +11,10 @@ from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     ActiveRefundAllocationV1,
     RefundExpenseV1,
     compile_refund_allowance_v1,
+    read_refundable_expense_v1,
 )
+from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
+from tests.test_lifecycle_v2 import live as live
 
 
 def test_two_partial_refunds_consume_the_exact_original_expense_allowance():
@@ -56,3 +59,39 @@ def test_retained_relationship_tracks_original_observation_and_current_expense_l
         compile_refund_allowance_v1(replace(expense, original_amount="10.36"), (refund,))
     with pytest.raises(LifecycleError, match="refund amount required"):
         replace(refund, original_amount="10.3")
+
+
+def test_only_the_exact_current_original_consumption_is_refundable(live):
+    ledger, port, _, movements, reader, account = prepare(live, opening=None, currency="SGD")
+    values = fields(account, amount="9", original="1000", currency="JPY")
+    values["coverage"] = None
+    _, _, receipt = movement(ledger, port, movements, account, "outstanding-purchase", values)
+    original = reader.detail(receipt.receipt.record_id)
+    before = ledger.reader().full_audit()
+    target = read_refundable_expense_v1(ledger, original.fact_ref)
+    assert (target.original_currency, target.original_amount) == ("JPY", "1000")
+    assert target.economic_event_id == original.economic_event_id
+    assert ledger.reader().full_audit() == before
+    movement(
+        ledger, port, movements, account, "void-purchase", {}, target=original, kind="movement_void"
+    )
+    with pytest.raises(LifecycleError, match="no longer the selected expense version"):
+        read_refundable_expense_v1(ledger, original.fact_ref)
+    closed = reader.detail(receipt.receipt.record_id)
+    with pytest.raises(LifecycleError, match="current active expense"):
+        read_refundable_expense_v1(ledger, closed.fact_ref)
+
+
+def test_verified_legacy_personal_expense_provides_only_its_original_amount(live):
+    ledger, _, _ = live
+    source = ledger.capture("source1", "legacy-capture")
+    draft = ledger.propose(source.source_id, "legacy-observation", 0, "legacy-draft")
+    review = ledger.prepare_review(draft.proposal_id, draft.version)
+    ledger.record_delivery(review.review_id, "legacy-delivery")
+    receipt = ledger.confirm(review.review_id, "legacy-action", "legacy-confirm")
+    ref = BundleFactRefV1(
+        receipt.record_id, receipt.version, receipt.fact_sha256, receipt.commit_seq
+    )
+    target = read_refundable_expense_v1(ledger, ref)
+    assert (target.original_currency, target.original_amount) == ("SGD", "12.00")
+    assert compile_refund_allowance_v1(target, ()).remaining_original == "12.00"

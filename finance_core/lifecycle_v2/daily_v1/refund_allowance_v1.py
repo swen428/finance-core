@@ -8,11 +8,12 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from finance_core.money import SUPPORTED_CURRENCIES, MoneyValidationError, canonical_money_str
 
 from ..contracts import LifecycleError, digest
-from .accounts import MAX_RECORDS
-from .contracts import BundleFactRefV1, _money, text
+from .accounts import MAX_RECORDS, DailyAccountServiceV1, _audit, bundle_ref
+from .contracts import BundleFactRefV1, _money, strict_json, text
+from .movement_contracts import MOVEMENT_FORMAT
 
 
-def _positive(amount: str, currency: str) -> str:
+def _positive(amount: str, currency: str) -> None:
     if type(currency) is not str or currency not in SUPPORTED_CURRENCIES:
         raise LifecycleError("Exact original refund currency required")
     try:
@@ -21,7 +22,6 @@ def _positive(amount: str, currency: str) -> str:
         raise LifecycleError("Refund amount exceeds its original currency precision") from None
     if canonical != amount or Decimal(canonical) <= 0:
         raise LifecycleError("Canonical positive original refund amount required")
-    return canonical
 
 
 @dataclass(frozen=True)
@@ -109,3 +109,32 @@ def compile_refund_allowance_v1(
             canonical_money_str(allocated, expense.original_currency),
             canonical_money_str(remaining, expense.original_currency),
         )
+
+
+def read_refundable_expense_v1(service, selected: BundleFactRefV1) -> RefundExpenseV1:
+    """Qualify one exact current consumption fact before a linked refund can be prepared."""
+    if type(selected) is not BundleFactRefV1:
+        raise LifecycleError("Exact selected expense fact required")
+    with DailyAccountServiceV1(service)._read() as (bound, conn):
+        _audit(bound, conn)
+        row = conn.execute(
+            "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+            (selected.record_id,),
+        ).fetchone()
+        if row is None or bundle_ref(row) != selected:
+            raise LifecycleError("Refund target is no longer the selected expense version")
+        values = strict_json(row["values_json"])
+        if (
+            values.get("format") == MOVEMENT_FORMAT
+            and values["kind"] == "expense"
+            and values["status"] == "ACTIVE"
+        ):
+            amount, currency = values["original_amount"], values["original_currency"]
+        elif "format" not in values:
+            from ..effective_v1 import _business_fields
+
+            original = _business_fields(row["values_json"])
+            amount, currency = original["amount"], original["currency"]
+        else:
+            raise LifecycleError("Linked refund requires a current active expense")
+        return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
