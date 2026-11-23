@@ -404,7 +404,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 
 def verify_review(service, conn, review, *, _rows=None):
-    if strict_json(review["material_json"]).get("format") == "finance-daily-opening-review-v2":
+    if strict_json(review["material_json"]).get("format") in {
+        "finance-daily-opening-review-v2",
+        "finance-daily-opening-review-v3",
+    }:
         from .opening_changes_v1 import verify_review as verify_opening_review
 
         return verify_opening_review(service, conn, review, _rows=_rows)
@@ -1385,7 +1388,10 @@ class DailyAccountServiceV1:
                     raise LifecycleError("Daily action or callback state mismatch")
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
-                if material["format"] == "finance-daily-opening-review-v2":
+                if material["format"] in {
+                    "finance-daily-opening-review-v2",
+                    "finance-daily-opening-review-v3",
+                }:
                     from .opening_changes_v1 import require_current_opening
 
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
@@ -1411,7 +1417,10 @@ class DailyAccountServiceV1:
                 if _fingerprint(conn) != fingerprint:
                     raise LifecycleError("State changed during source revalidation")
                 _require_current(conn, expected, proposal=proposal)
-                if material["format"] == "finance-daily-opening-review-v2":
+                if material["format"] in {
+                    "finance-daily-opening-review-v2",
+                    "finance-daily-opening-review-v3",
+                }:
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
                 elif needs_closure(values) and material["opening_dependency_closure"] != closure(
                     conn,

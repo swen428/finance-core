@@ -14,6 +14,7 @@ from finance_core.lifecycle_v2.daily_v1.ledger_reader import (
     _resolve_current_transfer,
 )
 from finance_core.lifecycle_v2.daily_v1.movements import DailyMovementServiceV1
+from finance_core.lifecycle_v2.daily_v1.opening_changes_v1 import DailyOpeningChangeServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_drafts_v1 import DailyTransferDraftServiceV1
 from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
     QUESTION_FORMAT,
@@ -22,8 +23,9 @@ from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
     require_transfer_opening_replies_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.transfer_review_v1 import read_transfer_create_preview_v1
-from tests.daily_account_support_v1 import unknown_time
+from tests.daily_account_support_v1 import OpeningPort, unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import change, setup
+from tests.test_daily_opening_changes_v1 import finish, opening_command, opening_proposal, row_reply
 from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_daily_transfer_opening_v1 import _account, _on
 from tests.test_lifecycle_v2 import live as live
@@ -109,8 +111,10 @@ def test_exact_role_reply_cannot_be_reused_after_other_transfer_terms_change(liv
             require_transfer_opening_replies_v1(service, conn, changed)
 
 
-def _transfer_with_account_snapshots(live, transfer):
+def _transfer_with_account_snapshots(live, transfer, *, opening_port=False):
     ledger, port, daily, reader, _ = setup(live)
+    if opening_port:
+        port = ledger.port = OpeningPort()
     boundary = _on("2026-11-21")
     out = _account(ledger, port, daily, reader, "SGD", "1", boundary)
     incoming = _account(ledger, port, daily, reader, "MYR", "2", unknown_time())
@@ -308,3 +312,110 @@ def test_commits_one_confirmed_transfer_with_both_legs_and_fee(live, transfer, t
     assert any(
         row[0] == receipt.record_id and row[2] == receipt.fact_sha256 for row in snapshot.facts
     )
+
+
+def test_opening_revision_treats_two_transfer_roles_separately_and_survives_rename(
+    live, transfer, tmp_path
+):
+    ledger, port, daily, reader, out = _transfer_with_account_snapshots(
+        live, transfer, opening_port=True
+    )
+    account_source = ledger.capture("source1", "capture1")
+    account_proposal = daily.propose_account_create(account_source.source_id, "obs1", 0, "propose1")
+    captured = ledger.capture(transfer["instruction_ref"]["evidence_id"], "payment-capture")
+    transfers = DailyTransferDraftServiceV1(ledger)
+    draft = transfers.propose_create(
+        captured.source_id, transfer, "payment-draft", "payment-propose"
+    )
+    review = transfers.prepare_review(draft.proposal_id, draft.version)
+    transfers.record_delivery(review.review_id, "payment-card")
+    transfer_receipt = transfers.confirm(
+        review.review_id, "payment-confirmation", "payment-confirm"
+    )
+    opening = DailyOpeningChangeServiceV1(ledger)
+    boundary = _on("2026-11-22")
+    pending = opening_proposal(
+        ledger,
+        port,
+        opening,
+        account_source,
+        account_proposal,
+        out,
+        "opening-correction",
+        opening_command(amount="125", boundary=boundary),
+    )
+    packet = opening.opening_questions_v1(pending.proposal_id)
+    assert len(packet["subjects"]) == 2
+    roles = {subject["impact_role"]: subject for subject in packet["subjects"]}
+    assert set(roles) == {"transfer_out", "fee_debit"}
+    assert all(
+        subject["movement_fact_ref"]["fact_sha256"] == transfer_receipt.fact_sha256
+        and subject["account_currency"] == "SGD"
+        for subject in roles.values()
+    )
+    assert {key: subject["account_amount"] for key, subject in roles.items()} == {
+        "transfer_out": "100.00",
+        "fee_debit": "1.00",
+    }
+    with pytest.raises(LifecycleError, match="incomplete_proposal"):
+        opening.prepare_review(pending.proposal_id, pending.version)
+    original_question = port.deliver_opening_question(packet, "transfer-roles")
+    answers = row_reply(
+        port, "role-reply", (roles["transfer_out"], "included"), (roles["fee_debit"], "excluded")
+    )
+    complete = opening_proposal(
+        ledger,
+        port,
+        opening,
+        account_source,
+        pending,
+        out,
+        "role-reply",
+        opening_command(amount="125", boundary=boundary, answers=answers),
+        "opening-correction",
+        original_question,
+    )
+    card, amended = finish(opening, complete, "role-reply")
+    effects = card.material["opening_effects"]
+    assert card.material["format"] == "finance-daily-opening-review-v3"
+    assert effects["before_balance"] == "0.00" and effects["after_balance"] == "124.00"
+    assert effects["statistics_changed"] is False
+    mapping = card.material["after_values"]["opening_dependency_map"]
+    assert mapping["format"] == "finance-daily-opening-dependency-map-v2"
+    assert {entry["impact_role"]: entry["treatment"] for entry in mapping["entries"]} == {
+        "transfer_out": "included",
+        "fee_debit": "excluded",
+    }
+    renamed = change(
+        port,
+        daily,
+        reader.get_account(out.account_id),
+        "account_rename",
+        {"name": "Wallet"},
+        "wallet",
+    )
+    assert renamed.receipt.version == amended.receipt.version + 1
+    combined = DailyLedgerReaderV1(ledger).collect_with_transfers_v2()
+    assert {b.currency: b.balance_amount for b in combined.collection.balances} == {
+        "SGD": "124.00",
+        "MYR": "100.00",
+    }
+    assert combined.collection.expense_by_currency == (("SGD", "1.00"),)
+    mapped = {
+        row.values["impact_role"]: row.values
+        for row in combined.effects
+        if row.values["source"] == "map"
+    }
+    assert {role: row["balance_impact"] for role, row in mapped.items()} == {
+        "transfer_out": "0.00",
+        "fee_debit": "-1.00",
+    }
+    assert all(
+        row["map_owner_fact_ref"]["fact_sha256"] == amended.receipt.fact_sha256
+        for row in mapped.values()
+    )
+    assert (
+        transfers.confirm(review.review_id, "payment-confirmation", "payment-confirm")
+        == transfer_receipt
+    )
+    assert len(ledger.seal_snapshot(tmp_path / "opening-map-transfer.sqlite").facts) == 3

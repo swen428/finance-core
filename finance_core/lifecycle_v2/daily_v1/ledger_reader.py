@@ -12,9 +12,9 @@ from finance_core.instance_admission.sessions import (
 from finance_core.money import canonical_money_str
 
 from ..contracts import LifecycleError, VerifiedSource, canonical, digest
-from ._impacts_v1 import effect, resolve_effect_v1
+from ._impacts_v1 import effect, resolve_effect_v1, resolve_transfer_effect_v1
 from .accounts import _audit, _BoundService, bundle_ref
-from .contracts import BUNDLE_FORMATS, BundleFactRefV1, opening_ref, strict_json
+from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
 from .reader import DailyAccountReaderV1, DailyReadIdentityV1, _read_limits, _view
 from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
@@ -115,41 +115,16 @@ class DailyLedgerWithTransfersV2:
         return self.collection.read_identity
 
 
-def _resolve_current_transfer(values, fact_ref, accounts):
+def _resolve_current_transfer(values, fact_ref, accounts, *, conn=None):
     """Resolve one exact current fact against each relevant account opening."""
     projection = project_transfer_fact_v1(values)
+    ref = asdict(fact_ref)
     resolved = []
     for impact in projection.effects:
         account = accounts.get(impact["account_id"])
-        if account is None or account.currency != impact["currency"]:
+        if account is None:
             raise LifecycleError("Transfer role refers to an absent or incompatible account")
-        bundle = account.values
-        opening = bundle["opening"]
-        current = (
-            asdict(opening_ref(bundle))
-            if opening is not None and opening["status"] == "ACTIVE"
-            else None
-        )
-        if current != impact["opening_ref"]:
-            raise LifecycleError("Transfer role lacks coverage for its current opening")
-        treatment = impact["coverage"]["treatment"]
-        resolved.append(
-            {
-                "format": "finance-daily-transfer-effect-v1",
-                "transfer_fact_ref": asdict(fact_ref),
-                "account_id": impact["account_id"],
-                "impact_role": impact["role"],
-                "currency": impact["currency"],
-                "opening_ref": current,
-                "treatment": treatment,
-                "recorded_change": impact["amount"],
-                "balance_impact": (
-                    canonical_money_str(Decimal(0), impact["currency"])
-                    if treatment == "included"
-                    else impact["amount"]
-                ),
-            }
-        )
+        resolved.append(resolve_transfer_effect_v1(conn, impact, ref, account.values))
     return projection.expenses_by_currency, resolved
 
 
@@ -238,7 +213,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     for view in transfers:
                         values = view.values
                         charges, effects = _resolve_current_transfer(
-                            values, view.fact_ref, accounts
+                            values, view.fact_ref, accounts, conn=conn
                         )
                         for impact in effects:
                             key = impact["account_id"]

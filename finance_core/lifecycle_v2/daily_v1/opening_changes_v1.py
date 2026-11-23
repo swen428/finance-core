@@ -17,7 +17,7 @@ from ..contracts import (
 )
 from ..service import _event, _id, _row
 from . import _opening_proposal_pages_v1 as pages
-from ._impacts_v1 import opening_inventory, resolve_effect_v1
+from ._impacts_v1 import opening_inventory, resolve_effect_v1, resolve_transfer_effect_v1
 from .accounts import (
     MAX_PROPOSALS,
     DailyAccountServiceV1,
@@ -44,8 +44,12 @@ from .contracts import (
 from .opening_contracts_v1 import (
     BUNDLE_V2,
     INCOMPLETE_FORMAT,
+    MOVEMENT_ROLES,
     OBSERVATION_FORMAT,
     REVIEW_FORMAT,
+    TRANSFER_EXPECTED_FORMAT,
+    TRANSFER_REVIEW_FORMAT,
+    TRANSFER_ROLES,
     ExpectedOpeningInvocationV2,
     OpeningInstructionTargetV1,
     VerifiedOpeningInstructionLinkV1,
@@ -55,8 +59,10 @@ from .opening_contracts_v1 import (
     decode_expected,
     decode_link,
     list_material,
+    opening_expected_format,
     question_pages_v2,
 )
+from .transfer_facts_v1 import project_transfer_fact_v1
 
 
 def _previous(conn, source_id, version=None, *, _rows=None):
@@ -128,7 +134,10 @@ def _compose(
     response = _source(service, conn, reply)
     original = response if original_id == reply else _source(service, conn, original_id)
     version = previous["version"] if previous else 0
-    dependencies = opening_inventory(conn, ref.record_id, before_seq, _rows=_rows)
+    dependencies = opening_inventory(
+        conn, ref.record_id, before_seq, include_transfers=True, _rows=_rows
+    )
+    expected_format = opening_expected_format(dependencies)
     retained, original_command = [], None
     if original_id != reply:
         previous_sealed = pages.read_sealed(previous) if previous is not None else {}
@@ -179,7 +188,12 @@ def _compose(
     link = service.port.opening_instruction_link_v1(conn, reply, target)
     if type(link) is not VerifiedOpeningInstructionLinkV1:
         raise LifecycleError("Exact independently retained opening link required")
-    decode_link(asdict(link), target)
+    roles = (
+        MOVEMENT_ROLES | TRANSFER_ROLES
+        if expected_format == TRANSFER_EXPECTED_FORMAT
+        else MOVEMENT_ROLES
+    )
+    decode_link(asdict(link), target, roles=roles)
     expected = ExpectedOpeningInvocationV2(
         binding,
         source["source_id"],
@@ -199,6 +213,7 @@ def _compose(
         dependencies=dependencies,
         retained_answers=retained,
         original_command=original_command,
+        format=expected_format,
     )
     return decode_expected(asdict(expected))
 
@@ -356,7 +371,7 @@ def _verify_proposal_item(service, conn, proposal, *, _rows=None):
 
 def require_dependencies(conn, expected, before_seq=None, *, _rows=None):
     if (
-        opening_inventory(conn, expected.record_id, before_seq, _rows=_rows)
+        opening_inventory(conn, expected.record_id, before_seq, include_transfers=True, _rows=_rows)
         != expected.dependencies
     ):
         raise LifecycleError("stale_opening_dependency_closure")
@@ -369,9 +384,19 @@ def review_effects(expected, values):
         before_delta, after_delta = Decimal(0), Decimal(0)
         for dependency, entry in zip(expected.dependencies, entries, strict=True):
             before = dependency["resolved_effect"]
-            resolved_after = resolve_effect_v1(
-                None, dependency["values"], dependency["fact_ref"], values, _proposed=True
-            )
+            if "impact_role" in dependency:
+                role = next(
+                    impact
+                    for impact in project_transfer_fact_v1(dependency["values"]).effects
+                    if impact["role"] == dependency["impact_role"]
+                )
+                resolved_after = resolve_transfer_effect_v1(
+                    None, role, dependency["fact_ref"], values, _proposed=True
+                )
+            else:
+                resolved_after = resolve_effect_v1(
+                    None, dependency["values"], dependency["fact_ref"], values, _proposed=True
+                )
             after = Decimal(resolved_after["balance_impact"])
             before_delta += Decimal(before["balance_impact"])
             after_delta += after
@@ -398,7 +423,11 @@ def review_effects(expected, values):
         after_balance = Decimal(values["opening"]["amount"]) + after_delta
         currency = values["account"]["currency"]
         return {
-            "format": "finance-daily-opening-review-effects-v1",
+            "format": (
+                "finance-daily-opening-review-effects-v2"
+                if expected.format == TRANSFER_EXPECTED_FORMAT
+                else "finance-daily-opening-review-effects-v1"
+            ),
             "rows": rows,
             "dependency_count": len(rows),
             "unresolved_count": 0,
@@ -418,7 +447,9 @@ def _material(expected, proposal, values, review_id, created_at):
         strict_json(proposal["observation_json"])["observation"]["raw_proposal"]
     )
     return {
-        "format": REVIEW_FORMAT,
+        "format": TRANSFER_REVIEW_FORMAT
+        if expected.format == TRANSFER_EXPECTED_FORMAT
+        else REVIEW_FORMAT,
         "binding": asdict(expected.binding),
         "review_id": review_id,
         "proposal_id": proposal["proposal_id"],
