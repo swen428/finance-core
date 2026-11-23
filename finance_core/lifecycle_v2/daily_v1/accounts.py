@@ -602,6 +602,12 @@ class _EvidenceReadPort:
                 method = getattr(self._port, name, None)
                 if not callable(method):
                     raise LifecycleError("Original receipt evidence port is unavailable")
+            elif name == "transfer_opening_reply_v1":
+                method = getattr(self._port, name, None)
+                if not callable(method):
+                    raise LifecycleError(
+                        "Authenticated transfer opening question evidence is unavailable"
+                    )
             else:
                 method = getattr(self._port, name)
             actual = (
@@ -654,6 +660,13 @@ class _EvidenceReadPort:
         from .movement_contracts import VerifiedMovementProposalV1
 
         return self._call("movement_proposal", VerifiedMovementProposalV1, conn, identity, expected)
+
+    def transfer_opening_reply_v1(self, conn, identity):
+        from .transfer_evidence_v1 import VerifiedTransferOpeningReplyV1
+
+        return self._call(
+            "transfer_opening_reply_v1", VerifiedTransferOpeningReplyV1, conn, identity
+        )
 
     def opening_instruction_link_v1(self, conn, identity, expected):
         from .opening_contracts_v1 import VerifiedOpeningInstructionLinkV1
