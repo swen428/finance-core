@@ -9,7 +9,7 @@ from finance_core.money import SUPPORTED_CURRENCIES, MoneyValidationError, canon
 
 from ..contracts import LifecycleError, digest
 from .accounts import MAX_RECORDS, DailyAccountServiceV1, _audit, bundle_ref
-from .contracts import BundleFactRefV1, _money, strict_json, text
+from .contracts import AccountDefinitionRefV1, BundleFactRefV1, _money, strict_json, text
 from .movement_contracts import MOVEMENT_FORMAT
 
 
@@ -138,3 +138,58 @@ def read_refundable_expense_v1(service, selected: BundleFactRefV1) -> RefundExpe
         else:
             raise LifecycleError("Linked refund requires a current active expense")
         return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
+
+
+@dataclass(frozen=True)
+class RefundTermsV1:
+    original_currency: str
+    original_amount: str
+    credit_account: AccountDefinitionRefV1
+    credit_currency: str
+    credit_amount: str
+
+    def __post_init__(self) -> None:
+        if type(self.credit_account) is not AccountDefinitionRefV1:
+            raise LifecycleError("Exact refund receipt account required")
+        _positive(self.original_amount, self.original_currency)
+        _positive(self.credit_amount, self.credit_currency)
+
+
+@dataclass(frozen=True)
+class RefundAmountPreviewV1:
+    allowance: RefundAllowanceV1
+    terms: RefundTermsV1
+    replaced: BundleFactRefV1 | None
+    projected_remaining_original: str
+
+
+def preview_refund_amount_v1(
+    expense: RefundExpenseV1,
+    active_refunds: tuple[ActiveRefundAllocationV1, ...],
+    terms: RefundTermsV1,
+    *,
+    replaced: BundleFactRefV1 | None = None,
+) -> RefundAmountPreviewV1:
+    """Preview only the original limit and separate account credit for a complete card."""
+    allowance = compile_refund_allowance_v1(expense, active_refunds)
+    if type(terms) is not RefundTermsV1 or terms.original_currency != expense.original_currency:
+        raise LifecycleError("Refund must use the expense's original currency for its allowance")
+    if replaced is not None and type(replaced) is not BundleFactRefV1:
+        raise LifecycleError("Exact current refund fact required for replacement")
+    replaced_amount = next(
+        (item.original_amount for item in allowance.active_refunds if item.fact == replaced),
+        None,
+    )
+    if replaced is not None and replaced_amount is None:
+        raise LifecycleError("Refund to replace is no longer current in this expense relationship")
+    with localcontext(Context(prec=256, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999)):
+        available = Decimal(allowance.remaining_original) + Decimal(replaced_amount or "0")
+        remaining = available - Decimal(terms.original_amount)
+        if remaining < 0:
+            raise LifecycleError("Refunds exceed the expense's original currency allowance")
+        return RefundAmountPreviewV1(
+            allowance,
+            terms,
+            replaced,
+            canonical_money_str(remaining, expense.original_currency),
+        )

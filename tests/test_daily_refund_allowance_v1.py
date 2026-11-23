@@ -6,11 +6,13 @@ from decimal import Context, Inexact, localcontext
 import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError
-from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1
+from finance_core.lifecycle_v2.daily_v1.contracts import AccountDefinitionRefV1, BundleFactRefV1
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     ActiveRefundAllocationV1,
     RefundExpenseV1,
+    RefundTermsV1,
     compile_refund_allowance_v1,
+    preview_refund_amount_v1,
     read_refundable_expense_v1,
 )
 from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
@@ -95,3 +97,28 @@ def test_verified_legacy_personal_expense_provides_only_its_original_amount(live
     target = read_refundable_expense_v1(ledger, ref)
     assert (target.original_currency, target.original_amount) == ("SGD", "12.00")
     assert compile_refund_allowance_v1(target, ()).remaining_original == "12.00"
+
+
+def test_received_money_and_original_allowance_are_independent_in_refund_preview():
+    expense_ref = BundleFactRefV1("expense", 1, "1" * 64, 20)
+    expense = RefundExpenseV1(expense_ref, "purchase", "JPY", "1000")
+    account = AccountDefinitionRefV1("bank-sgd", 1, "2" * 64)
+    terms = RefundTermsV1("JPY", "1000", account, "SGD", "9.20")
+    full = preview_refund_amount_v1(expense, (), terms)
+    assert full.allowance.remaining_original == "1000"
+    assert full.projected_remaining_original == "0"
+    assert full.terms.credit_amount == "9.20" and full.terms.credit_currency == "SGD"
+    posted = ActiveRefundAllocationV1(
+        BundleFactRefV1("refund", 2, "4" * 64, 40), expense_ref, "purchase", "JPY", "550"
+    )
+    with pytest.raises(LifecycleError, match="original currency allowance"):
+        preview_refund_amount_v1(expense, (posted,), terms)
+    replaced = preview_refund_amount_v1(expense, (posted,), terms, replaced=posted.fact)
+    assert replaced.projected_remaining_original == "0"
+    assert replaced.allowance.refunded_original == "550"
+    stale = BundleFactRefV1("refund", 1, "3" * 64, 30)
+    with pytest.raises(LifecycleError, match="no longer current"):
+        preview_refund_amount_v1(expense, (posted,), terms, replaced=stale)
+    wrong = RefundTermsV1("SGD", "10.00", account, "SGD", "9.20")
+    with pytest.raises(LifecycleError, match="expense's original currency"):
+        preview_refund_amount_v1(expense, (), wrong)
