@@ -289,7 +289,7 @@ formats does not implicitly upgrade historical records or recovery protocols.
 
 ## Refusal bounds and capacity
 
-This slice limits the complete checked inventory to 128 record identities,
+The ordinary entry points limit the complete checked inventory to 512 record identities,
 2,048 fact versions and 4,096 proposals. Record and version counts include
 legacy personal-expense history. `DailyReadLimitsV1` can lower the read bounds;
 it cannot enlarge them or authorize a partial complete result. Exceeding a
@@ -302,18 +302,17 @@ the later complete financial domain need their own measured volume, history,
 pending-state and installation evidence. No audit, callback, resource or
 transaction check may be skipped to satisfy a timing target.
 
-For ordinary workload measurement, a synthetic service can explicitly select
-`DailyCapacityV2.SYNTHETIC_512` when constructing `LedgerService`. It raises the
-total record inventory bound to 512 for that service and its daily account and
-movement operations. Fact-version and proposal bounds are the same. An
+For the existing synthetic workload measurement protocol a service can explicitly select
+`DailyCapacityV2.SYNTHETIC_512` when constructing `LedgerService`. That profile
+keeps its fixed 512-record bound and synthetic evidence requirements. An
 independent caller specifies the same synthetic profile when verifying a sealed
 snapshot. Retained proposals must authenticate a synthetic request scope, and
 legacy imports and archives are outside this test profile. A protected full
 audit also checks the actual current runtime registration. The profile is fixed
-when a service is constructed. Existing entry points use the default bound
-unless the profile is explicitly selected. The separate opening-answer and
-opening-map limits still apply. Each ordinary expense still follows capture, proposal,
-review, delivery and confirmation.
+when a service is constructed. Ordinary entry points use the default 512-record
+ceiling without selecting a profile. The separate opening-answer and opening-map
+limits still apply. Each ordinary expense still follows capture, proposal, review,
+delivery and confirmation.
 
 Source validation, independently installed wheel/sdist acceptance, hosted
 validation, merge approval, immutable release publication, consumer admission

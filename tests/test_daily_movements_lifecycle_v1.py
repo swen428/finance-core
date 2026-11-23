@@ -360,6 +360,18 @@ def test_equal_expenses_contribute_separate_record_versions_to_one_total(live):
     )
 
 
+def test_ordinary_capacity_covers_the_first_release_inventory():
+    from finance_core.lifecycle_v2.daily_v1 import DailyReadLimitsV1, accounts
+    from finance_core.lifecycle_v2.daily_v1.reader import _read_limits
+
+    assert accounts._record_limit(None) == 512
+    assert _read_limits(None, None) == (512, 2048)
+    assert DailyReadLimitsV1().max_records == 512
+    assert DailyReadLimitsV1(max_records=129).max_records == 129
+    with pytest.raises(LifecycleError, match="Exact bounded daily read limits required"):
+        DailyReadLimitsV1(max_records=513)
+
+
 def test_account_and_movement_share_confirmation_capacity(live, monkeypatch):
     from finance_core.lifecycle_v2.daily_v1 import accounts
 
