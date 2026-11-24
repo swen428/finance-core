@@ -13,6 +13,7 @@ from finance_core.lifecycle_v2.daily_v1.contracts import (
     BUNDLE_FORMAT,
     BundleFactRefV1,
     instruction_ref,
+    strict_json,
 )
 from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
@@ -33,6 +34,7 @@ from finance_core.lifecycle_v2.daily_v1.refund_facts_v1 import (
     require_refund_predecessor_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.refund_inventory_v1 import active_refund_allocations_v1
+from finance_core.lifecycle_v2.daily_v1.refund_review_v1 import read_refund_review_v1
 from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
 from tests.test_daily_transfer_facts_v1 import instruction
 from tests.test_lifecycle_v2 import live as live
@@ -318,6 +320,56 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
         _bind_opening(refund)
         with pytest.raises(LifecycleError, match="actual opening time"):
             refund_posting_state_v1(conn, refund)
+
+    raw = "The shop refunded my earlier purchase"
+    actual = VerifiedSource(
+        "refund-capture",
+        "user",
+        "chat",
+        "refund-source-key",
+        raw,
+        sha256(raw.encode()).hexdigest(),
+        1792937000,
+    )
+    port.sources[actual.evidence_id] = actual
+    captured = ledger.capture(actual.evidence_id, "capture-refund-preview")
+
+    refund["received_date"] = "2026-11-19"
+    refund["instruction_ref"] = instruction_ref(asdict(actual), ledger.binding)
+    _bind_opening(refund)
+    retained = {
+        "format": TARGET_FORMAT,
+        "transition": "refund_create",
+        "instruction_ref": refund["instruction_ref"],
+        "original_expense": deepcopy(refund["expense"]),
+        "refund_predecessor": None,
+        "reason_span": None,
+    }
+
+    def retained_target(conn, identity):
+        assert identity == actual.evidence_id
+        return VerifiedRefundTargetV1("chosen-original-expense", canonical(retained))
+
+    port.refund_target_v1 = retained_target
+    audit = ledger.reader().full_audit()
+    draft = read_refund_review_v1(ledger, captured.source_id, refund)
+    material = strict_json(draft.material_json)
+    assert draft.material_sha256 == digest(material)
+    assert material["after_values"]["original"] == {"currency": "JPY", "amount": "1000"}
+    assert material["dependencies"]["remaining_original_after"] == "0"
+    assert material["account_impact_changes"] == [
+        {
+            "account_id": account,
+            "currency": "SGD",
+            "recorded_change": "9.20",
+            "balance_change": "9.20",
+        }
+    ]
+    assert ledger.reader().full_audit() == audit
+    retained["original_expense"]["fact_ref"]["record_id"] = "wrong-expense"
+    with pytest.raises(LifecycleError, match="retained expense"):
+        read_refund_review_v1(ledger, captured.source_id, refund)
+    assert ledger.reader().full_audit() == audit
 
 
 def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identity(refund):
