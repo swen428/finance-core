@@ -25,6 +25,13 @@ class RefundReviewPreviewV1:
     material_sha256: str
 
 
+@dataclass(frozen=True)
+class PendingRefundPreparationV1:
+    proposal_id: str
+    instruction_id: str
+    opening_sha256: str | None
+
+
 def _resolved_credit(conn, values, fact_ref, before_seq):
     effect = project_refund_fact_v1(values).credit_effect
     if effect is None:
@@ -61,6 +68,7 @@ def _compact_dependencies(state: RefundPostingStateV1) -> dict[str, Any]:
         ),
         "remaining_original_after": state.remaining_original_after,
         "available_if_pending": state.available_if_pending,
+        "pending_opening_sha256": state.pending_opening_sha256,
         "refund_lineage_sha256": state.refund_lineage_sha256,
         "replaced": asdict(state.replaced) if state.replaced is not None else None,
         "credit_account_fact": (
@@ -79,6 +87,7 @@ def _refund_review_material(
     *,
     before_seq: int | None = None,
     allow_pending: bool = False,
+    preparation: PendingRefundPreparationV1 | None = None,
 ) -> dict[str, Any]:
     fingerprint = _fingerprint(conn)
     dependencies = refund_posting_state_v1(
@@ -87,10 +96,24 @@ def _refund_review_material(
     source = service._source(
         conn, source_id, allow_archived=before_seq is not None or replaced is not None
     )
+    selection_preparation = None
     if replaced is None:
         if source["generation"] != binding.generation:
             raise LifecycleError("Refund source belongs to another capture generation")
         instruction = VerifiedSource(**_source_instruction(source))
+        requested = values["instruction_ref"]["evidence_id"]
+        if requested != instruction.evidence_id:
+            if preparation is None:
+                raise LifecycleError("A changed refund selection requires its exact pending draft")
+            selected_by = service.port.source(conn, requested)
+            if (
+                type(selected_by) is not VerifiedSource
+                or selected_by.evidence_id != requested
+                or selected_by.source_timestamp < instruction.source_timestamp
+            ):
+                raise LifecycleError("Refund reselection requires independent authenticated input")
+            instruction = selected_by
+            selection_preparation = preparation.proposal_id
         before_values = None
         before_effect = []
     else:
@@ -98,12 +121,38 @@ def _refund_review_material(
         if previous is None or previous["source_id"] != source_id:
             raise LifecycleError("Refund predecessor belongs to another capture")
         instruction = service.port.source(conn, values["instruction_ref"]["evidence_id"])
+        if preparation is not None and instruction.evidence_id != preparation.instruction_id:
+            selection_preparation = preparation.proposal_id
         before_values = strict_json(previous["values_json"])
         before_effect = _resolved_credit(conn, before_values, asdict(replaced), before_seq)
 
-    evidence = verify_refund_evidence_v1(service, conn, binding, instruction, values, replaced)
-    after_effect = _resolved_credit(conn, values, None, before_seq)
-    amount_changes = _change_totals(before_effect, after_effect)
+    opening_preparation = None
+    coverage = values["credit"]["coverage"]
+    if (
+        preparation is not None
+        and preparation.opening_sha256 is not None
+        and coverage["basis"] == "authenticated_reply"
+    ):
+        if coverage["binding_sha256"] != preparation.opening_sha256:
+            raise LifecycleError("A changed refund credit requires a new opening preparation")
+        opening_preparation = preparation.proposal_id
+    evidence = verify_refund_evidence_v1(
+        service,
+        conn,
+        binding,
+        instruction,
+        values,
+        replaced,
+        allow_pending=allow_pending,
+        selection_preparation_id=selection_preparation,
+        opening_preparation_id=opening_preparation,
+    )
+    if dependencies.pending_opening_sha256 is None:
+        after_effect = _resolved_credit(conn, values, None, before_seq)
+        amount_changes = _change_totals(before_effect, after_effect)
+    else:
+        after_effect = []
+        amount_changes = ()
     if dependencies.previous_allocation is not None and any(
         Decimal(row.recorded_change) != 0
         or (row.balance_change is not None and Decimal(row.balance_change) != 0)

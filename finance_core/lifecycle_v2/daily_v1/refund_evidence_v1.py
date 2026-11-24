@@ -36,6 +36,7 @@ def _require_target(
     source: VerifiedSource,
     value: dict[str, Any],
     previous: BundleFactRefV1 | None,
+    preparation_id: str | None,
 ) -> None:
     if type(retained) is not VerifiedRefundTargetV1:
         raise LifecycleError("Exact independently retained refund selection required")
@@ -56,6 +57,8 @@ def _require_target(
         "refund_predecessor": asdict(previous) if previous is not None else None,
         "reason_span": span,
     }
+    if preparation_id is not None:
+        target["preparation_id"] = preparation_id
     if retained.target_json != canonical(target):
         raise LifecycleError("Refund selection differs from the retained expense, target or reason")
 
@@ -65,12 +68,16 @@ def _require_opening_reply(
     coverage: dict[str, Any],
     reply: VerifiedSource,
     retained: VerifiedRefundOpeningReplyV1,
+    preparation_id: str | None,
 ) -> dict[str, Any]:
     if type(reply) is not VerifiedSource or type(retained) is not VerifiedRefundOpeningReplyV1:
         raise LifecycleError("Exact verified refund opening reply required")
     actual = instruction_ref(asdict(reply), binding)
     question = strict_json(retained.question_json)
-    exact(question, {"format", "delivery_id", "delivered_at", "credit_sha256"}, "refund question")
+    keys = {"format", "delivery_id", "delivered_at", "credit_sha256"}
+    if preparation_id is not None:
+        keys.add("preparation_id")
+    exact(question, keys, "refund question")
     original = coverage["binding"]["instruction_ref"]
     delivery = text(question["delivery_id"], "refund opening question delivery")
     if (
@@ -82,6 +89,7 @@ def _require_opening_reply(
         or type(question["delivered_at"]) is not int
         or not original["source_timestamp"] <= question["delivered_at"] <= reply.source_timestamp
         or question["credit_sha256"] != coverage["binding_sha256"]
+        or question.get("preparation_id") != preparation_id
         or _OPENING_CHOICES.get(reply.raw_input.strip().casefold()) != coverage["treatment"]
     ):
         raise LifecycleError("Refund opening reply differs from its exact delivered question")
@@ -95,9 +103,13 @@ def verify_refund_evidence_v1(
     source: VerifiedSource,
     value: dict[str, Any],
     previous: BundleFactRefV1 | None,
+    *,
+    allow_pending: bool = False,
+    selection_preparation_id: str | None = None,
+    opening_preparation_id: str | None = None,
 ) -> dict[str, Any]:
     """Return canonical verified material for later replay under the original binding."""
-    projected = project_refund_fact_v1(value)
+    projected = project_refund_fact_v1(value, allow_pending=allow_pending)
     if not conn.in_transaction:
         raise LifecycleError("Refund evidence requires one protected ledger transaction")
     if (
@@ -111,7 +123,7 @@ def verify_refund_evidence_v1(
         raise LifecycleError("Exact refund change predecessor required")
     port = service.port
     link = port.refund_target_v1(conn, source.evidence_id)
-    _require_target(link, source, value, previous)
+    _require_target(link, source, value, previous, selection_preparation_id)
     retained = {"selection": asdict(link), "opening_question": None}
     if projected.credit_effect is not None:
         coverage = projected.credit_effect["coverage"]
@@ -122,6 +134,7 @@ def verify_refund_evidence_v1(
                 coverage,
                 port.source(conn, identity),
                 port.refund_opening_reply_v1(conn, identity),
+                opening_preparation_id,
             )
             if link.evidence_id in {identity, question["delivery_id"]}:
                 raise LifecycleError("Refund selection and opening response require separate proof")

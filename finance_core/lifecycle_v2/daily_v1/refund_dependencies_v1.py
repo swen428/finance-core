@@ -37,6 +37,7 @@ class RefundPostingStateV1:
     remaining_original_after: str | None
     refund_lineage_sha256: str
     available_if_pending: str | None = None
+    pending_opening_sha256: str | None = None
     previous_allocation: PriorRefundAllocationV1 | None = None
     format: str = "finance-daily-refund-posting-state-v1"
 
@@ -80,7 +81,7 @@ def refund_posting_state_v1(
     if before_seq is not None and (type(before_seq) is not int or before_seq <= 0):
         raise LifecycleError("Exact refund history prefix required")
 
-    projection = project_refund_fact_v1(values)
+    projection = project_refund_fact_v1(values, allow_pending=allow_pending)
     previous_values = None
     if replaced is not None:
         if type(replaced) is not BundleFactRefV1:
@@ -89,7 +90,7 @@ def refund_posting_state_v1(
         if previous is None or bundle_ref(previous) != replaced:
             raise LifecycleError("Refund predecessor is no longer current")
         previous_values = strict_json(previous["values_json"])
-    require_refund_predecessor_v1(previous_values, values)
+    require_refund_predecessor_v1(previous_values, values, allow_pending=allow_pending)
 
     row = _fact_at(conn, projection.observed_expense.record_id, before_seq)
     if row is None:
@@ -122,8 +123,13 @@ def refund_posting_state_v1(
     if effect["opening_ref"] != (None if opening is None else asdict(opening)):
         raise LifecycleError("Refund credit opening reference changed")
     basis = "authenticated_reply" if requirement == "authenticated_reply_required" else requirement
-    if effect["coverage"]["basis"] != basis:
+    coverage = effect["coverage"]
+    pending_opening = (
+        allow_pending and basis == "authenticated_reply" and coverage["basis"] == "awaiting_reply"
+    )
+    if coverage["basis"] != basis and not pending_opening:
         raise LifecycleError("Refund credit coverage differs from its actual opening time")
+    pending_sha256 = coverage["binding_sha256"] if pending_opening else None
     try:
         amount = preview_refund_amount_v1(
             expense, active, projection.terms, replaced=replacement_in_target
@@ -138,6 +144,7 @@ def refund_posting_state_v1(
             None,
             lineage_sha256,
             available_if_pending=conflict.available,
+            pending_opening_sha256=pending_sha256,
             previous_allocation=previous_allocation,
         )
     return RefundPostingStateV1(
@@ -146,5 +153,6 @@ def refund_posting_state_v1(
         account_fact,
         amount.projected_remaining_original,
         lineage_sha256,
+        pending_opening_sha256=pending_sha256,
         previous_allocation=previous_allocation,
     )

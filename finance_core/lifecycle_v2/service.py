@@ -701,6 +701,21 @@ class LedgerService:
             conn.commit()
             return result
 
+    @staticmethod
+    def _require_native_refund_compatibility(conn, row):
+        if row["record_id"] is None:
+            return
+        from .daily_v1.refund_inventory_v1 import require_refund_compatible_expense_change
+
+        predecessor = conn.execute(
+            "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+            (row["record_id"],),
+        ).fetchone()
+        if predecessor is None or predecessor["version"] != row["expected_version"]:
+            raise LifecycleError("Correction target changed before review or delivery")
+        values = json.loads(row["values_json"])
+        require_refund_compatible_expense_change(conn, predecessor, values)
+
     def _review(self, conn, proposal_id, expected_version):
         proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
         if "format" in json.loads(proposal["observation_json"]):
@@ -718,23 +733,18 @@ class LedgerService:
             from .reader import verify_review
 
             verify_review(self, conn, existing)
+            if not conn.execute(
+                "SELECT 1 FROM l2_deliveries WHERE review_id=?", (existing["review_id"],)
+            ).fetchone():
+                self._require_native_refund_compatibility(conn, proposal)
             return self._review_dto(conn, existing)
         latest = conn.execute(
             "SELECT max(version) FROM l2_proposals WHERE source_id=?", (proposal["source_id"],)
         ).fetchone()[0]
         if latest != expected_version:
             raise LifecycleError("Superseded proposal cannot be reviewed")
+        self._require_native_refund_compatibility(conn, proposal)
         values = json.loads(proposal["values_json"])
-        if proposal["record_id"] is not None:
-            from .daily_v1.refund_inventory_v1 import require_refund_compatible_expense_change
-
-            predecessor = conn.execute(
-                "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-                (proposal["record_id"],),
-            ).fetchone()
-            if predecessor is None or predecessor["version"] != proposal["expected_version"]:
-                raise LifecycleError("Correction target changed before review")
-            require_refund_compatible_expense_change(conn, predecessor, values)
         review_id = _id("review")
         material = {
             "binding": asdict(self.binding),
@@ -828,6 +838,7 @@ class LedgerService:
                     raise LifecycleError("Delivery replay mismatch")
                 return self._review_dto(conn, row)
             conn.execute("BEGIN IMMEDIATE")
+            self._require_native_refund_compatibility(conn, row)
             conn.execute(
                 "INSERT INTO l2_deliveries VALUES(?,?,?)",
                 (review_id, delivery_evidence_id, canonical(asdict(delivery))),
@@ -905,6 +916,9 @@ class LedgerService:
         reply_evidence_id=None,
         reason=None,
     ):
+        from .daily_v1.refund_inventory_v1 import LinkedRefundConflictV1
+
+        conflict = None
         with self._write_operation() as conn:
             conn.execute("BEGIN IMMEDIATE")
             fact = conn.execute(
@@ -923,9 +937,15 @@ class LedgerService:
                 reply_evidence_id,
                 reason,
             )
-            review = self._review(conn, proposal.proposal_id, proposal.version)
+            try:
+                review = self._review(conn, proposal.proposal_id, proposal.version)
+            except LinkedRefundConflictV1 as refusal:
+                refusal.pending_proposal = proposal
+                conflict = refusal
             conn.commit()
-            return review
+        if conflict is not None:
+            raise conflict
+        return review
 
     def reader(self):
         from .reader import LedgerReader

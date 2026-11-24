@@ -36,7 +36,7 @@ from .accounts import (
 from .contracts import BundleFactRefV1, exact, strict_json, text
 from .refund_allowance_v1 import _fact_at
 from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
-from .refund_review_v1 import _refund_review_material
+from .refund_review_v1 import PendingRefundPreparationV1, _refund_review_material
 from .transfer_drafts_v1 import _require_unused_capture, _verified_delivery
 
 DRAFT_FORMAT = "finance-daily-refund-draft-v1"
@@ -72,20 +72,49 @@ def _previous_proposal(conn, source_id, version, *, _rows=None):
     return previous["proposal_id"]
 
 
+def _pending_preparation(conn, expected):
+    if expected.current_proposal_id is None:
+        return None
+    row = _row(conn, "l2_proposals", "proposal_id", expected.current_proposal_id)
+    sealed = strict_json(row["observation_json"])
+    eligibility = sealed["observation"]["eligibility"]
+    if row["source_id"] != expected.source_id or eligibility["status"] == "eligible":
+        return None
+    values = strict_json(row["values_json"])
+    return PendingRefundPreparationV1(
+        row["proposal_id"],
+        values["instruction_ref"]["evidence_id"],
+        eligibility["pending_opening_sha256"],
+    )
+
+
 def _observation(expected, observation_id, material):
     dependencies = material["dependencies"]
     available = dependencies["available_if_pending"]
-    original = material["after_values"]["original"]
+    values = material["after_values"]
+    original = values["original"]
+    credit = values["credit"]
+    pending_opening = dependencies["pending_opening_sha256"]
+    status = "eligible"
+    if pending_opening is not None:
+        status = "pending_opening"
+    elif available is not None:
+        status = "pending_allowance"
     return {
         "evidence_id": observation_id,
         "request_sha256": digest(asdict(expected)),
         "retained_material_sha256": digest(material),
         "retained_evidence": material["evidence"],
         "eligibility": {
-            "status": "pending_allowance" if available is not None else "eligible",
+            "status": status,
+            "pending_opening_sha256": pending_opening,
             "available_original": available,
             "requested_original": original["amount"],
             "currency": original["currency"],
+            "received_date": values["received_date"],
+            "credit": {
+                key: credit[key] for key in ("account_ref", "currency", "amount", "opening_ref")
+            },
             "original_expense": dependencies["expense"]["current_fact"],
             "active_refund_count": dependencies["allocation_count"],
         },
@@ -148,6 +177,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         target,
         before_seq=cutoff,
         allow_pending=True,
+        preparation=_pending_preparation(conn, expected),
     )
     observed = _observation(expected, proposal["observation_id"], material)
     event = (
@@ -171,7 +201,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 def _review_material(service, conn, proposal, expected, review_id, created_at, cutoff=None):
     observation = strict_json(proposal["observation_json"])["observation"]
     if observation["eligibility"]["status"] != "eligible":
-        raise LifecycleError("Refund allowance is pending and requires a new eligible proposal")
+        raise LifecycleError("A pending refund requires a new eligible proposal")
     replaced = BundleFactRefV1(**expected.target_bundle_ref) if expected.target_bundle_ref else None
     refund = _refund_review_material(
         service,
@@ -181,6 +211,7 @@ def _review_material(service, conn, proposal, expected, review_id, created_at, c
         strict_json(proposal["values_json"]),
         replaced,
         before_seq=cutoff,
+        preparation=_pending_preparation(conn, expected),
     )
     return {
         "format": REVIEW_FORMAT,
@@ -349,7 +380,7 @@ class DailyRefundServiceV1:
         if replaced is not None and type(replaced) is not BundleFactRefV1:
             raise LifecycleError("Exact refund predecessor required")
         cleaned = strict_json(canonical(values))
-        project_refund_fact_v1(cleaned)
+        project_refund_fact_v1(cleaned, allow_pending=True)
         target = asdict(replaced) if replaced is not None else None
         with self._boundary._write() as (service, conn):
             _audit(service, conn)
@@ -399,7 +430,14 @@ class DailyRefundServiceV1:
             )
             _require_current(conn, expected)
             material = _refund_review_material(
-                service, conn, service.binding, source_id, cleaned, replaced, allow_pending=True
+                service,
+                conn,
+                service.binding,
+                source_id,
+                cleaned,
+                replaced,
+                allow_pending=True,
+                preparation=_pending_preparation(conn, expected),
             )
             observed = _observation(expected, observation_id, material)
             row = {

@@ -6,7 +6,7 @@ from dataclasses import asdict
 from decimal import Decimal
 from typing import Any
 
-from ..contracts import LifecycleError, canonical, digest
+from ..contracts import LifecycleError, ProposalRef, canonical, digest
 from .accounts import bundle_ref
 from .contracts import BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
@@ -145,6 +145,7 @@ class LinkedRefundConflictV1(LifecycleError):
     ):
         super().__init__(message)
         self.original = original
+        self.pending_proposal: ProposalRef | None = None
         self.refund_refs = tuple(item.fact for item in allocations)
 
 

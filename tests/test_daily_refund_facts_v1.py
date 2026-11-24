@@ -22,6 +22,7 @@ from finance_core.lifecycle_v2.daily_v1.contracts import (
     instruction_ref,
     strict_json,
 )
+from finance_core.lifecycle_v2.daily_v1.ledger_reader import DailyLedgerReaderV1
 from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     ActiveRefundAllocationV1,
@@ -69,6 +70,7 @@ from tests.test_daily_opening_changes_v1 import (
 )
 from tests.test_daily_transfer_facts_v1 import instruction
 from tests.test_lifecycle_v2 import live as live
+from tests.test_lifecycle_v2 import response
 
 
 def _bind_opening(value):
@@ -989,3 +991,258 @@ def test_large_valid_refund_inventory_binds_exactly_without_overflowing_a_review
     assert summary["allowance_sha256"] == allowance.allowance_sha256
     amended = compile_refund_allowance_v1(expense, active[:-1])
     assert amended.allowance_sha256 != summary["allowance_sha256"]
+
+
+def _refund_instruction(port, ledger, value, targets, identity, *, preparation_id=None):
+    original = "Refund received for the selected purchase"
+    source = VerifiedSource(
+        identity,
+        "user",
+        "chat",
+        "message-" + identity,
+        original,
+        sha256(original.encode()).hexdigest(),
+        1792937020,
+    )
+    port.sources[identity] = source
+    value["instruction_ref"] = instruction_ref(asdict(source), ledger.binding)
+    _bind_opening(value)
+    selection = {
+        "format": TARGET_FORMAT,
+        "transition": value["transition"],
+        "instruction_ref": value["instruction_ref"],
+        "original_expense": value["expense"],
+        "refund_predecessor": None,
+        "reason_span": None,
+    }
+    if preparation_id is not None:
+        selection["preparation_id"] = preparation_id
+    targets[identity] = VerifiedRefundTargetV1("selection-" + identity, canonical(selection))
+    return source
+
+
+def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live, refund):
+    boundary = {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": "2026-11-24",
+        "timezone": "Asia/Singapore",
+    }
+    ledger, port, _, movements, reader, account = prepare(
+        live, opening="100", opening_as_of=boundary, currency="SGD"
+    )
+    values = fields(account, amount="9", original="1000", currency="JPY")
+    _, _, purchase = movement(ledger, port, movements, account, "initial-purchase", values)
+    original = reader.detail(purchase.receipt.record_id)
+    refund["expense"] = {
+        "fact_ref": asdict(original.fact_ref),
+        "economic_event_id": original.economic_event_id,
+    }
+    refund["received_date"] = boundary["local_date"]
+    credit = refund["credit"]
+    credit["account_ref"] = original.values["account_ref"]
+    credit["opening_ref"] = original.values["opening_ref"]
+    credit["coverage"].update(treatment="unknown", basis="awaiting_reply", reply_ref=None)
+    targets = {}
+    port.refund_target_v1 = lambda conn, identity: targets[identity]
+    source = _refund_instruction(port, ledger, refund, targets, "coverage-pending")
+    captured = ledger.capture(source.evidence_id, "capture-pending-coverage")
+    service = DailyRefundServiceV1(ledger)
+    before = ledger.reader().full_audit()
+    pending = service.propose(captured.source_id, refund, "pending-coverage", "save-pending")
+    state = service.proposal_state_v1(pending.proposal_id)
+    assert state["status"] == "pending_opening"
+    assert state["pending_opening_sha256"] == credit["coverage"]["binding_sha256"]
+    assert ledger.reader().full_audit()["fact_version_count"] == before["fact_version_count"]
+    with pytest.raises(LifecycleError, match="requires a new eligible proposal"):
+        service.prepare_review(pending.proposal_id, pending.version)
+
+    ledger.owner.close()
+    with acquire_production_owner(live[2]) as owner:
+        reopened = LedgerService(owner, port, ledger.binding, ledger.clock)
+        service = DailyRefundServiceV1(reopened)
+        assert service.proposal_state_v1(pending.proposal_id) == state
+        reply_text = "已包含"
+        reply = VerifiedSource(
+            "coverage-reply",
+            "user",
+            "chat",
+            "message-opening-coverage",
+            reply_text,
+            sha256(reply_text.encode()).hexdigest(),
+            source.source_timestamp + 2,
+        )
+        port.sources[reply.evidence_id] = reply
+        credit["coverage"].update(
+            treatment="included",
+            basis="authenticated_reply",
+            reply_ref=instruction_ref(asdict(reply), ledger.binding),
+        )
+        _bind_opening(refund)
+        question = {
+            "format": OPENING_QUESTION_FORMAT,
+            "delivery_id": "coverage-card",
+            "delivered_at": source.source_timestamp + 1,
+            "credit_sha256": state["pending_opening_sha256"],
+            "preparation_id": "old-question-for-another-preparation",
+        }
+
+        def retained_question(conn, identity):
+            assert identity == reply.evidence_id
+            return VerifiedRefundOpeningReplyV1(identity, canonical(question))
+
+        port.refund_opening_reply_v1 = retained_question
+        with pytest.raises(LifecycleError, match="exact delivered question"):
+            service.propose(
+                captured.source_id,
+                refund,
+                "wrong-opening",
+                "wrong-opening-proposal",
+                expected_proposal_version=1,
+            )
+        question["preparation_id"] = pending.proposal_id
+        ready = service.propose(
+            captured.source_id,
+            refund,
+            "right-opening",
+            "right-opening-proposal",
+            expected_proposal_version=1,
+        )
+        assert service.proposal_state_v1(ready.proposal_id)["status"] == "eligible"
+        review = service.prepare_review(ready.proposal_id, ready.version)
+        service.record_delivery(review.review_id, "new-refund-card")
+        service.confirm(review.review_id, "confirm-new-refund", "post-new-refund")
+        assert (
+            reopened.reader().full_audit()["fact_version_count"] == before["fact_version_count"] + 1
+        )
+        with pytest.raises(LifecycleError, match="stale_bundle_ref|stale_proposal"):
+            service.prepare_review(pending.proposal_id, pending.version)
+
+
+def test_native_expense_conflict_retains_preparation_and_denies_stale_delivery(live, refund):
+    ledger, port, _, _, reader, _ = prepare(live, opening=None, currency="SGD")
+    raw = "2026-10-24 Cafe SGD 12.00"
+    port.add_source("native-refund-purchase", raw)
+    port.native_raw["native-original-observation"] = response(raw)
+    captured = ledger.capture("native-refund-purchase", "capture-native-purchase")
+    proposal = ledger.propose(
+        captured.source_id, "native-original-observation", 0, "native-propose"
+    )
+    review = ledger.prepare_review(proposal.proposal_id, proposal.version)
+    ledger.record_delivery(review.review_id, "deliver-native-purchase")
+    posted = ledger.confirm(review.review_id, "accept-native-purchase", "post-native-purchase")
+    original = reader.detail(posted.record_id)
+
+    def native_correction(label, amount, service=ledger):
+        command = f"change amount to SGD {amount} reason: original was incorrect"
+        reply = f"native-{label}-reply"
+        observation = f"native-{label}-observation"
+        port.add_source(reply, command)
+        port.native_raw[observation] = response(
+            command, "reply", {"amount": amount, "currency": "SGD"}
+        )
+        return service.prepare_correction(
+            posted.record_id,
+            1,
+            observation,
+            f"native-{label}-proposal",
+            reply_evidence_id=reply,
+            reason="original was incorrect",
+        )
+
+    old = native_correction("before-refund", "5.00")
+    account = reader.collect_accounts().accounts[0]
+    refund["expense"] = {
+        "fact_ref": asdict(original.fact_ref),
+        "economic_event_id": original.economic_event_id,
+    }
+    refund["original"] = {"currency": "SGD", "amount": "6.00"}
+    refund["credit"].update(
+        account_ref=asdict(account.account_ref),
+        amount="6.00",
+        opening_ref=None,
+    )
+    refund["credit"]["coverage"].update(
+        treatment="no_baseline", basis="no_active_opening", reply_ref=None
+    )
+    targets = {}
+    port.refund_target_v1 = lambda conn, identity: targets[identity]
+    source = _refund_instruction(port, ledger, refund, targets, "credit-for-native")
+    received = ledger.capture(source.evidence_id, "capture-credit-for-native")
+    refunds = DailyRefundServiceV1(ledger)
+    proposal = refunds.propose(
+        received.source_id, refund, "refund-for-native", "propose-credit-native"
+    )
+    card = refunds.prepare_review(proposal.proposal_id, proposal.version)
+    refunds.record_delivery(card.review_id, "deliver-credit-native")
+    receipt = refunds.confirm(card.review_id, "accept-credit-native", "post-credit-native")
+    audit = ledger.reader().full_audit()
+    with pytest.raises(LinkedRefundConflictV1):
+        ledger.record_delivery(old.review_id, "attempt-stale-native-delivery")
+    assert ledger.reader().full_audit() == audit
+
+    with pytest.raises(LinkedRefundConflictV1) as conflict:
+        native_correction("after-refund", "5.00")
+    assert conflict.value.refund_refs[0].record_id == receipt.record_id
+    saved = conflict.value.pending_proposal
+    assert saved is not None
+    more = deepcopy(refund)
+    more["original"]["amount"] = "7.00"
+    more["credit"]["amount"] = "7.00"
+    other = _refund_instruction(port, ledger, more, targets, "try-extra-credit")
+    extra_source = ledger.capture(other.evidence_id, "capture-extra-credit")
+    first_pending = refunds.propose(
+        extra_source.source_id, more, "extra-credit", "save-pending-extra-credit"
+    )
+    assert refunds.proposal_state_v1(first_pending.proposal_id)["status"] == "pending_allowance"
+    ledger.owner.close()
+    with acquire_production_owner(live[2]) as owner:
+        reopen = LedgerService(owner, port, ledger.binding, ledger.clock)
+        assert reopen.reader().full_audit()["fact_version_count"] == audit["fact_version_count"]
+        with pytest.raises(LinkedRefundConflictV1):
+            reopen.prepare_review(saved.proposal_id, saved.version)
+        with DailyAccountServiceV1(reopen)._read() as (_, conn):
+            assert not conn.execute(
+                "SELECT 1 FROM l2_reviews WHERE proposal_id=?", (saved.proposal_id,)
+            ).fetchone()
+            assert not conn.execute(
+                "SELECT 1 FROM l2_deliveries WHERE review_id=?", (old.review_id,)
+            ).fetchone()
+
+        updated = native_correction("increase-after-pending", "15.00", reopen)
+        reopen.record_delivery(updated.review_id, "deliver-valid-native-correction")
+        corrected = reopen.confirm(
+            updated.review_id, "accept-valid-native-correction", "post-valid-native-correction"
+        )
+        assert corrected.version == 2
+        current = DailyLedgerReaderV1(reopen).detail(posted.record_id)
+        more["expense"] = {
+            "fact_ref": asdict(current.fact_ref),
+            "economic_event_id": current.economic_event_id,
+        }
+        _refund_instruction(
+            port,
+            reopen,
+            more,
+            targets,
+            "reselect-corrected-purchase",
+            preparation_id=first_pending.proposal_id,
+        )
+        refunds = DailyRefundServiceV1(reopen)
+        active = refunds.propose(
+            extra_source.source_id,
+            more,
+            "selected-v2",
+            "restore-after-eligible-correction",
+            expected_proposal_version=1,
+        )
+        assert refunds.proposal_state_v1(first_pending.proposal_id)["status"] == "pending_allowance"
+        assert refunds.proposal_state_v1(active.proposal_id)["status"] == "eligible"
+        card = refunds.prepare_review(active.proposal_id, active.version)
+        refunds.record_delivery(card.review_id, "deliver-last-refund")
+        refunds.confirm(card.review_id, "confirm-last-refund", "post-last-refund")
+        final = DailyLedgerReaderV1(reopen).collect_with_refunds_v3()
+        assert final.net_expense_by_currency == (("SGD", "2.00"),)
+        compatibility = EffectiveLedgerReaderV1.for_daily_ledger(reopen)
+        assert compatibility.get(posted.record_id).amount == "15.00"

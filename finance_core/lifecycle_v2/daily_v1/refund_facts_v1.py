@@ -30,7 +30,7 @@ class RefundFactProjectionV1:
     credit_effect: dict[str, Any] | None
 
 
-def _require_credit_coverage(value: dict[str, Any]) -> OpeningRefV1 | None:
+def _require_credit_coverage(value: dict[str, Any], allow_pending: bool) -> OpeningRefV1 | None:
     credit = value["credit"]
     coverage = credit["coverage"]
     exact(
@@ -89,6 +89,10 @@ def _require_credit_coverage(value: dict[str, Any]) -> OpeningRefV1 | None:
     opening = OpeningRefV1(**raw_opening)
     if opening.account_id != credit["account_ref"]["account_id"]:
         raise LifecycleError("Refund opening belongs to a different account")
+    if (basis, treatment, reply) == ("awaiting_reply", "unknown", None):
+        if not allow_pending or value["status"] != "ACTIVE":
+            raise LifecycleError("Pending opening coverage cannot enter a refund fact")
+        return opening
     if basis == "strictly_later" and treatment == "excluded" and reply is None:
         return opening
     if basis != "authenticated_reply" or treatment not in {"included", "excluded"}:
@@ -103,7 +107,9 @@ def _require_credit_coverage(value: dict[str, Any]) -> OpeningRefV1 | None:
     return opening
 
 
-def project_refund_fact_v1(value: dict[str, Any]) -> RefundFactProjectionV1:
+def project_refund_fact_v1(
+    value: dict[str, Any], *, allow_pending: bool = False
+) -> RefundFactProjectionV1:
     """Validate the serialized shape without granting authority to post a refund."""
     exact(
         value,
@@ -149,7 +155,7 @@ def project_refund_fact_v1(value: dict[str, Any]) -> RefundFactProjectionV1:
     terms = RefundTermsV1(
         original["currency"], original["amount"], account, credit["currency"], credit["amount"]
     )
-    opening = _require_credit_coverage(value)
+    opening = _require_credit_coverage(value, allow_pending)
     effect = None
     if status == "ACTIVE":
         effect = {
@@ -164,9 +170,11 @@ def project_refund_fact_v1(value: dict[str, Any]) -> RefundFactProjectionV1:
     return RefundFactProjectionV1(observed, event_id, terms, effect)
 
 
-def require_refund_predecessor_v1(before: dict[str, Any] | None, after: dict[str, Any]) -> None:
+def require_refund_predecessor_v1(
+    before: dict[str, Any] | None, after: dict[str, Any], *, allow_pending: bool = False
+) -> None:
     """Preserve the original relationship and the immutable values of a reversed refund."""
-    current = project_refund_fact_v1(after)
+    current = project_refund_fact_v1(after, allow_pending=allow_pending)
     if before is None:
         if after["transition"] != "refund_create":
             raise LifecycleError("A refund change requires its exact active predecessor")

@@ -325,3 +325,11 @@ actual credit, receipt date and current balance effect. After the correction,
 the former expense may be reversed if no effective refund still depends on
 it. A known conflict keeps the expense proposal pending and exposes its
 linked refund references before card delivery.
+
+When the credit needs an opening answer, submit coverage with
+`basis="awaiting_reply"`, `treatment="unknown"`, and a null reply. The draft
+reports `pending_opening` with its exact receipt date, credit and opening
+reference. Reopen that draft and bind the later delivered question to its
+`preparation_id` and credit digest. The later answer creates a new proposal
+version. A changed expense version requires a new independently retained
+selection that identifies the exact pending preparation.

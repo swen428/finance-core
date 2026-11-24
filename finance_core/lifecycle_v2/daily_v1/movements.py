@@ -860,7 +860,10 @@ class DailyMovementServiceV1:
                 "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
             ).fetchone()
             if existing:
-                verify_review(service, conn, existing)
+                _, retained_delivery = verify_review(service, conn, existing)
+                if retained_delivery is None:
+                    _require_current(conn, expected, proposal=proposal)
+                    _require_refund_compatible_review(conn, expected, values)
                 result = _review_dto(conn, existing)
             else:
                 _require_current_authority(service, conn, expected)
