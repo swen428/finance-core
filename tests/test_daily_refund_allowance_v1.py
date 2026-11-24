@@ -13,6 +13,7 @@ from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     RefundTermsV1,
     compile_refund_allowance_v1,
     preview_refund_amount_v1,
+    read_refund_credit_preview_v1,
     read_refundable_expense_v1,
 )
 from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
@@ -76,6 +77,9 @@ def test_only_the_exact_current_original_consumption_is_refundable(live):
     credit = AccountDefinitionRefV1(**original.values["account_ref"])
     terms = RefundTermsV1("JPY", "1000", credit, "SGD", "9.20")
     assert read_refundable_expense_v1(ledger, original.fact_ref, terms=terms) == target
+    preview = read_refund_credit_preview_v1(ledger, original.fact_ref, terms, "2026-11-19")
+    assert preview.expense == target and preview.terms == terms
+    assert preview.active_opening is None and preview.opening_requirement == "no_active_opening"
     for incorrect in (
         replace(terms, credit_currency="MYR"),
         replace(terms, credit_account=replace(credit, definition_sha256="f" * 64)),
@@ -92,6 +96,38 @@ def test_only_the_exact_current_original_consumption_is_refundable(live):
     closed = reader.detail(receipt.receipt.record_id)
     with pytest.raises(LifecycleError, match="current active expense"):
         read_refundable_expense_v1(ledger, closed.fact_ref)
+
+
+def test_refund_opening_requirement_uses_the_actual_credit_date(live):
+    opening = {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": "2026-11-18",
+        "timezone": "Asia/Singapore",
+    }
+    ledger, port, _, movements, reader, account = prepare(
+        live, opening_as_of=opening, currency="SGD"
+    )
+    values = fields(account, amount="9", original="1000", currency="JPY")
+    _, _, receipt = movement(ledger, port, movements, account, "purchase", values)
+    original = reader.detail(receipt.receipt.record_id)
+    credit = AccountDefinitionRefV1(**original.values["account_ref"])
+    terms = RefundTermsV1("JPY", "1000", credit, "SGD", "9.20")
+    before = ledger.reader().full_audit()
+
+    later = read_refund_credit_preview_v1(ledger, original.fact_ref, terms, "2026-11-19")
+    assert later.expense.current_fact == original.fact_ref
+    assert later.credit_account_fact.record_id == account
+    assert later.active_opening is not None and later.opening_requirement == "strictly_later"
+    assert (later.terms.original_amount, later.terms.credit_amount) == ("1000", "9.20")
+    for day in ("2026-11-17", "2026-11-18"):
+        assert read_refund_credit_preview_v1(ledger, original.fact_ref, terms, day) == replace(
+            later, received_date=day, opening_requirement="authenticated_reply_required"
+        )
+    with pytest.raises(LifecycleError):
+        read_refund_credit_preview_v1(ledger, original.fact_ref, terms, "2026-02-30")
+    assert ledger.reader().full_audit() == before
 
 
 def test_verified_legacy_personal_expense_provides_only_its_original_amount(live):

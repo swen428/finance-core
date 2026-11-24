@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
+from typing import Literal
 
 from finance_core.money import SUPPORTED_CURRENCIES, MoneyValidationError, canonical_money_str
 
@@ -13,12 +14,14 @@ from .contracts import (
     BUNDLE_FORMATS,
     AccountDefinitionRefV1,
     BundleFactRefV1,
+    OpeningRefV1,
     _money,
     account_ref,
+    opening_ref,
     strict_json,
     text,
 )
-from .movement_contracts import MOVEMENT_FORMAT
+from .movement_contracts import MOVEMENT_FORMAT, _day, _later
 
 
 def _positive(amount: str, currency: str) -> None:
@@ -129,41 +132,52 @@ def read_refundable_expense_v1(
         raise LifecycleError("Exact refund terms required")
     with DailyAccountServiceV1(service)._read() as (bound, conn):
         _audit(bound, conn)
-        row = conn.execute(
-            "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-            (selected.record_id,),
-        ).fetchone()
-        if row is None or bundle_ref(row) != selected:
-            raise LifecycleError("Refund target is no longer the selected expense version")
-        values = strict_json(row["values_json"])
-        if (
-            values.get("format") == MOVEMENT_FORMAT
-            and values["kind"] == "expense"
-            and values["status"] == "ACTIVE"
-        ):
-            amount, currency = values["original_amount"], values["original_currency"]
-        elif "format" not in values:
-            from ..effective_v1 import _business_fields
-
-            original = _business_fields(row["values_json"])
-            amount, currency = original["amount"], original["currency"]
-        else:
-            raise LifecycleError("Linked refund requires a current active expense")
+        expense = _current_refundable_expense(conn, selected)
         if terms is not None:
-            if terms.original_currency != currency:
-                raise LifecycleError("Refund must use the expense's original currency")
-            credit_row = conn.execute(
-                "SELECT values_json FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-                (terms.credit_account.account_id,),
-            ).fetchone()
-            credit = strict_json(credit_row["values_json"]) if credit_row is not None else {}
-            if (
-                credit.get("format") not in BUNDLE_FORMATS
-                or account_ref(credit) != terms.credit_account
-                or credit["account"]["currency"] != terms.credit_currency
-            ):
-                raise LifecycleError("Refund credit requires the current account and currency")
-        return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
+            _current_credit_account(conn, expense, terms)
+        return expense
+
+
+def _current_refundable_expense(conn, selected: BundleFactRefV1) -> RefundExpenseV1:
+    row = conn.execute(
+        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+        (selected.record_id,),
+    ).fetchone()
+    if row is None or bundle_ref(row) != selected:
+        raise LifecycleError("Refund target is no longer the selected expense version")
+    values = strict_json(row["values_json"])
+    if (
+        values.get("format") == MOVEMENT_FORMAT
+        and values["kind"] == "expense"
+        and values["status"] == "ACTIVE"
+    ):
+        amount, currency = values["original_amount"], values["original_currency"]
+    elif "format" not in values:
+        from ..effective_v1 import _business_fields
+
+        original = _business_fields(row["values_json"])
+        amount, currency = original["amount"], original["currency"]
+    else:
+        raise LifecycleError("Linked refund requires a current active expense")
+    return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
+
+
+def _current_credit_account(conn, expense: RefundExpenseV1, terms: RefundTermsV1):
+    if terms.original_currency != expense.original_currency:
+        raise LifecycleError("Refund must use the expense's original currency")
+    row = conn.execute(
+        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+        (terms.credit_account.account_id,),
+    ).fetchone()
+    values = strict_json(row["values_json"]) if row is not None else {}
+    if (
+        row is None
+        or values.get("format") not in BUNDLE_FORMATS
+        or account_ref(values) != terms.credit_account
+        or values["account"]["currency"] != terms.credit_currency
+    ):
+        raise LifecycleError("Refund credit requires the current account and currency")
+    return bundle_ref(row), values
 
 
 @dataclass(frozen=True)
@@ -179,6 +193,55 @@ class RefundTermsV1:
             raise LifecycleError("Exact refund receipt account required")
         _positive(self.original_amount, self.original_currency)
         _positive(self.credit_amount, self.credit_currency)
+
+
+@dataclass(frozen=True)
+class RefundCreditPreviewV1:
+    """Current dependencies and opening information for a proposed refund credit."""
+
+    expense: RefundExpenseV1
+    terms: RefundTermsV1
+    received_date: str
+    credit_account_fact: BundleFactRefV1
+    active_opening: OpeningRefV1 | None
+    opening_requirement: Literal[
+        "no_active_opening", "strictly_later", "authenticated_reply_required"
+    ]
+
+
+def read_refund_credit_preview_v1(
+    service, selected: BundleFactRefV1, terms: RefundTermsV1, received_date: str
+) -> RefundCreditPreviewV1:
+    """Read whether the actual receipt date needs an explicit opening balance reply."""
+    if type(selected) is not BundleFactRefV1 or type(terms) is not RefundTermsV1:
+        raise LifecycleError("Exact selected expense fact and refund terms required")
+    received = _day(received_date)
+    funds_time = {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": received,
+        "timezone": "Asia/Singapore",
+    }
+    with DailyAccountServiceV1(service)._read() as (bound, conn):
+        _audit(bound, conn)
+        expense = _current_refundable_expense(conn, selected)
+        credit_fact, credit = _current_credit_account(conn, expense, terms)
+        opening = credit["opening"]
+        if opening is None or opening["status"] != "ACTIVE":
+            return RefundCreditPreviewV1(
+                expense, terms, received, credit_fact, None, "no_active_opening"
+            )
+        return RefundCreditPreviewV1(
+            expense,
+            terms,
+            received,
+            credit_fact,
+            opening_ref(credit),
+            "strictly_later"
+            if _later(funds_time, opening["as_of"])
+            else "authenticated_reply_required",
+        )
 
 
 @dataclass(frozen=True)
