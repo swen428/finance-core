@@ -270,3 +270,71 @@ the complete version history, including the separately retained correction or
 reversal instruction. An opening correction with transfer dependencies uses a
 versioned map with one entry per exact fact and balance role. An account rename
 carries that map and its original confirmation identity.
+
+## Linked refunds
+
+`DailyRefundServiceV1.propose` takes the captured instruction, the exact
+original expense version, the original-currency reduction, the amount
+received in the account currency, and the actual receipt date. The evidence
+port retrieves the retained selection by instruction ID. When the date
+requires opening coverage, the port retrieves the separately delivered
+question and its answer by reply ID.
+
+`prepare_review` binds the selected expense, every current refund allocation,
+the latest versions of earlier linked refunds, and the account effects.
+`record_delivery` retains the exact card. `confirm` verifies a separate action
+and rechecks the same dependencies inside the transaction that appends the
+fact, decision and audit event. A changed allowance or opening requires a new
+card. Use `lookup_commit_receipt` to recover the outcome of the original
+operation after a retry.
+
+Corrections and whole reversals use the original refund capture and its exact
+active predecessor. Reversals retain the original amounts and release the
+allocation when confirmed. Expense corrections preserve the original currency
+and enough original amount to cover all effective refunds. Reverse the linked
+refunds through their own authorized flow before reversing the original
+expense.
+
+`DailyLedgerReaderV1.collect_with_refunds_v3` reads balances, transfers, gross
+expenses, original-currency refunds and net expenses from the same audited
+snapshot. The receiving account reflects the actual credit. The original
+currency totals reflect the refund allocation. An opening adjustment binds
+refund inclusion by the exact fact and credit role. `refund_history_v1`
+returns the immutable versions, including separately confirmed reversals.
+
+Call `propose(source_id, values, observation_id, operation_id,
+expected_proposal_version=0, replaced=None)`. Pass the last two arguments
+by keyword. A valid request that exceeds the current original-currency
+allowance is retained as `pending_allowance`. Read the original target,
+available amount, requested amount, and active refund count with
+`proposal_state_v1`. A later proposal must be prepared against the current
+allowance before an eligible card can be issued.
+
+The evidence port implements `refund_target_v1(conn, instruction_id)` and
+`refund_opening_reply_v1(conn, reply_id)`. It independently reconstructs
+`VerifiedRefundTargetV1(evidence_id, target_json)` and
+`VerifiedRefundOpeningReplyV1(reply_evidence_id, question_json)` from the
+original retained evidence. The target binds the instruction, transition,
+original expense, refund predecessor, and reason span. The delivered
+question binds its delivery ID, time and exact credit digest. Both callbacks
+retain these identities across historical audit and snapshot readback.
+
+A correction can move a refund to a different expense. The card binds the
+two complete allowance inventories and keeps the original receiving account,
+actual credit, receipt date and current balance effect. After the correction,
+the former expense may be reversed if no effective refund still depends on
+it. A known conflict keeps the expense proposal pending and exposes its
+linked refund references before card delivery.
+
+When the credit needs an opening answer, submit coverage with
+`basis="awaiting_reply"`, `treatment="unknown"`, and a null reply. The draft
+reports `pending_opening` with its exact receipt date, credit and opening
+reference. Reopen that draft and bind the later delivered question to its
+`preparation_id` and credit digest. The later answer creates a new proposal
+version. A changed expense version requires a new independently retained
+selection that identifies the exact pending preparation.
+
+A later proposal keeps each retained selection and opening answer tied to the
+preparation it actually answered. Reuse the exact answer when its credit
+digest and reply ID remain the same. A superseded or expired undelivered
+card requires a fresh proposal before delivery.

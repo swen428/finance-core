@@ -313,6 +313,7 @@ def _legacy_expense_rows(rows):
     """Select the original expense domain after the complete ledger audit."""
     from .daily_v1.contracts import BUNDLE_FORMATS
     from .daily_v1.movement_contracts import MOVEMENT_FORMAT
+    from .daily_v1.refund_facts_v1 import REFUND_FORMAT
     from .daily_v1.transfer_facts_v1 import TRANSFER_FORMAT
 
     # The current version selects the record's domain. A legacy expense that
@@ -322,7 +323,7 @@ def _legacy_expense_rows(rows):
         values = json.loads(history[-1]["values_json"])
         schema = values.get("format") if type(values) is dict else None
         if type(schema) is str and (
-            schema in BUNDLE_FORMATS or schema in {MOVEMENT_FORMAT, TRANSFER_FORMAT}
+            schema in BUNDLE_FORMATS or schema in {MOVEMENT_FORMAT, REFUND_FORMAT, TRANSFER_FORMAT}
         ):
             continue
         for row in history:

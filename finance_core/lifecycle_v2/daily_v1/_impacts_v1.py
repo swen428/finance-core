@@ -32,7 +32,11 @@ def _inventory(facts, *, daily_only=False):
             if value["account"]["account_id"] != row["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
             accounts[row["record_id"]] = (bundle_ref(row), row)
-        elif value.get("format") not in {MOVEMENT_FORMAT, TRANSFER_FORMAT}:
+        elif value.get("format") not in {
+            MOVEMENT_FORMAT,
+            TRANSFER_FORMAT,
+            "finance-daily-refund-v1",
+        }:
             _business_fields(canonical(value))
         current[row["record_id"]] = row
     return (
@@ -195,6 +199,8 @@ def map_owner(conn, account, before_seq=None, *, _rows=None):
 def _map_owner_fact(conn, account, rows, *, _rows=None):
     from .accounts import bundle_ref
     from .opening_contracts_v1 import (
+        REFUND_MAP_FORMAT,
+        REFUND_REVIEW_FORMAT,
         REVIEW_FORMAT,
         TRANSFER_MAP_FORMAT,
         TRANSFER_REVIEW_FORMAT,
@@ -202,9 +208,10 @@ def _map_owner_fact(conn, account, rows, *, _rows=None):
     )
 
     mapping = account["opening_dependency_map"]
-    review_format = (
-        TRANSFER_REVIEW_FORMAT if mapping["format"] == TRANSFER_MAP_FORMAT else REVIEW_FORMAT
-    )
+    review_format = {
+        REFUND_MAP_FORMAT: REFUND_REVIEW_FORMAT,
+        TRANSFER_MAP_FORMAT: TRANSFER_REVIEW_FORMAT,
+    }.get(mapping["format"], REVIEW_FORMAT)
     predecessor = mapping["predecessor_bundle_ref"]
     if len(rows) <= predecessor["version"]:
         raise LifecycleError("Opening map original owner absent")
@@ -283,7 +290,7 @@ def _map_owner_fact(conn, account, rows, *, _rows=None):
             "economic_event_id": fact["economic_event_id"],
             "values": strict_json(fact["values_json"]),
         }
-        if dependency["values"].get("format") == TRANSFER_FORMAT:
+        if dependency["values"].get("format") in {TRANSFER_FORMAT, "finance-daily-refund-v1"}:
             dependency["impact_role"] = entry["impact_role"]
         if subject(dependency, owner_values) != entry["subject"]:
             raise LifecycleError("Opening map subject differs from original fact")
@@ -392,6 +399,17 @@ def resolve_transfer_effect_v1(
     }
 
 
+def resolve_refund_effect_v1(
+    conn, impact, fact_ref, account, before_seq=None, *, _proposed=False, _rows=None
+):
+    result = resolve_transfer_effect_v1(
+        conn, impact, fact_ref, account, before_seq, _proposed=_proposed, _rows=_rows
+    )
+    result["format"] = "finance-daily-refund-effect-v1"
+    result["refund_fact_ref"] = result.pop("transfer_fact_ref")
+    return result
+
+
 def opening_inventory(conn, account_id, before_seq=None, *, include_transfers=False, _rows=None):
     """Complete current active rows, including included and no-baseline rows."""
     from .accounts import bundle_ref, registered_values
@@ -448,6 +466,27 @@ def opening_inventory(conn, account_id, before_seq=None, *, include_transfers=Fa
                         ),
                     }
                 )
+            continue
+        if values.get("format") == "finance-daily-refund-v1":
+            from .refund_facts_v1 import project_refund_fact_v1
+
+            refund = project_refund_fact_v1(values).credit_effect
+            if refund is None or refund["account_id"] != account_id:
+                continue
+            if not include_transfers:
+                raise LifecycleError("unsupported_refund_opening_dependencies")
+            ref = asdict(bundle_ref(row))
+            result.append(
+                {
+                    "fact_ref": ref,
+                    "economic_event_id": row["economic_event_id"],
+                    "values": values,
+                    "impact_role": refund["role"],
+                    "resolved_effect": resolve_refund_effect_v1(
+                        conn, refund, ref, accounts[account_id], before_seq, _rows=_rows
+                    ),
+                }
+            )
             continue
         impact = effect(values)
         if impact and impact["account_id"] == account_id:

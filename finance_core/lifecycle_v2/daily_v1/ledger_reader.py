@@ -12,11 +12,17 @@ from finance_core.instance_admission.sessions import (
 from finance_core.money import canonical_money_str
 
 from ..contracts import LifecycleError, VerifiedSource, canonical, digest
-from ._impacts_v1 import effect, resolve_effect_v1, resolve_transfer_effect_v1
+from ._impacts_v1 import (
+    effect,
+    resolve_effect_v1,
+    resolve_refund_effect_v1,
+    resolve_transfer_effect_v1,
+)
 from .accounts import _audit, _BoundService, bundle_ref
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
 from .reader import DailyAccountReaderV1, DailyReadIdentityV1, _read_limits, _view
+from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
 from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
 
@@ -115,6 +121,22 @@ class DailyLedgerWithTransfersV2:
         return self.collection.read_identity
 
 
+@dataclass(frozen=True)
+class DailyLedgerWithRefundsV3:
+    collection: DailyLedgerCollectionV1
+    transfers: tuple[DailyMovementViewV1, ...]
+    refunds: tuple[DailyMovementViewV1, ...]
+    contributions: tuple[DailyStatisticContributionV1, ...]
+    effects: tuple[DailyResolvedEffectV1, ...]
+    refund_by_currency: tuple[tuple[str, str], ...]
+    net_expense_by_currency: tuple[tuple[str, str], ...]
+    format: str = "finance-daily-ledger-with-refunds-v3"
+
+    @property
+    def read_identity(self):
+        return self.collection.read_identity
+
+
 def _resolve_current_transfer(values, fact_ref, accounts, *, conn=None):
     """Resolve one exact current fact against each relevant account opening."""
     projection = project_transfer_fact_v1(values)
@@ -129,7 +151,14 @@ def _resolve_current_transfer(values, fact_ref, accounts, *, conn=None):
 
 
 class DailyLedgerReaderV1(DailyAccountReaderV1):
-    def _ledger(self, limits=None, *, include_contributions=False, include_transfers=False):
+    def _ledger(
+        self,
+        limits=None,
+        *,
+        include_contributions=False,
+        include_transfers=False,
+        include_refunds=False,
+    ):
         base = self._service
         max_records, max_versions = _read_limits(limits, base.daily_capacity)
         with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
@@ -152,7 +181,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     )
                     current[row["record_id"]] = view
                     history.setdefault(row["record_id"], []).append(view)
-                accounts, movements, transfers, legacy = {}, [], [], []
+                accounts, movements, transfers, refunds, legacy = {}, [], [], [], []
                 for identity in sorted(current):
                     view = current[identity]
                     values = view.values
@@ -168,9 +197,13 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                                 "unsupported_record_format: use the transfer ledger"
                             )
                         transfers.append(view)
+                    elif values.get("format") == REFUND_FORMAT:
+                        if not include_refunds:
+                            raise LifecycleError("unsupported_record_format: use the refund ledger")
+                        refunds.append(view)
                     else:
                         legacy.append(view)
-                income, expense = {}, {}
+                income, expense, refunded = {}, {}, {}
                 resolved_effects = []
                 contributions = []
                 net = {k: Decimal(0) for k in accounts}
@@ -223,6 +256,26 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         business_date = values["business_date"]
                         for currency, amount in charges:
                             add_total("expense", currency, amount, business_date, view.fact_ref)
+                    for view in refunds:
+                        projection = project_refund_fact_v1(view.values)
+                        credit = projection.credit_effect
+                        if credit is None:
+                            continue
+                        account_id = credit["account_id"]
+                        account = accounts.get(account_id)
+                        if account is None:
+                            raise LifecycleError("Refund credit refers to an absent account")
+                        resolved = resolve_refund_effect_v1(
+                            conn, credit, asdict(view.fact_ref), account.values
+                        )
+                        net[account_id] += Decimal(resolved["recorded_change"])
+                        delta[account_id] += Decimal(resolved["balance_impact"])
+                        resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
+                        currency = projection.terms.original_currency
+                        refunded[currency] = refunded.get(currency, Decimal(0)) + Decimal(
+                            projection.terms.original_amount
+                        )
+
                     from ..effective_v1 import _business_fields
 
                     for view in legacy:
@@ -287,6 +340,17 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         if any(a.opening_amount is None for a in accounts.values())
                         else ()
                     )
+                    scope = "registered-account-opening-income-expense-v1"
+                    if include_refunds:
+                        scope = "registered-account-opening-income-expense-transfer-refund-v3"
+                    elif include_transfers:
+                        scope = "registered-account-opening-income-expense-transfer-v2"
+                    net_expenses = {
+                        currency: expense.get(currency, Decimal(0))
+                        - refunded.get(currency, Decimal(0))
+                        for currency in expense.keys() | refunded.keys()
+                    }
+                    refund_amounts, net_amounts = totals(refunded), totals(net_expenses)
                     collection = DailyLedgerCollectionV1(
                         tuple(accounts.values()),
                         tuple(movements),
@@ -298,11 +362,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         pending,
                         gaps,
                         len(rows),
-                        scope=(
-                            "registered-account-opening-income-expense-transfer-v2"
-                            if include_transfers
-                            else "registered-account-opening-income-expense-v1"
-                        ),
+                        scope=scope,
                     )
                 return (
                     collection,
@@ -310,6 +370,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     tuple(resolved_effects),
                     tuple(contributions),
                     tuple(transfers),
+                    (tuple(refunds), refund_amounts, net_amounts),
                 )
             finally:
                 conn.rollback()
@@ -318,32 +379,55 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         return self._ledger(limits)[0]
 
     def collect_with_effects_v1(self, *, limits=None):
-        collection, _, effects, _, _ = self._ledger(limits)
+        collection, _, effects, _, _, _ = self._ledger(limits)
         return DailyLedgerWithEffectsV1(collection, effects)
 
     def collect_with_contributions_v1(self, *, limits=None):
-        collection, _, effects, contributions, _ = self._ledger(limits, include_contributions=True)
+        collection, _, effects, contributions, _, _ = self._ledger(
+            limits, include_contributions=True
+        )
         return DailyLedgerWithContributionsV1(collection, contributions, effects)
 
     def collect_with_transfers_v2(self, *, limits=None):
-        collection, _, effects, contributions, transfers = self._ledger(
+        collection, _, effects, contributions, transfers, _ = self._ledger(
             limits, include_contributions=True, include_transfers=True
         )
         return DailyLedgerWithTransfersV2(collection, transfers, contributions, effects)
 
+    def collect_with_refunds_v3(self, *, limits=None):
+        collection, _, effects, steps, transfers, refund_data = self._ledger(
+            limits, include_contributions=True, include_transfers=True, include_refunds=True
+        )
+        refunds, refunded, net = refund_data
+        return DailyLedgerWithRefundsV3(
+            collection, transfers, refunds, steps, effects, refunded, net
+        )
+
+    def refund_history_v1(self, record_id, *, limits=None):
+        """Read the complete verified version history of one linked refund."""
+        history = self._ledger(limits, include_transfers=True, include_refunds=True)[1]
+        rows = history.get(record_id, ())
+        if rows and rows[0].values.get("format") != REFUND_FORMAT:
+            raise LifecycleError("Expected a refund record")
+        return tuple(rows)
+
     def transfer_history_v1(self, record_id, *, limits=None):
         """Read all verified versions of a transfer from one complete snapshot."""
-        history = self._ledger(limits, include_transfers=True)[1].get(record_id, ())
+        history = self._point_history(record_id, limits)
         if history and history[0].values.get("format") != TRANSFER_FORMAT:
             raise LifecycleError("Expected a transfer record")
         return tuple(history)
 
+    def _point_history(self, record_id, limits):
+        ledger = self._ledger(limits, include_transfers=True, include_refunds=True)
+        return tuple(ledger[1].get(record_id, ()))
+
     def detail(self, record_id, *, limits=None):
-        history = self._ledger(limits)[1].get(record_id, ())
+        history = self._point_history(record_id, limits)
         return history[-1] if history else None
 
     def history(self, record_id, *, limits=None):
-        return tuple(self._ledger(limits)[1].get(record_id, ()))
+        return self._point_history(record_id, limits)
 
     def source(self, source_id):
         base = self._service
