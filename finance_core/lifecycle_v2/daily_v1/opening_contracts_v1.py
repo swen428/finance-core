@@ -28,15 +28,20 @@ MAP_FORMAT = "finance-daily-opening-dependency-map-v1"
 REGISTRY = "finance-daily-account-opening-ordinary-income-expense-v1"
 TRANSFER_MAP_FORMAT = "finance-daily-opening-dependency-map-v2"
 TRANSFER_REGISTRY = "finance-daily-account-opening-movements-transfers-v2"
+REFUND_MAP_FORMAT = "finance-daily-opening-dependency-map-v3"
+REFUND_REGISTRY = "finance-daily-account-opening-movements-transfers-refunds-v3"
 MOVEMENT_ROLES = frozenset({"debit", "credit"})
 TRANSFER_ROLES = frozenset({"transfer_out", "transfer_in", "fee_debit"})
+REFUND_ROLES = frozenset({"refund_credit"})
 EXPECTED_FORMAT = "finance-daily-opening-expected-v2"
 TRANSFER_EXPECTED_FORMAT = "finance-daily-opening-expected-v3"
+REFUND_EXPECTED_FORMAT = "finance-daily-opening-expected-v4"
 OBSERVATION_FORMAT = "finance-daily-opening-observation-v2"
 COMMAND_FORMAT = "finance-daily-opening-command-v2"
 INCOMPLETE_FORMAT = "finance-daily-opening-incomplete-v2"
 REVIEW_FORMAT = "finance-daily-opening-review-v2"
 TRANSFER_REVIEW_FORMAT = "finance-daily-opening-review-v3"
+REFUND_REVIEW_FORMAT = "finance-daily-opening-review-v4"
 
 
 @dataclass(frozen=True)
@@ -130,9 +135,19 @@ def decode_expected(raw):
 
 
 def opening_expected_format(dependencies):
+    if any(row["values"].get("format") == "finance-daily-refund-v1" for row in dependencies):
+        return REFUND_EXPECTED_FORMAT
     if any(row["values"].get("format") == TRANSFER_FORMAT for row in dependencies):
         return TRANSFER_EXPECTED_FORMAT
     return EXPECTED_FORMAT
+
+
+def opening_roles(expected_format):
+    if expected_format == REFUND_EXPECTED_FORMAT:
+        return MOVEMENT_ROLES | TRANSFER_ROLES | REFUND_ROLES
+    if expected_format == TRANSFER_EXPECTED_FORMAT:
+        return MOVEMENT_ROLES | TRANSFER_ROLES
+    return MOVEMENT_ROLES
 
 
 def decode_link(value, target, *, roles=MOVEMENT_ROLES):
@@ -239,6 +254,29 @@ def subject(dependency, candidate):
             "description": value["description"],
             "business_date": value["business_date"],
             "account_amount": role["amount"].removeprefix("-"),
+            "account_currency": role["currency"],
+            "funds_time": role["funds_time"],
+        }
+    if value.get("format") == "finance-daily-refund-v1":
+        from .refund_facts_v1 import project_refund_fact_v1
+
+        projected = project_refund_fact_v1(value)
+        role = projected.credit_effect
+        if (
+            role is None
+            or role["role"] != dependency["impact_role"]
+            or role["account_id"] != common["account_ref"]["account_id"]
+        ):
+            raise LifecycleError("Opening dependency differs from its exact refund credit")
+        return {
+            **common,
+            "impact_role": role["role"],
+            "kind": "refund",
+            "description": value["description"],
+            "business_date": value["received_date"],
+            "original_amount": projected.terms.original_amount,
+            "original_currency": projected.terms.original_currency,
+            "account_amount": role["amount"],
             "account_currency": role["currency"],
             "funds_time": role["funds_time"],
         }
@@ -410,6 +448,8 @@ def validate_map(value, bundle):
         roles = MOVEMENT_ROLES
     elif version == (TRANSFER_MAP_FORMAT, TRANSFER_REGISTRY):
         roles = MOVEMENT_ROLES | TRANSFER_ROLES
+    elif version == (REFUND_MAP_FORMAT, REFUND_REGISTRY):
+        roles = MOVEMENT_ROLES | TRANSFER_ROLES | REFUND_ROLES
     else:
         raise LifecycleError("Unsupported opening dependency map")
     predecessor = BundleFactRefV1(**value["predecessor_bundle_ref"])
@@ -470,6 +510,10 @@ def validate_map(value, bundle):
             version == (TRANSFER_MAP_FORMAT, TRANSFER_REGISTRY)
             and not any(role in TRANSFER_ROLES for _, role in keys)
         )
+        or (
+            version == (REFUND_MAP_FORMAT, REFUND_REGISTRY)
+            and not any(role in REFUND_ROLES for _, role in keys)
+        )
         or digest({k: v for k, v in value.items() if k != "map_sha256"}) != value["map_sha256"]
     ):
         raise LifecycleError("Opening dependency map order/hash differs")
@@ -489,7 +533,7 @@ _OPENING_CHOICES = {
 
 def _selection_key(item):
     ref = BundleFactRefV1(**item["movement_fact_ref"])
-    if item["impact_role"] not in MOVEMENT_ROLES | TRANSFER_ROLES:
+    if item["impact_role"] not in MOVEMENT_ROLES | TRANSFER_ROLES | REFUND_ROLES:
         raise LifecycleError("Unsupported actual opening row role")
     return ref.record_id, item["impact_role"]
 
@@ -723,10 +767,14 @@ def compile_opening(command, expected):
             "answers": entries,
             "missing_fields": missing,
         }
-    multi_role = expected.format == TRANSFER_EXPECTED_FORMAT
+    map_format, registry = {
+        REFUND_EXPECTED_FORMAT: (REFUND_MAP_FORMAT, REFUND_REGISTRY),
+        TRANSFER_EXPECTED_FORMAT: (TRANSFER_MAP_FORMAT, TRANSFER_REGISTRY),
+        EXPECTED_FORMAT: (MAP_FORMAT, REGISTRY),
+    }[expected.format]
     material = {
-        "format": TRANSFER_MAP_FORMAT if multi_role else MAP_FORMAT,
-        "registry": TRANSFER_REGISTRY if multi_role else REGISTRY,
+        "format": map_format,
+        "registry": registry,
         "predecessor_bundle_ref": expected.target_bundle_ref,
         "account_id": expected.record_id,
         "new_opening_ref": asdict(opening_ref(candidate)),

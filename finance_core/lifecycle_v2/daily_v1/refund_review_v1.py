@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from ..contracts import LifecycleError, RuntimeBinding, VerifiedSource, canonical, digest
-from ._impacts_v1 import resolve_transfer_effect_v1
+from ._impacts_v1 import resolve_refund_effect_v1
 from .accounts import DailyAccountServiceV1, _audit, _fingerprint, _source_instruction
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json, text
 from .refund_allowance_v1 import _fact_at
@@ -32,7 +32,7 @@ def _resolved_credit(conn, values, fact_ref, before_seq):
     account = strict_json(row["values_json"]) if row is not None else None
     if account is None or account.get("format") not in BUNDLE_FORMATS:
         raise LifecycleError("Refund review requires a current credit account")
-    return [resolve_transfer_effect_v1(conn, effect, fact_ref, account, before_seq)]
+    return [resolve_refund_effect_v1(conn, effect, fact_ref, account, before_seq)]
 
 
 def _refund_review_material(
@@ -70,7 +70,7 @@ def _refund_review_material(
     # Each account reference is exact even when a reversal credits no account.
     # Null opening balance remains unknown while the recorded change is known.
     associations = [
-        {key: value for key, value in effect.items() if key not in {"format", "transfer_fact_ref"}}
+        {key: value for key, value in effect.items() if key not in {"format", "refund_fact_ref"}}
         for effect in before_effect + after_effect
     ]
     if _fingerprint(conn) != fingerprint:

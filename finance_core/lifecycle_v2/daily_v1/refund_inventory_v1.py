@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Any
 
-from ..contracts import LifecycleError, canonical
+from ..contracts import LifecycleError, canonical, digest
 from .accounts import bundle_ref
 from .contracts import strict_json
 from .movement_contracts import MOVEMENT_FORMAT
@@ -18,7 +18,7 @@ from .refund_allowance_v1 import (
 from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
 
 
-def _linked_refund_rows(conn, record_id, economic_event_id, before_seq):
+def _linked_refund_rows(conn, record_id, economic_event_id, before_seq, *, include_void=False):
     return conn.execute(
         """
         WITH latest AS (
@@ -28,7 +28,7 @@ def _linked_refund_rows(conn, record_id, economic_event_id, before_seq):
         )
         SELECT f.* FROM l2_facts AS f JOIN latest USING (record_id,version)
         WHERE json_extract(f.values_json,'$.format')=:format
-          AND json_extract(f.values_json,'$.status') IS NOT 'VOID'
+          AND (:include_void OR json_extract(f.values_json,'$.status') IS NOT 'VOID')
           AND (
               json_extract(f.values_json,'$.expense.economic_event_id')=:event_id
               OR json_extract(f.values_json,'$.expense.fact_ref.record_id')=:record_id
@@ -37,6 +37,7 @@ def _linked_refund_rows(conn, record_id, economic_event_id, before_seq):
         """,
         {
             "cutoff": before_seq,
+            "include_void": include_void,
             "format": REFUND_FORMAT,
             "event_id": economic_event_id,
             "record_id": record_id,
@@ -81,17 +82,34 @@ def _allocations_from_rows(conn, expense, rows) -> tuple[ActiveRefundAllocationV
     return tuple(active)
 
 
-def active_refund_allocations_v1(
-    conn, expense: RefundExpenseV1, before_seq: int | None = None
-) -> tuple[ActiveRefundAllocationV1, ...]:
-    """Read within the caller's protected transaction, including historical replay cuts."""
+def _refund_state_rows(conn, expense: RefundExpenseV1, before_seq: int | None = None):
     if not conn.in_transaction:
         raise LifecycleError("Refund inventory requires one protected ledger transaction")
     target = expense.current_fact
     if before_seq is not None and (type(before_seq) is not int or target.commit_seq >= before_seq):
         raise LifecycleError("Refund expense is outside the requested ledger prefix")
-    rows = _linked_refund_rows(conn, target.record_id, expense.economic_event_id, before_seq)
-    return _allocations_from_rows(conn, expense, rows)
+    return tuple(
+        _linked_refund_rows(
+            conn, target.record_id, expense.economic_event_id, before_seq, include_void=True
+        )
+    )
+
+
+def refund_inventory_snapshot_v1(
+    conn, expense: RefundExpenseV1, before_seq: int | None = None
+) -> tuple[tuple[ActiveRefundAllocationV1, ...], str]:
+    """Include reversed records in the identity so an old card cannot revive."""
+    rows = _refund_state_rows(conn, expense, before_seq)
+    active = _allocations_from_rows(conn, expense, rows)
+    lineage_sha256 = digest([asdict(bundle_ref(row)) for row in rows])
+    return active, lineage_sha256
+
+
+def active_refund_allocations_v1(
+    conn, expense: RefundExpenseV1, before_seq: int | None = None
+) -> tuple[ActiveRefundAllocationV1, ...]:
+    """Read within the caller's protected transaction, including historical replay cuts."""
+    return _allocations_from_rows(conn, expense, _refund_state_rows(conn, expense, before_seq))
 
 
 def require_refund_compatible_expense_change(

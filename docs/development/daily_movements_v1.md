@@ -270,3 +270,34 @@ the complete version history, including the separately retained correction or
 reversal instruction. An opening correction with transfer dependencies uses a
 versioned map with one entry per exact fact and balance role. An account rename
 carries that map and its original confirmation identity.
+
+## Linked refunds
+
+`DailyRefundServiceV1.propose` takes the captured instruction, the exact
+original expense version, the original-currency reduction, the amount
+received in the account currency, and the actual receipt date. The evidence
+port retrieves the retained selection by instruction ID. When the date
+requires opening coverage, the port retrieves the separately delivered
+question and its answer by reply ID.
+
+`prepare_review` binds the selected expense, every current refund allocation,
+the latest versions of earlier linked refunds, and the account effects.
+`record_delivery` retains the exact card. `confirm` verifies a separate action
+and rechecks the same dependencies inside the transaction that appends the
+fact, decision and audit event. A changed allowance or opening requires a new
+card. Use `lookup_commit_receipt` to recover the outcome of the original
+operation after a retry.
+
+Corrections and whole reversals use the original refund capture and its exact
+active predecessor. Reversals retain the original amounts and release the
+allocation when confirmed. Expense corrections preserve the original currency
+and enough original amount to cover all effective refunds. Reverse the linked
+refunds through their own authorized flow before reversing the original
+expense.
+
+`DailyLedgerReaderV1.collect_with_refunds_v3` reads balances, transfers, gross
+expenses, original-currency refunds and net expenses from the same audited
+snapshot. The receiving account reflects the actual credit. The original
+currency totals reflect the refund allocation. An opening adjustment binds
+refund inclusion by the exact fact and credit role. `refund_history_v1`
+returns the immutable versions, including separately confirmed reversals.

@@ -138,6 +138,7 @@ def _audit_connection(conn, *, _rows=None):
             "finance-daily-movement-review-v2",
             "finance-daily-opening-review-v2",
             "finance-daily-opening-review-v3",
+            "finance-daily-opening-review-v4",
             "finance-daily-transfer-review-v1",
             "finance-daily-transfer-change-review-v1",
             "finance-daily-refund-review-v1",
@@ -601,6 +602,7 @@ def verify_review(service, conn, review, *, _rows=None):
     if material.get("format") in {
         "finance-daily-opening-review-v2",
         "finance-daily-opening-review-v3",
+        "finance-daily-opening-review-v4",
     }:
         from .daily_v1.opening_changes_v1 import verify_review as verify_opening_review
 

@@ -18,7 +18,7 @@ from .refund_allowance_v1 import (
     preview_refund_amount_v1,
 )
 from .refund_facts_v1 import project_refund_fact_v1, require_refund_predecessor_v1
-from .refund_inventory_v1 import active_refund_allocations_v1
+from .refund_inventory_v1 import refund_inventory_snapshot_v1
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class RefundPostingStateV1:
     replaced: BundleFactRefV1 | None
     credit_account_fact: BundleFactRefV1 | None
     remaining_original_after: str
+    refund_lineage_sha256: str
     format: str = "finance-daily-refund-posting-state-v1"
 
     @property
@@ -68,7 +69,7 @@ def refund_posting_state_v1(
     expense = _expense_from_fact(row)
     if expense.economic_event_id != projection.expense_economic_event_id:
         raise LifecycleError("Refund must retain the original expense economic event")
-    active = active_refund_allocations_v1(conn, expense, before_seq)
+    active, lineage_sha256 = refund_inventory_snapshot_v1(conn, expense, before_seq)
     effect = projection.credit_effect
     if effect is None:
         if not any(entry.fact == replaced for entry in active):
@@ -77,7 +78,7 @@ def refund_posting_state_v1(
         remaining = compile_refund_allowance_v1(
             expense, tuple(entry for entry in active if entry.fact != replaced)
         ).remaining_original
-        return RefundPostingStateV1(allowance, replaced, None, remaining)
+        return RefundPostingStateV1(allowance, replaced, None, remaining, lineage_sha256)
 
     if expense.current_fact != projection.observed_expense:
         raise LifecycleError("Refund original expense version changed")
@@ -90,5 +91,9 @@ def refund_posting_state_v1(
         raise LifecycleError("Refund credit coverage differs from its actual opening time")
     amount = preview_refund_amount_v1(expense, active, projection.terms, replaced=replaced)
     return RefundPostingStateV1(
-        amount.allowance, replaced, account_fact, amount.projected_remaining_original
+        amount.allowance,
+        replaced,
+        account_fact,
+        amount.projected_remaining_original,
+        lineage_sha256,
     )

@@ -12,7 +12,12 @@ from finance_core.instance_admission.sessions import (
 from finance_core.money import canonical_money_str
 
 from ..contracts import LifecycleError, VerifiedSource, canonical, digest
-from ._impacts_v1 import effect, resolve_effect_v1, resolve_transfer_effect_v1
+from ._impacts_v1 import (
+    effect,
+    resolve_effect_v1,
+    resolve_refund_effect_v1,
+    resolve_transfer_effect_v1,
+)
 from .accounts import _audit, _BoundService, bundle_ref
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
@@ -260,11 +265,9 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         account = accounts.get(account_id)
                         if account is None:
                             raise LifecycleError("Refund credit refers to an absent account")
-                        resolved = resolve_transfer_effect_v1(
+                        resolved = resolve_refund_effect_v1(
                             conn, credit, asdict(view.fact_ref), account.values
                         )
-                        resolved["format"] = "finance-daily-refund-effect-v1"
-                        resolved["refund_fact_ref"] = resolved.pop("transfer_fact_ref")
                         net[account_id] += Decimal(resolved["recorded_change"])
                         delta[account_id] += Decimal(resolved["balance_impact"])
                         resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))

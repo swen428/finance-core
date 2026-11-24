@@ -36,7 +36,15 @@ from finance_core.lifecycle_v2.daily_v1.refund_facts_v1 import (
 )
 from finance_core.lifecycle_v2.daily_v1.refund_inventory_v1 import active_refund_allocations_v1
 from finance_core.lifecycle_v2.daily_v1.refund_review_v1 import read_refund_review_v1
+from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
 from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
+from tests.test_daily_opening_changes_v1 import (
+    finish,
+    opening_command,
+    opening_proposal,
+    prepare_opening,
+    row_reply,
+)
 from tests.test_daily_transfer_facts_v1 import instruction
 from tests.test_lifecycle_v2 import live as live
 
@@ -288,7 +296,10 @@ def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(r
             active_refund_allocations_v1(conn, expense)
 
 
-def test_refund_confirmation_dependencies_use_current_verified_opening_date(live, refund):
+@pytest.mark.parametrize("transition", ["refund_void", "refund_correct"])
+def test_refund_confirmation_dependencies_use_current_verified_opening_date(
+    live, refund, tmp_path, transition
+):
     opening = {
         "format": "finance-daily-as-of-v1",
         "precision": "date",
@@ -461,11 +472,17 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
         1792937010,
     )
     port.sources[reverse_source.evidence_id] = reverse_source
-    reverse = _change(refund, "refund_void")
-    reverse["status"] = "VOID"
+    reverse = _change(refund, transition)
+    if transition == "refund_void":
+        reverse["status"] = "VOID"
+    else:
+        reverse["original"]["amount"] = "900"
+        reverse["credit"]["amount"] = "8.24"
     reverse_instruction = instruction_ref(asdict(reverse_source), ledger.binding)
     reverse["instruction_ref"] = reverse_instruction
     reverse["reason_ref"]["instruction_ref"] = reverse_instruction
+    if transition == "refund_correct":
+        _bind_opening(reverse)
     original_refund = snapshot.refunds[0].fact_ref
 
     def target_for_both(conn, identity):
@@ -477,7 +494,7 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
             canonical(
                 {
                     "format": TARGET_FORMAT,
-                    "transition": "refund_void",
+                    "transition": transition,
                     "instruction_ref": reverse_instruction,
                     "original_expense": refund["expense"],
                     "refund_predecessor": asdict(original_refund),
@@ -502,12 +519,25 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
     )
     assert (reversed_posting.record_id, reversed_posting.version) == (posted.record_id, 2)
     after_reversal = reader.collect_with_refunds_v3()
-    assert after_reversal.refund_by_currency == ()
-    assert after_reversal.net_expense_by_currency == (("JPY", "1000"),)
-    assert after_reversal.collection.balances[0].balance_amount == "91.00"
     history = reader.refund_history_v1(posted.record_id)
-    assert [view.values["status"] for view in history] == ["ACTIVE", "VOID"]
-    assert history[0].values["credit"] == history[1].values["credit"]
+    assert [view.fact_ref.version for view in history] == [1, 2]
+    assert history[0].values["credit"] == refund["credit"]
+    assert history[1].values["credit"] == reverse["credit"]
+    if transition == "refund_void":
+        assert after_reversal.refund_by_currency == ()
+        assert after_reversal.net_expense_by_currency == (("JPY", "1000"),)
+        assert after_reversal.collection.balances[0].balance_amount == "91.00"
+        assert history[1].values["status"] == "VOID"
+    else:
+        assert after_reversal.refund_by_currency == (("JPY", "900"),)
+        assert after_reversal.net_expense_by_currency == (("JPY", "100"),)
+        assert after_reversal.collection.balances[0].balance_amount == "99.24"
+        assert history[1].values["status"] == "ACTIVE"
+    snapshot_path = tmp_path / "verified-refund.sqlite"
+    cut = ledger.seal_snapshot(snapshot_path)
+    audited = verify_snapshot_evidence(snapshot_path, port, ledger.binding, cut)
+    assert cut.logical_database_sha256 == after_reversal.read_identity.logical_database_sha256
+    assert audited["fact_version_count"] == after_reversal.collection.fact_version_count
 
 
 def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identity(refund):
@@ -590,3 +620,132 @@ def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identit
         _bind_opening(refund)
         with pytest.raises(LifecycleError, match="exact delivered question"):
             verify_refund_evidence_v1(service, conn, binding, written, refund, None)
+
+
+def test_two_delivered_refunds_cannot_spend_the_same_original_allowance(live, refund):
+    (ledger, port, _, movements, reader, openings, opening_source, opening_draft, account, _) = (
+        prepare_opening(live, opening=None, currency="SGD")
+    )
+    original_values = fields(account, amount="9", original="1000", currency="JPY")
+    original_values["coverage"] = None
+    _, _, purchase = movement(ledger, port, movements, account, "purchase-race", original_values)
+    original = reader.detail(purchase.receipt.record_id)
+    refund["expense"] = {
+        "fact_ref": asdict(original.fact_ref),
+        "economic_event_id": original.economic_event_id,
+    }
+    credit = refund["credit"]
+    credit["account_ref"] = original.values["account_ref"]
+    credit["opening_ref"] = None
+    credit["coverage"].update(treatment="no_baseline", basis="no_active_opening", reply_ref=None)
+
+    targets = {}
+    port.refund_target_v1 = lambda conn, identity: targets[identity]
+    refunds = DailyRefundServiceV1(ledger)
+    delivered = []
+    for name, original_amount, credited in (("first", "600", "5.52"), ("second", "500", "4.61")):
+        text = f"Received {name} refund"
+        source = VerifiedSource(
+            f"{name}-refund",
+            "user",
+            "chat",
+            f"{name}-refund-message",
+            text,
+            sha256(text.encode()).hexdigest(),
+            1792937010,
+        )
+        port.sources[source.evidence_id] = source
+        captured = ledger.capture(source.evidence_id, f"capture-{name}-refund")
+        values = deepcopy(refund)
+        values["original"]["amount"] = original_amount
+        values["credit"]["amount"] = credited
+        instruction = instruction_ref(asdict(source), ledger.binding)
+        values["instruction_ref"] = instruction
+        _bind_opening(values)
+        targets[source.evidence_id] = VerifiedRefundTargetV1(
+            f"{name}-selection",
+            canonical(
+                {
+                    "format": TARGET_FORMAT,
+                    "transition": "refund_create",
+                    "instruction_ref": instruction,
+                    "original_expense": refund["expense"],
+                    "refund_predecessor": None,
+                    "reason_span": None,
+                }
+            ),
+        )
+        draft = refunds.propose(
+            captured.source_id, values, f"{name}-observation", f"propose-{name}-refund"
+        )
+        review = refunds.prepare_review(draft.proposal_id, draft.version)
+        delivered.append(refunds.record_delivery(review.review_id, f"card-{name}"))
+
+    before = ledger.reader().full_audit()
+    first = refunds.confirm(delivered[0].review_id, "approve-first", "post-first")
+    with pytest.raises(LifecycleError, match="exceed the expense"):
+        refunds.confirm(delivered[1].review_id, "approve-second", "post-second")
+    assert (
+        refunds.lookup_commit_receipt(
+            "post-second", review_id=delivered[1].review_id, action_evidence_id="approve-second"
+        )
+        is None
+    )
+    after = ledger.reader().full_audit()
+    assert after["fact_version_count"] == before["fact_version_count"] + 1
+    assert after["event_count"] == before["event_count"] + 1
+    snapshot = reader.collect_with_refunds_v3()
+    assert snapshot.refunds[0].record_id == first.record_id
+    assert snapshot.net_expense_by_currency == (("JPY", "400"),)
+    assert snapshot.collection.balances[0].recorded_net_change == "-3.48"
+
+    boundary = {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": refund["received_date"],
+        "timezone": "Asia/Singapore",
+    }
+    account_view = reader.collect_accounts().accounts[0]
+    pending = opening_proposal(
+        ledger,
+        port,
+        openings,
+        opening_source,
+        opening_draft,
+        account_view,
+        "opening-with-refund",
+        opening_command(kind="opening_set", amount="110", boundary=boundary),
+    )
+    question = openings.opening_questions_v1(pending.proposal_id)
+    subjects = {item["impact_role"]: item for item in question["subjects"]}
+    assert set(subjects) == {"debit", "refund_credit"}
+    assert subjects["refund_credit"]["original_amount"] == "600"
+    assert subjects["refund_credit"]["account_amount"] == "5.52"
+    delivered_opening = port.deliver_opening_question(question, "opening-with-refund-delivery")
+    answers = row_reply(
+        port,
+        "opening-with-refund-answer",
+        (subjects["debit"], "excluded"),
+        (subjects["refund_credit"], "included"),
+    )
+    ready = opening_proposal(
+        ledger,
+        port,
+        openings,
+        opening_source,
+        pending,
+        account_view,
+        "opening-with-refund-answer",
+        opening_command(kind="opening_set", amount="110", boundary=boundary, answers=answers),
+        "opening-with-refund",
+        delivered_opening,
+    )
+    finish(openings, ready, "opening-with-refund-answer")
+    mapped = reader.collect_with_refunds_v3()
+    assert mapped.collection.balances[0].balance_amount == "101.00"
+    assert mapped.net_expense_by_currency == snapshot.net_expense_by_currency
+    effects = {effect.values["impact_role"]: effect.values for effect in mapped.effects}
+    assert effects["refund_credit"]["treatment"] == "included"
+    assert effects["refund_credit"]["balance_impact"] == "0.00"
+    assert effects["refund_credit"]["recorded_change"] == "5.52"

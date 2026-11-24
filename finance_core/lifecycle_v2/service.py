@@ -975,6 +975,7 @@ class LedgerService:
                     # foreign-key enforcement on the immutable copy as on the live read.
                     readback.execute("PRAGMA foreign_keys=ON")
                     require_foreign_keys_enabled(readback)
+                    readback.execute("BEGIN")
                     validate_application_database(readback, migration, schema, sealed_ledger)
                     _snapshot_integrity(readback)
                     readback.row_factory = sqlite3.Row

@@ -416,6 +416,7 @@ def verify_review(service, conn, review, *, _rows=None):
     if strict_json(review["material_json"]).get("format") in {
         "finance-daily-opening-review-v2",
         "finance-daily-opening-review-v3",
+        "finance-daily-opening-review-v4",
     }:
         from .opening_changes_v1 import verify_review as verify_opening_review
 
@@ -1419,6 +1420,7 @@ class DailyAccountServiceV1:
                 if material["format"] in {
                     "finance-daily-opening-review-v2",
                     "finance-daily-opening-review-v3",
+                    "finance-daily-opening-review-v4",
                 }:
                     from .opening_changes_v1 import require_current_opening
 
@@ -1448,6 +1450,7 @@ class DailyAccountServiceV1:
                 if material["format"] in {
                     "finance-daily-opening-review-v2",
                     "finance-daily-opening-review-v3",
+                    "finance-daily-opening-review-v4",
                 }:
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
                 elif needs_closure(values) and material["opening_dependency_closure"] != closure(
