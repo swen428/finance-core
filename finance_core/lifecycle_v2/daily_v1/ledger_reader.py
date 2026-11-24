@@ -21,7 +21,13 @@ from ._impacts_v1 import (
 from .accounts import _audit, _BoundService, bundle_ref
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json
 from .movement_contracts import MOVEMENT_FORMAT
-from .reader import DailyAccountReaderV1, DailyReadIdentityV1, _read_limits, _view
+from .reader import (
+    DailyAccountReaderV1,
+    DailyReadIdentityV1,
+    DailyReadLimitsV1,
+    _read_limits,
+    _view,
+)
 from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
 from .transfer_facts_v1 import TRANSFER_FORMAT, project_transfer_fact_v1
 
@@ -137,6 +143,39 @@ class DailyLedgerWithRefundsV3:
         return self.collection.read_identity
 
 
+@dataclass(frozen=True)
+class DailyTransactionHistoryV1:
+    record_id: str
+    versions: tuple[DailyMovementViewV1, ...]
+
+    @property
+    def current(self) -> DailyMovementViewV1:
+        return self.versions[-1]
+
+
+@dataclass(frozen=True)
+class DailyQueryContributionV1:
+    kind: Literal["income", "expense", "refund"]
+    currency: str
+    amount: str
+    business_date: str
+    fact_ref: BundleFactRefV1
+
+
+@dataclass(frozen=True)
+class DailyLedgerQuerySnapshotV1:
+    collection: DailyLedgerCollectionV1
+    transactions: tuple[DailyTransactionHistoryV1, ...]
+    contributions: tuple[DailyQueryContributionV1, ...]
+    refund_by_currency: tuple[tuple[str, str], ...]
+    net_expense_by_currency: tuple[tuple[str, str], ...]
+    format: str = "finance-daily-ledger-query-snapshot-v1"
+
+    @property
+    def read_identity(self) -> DailyReadIdentityV1:
+        return self.collection.read_identity
+
+
 def _resolve_current_transfer(values, fact_ref, accounts, *, conn=None):
     """Resolve one exact current fact against each relevant account opening."""
     projection = project_transfer_fact_v1(values)
@@ -158,6 +197,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         include_contributions=False,
         include_transfers=False,
         include_refunds=False,
+        include_refund_contributions=False,
     ):
         base = self._service
         max_records, max_versions = _read_limits(limits, base.daily_capacity)
@@ -206,6 +246,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                 income, expense, refunded = {}, {}, {}
                 resolved_effects = []
                 contributions = []
+                refund_contributions = []
                 net = {k: Decimal(0) for k in accounts}
                 delta = dict(net)
                 with localcontext(
@@ -257,7 +298,8 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         for currency, amount in charges:
                             add_total("expense", currency, amount, business_date, view.fact_ref)
                     for view in refunds:
-                        projection = project_refund_fact_v1(view.values)
+                        values = view.values
+                        projection = project_refund_fact_v1(values)
                         credit = projection.credit_effect
                         if credit is None:
                             continue
@@ -272,9 +314,18 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                         delta[account_id] += Decimal(resolved["balance_impact"])
                         resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
                         currency = projection.terms.original_currency
-                        refunded[currency] = refunded.get(currency, Decimal(0)) + Decimal(
-                            projection.terms.original_amount
-                        )
+                        amount = projection.terms.original_amount
+                        refunded[currency] = refunded.get(currency, Decimal(0)) + Decimal(amount)
+                        if include_refund_contributions:
+                            refund_contributions.append(
+                                DailyQueryContributionV1(
+                                    "refund",
+                                    currency,
+                                    amount,
+                                    values["received_date"],
+                                    view.fact_ref,
+                                )
+                            )
 
                     from ..effective_v1 import _business_fields
 
@@ -370,7 +421,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
                     tuple(resolved_effects),
                     tuple(contributions),
                     tuple(transfers),
-                    (tuple(refunds), refund_amounts, net_amounts),
+                    (tuple(refunds), refund_amounts, net_amounts, tuple(refund_contributions)),
                 )
             finally:
                 conn.rollback()
@@ -398,10 +449,39 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
         collection, _, effects, steps, transfers, refund_data = self._ledger(
             limits, include_contributions=True, include_transfers=True, include_refunds=True
         )
-        refunds, refunded, net = refund_data
+        refunds, refunded, net, _ = refund_data
         return DailyLedgerWithRefundsV3(
             collection, transfers, refunds, steps, effects, refunded, net
         )
+
+    def collect_query_snapshot_v1(
+        self, *, limits: DailyReadLimitsV1 | None = None
+    ) -> DailyLedgerQuerySnapshotV1:
+        """Return complete financial history and contributions from one audited cut."""
+        collection, history, _, steps, _, refund_data = self._ledger(
+            limits,
+            include_contributions=True,
+            include_transfers=True,
+            include_refunds=True,
+            include_refund_contributions=True,
+        )
+        _, refunded, net, refund_contributions = refund_data
+        account_records = {account.bundle_ref.record_id for account in collection.accounts}
+        transactions = tuple(
+            DailyTransactionHistoryV1(record_id, tuple(versions))
+            for record_id, versions in history.items()
+            if record_id not in account_records
+        )
+        contributions = (
+            tuple(
+                DailyQueryContributionV1(
+                    item.kind, item.currency, item.amount, item.business_date, item.fact_ref
+                )
+                for item in steps
+            )
+            + refund_contributions
+        )
+        return DailyLedgerQuerySnapshotV1(collection, transactions, contributions, refunded, net)
 
     def refund_history_v1(self, record_id, *, limits=None):
         """Read the complete verified version history of one linked refund."""
