@@ -127,6 +127,9 @@ def _compile_finalization(
         raise LifecycleError("Economic source already posted")
     economic = predecessor["economic_event_id"] if predecessor else source["source_key"]
     values = _money(json.loads(row["values_json"]))
+    from .daily_v1.refund_inventory_v1 import require_refund_compatible_expense_change
+
+    require_refund_compatible_expense_change(conn, predecessor, values)
     previous = predecessor["fact_sha256"] if predecessor else None
     sha = digest(
         _fact_material(record_id, version + 1, economic, source["source_id"], values, previous)

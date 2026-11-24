@@ -379,7 +379,7 @@ def verify_review(service, conn, review, *, _rows=None):
     return expected, delivery
 
 
-def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None):
+def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None, label="Transfer"):
     if _rows is None:
         used = conn.execute(
             "SELECT 1 FROM l2_facts WHERE source_id=? AND (? IS NULL OR commit_seq<?) LIMIT 1",
@@ -391,7 +391,7 @@ def _require_unused_capture(conn, source_id, before_seq=None, *, _rows=None):
             for row in _rows.many(conn, "source_facts", source_id)
         )
     if used:
-        raise LifecycleError("Transfer capture already has a posted fact")
+        raise LifecycleError(f"{label} capture already has a posted fact")
 
 
 def _require_separate_action(conn, proposal, action_id):
