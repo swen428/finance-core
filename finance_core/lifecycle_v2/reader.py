@@ -138,8 +138,10 @@ def _audit_connection(conn, *, _rows=None):
             "finance-daily-movement-review-v2",
             "finance-daily-opening-review-v2",
             "finance-daily-opening-review-v3",
+            "finance-daily-opening-review-v4",
             "finance-daily-transfer-review-v1",
             "finance-daily-transfer-change-review-v1",
+            "finance-daily-refund-review-v1",
         }:
             raise LifecycleError("Unsupported review format")
         values_key = "after_values" if "format" in material else "values"
@@ -444,6 +446,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.transfer_drafts_v1 import verify_proposal as verify_transfer_proposal
 
         return verify_transfer_proposal(service, conn, proposal, _rows=_rows)
+    if sealed.get("format") == "finance-daily-refund-draft-v1":
+        from .daily_v1.refund_drafts_v1 import verify_proposal as verify_refund_proposal
+
+        return verify_refund_proposal(service, conn, proposal, _rows=_rows)
     if sealed.get("format") == "finance-daily-movement-observation-v1":
         from .daily_v1.movements import verify_proposal as verify_movement_proposal
 
@@ -582,6 +588,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
+    if material.get("format") == "finance-daily-refund-review-v1":
+        from .daily_v1.refund_drafts_v1 import verify_review as verify_refund_review
+
+        return verify_refund_review(service, conn, review, _rows=_rows)
     if material.get("format") in {
         "finance-daily-transfer-review-v1",
         "finance-daily-transfer-change-review-v1",
@@ -592,6 +602,7 @@ def verify_review(service, conn, review, *, _rows=None):
     if material.get("format") in {
         "finance-daily-opening-review-v2",
         "finance-daily-opening-review-v3",
+        "finance-daily-opening-review-v4",
     }:
         from .daily_v1.opening_changes_v1 import verify_review as verify_opening_review
 
@@ -680,9 +691,11 @@ def verify_record(service, conn, record_id, *, _rows=None):
     from .contracts import ExpectedAction
     from .daily_v1.movement_contracts import CORRECTION_OPENING_BASIS
     from .daily_v1.movements import reuses_target_selection_evidence
+    from .daily_v1.refund_inventory_v1 import require_refund_compatible_expense_change
 
     audit_record_inventory(conn, record_id, _rows=_rows)
     previous = None
+    previous_fact = None
     version = 0
     economic = None
     for fact in (
@@ -722,6 +735,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
             raise LifecycleError("Current record/version predecessor hash mismatch")
         economic = fact["economic_event_id"]
         previous = fact["fact_sha256"]
+        predecessor, previous_fact = previous_fact, fact
         event = (
             _rows.one(conn, "event", fact["commit_seq"])
             if _rows is not None
@@ -736,6 +750,9 @@ def verify_record(service, conn, record_id, *, _rows=None):
 
             verify_imported_fact(conn, fact, service.legacy_verifier)
             continue
+        require_refund_compatible_expense_change(
+            conn, predecessor, values, before_seq=fact["commit_seq"]
+        )
         review = (
             _rows.one(conn, "review", fact["review_id"])
             if _rows is not None
@@ -804,6 +821,10 @@ def verify_record(service, conn, record_id, *, _rows=None):
             from .daily_v1.transfer_drafts_v1 import verify_confirmed_transfer
 
             verify_confirmed_transfer(conn, fact, review, expected, action, _rows=_rows)
+        if values.get("format") == "finance-daily-refund-v1":
+            from .daily_v1.refund_drafts_v1 import verify_confirmed_refund
+
+            verify_confirmed_refund(service, conn, fact, review, expected, action, _rows=_rows)
         payload = json.loads(event["payload_json"])
         accepted_at = payload.get("accepted_at")
         review_material = json.loads(review["material_json"])
@@ -868,7 +889,7 @@ def _has_daily_values(conn):
         or conn.execute(
             "SELECT EXISTS(SELECT 1 FROM l2_proposals "
             "WHERE CASE WHEN json_valid(values_json) THEN json_extract(values_json, '$.format') "
-            "END IN (?, ?, ?, ?, ?, ?, ?, ?))",
+            "END IN (?, ?, ?, ?, ?, ?, ?, ?, ?))",
             (
                 BUNDLE_FORMAT,
                 "finance-daily-account-bundle-v2",
@@ -878,6 +899,7 @@ def _has_daily_values(conn):
                 "finance-daily-movement-v1",
                 "finance-daily-movement-incomplete-v1",
                 "finance-daily-transfer-v1",
+                "finance-daily-refund-v1",
             ),
         ).fetchone()[0]
     )

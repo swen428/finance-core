@@ -139,6 +139,11 @@ def registered_values(value):
         if value["format"] == TRANSFER_FORMAT:
             project_transfer_fact_v1(value)
             return value
+        if value["format"] == "finance-daily-refund-v1":
+            from .refund_facts_v1 import project_refund_fact_v1
+
+            project_refund_fact_v1(value)
+            return value
         if value["format"] not in BUNDLE_FORMATS:
             raise LifecycleError("unsupported_record_format")
         return validate_bundle(value)
@@ -189,7 +194,11 @@ def closure(
                 owner = opening_owners.setdefault(identity, fact["record_id"])
                 if owner != fact["record_id"]:
                     raise LifecycleError("Opening identity has multiple owners")
-        elif values.get("format") in {"finance-daily-movement-v1", TRANSFER_FORMAT}:
+        elif values.get("format") in {
+            "finance-daily-movement-v1",
+            TRANSFER_FORMAT,
+            "finance-daily-refund-v1",
+        }:
             pass  # Exact daily fact already validated by registered_values.
         else:
             # This is the exact old native expense domain, with unknown account.
@@ -407,6 +416,7 @@ def verify_review(service, conn, review, *, _rows=None):
     if strict_json(review["material_json"]).get("format") in {
         "finance-daily-opening-review-v2",
         "finance-daily-opening-review-v3",
+        "finance-daily-opening-review-v4",
     }:
         from .opening_changes_v1 import verify_review as verify_opening_review
 
@@ -613,6 +623,10 @@ class _EvidenceReadPort:
                 method = getattr(self._port, name, None)
                 if not callable(method):
                     raise LifecycleError("Authenticated transfer evidence is unavailable")
+            elif name in {"refund_target_v1", "refund_opening_reply_v1"}:
+                method = getattr(self._port, name, None)
+                if not callable(method):
+                    raise LifecycleError("Authenticated refund evidence is unavailable")
             else:
                 method = getattr(self._port, name)
             actual = (
@@ -679,6 +693,16 @@ class _EvidenceReadPort:
         return self._call(
             "transfer_change_target_v1", VerifiedTransferChangeTargetV1, conn, identity
         )
+
+    def refund_target_v1(self, conn, identity):
+        from .refund_evidence_v1 import VerifiedRefundTargetV1
+
+        return self._call("refund_target_v1", VerifiedRefundTargetV1, conn, identity)
+
+    def refund_opening_reply_v1(self, conn, identity):
+        from .refund_evidence_v1 import VerifiedRefundOpeningReplyV1
+
+        return self._call("refund_opening_reply_v1", VerifiedRefundOpeningReplyV1, conn, identity)
 
     def opening_instruction_link_v1(self, conn, identity, expected):
         from .opening_contracts_v1 import VerifiedOpeningInstructionLinkV1
@@ -1396,6 +1420,7 @@ class DailyAccountServiceV1:
                 if material["format"] in {
                     "finance-daily-opening-review-v2",
                     "finance-daily-opening-review-v3",
+                    "finance-daily-opening-review-v4",
                 }:
                     from .opening_changes_v1 import require_current_opening
 
@@ -1425,6 +1450,7 @@ class DailyAccountServiceV1:
                 if material["format"] in {
                     "finance-daily-opening-review-v2",
                     "finance-daily-opening-review-v3",
+                    "finance-daily-opening-review-v4",
                 }:
                     require_current_opening(conn, expected, proposal, values, action_evidence_id)
                 elif needs_closure(values) and material["opening_dependency_closure"] != closure(
