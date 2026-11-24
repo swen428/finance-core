@@ -993,8 +993,11 @@ def test_large_valid_refund_inventory_binds_exactly_without_overflowing_a_review
     assert amended.allowance_sha256 != summary["allowance_sha256"]
 
 
-def _refund_instruction(port, ledger, value, targets, identity, *, preparation_id=None):
-    original = "Refund received for the selected purchase"
+def _refund_instruction(
+    port, ledger, value, targets, identity, *, preparation_id=None, previous=None
+):
+    reason = value["reason_ref"]
+    original = reason["quote"] if reason else "Refund received for the selected purchase"
     source = VerifiedSource(
         identity,
         "user",
@@ -1006,14 +1009,17 @@ def _refund_instruction(port, ledger, value, targets, identity, *, preparation_i
     )
     port.sources[identity] = source
     value["instruction_ref"] = instruction_ref(asdict(source), ledger.binding)
-    _bind_opening(value)
+    if reason is not None:
+        reason["instruction_ref"] = value["instruction_ref"]
+    if value["status"] != "VOID":
+        _bind_opening(value)
     selection = {
         "format": TARGET_FORMAT,
         "transition": value["transition"],
         "instruction_ref": value["instruction_ref"],
         "original_expense": value["expense"],
-        "refund_predecessor": None,
-        "reason_span": None,
+        "refund_predecessor": asdict(previous) if previous is not None else None,
+        "reason_span": reason["span"] if reason else None,
     }
     if preparation_id is not None:
         selection["preparation_id"] = preparation_id
@@ -1021,7 +1027,10 @@ def _refund_instruction(port, ledger, value, targets, identity, *, preparation_i
     return source
 
 
-def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live, refund):
+@pytest.mark.parametrize("path", ["direct", "reselect", "both_pending"])
+def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(
+    live, refund, path, monkeypatch
+):
     boundary = {
         "format": "finance-daily-as-of-v1",
         "precision": "date",
@@ -1049,6 +1058,27 @@ def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live,
     source = _refund_instruction(port, ledger, refund, targets, "coverage-pending")
     captured = ledger.capture(source.evidence_id, "capture-pending-coverage")
     service = DailyRefundServiceV1(ledger)
+    competing = None
+    if path == "both_pending":
+        other = deepcopy(refund)
+        other["original"]["amount"] = "200"
+        other["received_date"] = "2026-11-25"
+        other["credit"]["amount"] = "1.84"
+        other["credit"]["coverage"].update(treatment="excluded", basis="strictly_later")
+        other_input = _refund_instruction(port, ledger, other, targets, "other-actual-refund")
+        other_capture = ledger.capture(other_input.evidence_id, "capture-other-actual-refund")
+        other_draft = service.propose(
+            other_capture.source_id, other, "other-observation", "propose-other"
+        )
+        other_card = service.prepare_review(other_draft.proposal_id, other_draft.version)
+        service.record_delivery(other_card.review_id, "deliver-other-card")
+        other_receipt = service.confirm(other_card.review_id, "accept-other", "confirm-other")
+        competing = BundleFactRefV1(
+            other_receipt.record_id,
+            other_receipt.version,
+            other_receipt.fact_sha256,
+            other_receipt.commit_seq,
+        )
     before = ledger.reader().full_audit()
     pending = service.propose(captured.source_id, refund, "pending-coverage", "save-pending")
     state = service.proposal_state_v1(pending.proposal_id)
@@ -1058,6 +1088,43 @@ def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live,
     with pytest.raises(LifecycleError, match="requires a new eligible proposal"):
         service.prepare_review(pending.proposal_id, pending.version)
 
+    if path == "reselect":
+        replacement = fields(account, amount="9", original="1200", currency="JPY")
+        _, _, amended = movement(
+            ledger,
+            port,
+            movements,
+            account,
+            "amend-before-open-answer",
+            replacement,
+            target=original,
+            kind="movement_correct",
+        )
+        current = reader.detail(amended.receipt.record_id)
+        refund["expense"] = {
+            "fact_ref": asdict(current.fact_ref),
+            "economic_event_id": current.economic_event_id,
+        }
+        source = _refund_instruction(
+            port,
+            ledger,
+            refund,
+            targets,
+            "choose-new-version",
+            preparation_id=pending.proposal_id,
+        )
+        pending = service.propose(
+            captured.source_id,
+            refund,
+            "reselected",
+            "save-reselected",
+            expected_proposal_version=pending.version,
+        )
+        state = service.proposal_state_v1(pending.proposal_id)
+        assert state["status"] == "pending_opening"
+        assert state["original_expense"] == asdict(current.fact_ref)
+
+    before_confirmation = ledger.reader().full_audit()["fact_version_count"]
     ledger.owner.close()
     with acquire_production_owner(live[2]) as owner:
         reopened = LedgerService(owner, port, ledger.binding, ledger.clock)
@@ -1099,7 +1166,7 @@ def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live,
                 refund,
                 "wrong-opening",
                 "wrong-opening-proposal",
-                expected_proposal_version=1,
+                expected_proposal_version=pending.version,
             )
         question["preparation_id"] = pending.proposal_id
         ready = service.propose(
@@ -1107,15 +1174,47 @@ def test_same_day_opening_draft_resumes_after_restart_with_exact_new_reply(live,
             refund,
             "right-opening",
             "right-opening-proposal",
-            expected_proposal_version=1,
+            expected_proposal_version=pending.version,
+        )
+        if competing is not None:
+            assert service.proposal_state_v1(ready.proposal_id)["status"] == "pending_allowance"
+            with pytest.raises(LifecycleError, match="requires a new eligible proposal"):
+                service.prepare_review(ready.proposal_id, ready.version)
+            void = _change(other, "refund_void")
+            void["status"] = "VOID"
+            _refund_instruction(port, reopened, void, targets, "void-other", previous=competing)
+            release = service.propose(
+                other_capture.source_id,
+                void,
+                "release-other",
+                "release-other-proposal",
+                expected_proposal_version=1,
+                replaced=competing,
+            )
+            release_card = service.prepare_review(release.proposal_id, release.version)
+            service.record_delivery(release_card.review_id, "deliver-release-card")
+            service.confirm(release_card.review_id, "accept-release", "confirm-release")
+            before_confirmation += 1
+        if path == "direct":
+            unissued = service.prepare_review(ready.proposal_id, ready.version)
+            retained_audit = reopened.reader().full_audit()
+            with monkeypatch.context() as scoped:
+                scoped.setattr(reopened, "clock", lambda: unissued.material["expires_at"])
+                with pytest.raises(LifecycleError, match="requires a fresh proposal"):
+                    service.prepare_review(ready.proposal_id, ready.version)
+            assert reopened.reader().full_audit() == retained_audit
+        ready = service.propose(
+            captured.source_id,
+            refund,
+            "reuse-exact-proof",
+            "reuse-exact-proof-op",
+            expected_proposal_version=ready.version,
         )
         assert service.proposal_state_v1(ready.proposal_id)["status"] == "eligible"
         review = service.prepare_review(ready.proposal_id, ready.version)
         service.record_delivery(review.review_id, "new-refund-card")
         service.confirm(review.review_id, "confirm-new-refund", "post-new-refund")
-        assert (
-            reopened.reader().full_audit()["fact_version_count"] == before["fact_version_count"] + 1
-        )
+        assert reopened.reader().full_audit()["fact_version_count"] == before_confirmation + 1
         with pytest.raises(LifecycleError, match="stale_bundle_ref|stale_proposal"):
             service.prepare_review(pending.proposal_id, pending.version)
 

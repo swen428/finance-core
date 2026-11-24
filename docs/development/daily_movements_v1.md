@@ -333,3 +333,8 @@ reference. Reopen that draft and bind the later delivered question to its
 `preparation_id` and credit digest. The later answer creates a new proposal
 version. A changed expense version requires a new independently retained
 selection that identifies the exact pending preparation.
+
+A later proposal keeps each retained selection and opening answer tied to the
+preparation it actually answered. Reuse the exact answer when its credit
+digest and reply ID remain the same. A superseded or expired undelivered
+card requires a fresh proposal before delivery.

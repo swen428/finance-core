@@ -26,10 +26,37 @@ class RefundReviewPreviewV1:
 
 
 @dataclass(frozen=True)
-class PendingRefundPreparationV1:
+class RefundDraftPredecessorV1:
     proposal_id: str
+    status: str
     instruction_id: str
-    opening_sha256: str | None
+    selection_preparation_id: str | None
+    pending_opening_sha256: str | None
+    opening_preparation_id: str | None
+    opening_reply_id: str | None
+    credit_sha256: str
+
+    def selection_scope(self, instruction_id: str) -> str | None:
+        if instruction_id == self.instruction_id:
+            return self.selection_preparation_id
+        if self.status != "eligible":
+            return self.proposal_id
+        return None
+
+    def opening_scope(self, coverage: dict[str, Any]) -> str | None:
+        if coverage["basis"] != "authenticated_reply":
+            return None
+        credit_sha256 = coverage["binding_sha256"]
+        if self.pending_opening_sha256 is not None:
+            if credit_sha256 != self.pending_opening_sha256:
+                raise LifecycleError("A changed refund credit requires a new opening preparation")
+            return self.proposal_id
+        if (
+            credit_sha256 == self.credit_sha256
+            and coverage["reply_ref"]["evidence_id"] == self.opening_reply_id
+        ):
+            return self.opening_preparation_id
+        return None
 
 
 def _resolved_credit(conn, values, fact_ref, before_seq):
@@ -87,7 +114,7 @@ def _refund_review_material(
     *,
     before_seq: int | None = None,
     allow_pending: bool = False,
-    preparation: PendingRefundPreparationV1 | None = None,
+    preparation: RefundDraftPredecessorV1 | None = None,
 ) -> dict[str, Any]:
     fingerprint = _fingerprint(conn)
     dependencies = refund_posting_state_v1(
@@ -96,14 +123,13 @@ def _refund_review_material(
     source = service._source(
         conn, source_id, allow_archived=before_seq is not None or replaced is not None
     )
-    selection_preparation = None
     if replaced is None:
         if source["generation"] != binding.generation:
             raise LifecycleError("Refund source belongs to another capture generation")
         instruction = VerifiedSource(**_source_instruction(source))
         requested = values["instruction_ref"]["evidence_id"]
         if requested != instruction.evidence_id:
-            if preparation is None:
+            if preparation is None or preparation.selection_scope(requested) is None:
                 raise LifecycleError("A changed refund selection requires its exact pending draft")
             selected_by = service.port.source(conn, requested)
             if (
@@ -113,7 +139,6 @@ def _refund_review_material(
             ):
                 raise LifecycleError("Refund reselection requires independent authenticated input")
             instruction = selected_by
-            selection_preparation = preparation.proposal_id
         before_values = None
         before_effect = []
     else:
@@ -121,21 +146,15 @@ def _refund_review_material(
         if previous is None or previous["source_id"] != source_id:
             raise LifecycleError("Refund predecessor belongs to another capture")
         instruction = service.port.source(conn, values["instruction_ref"]["evidence_id"])
-        if preparation is not None and instruction.evidence_id != preparation.instruction_id:
-            selection_preparation = preparation.proposal_id
         before_values = strict_json(previous["values_json"])
         before_effect = _resolved_credit(conn, before_values, asdict(replaced), before_seq)
 
-    opening_preparation = None
-    coverage = values["credit"]["coverage"]
-    if (
-        preparation is not None
-        and preparation.opening_sha256 is not None
-        and coverage["basis"] == "authenticated_reply"
-    ):
-        if coverage["binding_sha256"] != preparation.opening_sha256:
-            raise LifecycleError("A changed refund credit requires a new opening preparation")
-        opening_preparation = preparation.proposal_id
+    selection_preparation = (
+        preparation.selection_scope(instruction.evidence_id) if preparation is not None else None
+    )
+    opening_preparation = (
+        preparation.opening_scope(values["credit"]["coverage"]) if preparation is not None else None
+    )
     evidence = verify_refund_evidence_v1(
         service,
         conn,

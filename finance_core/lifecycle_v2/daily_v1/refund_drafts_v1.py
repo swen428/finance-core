@@ -36,7 +36,7 @@ from .accounts import (
 from .contracts import BundleFactRefV1, exact, strict_json, text
 from .refund_allowance_v1 import _fact_at
 from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
-from .refund_review_v1 import PendingRefundPreparationV1, _refund_review_material
+from .refund_review_v1 import RefundDraftPredecessorV1, _refund_review_material
 from .transfer_drafts_v1 import _require_unused_capture, _verified_delivery
 
 DRAFT_FORMAT = "finance-daily-refund-draft-v1"
@@ -72,19 +72,27 @@ def _previous_proposal(conn, source_id, version, *, _rows=None):
     return previous["proposal_id"]
 
 
-def _pending_preparation(conn, expected):
+def _prior_preparation(conn, expected):
     if expected.current_proposal_id is None:
         return None
     row = _row(conn, "l2_proposals", "proposal_id", expected.current_proposal_id)
-    sealed = strict_json(row["observation_json"])
-    eligibility = sealed["observation"]["eligibility"]
-    if row["source_id"] != expected.source_id or eligibility["status"] == "eligible":
-        return None
+    if row["source_id"] != expected.source_id:
+        raise LifecycleError("Refund preparation predecessor belongs to another source")
+    observed = strict_json(row["observation_json"])["observation"]
+    eligibility = observed["eligibility"]
+    proof = observed["retained_evidence"]
+    target = strict_json(proof["selection"]["target_json"])
+    opening = proof["opening_question"]
     values = strict_json(row["values_json"])
-    return PendingRefundPreparationV1(
-        row["proposal_id"],
-        values["instruction_ref"]["evidence_id"],
-        eligibility["pending_opening_sha256"],
+    return RefundDraftPredecessorV1(
+        proposal_id=row["proposal_id"],
+        status=eligibility["status"],
+        instruction_id=values["instruction_ref"]["evidence_id"],
+        selection_preparation_id=target.get("preparation_id"),
+        pending_opening_sha256=eligibility["pending_opening_sha256"],
+        opening_preparation_id=opening["question"].get("preparation_id") if opening else None,
+        opening_reply_id=opening["reply_evidence_id"] if opening else None,
+        credit_sha256=values["credit"]["coverage"]["binding_sha256"],
     )
 
 
@@ -177,7 +185,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         target,
         before_seq=cutoff,
         allow_pending=True,
-        preparation=_pending_preparation(conn, expected),
+        preparation=_prior_preparation(conn, expected),
     )
     observed = _observation(expected, proposal["observation_id"], material)
     event = (
@@ -211,7 +219,7 @@ def _review_material(service, conn, proposal, expected, review_id, created_at, c
         strict_json(proposal["values_json"]),
         replaced,
         before_seq=cutoff,
-        preparation=_pending_preparation(conn, expected),
+        preparation=_prior_preparation(conn, expected),
     )
     return {
         "format": REVIEW_FORMAT,
@@ -437,7 +445,7 @@ class DailyRefundServiceV1:
                 cleaned,
                 replaced,
                 allow_pending=True,
-                preparation=_pending_preparation(conn, expected),
+                preparation=_prior_preparation(conn, expected),
             )
             observed = _observation(expected, observation_id, material)
             row = {
@@ -493,7 +501,16 @@ class DailyRefundServiceV1:
                 "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
             ).fetchone()
             if existing is not None:
-                verify_review(service, conn, existing)
+                _, delivery = verify_review(service, conn, existing)
+                if delivery is None:
+                    material = strict_json(existing["material_json"])
+                    if (
+                        expected.binding != service.binding
+                        or service._now() >= material["expires_at"]
+                    ):
+                        raise LifecycleError("Undelivered refund review requires a fresh proposal")
+                    _require_current(conn, expected, proposal=proposal)
+                    _require_current_review(service, conn, proposal, expected, existing)
                 return _review_dto(conn, existing)
             if expected.binding != service.binding:
                 raise LifecycleError("Stale refund proposal binding")
