@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from .contracts import LifecycleError, VerifiedSource, canonical, digest
 from .daily_v1.contracts import instruction_ref, validate_as_of
 from .daily_v1.movement_contracts import MOVEMENT_FORMAT, validate_movement
+from .receipt_payment_handoff_v1 import ReceiptPaymentAccountOptionV1
 
 if TYPE_CHECKING:
     from .receipt_review_fields_v1 import ReceiptReviewFieldsV1
@@ -24,6 +25,19 @@ class ReceiptExpenseCandidateV1:
     fields_reply_sha256: str
     values_json: str
     format: str = "finance-receipt-expense-candidate-v1"
+
+
+@dataclass(frozen=True)
+class ReceiptExpenseConfirmationPreviewV1:
+    """Display material from one authenticated receipt read."""
+
+    candidate: ReceiptExpenseCandidateV1
+    account: ReceiptPaymentAccountOptionV1
+    format: str = "finance-receipt-expense-confirmation-preview-v1"
+
+    @property
+    def preview_sha256(self) -> str:
+        return digest(asdict(self))
 
 
 def _coverage_reply(raw, treatment, instruction):

@@ -190,6 +190,7 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
     target = receipt_review_fields_target_v1(prepared)
     assert reader.completed(source_id) is None
     assert reader.expense_candidate(source_id) is None
+    assert reader.expense_confirmation_preview(source_id) is None
     question_timestamp = NOW + 4 * 86400
     reply = VerifiedReceiptPaymentReplyV1(
         "fields-question",
@@ -208,6 +209,7 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
     )
     assert reader.completed(source_id).missing_movement_fields == ("opening_coverage",)
     assert reader.expense_candidate(source_id) is None
+    assert reader.expense_confirmation_preview(source_id) is None
     port.review_reply = VerifiedReceiptReviewFieldsReplyV1(target, reply, "user", "chat")
     audit = ledger.reader().full_audit()
     completed = reader.completed(source_id)
@@ -220,7 +222,12 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         completed.opening_basis == "authenticated_reply" and completed.missing_movement_fields == ()
     )
     candidate = reader.expense_candidate(source_id)
-    values = json.loads(candidate.values_json)
+    preview = reader.expense_confirmation_preview(source_id)
+    assert preview.candidate == candidate
+    assert preview.account == prepared.payment.account
+    values = json.loads(preview.candidate.values_json)
+    assert (values["original_amount"], values["original_currency"]) == ("8.00", "USD")
+    assert (values["account_amount"], preview.account.currency) == ("10.37", "SGD")
     assert candidate.source_id == source_id
     assert candidate.original_media_sha256 == prepared.source.original_sha256
     assert values["funds_time"]["local_date"] == "2026-11-17"
@@ -232,7 +239,7 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         port.review_reply, target=replace(target, debit_response_sha256="7" * 64)
     )
     with pytest.raises(LifecycleError, match="linked payment"):
-        reader.completed(source_id)
+        reader.expense_confirmation_preview(source_id)
     port.review_reply = replace(
         completed.evidence, target=replace(target, source_evidence_id="another-receipt")
     )
@@ -249,6 +256,9 @@ def test_receipt_review_fields_exact_opening_reply_reopens_without_booking(live)
         reopened = LedgerService(owner, port, ledger.binding, ledger.clock)
         assert ReceiptReviewReaderV1(reopened).completed(source_id) == completed
         assert ReceiptReviewReaderV1(reopened).expense_candidate(source_id) == candidate
+        reopened_preview = ReceiptReviewReaderV1(reopened).expense_confirmation_preview(source_id)
+        assert reopened_preview == preview
+        assert reopened_preview.preview_sha256 == preview.preview_sha256
         assert reopened.reader().full_audit() == audit
         assert reopened.reader().pending() == []
 
