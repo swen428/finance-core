@@ -1,5 +1,6 @@
 """Transfer coverage can be read only from the exact delivered role question."""
 
+import json
 from copy import deepcopy
 from dataclasses import asdict, replace
 from hashlib import sha256
@@ -30,12 +31,18 @@ from finance_core.lifecycle_v2.daily_v1.transfer_evidence_v1 import (
     require_transfer_opening_replies_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.transfer_review_v1 import read_transfer_create_preview_v1
+from finance_core.lifecycle_v2.effective_v1 import (
+    EffectiveFilterV1,
+    EffectiveLedgerReaderV1,
+    EffectiveReadError,
+)
 from tests.daily_account_support_v1 import OpeningPort, command, unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import change, create, setup
 from tests.test_daily_opening_changes_v1 import finish, opening_command, opening_proposal, row_reply
 from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_daily_transfer_opening_v1 import _account, _on
 from tests.test_lifecycle_v2 import live as live
+from tests.test_lifecycle_v2 import response
 
 
 def _retained_questions(
@@ -144,6 +151,104 @@ def _transfer_with_account_snapshots(live, transfer, *, opening_port=False):
         )
     _retained_questions(ledger, port, transfer)
     return ledger, port, daily, reader, out
+
+
+@pytest.fixture
+def mixed_expense_transfer(live, transfer):
+    ledger, port, daily, accounts, _ = setup(live)
+    raw = "2026-10-24 Cafe SGD 12.00"
+    port.add_source("old-expense", raw)
+    port.native_raw["old-observation"] = response(raw)
+    source = ledger.capture("old-expense", "old-capture")
+    proposal = ledger.propose(source.source_id, "old-observation", 0, "old-proposal")
+    review = ledger.prepare_review(proposal.proposal_id, proposal.version)
+    ledger.record_delivery(review.review_id, "old-delivery")
+    expense = ledger.confirm(review.review_id, "old-action", "old-confirm")
+
+    boundary = _on("2026-11-21")
+    debit = _account(ledger, port, daily, accounts, "SGD", "1", boundary)
+    credit = _account(ledger, port, daily, accounts, "MYR", "2", boundary)
+    for leg, account in (
+        (transfer["outgoing"], debit),
+        (transfer["incoming"], credit),
+        (transfer["fee"]["charge"], debit),
+    ):
+        leg.update(account_ref=asdict(account.account_ref), opening_ref=asdict(account.opening_ref))
+        coverage = leg["coverage"]
+        coverage["binding"].update(account_ref=leg["account_ref"], opening_ref=leg["opening_ref"])
+        coverage.update(treatment="excluded", basis="strictly_later", reply_ref=None)
+    _retained_questions(ledger, port, transfer)
+    source = ledger.capture(transfer["instruction_ref"]["evidence_id"], "transfer-capture")
+    service = DailyTransferServiceV1(ledger)
+    proposal = service.propose_create(
+        source.source_id, transfer, "transfer-result", "transfer-draft"
+    )
+    review = service.prepare_review(proposal.proposal_id, proposal.version)
+    service.record_delivery(review.review_id, "transfer-display")
+    posted_transfer = service.confirm(review.review_id, "transfer-action", "transfer-confirm")
+    return ledger, port, expense, posted_transfer
+
+
+def test_original_expense_reads_remain_available_after_confirmed_transfer(mixed_expense_transfer):
+    ledger, _, expense, posted_transfer = mixed_expense_transfer
+    daily = DailyLedgerReaderV1(ledger).collect_with_transfers_v2()
+    assert [fact.record_id for fact in daily.transfers] == [posted_transfer.record_id]
+    assert daily.collection.income_by_currency == ()
+    assert daily.collection.expense_by_currency == (("SGD", "13.00"),)
+    assert daily.collection.unassigned_personal_expense_count == 1
+    assert {
+        (effect.values["impact_role"], effect.values["balance_impact"]) for effect in daily.effects
+    } == {("transfer_out", "-100.00"), ("transfer_in", "330.00"), ("fee_debit", "-1.00")}
+    assert {row.currency: row.balance_amount for row in daily.collection.balances} == {
+        "SGD": "-1.00",
+        "MYR": "430.00",
+    }
+
+    reader = EffectiveLedgerReaderV1.for_daily_ledger(ledger)
+    current = reader.get(expense.record_id)
+    assert (current.record_id, current.fact_sha256, current.currency, current.amount) == (
+        expense.record_id,
+        expense.fact_sha256,
+        "SGD",
+        "12.00",
+    )
+    assert reader.get(posted_transfer.record_id) is None
+    collection = reader.collect()
+    assert collection.scope == "native-lifecycle-v2-original-expenses"
+    assert collection.facts == (current,)
+    history = reader.history(expense.record_id)
+    assert [(fact.fact_sha256, fact.amount) for fact in history.versions] == [
+        (expense.fact_sha256, "12.00")
+    ]
+    assert reader.history(posted_transfer.record_id) is None
+    assert [
+        (item.currency, item.event_count, item.total_amount) for item in reader.summary().items
+    ] == [("SGD", 1, "12.00")]
+    assert json.loads(reader.export_json())["facts"] == [asdict(current)]
+
+
+def test_original_expense_projection_still_requires_transfer_evidence(
+    mixed_expense_transfer, monkeypatch
+):
+    ledger, port, expense, _ = mixed_expense_transfer
+    delivery = port.deliveries["transfer-display"]
+    monkeypatch.setitem(
+        port.deliveries, "transfer-display", replace(delivery, display_sha256="0" * 64)
+    )
+
+    with pytest.raises(
+        LifecycleError, match="Transfer delivery differs from the authenticated review"
+    ):
+        DailyLedgerReaderV1(ledger).collect_with_transfers_v2()
+
+    reader = EffectiveLedgerReaderV1.for_daily_ledger(ledger)
+    expense_filter = EffectiveFilterV1(date_to="2026-10-24", currency="SGD")
+    with pytest.raises(EffectiveReadError) as error:
+        reader.collect(expense_filter)
+    assert error.value.code == "fact_evidence_invalid"
+    with pytest.raises(EffectiveReadError) as error:
+        reader.get(expense.record_id)
+    assert error.value.code == "fact_evidence_invalid"
 
 
 def test_complete_transfer_preview_shows_per_currency_deltas_without_writing(live, transfer):
