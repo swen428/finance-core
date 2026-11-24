@@ -21,7 +21,7 @@ from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     compile_refund_allowance_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.refund_dependencies_v1 import refund_posting_state_v1
-from finance_core.lifecycle_v2.daily_v1.refund_drafts_v1 import DailyRefundDraftServiceV1
+from finance_core.lifecycle_v2.daily_v1.refund_drafts_v1 import DailyRefundServiceV1
 from finance_core.lifecycle_v2.daily_v1.refund_evidence_v1 import (
     OPENING_QUESTION_FORMAT,
     TARGET_FORMAT,
@@ -297,7 +297,7 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
         "timezone": "Asia/Singapore",
     }
     ledger, port, _, movements, reader, account = prepare(
-        live, opening_as_of=opening, currency="SGD"
+        live, opening="100", opening_as_of=opening, currency="SGD"
     )
     values = fields(account, amount="9", original="1000", currency="JPY")
     _, _, receipt = movement(ledger, port, movements, account, "purchase", values)
@@ -373,7 +373,7 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
     assert ledger.reader().full_audit() == audit
 
     retained["original_expense"] = deepcopy(refund["expense"])
-    drafts = DailyRefundDraftServiceV1(ledger)
+    drafts = DailyRefundServiceV1(ledger)
     proposal = drafts.propose(captured.source_id, refund, "refund-observation", "propose-refund")
     assert proposal.version == 1
     after = ledger.reader().full_audit()
@@ -386,6 +386,128 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
     with pytest.raises(LifecycleError, match="replay mismatch"):
         drafts.propose(captured.source_id, refund, "refund-observation", "different-operation")
     assert ledger.reader().full_audit() == after
+
+    review = drafts.prepare_review(proposal.proposal_id, proposal.version)
+    assert {
+        **review.material["refund"],
+        "after_values": review.material["after_values"],
+    } == material
+    assert review.delivery_evidence_id is None
+    delivered = drafts.record_delivery(review.review_id, "actual-refund-card-delivery")
+    assert delivered.delivery_evidence_id == "actual-refund-card-delivery"
+    assert delivered.review_sha256 == review.review_sha256
+    assert drafts.record_delivery(review.review_id, "actual-refund-card-delivery") == delivered
+    with pytest.raises(LifecycleError, match="delivery replay mismatch"):
+        drafts.record_delivery(review.review_id, "different-card-delivery")
+    with pytest.raises(LifecycleError, match="use the explicit daily API"):
+        ledger.confirm(review.review_id, "legacy-confirm", "legacy-confirm-refund")
+    after_delivery = ledger.reader().full_audit()
+    assert after_delivery["event_count"] == after["event_count"] + 2
+    assert after_delivery["fact_version_count"] == audit["fact_version_count"]
+
+    assert (
+        drafts.lookup_commit_receipt(
+            "confirm-first-refund", review_id=review.review_id, action_evidence_id="refund-confirm"
+        )
+        is None
+    )
+    with pytest.raises(LifecycleError, match="separate human action"):
+        drafts.confirm(review.review_id, actual.evidence_id, "reuse-refund-instruction")
+    assert ledger.reader().full_audit() == after_delivery
+    posted = drafts.confirm(review.review_id, "refund-confirm", "confirm-first-refund")
+    assert posted.version == 1
+    assert drafts.confirm(review.review_id, "refund-confirm", "confirm-first-refund") == posted
+    assert (
+        drafts.lookup_commit_receipt(
+            "confirm-first-refund", review_id=review.review_id, action_evidence_id="refund-confirm"
+        )
+        == posted
+    )
+    after_confirmation = ledger.reader().full_audit()
+    assert after_confirmation["fact_version_count"] == audit["fact_version_count"] + 1
+    assert after_confirmation["event_count"] == after_delivery["event_count"] + 1
+    with pytest.raises(LifecycleError, match="exceed the expense"):
+        read_refund_review_v1(ledger, captured.source_id, refund)
+    assert ledger.reader().full_audit() == after_confirmation
+
+    snapshot = reader.collect_with_refunds_v3()
+    assert snapshot.collection.income_by_currency == ()
+    assert snapshot.collection.expense_by_currency == (("JPY", "1000"),)
+    assert snapshot.refund_by_currency == (("JPY", "1000"),)
+    assert snapshot.net_expense_by_currency == (("JPY", "0"),)
+    assert snapshot.collection.balances[0].balance_amount == "100.20"
+    assert snapshot.refunds[0].fact_ref.record_id == posted.record_id
+
+    with pytest.raises(LifecycleError, match="active linked refunds cannot be reversed"):
+        movement(
+            ledger,
+            port,
+            movements,
+            account,
+            "void-original-purchase",
+            {},
+            target=original,
+            kind="movement_void",
+        )
+    assert reader.collect_with_refunds_v3().collection.balances[0].balance_amount == "100.20"
+
+    reverse_source = VerifiedSource(
+        "refund-reverse-source",
+        "user",
+        "chat",
+        "separate-refund-reverse-source-key",
+        "Merchant confirmed the refund",
+        sha256(b"Merchant confirmed the refund").hexdigest(),
+        1792937010,
+    )
+    port.sources[reverse_source.evidence_id] = reverse_source
+    reverse = _change(refund, "refund_void")
+    reverse["status"] = "VOID"
+    reverse_instruction = instruction_ref(asdict(reverse_source), ledger.binding)
+    reverse["instruction_ref"] = reverse_instruction
+    reverse["reason_ref"]["instruction_ref"] = reverse_instruction
+    original_refund = snapshot.refunds[0].fact_ref
+
+    def target_for_both(conn, identity):
+        if identity == actual.evidence_id:
+            return retained_target(conn, identity)
+        assert identity == reverse_source.evidence_id
+        return VerifiedRefundTargetV1(
+            "proof-of-refund-reversal-target",
+            canonical(
+                {
+                    "format": TARGET_FORMAT,
+                    "transition": "refund_void",
+                    "instruction_ref": reverse_instruction,
+                    "original_expense": refund["expense"],
+                    "refund_predecessor": asdict(original_refund),
+                    "reason_span": reverse["reason_ref"]["span"],
+                }
+            ),
+        )
+
+    port.refund_target_v1 = target_for_both
+    reverse_proposal = drafts.propose(
+        captured.source_id,
+        reverse,
+        "reverse-observation",
+        "propose-reversal",
+        expected_proposal_version=1,
+        replaced=original_refund,
+    )
+    reverse_review = drafts.prepare_review(reverse_proposal.proposal_id, reverse_proposal.version)
+    drafts.record_delivery(reverse_review.review_id, "refund-reversal-card")
+    reversed_posting = drafts.confirm(
+        reverse_review.review_id, "refund-reversal-confirmation", "confirm-reversal"
+    )
+    assert (reversed_posting.record_id, reversed_posting.version) == (posted.record_id, 2)
+    after_reversal = reader.collect_with_refunds_v3()
+    assert after_reversal.refund_by_currency == ()
+    assert after_reversal.net_expense_by_currency == (("JPY", "1000"),)
+    assert after_reversal.collection.balances[0].balance_amount == "91.00"
+    history = reader.refund_history_v1(posted.record_id)
+    assert [view.values["status"] for view in history] == ["ACTIVE", "VOID"]
+    assert history[0].values["credit"] == history[1].values["credit"]
 
 
 def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identity(refund):

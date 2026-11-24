@@ -32,7 +32,11 @@ def _inventory(facts, *, daily_only=False):
             if value["account"]["account_id"] != row["record_id"]:
                 raise LifecycleError("Account component belongs to another fact")
             accounts[row["record_id"]] = (bundle_ref(row), row)
-        elif value.get("format") not in {MOVEMENT_FORMAT, TRANSFER_FORMAT}:
+        elif value.get("format") not in {
+            MOVEMENT_FORMAT,
+            TRANSFER_FORMAT,
+            "finance-daily-refund-v1",
+        }:
             _business_fields(canonical(value))
         current[row["record_id"]] = row
     return (
@@ -448,6 +452,13 @@ def opening_inventory(conn, account_id, before_seq=None, *, include_transfers=Fa
                         ),
                     }
                 )
+            continue
+        if values.get("format") == "finance-daily-refund-v1":
+            from .refund_facts_v1 import project_refund_fact_v1
+
+            refund = project_refund_fact_v1(values).credit_effect
+            if refund is not None and refund["account_id"] == account_id:
+                raise LifecycleError("unsupported_refund_opening_dependencies")
             continue
         impact = effect(values)
         if impact and impact["account_id"] == account_id:

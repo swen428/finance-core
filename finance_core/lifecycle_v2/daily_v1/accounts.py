@@ -139,6 +139,11 @@ def registered_values(value):
         if value["format"] == TRANSFER_FORMAT:
             project_transfer_fact_v1(value)
             return value
+        if value["format"] == "finance-daily-refund-v1":
+            from .refund_facts_v1 import project_refund_fact_v1
+
+            project_refund_fact_v1(value)
+            return value
         if value["format"] not in BUNDLE_FORMATS:
             raise LifecycleError("unsupported_record_format")
         return validate_bundle(value)
@@ -189,7 +194,11 @@ def closure(
                 owner = opening_owners.setdefault(identity, fact["record_id"])
                 if owner != fact["record_id"]:
                     raise LifecycleError("Opening identity has multiple owners")
-        elif values.get("format") in {"finance-daily-movement-v1", TRANSFER_FORMAT}:
+        elif values.get("format") in {
+            "finance-daily-movement-v1",
+            TRANSFER_FORMAT,
+            "finance-daily-refund-v1",
+        }:
             pass  # Exact daily fact already validated by registered_values.
         else:
             # This is the exact old native expense domain, with unknown account.

@@ -1009,6 +1009,9 @@ class DailyMovementServiceV1:
                     raise LifecycleError("State changed during source revalidation")
                 _require_current(conn, expected, proposal=proposal)
                 require_accounts(conn, expected, values)
+                from .refund_inventory_v1 import require_refund_compatible_expense_change
+
+                require_refund_compatible_expense_change(conn, predecessor, values)
                 version = expected.expected_version + 1
                 economic = predecessor["economic_event_id"] if predecessor else source["source_key"]
                 previous = predecessor["fact_sha256"] if predecessor else None
