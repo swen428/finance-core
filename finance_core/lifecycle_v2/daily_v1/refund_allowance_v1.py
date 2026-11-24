@@ -209,6 +209,16 @@ class RefundCreditPreviewV1:
     ]
 
 
+def _refund_funds_time(received_date: str) -> dict[str, str | None]:
+    return {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": received_date,
+        "timezone": "Asia/Singapore",
+    }
+
+
 def read_refund_credit_preview_v1(
     service, selected: BundleFactRefV1, terms: RefundTermsV1, received_date: str
 ) -> RefundCreditPreviewV1:
@@ -216,13 +226,7 @@ def read_refund_credit_preview_v1(
     if type(selected) is not BundleFactRefV1 or type(terms) is not RefundTermsV1:
         raise LifecycleError("Exact selected expense fact and refund terms required")
     received = _day(received_date)
-    funds_time = {
-        "format": "finance-daily-as-of-v1",
-        "precision": "date",
-        "timestamp": None,
-        "local_date": received,
-        "timezone": "Asia/Singapore",
-    }
+    funds_time = _refund_funds_time(received)
     with DailyAccountServiceV1(service)._read() as (bound, conn):
         _audit(bound, conn)
         expense = _current_refundable_expense(conn, selected)
