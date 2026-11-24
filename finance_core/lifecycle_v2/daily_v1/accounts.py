@@ -613,6 +613,10 @@ class _EvidenceReadPort:
                 method = getattr(self._port, name, None)
                 if not callable(method):
                     raise LifecycleError("Authenticated transfer evidence is unavailable")
+            elif name in {"refund_target_v1", "refund_opening_reply_v1"}:
+                method = getattr(self._port, name, None)
+                if not callable(method):
+                    raise LifecycleError("Authenticated refund evidence is unavailable")
             else:
                 method = getattr(self._port, name)
             actual = (
@@ -679,6 +683,16 @@ class _EvidenceReadPort:
         return self._call(
             "transfer_change_target_v1", VerifiedTransferChangeTargetV1, conn, identity
         )
+
+    def refund_target_v1(self, conn, identity):
+        from .refund_evidence_v1 import VerifiedRefundTargetV1
+
+        return self._call("refund_target_v1", VerifiedRefundTargetV1, conn, identity)
+
+    def refund_opening_reply_v1(self, conn, identity):
+        from .refund_evidence_v1 import VerifiedRefundOpeningReplyV1
+
+        return self._call("refund_opening_reply_v1", VerifiedRefundOpeningReplyV1, conn, identity)
 
     def opening_instruction_link_v1(self, conn, identity, expected):
         from .opening_contracts_v1 import VerifiedOpeningInstructionLinkV1

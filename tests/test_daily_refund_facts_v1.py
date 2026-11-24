@@ -2,19 +2,31 @@ import sqlite3
 from copy import deepcopy
 from dataclasses import asdict
 from hashlib import sha256
+from types import SimpleNamespace
 
 import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError
-from finance_core.lifecycle_v2.contracts import canonical, digest
+from finance_core.lifecycle_v2.contracts import RuntimeBinding, VerifiedSource, canonical, digest
 from finance_core.lifecycle_v2.daily_v1.accounts import DailyAccountServiceV1
-from finance_core.lifecycle_v2.daily_v1.contracts import BUNDLE_FORMAT, BundleFactRefV1
+from finance_core.lifecycle_v2.daily_v1.contracts import (
+    BUNDLE_FORMAT,
+    BundleFactRefV1,
+    instruction_ref,
+)
 from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     RefundExpenseV1,
     compile_refund_allowance_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.refund_dependencies_v1 import refund_posting_state_v1
+from finance_core.lifecycle_v2.daily_v1.refund_evidence_v1 import (
+    OPENING_QUESTION_FORMAT,
+    TARGET_FORMAT,
+    VerifiedRefundOpeningReplyV1,
+    VerifiedRefundTargetV1,
+    verify_refund_evidence_v1,
+)
 from finance_core.lifecycle_v2.daily_v1.refund_facts_v1 import (
     REFUND_FORMAT,
     project_refund_fact_v1,
@@ -306,3 +318,85 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
         _bind_opening(refund)
         with pytest.raises(LifecycleError, match="actual opening time"):
             refund_posting_state_v1(conn, refund)
+
+
+def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identity(refund):
+    binding = RuntimeBinding("synthetic", "generation", "synthetic-owner", "synthetic-chat")
+
+    def source(evidence_id, raw, timestamp):
+        return VerifiedSource(
+            evidence_id,
+            binding.principal_id,
+            binding.client_id,
+            "source-" + evidence_id,
+            raw,
+            sha256(raw.encode()).hexdigest(),
+            timestamp,
+        )
+
+    written = source("refund-input", "Refund for my old purchase", 1780000000)
+    answer = source("opening-answer", "已包含", 1780000002)
+    refund["instruction_ref"] = instruction_ref(asdict(written), binding)
+    coverage = refund["credit"]["coverage"]
+    coverage["reply_ref"] = instruction_ref(asdict(answer), binding)
+    _bind_opening(refund)
+
+    selected = {
+        "format": TARGET_FORMAT,
+        "transition": "refund_create",
+        "instruction_ref": refund["instruction_ref"],
+        "original_expense": deepcopy(refund["expense"]),
+        "refund_predecessor": None,
+        "reason_span": None,
+    }
+    question = {
+        "format": OPENING_QUESTION_FORMAT,
+        "delivery_id": "real-opening-question",
+        "delivered_at": 1780000001,
+        "credit_sha256": coverage["binding_sha256"],
+    }
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute("BEGIN")
+        chosen = VerifiedRefundTargetV1("retained-selection", canonical(selected))
+
+        def get_selection(actual_conn, identity):
+            assert (actual_conn, identity) == (conn, written.evidence_id)
+            return chosen
+
+        def get_reply(actual_conn, identity):
+            assert (actual_conn, identity) == (conn, answer.evidence_id)
+            return answer
+
+        def get_question(actual_conn, identity):
+            assert (actual_conn, identity) == (conn, answer.evidence_id)
+            return VerifiedRefundOpeningReplyV1(identity, canonical(question))
+
+        service = SimpleNamespace(
+            port=SimpleNamespace(
+                refund_target_v1=get_selection,
+                source=get_reply,
+                refund_opening_reply_v1=get_question,
+            ),
+        )
+        result = verify_refund_evidence_v1(service, conn, binding, written, refund, None)
+        assert result["selection"] == asdict(chosen)
+        assert result["opening_question"] == {
+            "reply_evidence_id": answer.evidence_id,
+            "question": question,
+        }
+
+        chosen = VerifiedRefundTargetV1(answer.evidence_id, canonical(selected))
+        with pytest.raises(LifecycleError, match="require separate proof"):
+            verify_refund_evidence_v1(service, conn, binding, written, refund, None)
+
+        wrong = deepcopy(selected)
+        wrong["original_expense"]["fact_ref"]["record_id"] = "another-purchase"
+        chosen = VerifiedRefundTargetV1("retained-selection", canonical(wrong))
+        with pytest.raises(LifecycleError, match="retained expense, target or reason"):
+            verify_refund_evidence_v1(service, conn, binding, written, refund, None)
+
+        chosen = VerifiedRefundTargetV1("retained-selection", canonical(selected))
+        refund["credit"]["amount"] = "9.50"
+        _bind_opening(refund)
+        with pytest.raises(LifecycleError, match="exact delivered question"):
+            verify_refund_evidence_v1(service, conn, binding, written, refund, None)
