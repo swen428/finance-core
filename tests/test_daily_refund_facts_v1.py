@@ -1,24 +1,29 @@
 import sqlite3
 from copy import deepcopy
+from dataclasses import asdict
 from hashlib import sha256
 
 import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError
 from finance_core.lifecycle_v2.contracts import canonical, digest
-from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1
+from finance_core.lifecycle_v2.daily_v1.accounts import DailyAccountServiceV1
+from finance_core.lifecycle_v2.daily_v1.contracts import BUNDLE_FORMAT, BundleFactRefV1
 from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     RefundExpenseV1,
     compile_refund_allowance_v1,
 )
+from finance_core.lifecycle_v2.daily_v1.refund_dependencies_v1 import refund_posting_state_v1
 from finance_core.lifecycle_v2.daily_v1.refund_facts_v1 import (
     REFUND_FORMAT,
     project_refund_fact_v1,
     require_refund_predecessor_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.refund_inventory_v1 import active_refund_allocations_v1
+from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
 from tests.test_daily_transfer_facts_v1 import instruction
+from tests.test_lifecycle_v2 import live as live
 
 
 def _bind_opening(value):
@@ -189,6 +194,19 @@ def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(r
     _bind_opening(second)
     reversed_first = _change(refund, "refund_void")
     reversed_first["status"] = "VOID"
+    future = deepcopy(refund)
+    future["expense"]["fact_ref"] = asdict(current)
+    future_credit = future["credit"]
+    future_credit["opening_ref"] = None
+    future_credit["coverage"].update(
+        treatment="no_baseline", basis="no_active_opening", reply_ref=None
+    )
+    _bind_opening(future)
+    receiving_account = {
+        "format": BUNDLE_FORMAT,
+        "account": {**future_credit["account_ref"], "currency": future_credit["currency"]},
+        "opening": None,
+    }
 
     with sqlite3.connect(":memory:") as conn:
         conn.row_factory = sqlite3.Row
@@ -218,6 +236,7 @@ def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(r
                     "purchase-event",
                     canonical(original),
                 ),
+                ("card", 1, "9" * 64, 10, "card-event", canonical(receiving_account)),
                 ("refund-a", 1, "1" * 64, 30, "event-a", canonical(refund)),
                 ("refund-b", 1, "2" * 64, 40, "event-b", canonical(second)),
                 ("refund-a", 2, "3" * 64, 50, "event-a", canonical(reversed_first)),
@@ -231,6 +250,20 @@ def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(r
         assert (restored.refunded_original, restored.remaining_original) == ("600", "400")
         assert [entry.fact.record_id for entry in restored.active_refunds] == ["refund-b"]
 
+        before_second = refund_posting_state_v1(conn, future, before_seq=40)
+        assert before_second.remaining_original_after == "200"
+        with pytest.raises(LifecycleError, match="exceed the expense"):
+            refund_posting_state_v1(conn, future, before_seq=50)
+        after_reversal = refund_posting_state_v1(conn, future)
+        assert after_reversal.remaining_original_after == "0"
+        assert before_second.state_sha256 != after_reversal.state_sha256
+        with pytest.raises(LifecycleError, match="expense version changed"):
+            refund_posting_state_v1(conn, refund)
+        reversal = refund_posting_state_v1(
+            conn, reversed_first, BundleFactRefV1("refund-a", 1, "1" * 64, 30), before_seq=50
+        )
+        assert reversal.remaining_original_after == "400"
+
         second["expense"]["fact_ref"]["fact_sha256"] = "f" * 64
         _bind_opening(second)
         conn.execute(
@@ -238,3 +271,38 @@ def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(r
         )
         with pytest.raises(LifecycleError, match="lacks its exact observed expense fact"):
             active_refund_allocations_v1(conn, expense)
+
+
+def test_refund_confirmation_dependencies_use_current_verified_opening_date(live, refund):
+    opening = {
+        "format": "finance-daily-as-of-v1",
+        "precision": "date",
+        "timestamp": None,
+        "local_date": "2026-11-18",
+        "timezone": "Asia/Singapore",
+    }
+    ledger, port, _, movements, reader, account = prepare(
+        live, opening_as_of=opening, currency="SGD"
+    )
+    values = fields(account, amount="9", original="1000", currency="JPY")
+    _, _, receipt = movement(ledger, port, movements, account, "purchase", values)
+    original = reader.detail(receipt.receipt.record_id)
+    refund["expense"] = {
+        "fact_ref": asdict(original.fact_ref),
+        "economic_event_id": original.economic_event_id,
+    }
+    refund["received_date"] = "2026-11-19"
+    credit = refund["credit"]
+    credit["account_ref"] = original.values["account_ref"]
+    credit["opening_ref"] = original.values["opening_ref"]
+    credit["coverage"].update(treatment="excluded", basis="strictly_later", reply_ref=None)
+    _bind_opening(refund)
+
+    with DailyAccountServiceV1(ledger)._read() as (_, conn):
+        reviewed = refund_posting_state_v1(conn, refund)
+        assert reviewed.remaining_original_after == "0"
+        assert reviewed.credit_account_fact.record_id == account
+        refund["received_date"] = opening["local_date"]
+        _bind_opening(refund)
+        with pytest.raises(LifecycleError, match="actual opening time"):
+            refund_posting_state_v1(conn, refund)

@@ -138,11 +138,16 @@ def read_refundable_expense_v1(
         return expense
 
 
-def _current_refundable_expense(conn, selected: BundleFactRefV1) -> RefundExpenseV1:
-    row = conn.execute(
-        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-        (selected.record_id,),
+def _fact_at(conn, record_id: str, before_seq: int | None = None):
+    return conn.execute(
+        "SELECT * FROM l2_facts WHERE record_id=? AND (? IS NULL OR commit_seq<?) "
+        "ORDER BY version DESC LIMIT 1",
+        (record_id, before_seq, before_seq),
     ).fetchone()
+
+
+def _current_refundable_expense(conn, selected: BundleFactRefV1) -> RefundExpenseV1:
+    row = _fact_at(conn, selected.record_id)
     if row is None or bundle_ref(row) != selected:
         raise LifecycleError("Refund target is no longer the selected expense version")
     return _expense_from_fact(row)
@@ -166,13 +171,12 @@ def _expense_from_fact(row) -> RefundExpenseV1:
     return RefundExpenseV1(bundle_ref(row), row["economic_event_id"], currency, amount)
 
 
-def _current_credit_account(conn, expense: RefundExpenseV1, terms: RefundTermsV1):
+def _current_credit_account(
+    conn, expense: RefundExpenseV1, terms: RefundTermsV1, before_seq: int | None = None
+):
     if terms.original_currency != expense.original_currency:
         raise LifecycleError("Refund must use the expense's original currency")
-    row = conn.execute(
-        "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
-        (terms.credit_account.account_id,),
-    ).fetchone()
+    row = _fact_at(conn, terms.credit_account.account_id, before_seq)
     values = strict_json(row["values_json"]) if row is not None else {}
     if (
         row is None
@@ -199,6 +203,11 @@ class RefundTermsV1:
         _positive(self.credit_amount, self.credit_currency)
 
 
+RefundOpeningRequirement = Literal[
+    "no_active_opening", "strictly_later", "authenticated_reply_required"
+]
+
+
 @dataclass(frozen=True)
 class RefundCreditPreviewV1:
     """Current dependencies and opening information for a proposed refund credit."""
@@ -207,9 +216,7 @@ class RefundCreditPreviewV1:
     received_date: str
     credit_account_fact: BundleFactRefV1
     active_opening: OpeningRefV1 | None
-    opening_requirement: Literal[
-        "no_active_opening", "strictly_later", "authenticated_reply_required"
-    ]
+    opening_requirement: RefundOpeningRequirement
 
     @property
     def expense(self) -> RefundExpenseV1:
@@ -230,6 +237,18 @@ def _refund_funds_time(received_date: str) -> dict[str, str | None]:
     }
 
 
+def _refund_opening_requirement(
+    credit, funds_time: dict[str, str | None]
+) -> tuple[OpeningRefV1 | None, RefundOpeningRequirement]:
+    opening = credit["opening"]
+    if opening is None or opening["status"] != "ACTIVE":
+        return None, "no_active_opening"
+    requirement: RefundOpeningRequirement = (
+        "strictly_later" if _later(funds_time, opening["as_of"]) else "authenticated_reply_required"
+    )
+    return opening_ref(credit), requirement
+
+
 def read_refund_credit_preview_v1(
     service, selected: BundleFactRefV1, terms: RefundTermsV1, received_date: str
 ) -> RefundCreditPreviewV1:
@@ -247,18 +266,8 @@ def read_refund_credit_preview_v1(
         amount = preview_refund_amount_v1(
             expense, active_refund_allocations_v1(conn, expense), terms
         )
-        opening = credit["opening"]
-        if opening is None or opening["status"] != "ACTIVE":
-            return RefundCreditPreviewV1(amount, received, credit_fact, None, "no_active_opening")
-        return RefundCreditPreviewV1(
-            amount,
-            received,
-            credit_fact,
-            opening_ref(credit),
-            "strictly_later"
-            if _later(funds_time, opening["as_of"])
-            else "authenticated_reply_required",
-        )
+        opening, requirement = _refund_opening_requirement(credit, funds_time)
+        return RefundCreditPreviewV1(amount, received, credit_fact, opening, requirement)
 
 
 @dataclass(frozen=True)
