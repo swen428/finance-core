@@ -197,7 +197,7 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     if (
         canonical(sealed) != proposal["observation_json"]
         or canonical(values) != proposal["values_json"]
-        or observed != sealed["observation"]
+        or canonical(observed) != canonical(sealed["observation"])
         or event is None
         or canonical(hashed) != event["payload_json"]
         or digest(hashed) != proposal["proposal_sha256"]

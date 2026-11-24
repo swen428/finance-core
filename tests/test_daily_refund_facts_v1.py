@@ -900,6 +900,20 @@ def test_two_delivered_refunds_cannot_spend_the_same_original_allowance(live, re
         "500",
     )
     assert state["original_expense"] == asdict(original.fact_ref)
+    from finance_core.lifecycle_v2.daily_v1.refund_drafts_v1 import verify_proposal
+
+    with DailyAccountServiceV1(ledger)._read() as (bound, conn):
+        modeled = dict(
+            conn.execute(
+                "SELECT * FROM l2_proposals WHERE proposal_id=?", (pending_refund.proposal_id,)
+            ).fetchone()
+        )
+        changed = strict_json(modeled["observation_json"])
+        changed["observation"]["eligibility"]["active_refund_count"] = True
+        modeled["observation_json"] = canonical(changed)
+        with pytest.raises(LifecycleError, match="verified evidence or ledger prefix"):
+            verify_proposal(bound, conn, modeled)
+
     with pytest.raises(LifecycleError, match="requires a new eligible proposal"):
         refunds.prepare_review(pending_refund.proposal_id, pending_refund.version)
     assert ledger.reader().full_audit()["fact_version_count"] == after["fact_version_count"]
@@ -1295,6 +1309,16 @@ def test_native_expense_conflict_retains_preparation_and_denies_stale_delivery(l
         extra_source.source_id, more, "extra-credit", "save-pending-extra-credit"
     )
     assert refunds.proposal_state_v1(first_pending.proposal_id)["status"] == "pending_allowance"
+    small = deepcopy(refund)
+    small["original"]["amount"] = "1.00"
+    small["credit"]["amount"] = "1.00"
+    small_input = _refund_instruction(port, ledger, small, targets, "small-original")
+    small_source = ledger.capture(small_input.evidence_id, "capture-small-original")
+    initially_eligible = refunds.propose(
+        small_source.source_id, small, "small-observation", "small-proposal"
+    )
+    assert refunds.proposal_state_v1(initially_eligible.proposal_id)["status"] == "eligible"
+    old_card = refunds.prepare_review(initially_eligible.proposal_id, initially_eligible.version)
     ledger.owner.close()
     with acquire_production_owner(live[2]) as owner:
         reopen = LedgerService(owner, port, ledger.binding, ledger.clock)
@@ -1315,6 +1339,9 @@ def test_native_expense_conflict_retains_preparation_and_denies_stale_delivery(l
             updated.review_id, "accept-valid-native-correction", "post-valid-native-correction"
         )
         assert corrected.version == 2
+        refunds = DailyRefundServiceV1(reopen)
+        with pytest.raises(LifecycleError, match="expense version changed"):
+            refunds.record_delivery(old_card.review_id, "stale-small-card")
         current = DailyLedgerReaderV1(reopen).detail(posted.record_id)
         more["expense"] = {
             "fact_ref": asdict(current.fact_ref),
@@ -1341,7 +1368,27 @@ def test_native_expense_conflict_retains_preparation_and_denies_stale_delivery(l
         card = refunds.prepare_review(active.proposal_id, active.version)
         refunds.record_delivery(card.review_id, "deliver-last-refund")
         refunds.confirm(card.review_id, "confirm-last-refund", "post-last-refund")
+        small["expense"] = deepcopy(more["expense"])
+        _refund_instruction(
+            port,
+            reopen,
+            small,
+            targets,
+            "reselect-small-target",
+            preparation_id=initially_eligible.proposal_id,
+        )
+        small_ready = refunds.propose(
+            small_source.source_id,
+            small,
+            "new-small-observation",
+            "new-small-proposal",
+            expected_proposal_version=initially_eligible.version,
+        )
+        small_card = refunds.prepare_review(small_ready.proposal_id, small_ready.version)
+        refunds.record_delivery(small_card.review_id, "deliver-new-small")
+        result = refunds.confirm(small_card.review_id, "accept-new-small", "post-new-small")
+        assert refunds.confirm(small_card.review_id, "accept-new-small", "post-new-small") == result
         final = DailyLedgerReaderV1(reopen).collect_with_refunds_v3()
-        assert final.net_expense_by_currency == (("SGD", "2.00"),)
+        assert final.net_expense_by_currency == (("SGD", "1.00"),)
         compatibility = EffectiveLedgerReaderV1.for_daily_ledger(reopen)
         assert compatibility.get(posted.record_id).amount == "15.00"

@@ -36,10 +36,10 @@ class RefundDraftPredecessorV1:
     opening_reply_id: str | None
     credit_sha256: str
 
-    def selection_scope(self, instruction_id: str) -> str | None:
+    def selection_scope(self, instruction_id: str, *, unposted: bool = False) -> str | None:
         if instruction_id == self.instruction_id:
             return self.selection_preparation_id
-        if self.status != "eligible":
+        if unposted or self.status != "eligible":
             return self.proposal_id
         return None
 
@@ -129,7 +129,7 @@ def _refund_review_material(
         instruction = VerifiedSource(**_source_instruction(source))
         requested = values["instruction_ref"]["evidence_id"]
         if requested != instruction.evidence_id:
-            if preparation is None or preparation.selection_scope(requested) is None:
+            if preparation is None or preparation.selection_scope(requested, unposted=True) is None:
                 raise LifecycleError("A changed refund selection requires its exact pending draft")
             selected_by = service.port.source(conn, requested)
             if (
@@ -149,8 +149,12 @@ def _refund_review_material(
         before_values = strict_json(previous["values_json"])
         before_effect = _resolved_credit(conn, before_values, asdict(replaced), before_seq)
 
+    if type(instruction) is not VerifiedSource:
+        raise LifecycleError("Exact refund instruction required")
     selection_preparation = (
-        preparation.selection_scope(instruction.evidence_id) if preparation is not None else None
+        preparation.selection_scope(instruction.evidence_id, unposted=replaced is None)
+        if preparation is not None
+        else None
     )
     opening_preparation = (
         preparation.opening_scope(values["credit"]["coverage"]) if preparation is not None else None
