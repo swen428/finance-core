@@ -1,15 +1,23 @@
+import sqlite3
 from copy import deepcopy
 from hashlib import sha256
 
 import pytest
 
 from finance_core.lifecycle_v2 import LifecycleError
-from finance_core.lifecycle_v2.contracts import digest
+from finance_core.lifecycle_v2.contracts import canonical, digest
+from finance_core.lifecycle_v2.daily_v1.contracts import BundleFactRefV1
+from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
+from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
+    RefundExpenseV1,
+    compile_refund_allowance_v1,
+)
 from finance_core.lifecycle_v2.daily_v1.refund_facts_v1 import (
     REFUND_FORMAT,
     project_refund_fact_v1,
     require_refund_predecessor_v1,
 )
+from finance_core.lifecycle_v2.daily_v1.refund_inventory_v1 import active_refund_allocations_v1
 from tests.test_daily_transfer_facts_v1 import instruction
 
 
@@ -160,3 +168,73 @@ def test_reversed_refund_retains_the_original_credit_evidence_without_effect(ref
     reverse["description"] = "Changed description"
     with pytest.raises(LifecycleError, match="retain all original business values"):
         require_refund_predecessor_v1(refund, reverse)
+
+
+def test_refund_inventory_uses_the_latest_versions_at_the_requested_ledger_cut(refund):
+    observed = refund["expense"]["fact_ref"]
+    current = BundleFactRefV1(observed["record_id"], 2, "e" * 64, 35)
+    expense = RefundExpenseV1(current, "purchase-event", "JPY", "1000")
+    original = {
+        "format": MOVEMENT_FORMAT,
+        "kind": "expense",
+        "status": "ACTIVE",
+        "original_amount": "1000",
+        "original_currency": "JPY",
+    }
+    refund["original"]["amount"] = "400"
+    _bind_opening(refund)
+    second = deepcopy(refund)
+    second["original"]["amount"] = "600"
+    second["instruction_ref"] = instruction("second-original-refund")
+    _bind_opening(second)
+    reversed_first = _change(refund, "refund_void")
+    reversed_first["status"] = "VOID"
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE l2_facts (record_id TEXT, version INTEGER, fact_sha256 TEXT, "
+            "commit_seq INTEGER, economic_event_id TEXT, values_json TEXT, "
+            "PRIMARY KEY(record_id,version))"
+        )
+        with pytest.raises(LifecycleError, match="one protected ledger transaction"):
+            active_refund_allocations_v1(conn, expense)
+        conn.executemany(
+            "INSERT INTO l2_facts VALUES (?,?,?,?,?,?)",
+            [
+                (
+                    observed["record_id"],
+                    1,
+                    observed["fact_sha256"],
+                    18,
+                    "purchase-event",
+                    canonical(original),
+                ),
+                (
+                    current.record_id,
+                    2,
+                    current.fact_sha256,
+                    35,
+                    "purchase-event",
+                    canonical(original),
+                ),
+                ("refund-a", 1, "1" * 64, 30, "event-a", canonical(refund)),
+                ("refund-b", 1, "2" * 64, 40, "event-b", canonical(second)),
+                ("refund-a", 2, "3" * 64, 50, "event-a", canonical(reversed_first)),
+            ],
+        )
+        historical = compile_refund_allowance_v1(
+            expense, active_refund_allocations_v1(conn, expense, 50)
+        )
+        assert (historical.refunded_original, historical.remaining_original) == ("1000", "0")
+        restored = compile_refund_allowance_v1(expense, active_refund_allocations_v1(conn, expense))
+        assert (restored.refunded_original, restored.remaining_original) == ("600", "400")
+        assert [entry.fact.record_id for entry in restored.active_refunds] == ["refund-b"]
+
+        second["expense"]["fact_ref"]["fact_sha256"] = "f" * 64
+        _bind_opening(second)
+        conn.execute(
+            "UPDATE l2_facts SET values_json=? WHERE record_id='refund-b'", (canonical(second),)
+        )
+        with pytest.raises(LifecycleError, match="lacks its exact observed expense fact"):
+            active_refund_allocations_v1(conn, expense)

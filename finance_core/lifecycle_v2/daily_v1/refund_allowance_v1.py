@@ -145,6 +145,10 @@ def _current_refundable_expense(conn, selected: BundleFactRefV1) -> RefundExpens
     ).fetchone()
     if row is None or bundle_ref(row) != selected:
         raise LifecycleError("Refund target is no longer the selected expense version")
+    return _expense_from_fact(row)
+
+
+def _expense_from_fact(row) -> RefundExpenseV1:
     values = strict_json(row["values_json"])
     if (
         values.get("format") == MOVEMENT_FORMAT
@@ -159,7 +163,7 @@ def _current_refundable_expense(conn, selected: BundleFactRefV1) -> RefundExpens
         amount, currency = original["amount"], original["currency"]
     else:
         raise LifecycleError("Linked refund requires a current active expense")
-    return RefundExpenseV1(selected, row["economic_event_id"], currency, amount)
+    return RefundExpenseV1(bundle_ref(row), row["economic_event_id"], currency, amount)
 
 
 def _current_credit_account(conn, expense: RefundExpenseV1, terms: RefundTermsV1):
@@ -199,14 +203,21 @@ class RefundTermsV1:
 class RefundCreditPreviewV1:
     """Current dependencies and opening information for a proposed refund credit."""
 
-    expense: RefundExpenseV1
-    terms: RefundTermsV1
+    amount_preview: RefundAmountPreviewV1
     received_date: str
     credit_account_fact: BundleFactRefV1
     active_opening: OpeningRefV1 | None
     opening_requirement: Literal[
         "no_active_opening", "strictly_later", "authenticated_reply_required"
     ]
+
+    @property
+    def expense(self) -> RefundExpenseV1:
+        return self.amount_preview.allowance.expense
+
+    @property
+    def terms(self) -> RefundTermsV1:
+        return self.amount_preview.terms
 
 
 def _refund_funds_time(received_date: str) -> dict[str, str | None]:
@@ -222,7 +233,9 @@ def _refund_funds_time(received_date: str) -> dict[str, str | None]:
 def read_refund_credit_preview_v1(
     service, selected: BundleFactRefV1, terms: RefundTermsV1, received_date: str
 ) -> RefundCreditPreviewV1:
-    """Read whether the actual receipt date needs an explicit opening balance reply."""
+    """Read the remaining allowance and opening requirement in one audited snapshot."""
+    from .refund_inventory_v1 import active_refund_allocations_v1
+
     if type(selected) is not BundleFactRefV1 or type(terms) is not RefundTermsV1:
         raise LifecycleError("Exact selected expense fact and refund terms required")
     received = _day(received_date)
@@ -231,14 +244,14 @@ def read_refund_credit_preview_v1(
         _audit(bound, conn)
         expense = _current_refundable_expense(conn, selected)
         credit_fact, credit = _current_credit_account(conn, expense, terms)
+        amount = preview_refund_amount_v1(
+            expense, active_refund_allocations_v1(conn, expense), terms
+        )
         opening = credit["opening"]
         if opening is None or opening["status"] != "ACTIVE":
-            return RefundCreditPreviewV1(
-                expense, terms, received, credit_fact, None, "no_active_opening"
-            )
+            return RefundCreditPreviewV1(amount, received, credit_fact, None, "no_active_opening")
         return RefundCreditPreviewV1(
-            expense,
-            terms,
+            amount,
             received,
             credit_fact,
             opening_ref(credit),

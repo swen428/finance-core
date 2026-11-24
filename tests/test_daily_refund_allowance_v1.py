@@ -121,6 +121,11 @@ def test_refund_opening_requirement_uses_the_actual_credit_date(live):
     assert later.credit_account_fact.record_id == account
     assert later.active_opening is not None and later.opening_requirement == "strictly_later"
     assert (later.terms.original_amount, later.terms.credit_amount) == ("1000", "9.20")
+    assert later.amount_preview.projected_remaining_original == "0"
+    with pytest.raises(LifecycleError, match="exceed the expense"):
+        read_refund_credit_preview_v1(
+            ledger, original.fact_ref, replace(terms, original_amount="1001"), "2026-11-19"
+        )
     for day in ("2026-11-17", "2026-11-18"):
         assert read_refund_credit_preview_v1(ledger, original.fact_ref, terms, day) == replace(
             later, received_date=day, opening_requirement="authenticated_reply_required"
