@@ -47,7 +47,9 @@ def _refund_review_material(
 ) -> dict[str, Any]:
     fingerprint = _fingerprint(conn)
     dependencies = refund_posting_state_v1(conn, values, replaced, before_seq=before_seq)
-    source = service._source(conn, source_id, allow_archived=replaced is not None)
+    source = service._source(
+        conn, source_id, allow_archived=before_seq is not None or replaced is not None
+    )
     if replaced is None:
         if source["generation"] != binding.generation:
             raise LifecycleError("Refund source belongs to another capture generation")

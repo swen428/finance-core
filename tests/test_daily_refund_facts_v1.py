@@ -21,6 +21,7 @@ from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     compile_refund_allowance_v1,
 )
 from finance_core.lifecycle_v2.daily_v1.refund_dependencies_v1 import refund_posting_state_v1
+from finance_core.lifecycle_v2.daily_v1.refund_drafts_v1 import DailyRefundDraftServiceV1
 from finance_core.lifecycle_v2.daily_v1.refund_evidence_v1 import (
     OPENING_QUESTION_FORMAT,
     TARGET_FORMAT,
@@ -370,6 +371,21 @@ def test_refund_confirmation_dependencies_use_current_verified_opening_date(live
     with pytest.raises(LifecycleError, match="retained expense"):
         read_refund_review_v1(ledger, captured.source_id, refund)
     assert ledger.reader().full_audit() == audit
+
+    retained["original_expense"] = deepcopy(refund["expense"])
+    drafts = DailyRefundDraftServiceV1(ledger)
+    proposal = drafts.propose(captured.source_id, refund, "refund-observation", "propose-refund")
+    assert proposal.version == 1
+    after = ledger.reader().full_audit()
+    assert after["event_count"] == audit["event_count"] + 1
+    assert after["fact_version_count"] == audit["fact_version_count"]
+    assert (
+        drafts.propose(captured.source_id, refund, "refund-observation", "propose-refund")
+        == proposal
+    )
+    with pytest.raises(LifecycleError, match="replay mismatch"):
+        drafts.propose(captured.source_id, refund, "refund-observation", "different-operation")
+    assert ledger.reader().full_audit() == after
 
 
 def test_refund_selection_and_opening_answer_are_reconstructed_by_actual_identity(refund):

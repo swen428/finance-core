@@ -444,6 +444,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.transfer_drafts_v1 import verify_proposal as verify_transfer_proposal
 
         return verify_transfer_proposal(service, conn, proposal, _rows=_rows)
+    if sealed.get("format") == "finance-daily-refund-draft-v1":
+        from .daily_v1.refund_drafts_v1 import verify_proposal as verify_refund_proposal
+
+        return verify_refund_proposal(service, conn, proposal, _rows=_rows)
     if sealed.get("format") == "finance-daily-movement-observation-v1":
         from .daily_v1.movements import verify_proposal as verify_movement_proposal
 
@@ -868,7 +872,7 @@ def _has_daily_values(conn):
         or conn.execute(
             "SELECT EXISTS(SELECT 1 FROM l2_proposals "
             "WHERE CASE WHEN json_valid(values_json) THEN json_extract(values_json, '$.format') "
-            "END IN (?, ?, ?, ?, ?, ?, ?, ?))",
+            "END IN (?, ?, ?, ?, ?, ?, ?, ?, ?))",
             (
                 BUNDLE_FORMAT,
                 "finance-daily-account-bundle-v2",
@@ -878,6 +882,7 @@ def _has_daily_values(conn):
                 "finance-daily-movement-v1",
                 "finance-daily-movement-incomplete-v1",
                 "finance-daily-transfer-v1",
+                "finance-daily-refund-v1",
             ),
         ).fetchone()[0]
     )
