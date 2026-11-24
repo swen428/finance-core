@@ -413,17 +413,21 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
 
     def transfer_history_v1(self, record_id, *, limits=None):
         """Read all verified versions of a transfer from one complete snapshot."""
-        history = self._ledger(limits, include_transfers=True)[1].get(record_id, ())
+        history = self._point_history(record_id, limits)
         if history and history[0].values.get("format") != TRANSFER_FORMAT:
             raise LifecycleError("Expected a transfer record")
         return tuple(history)
 
+    def _point_history(self, record_id, limits):
+        ledger = self._ledger(limits, include_transfers=True, include_refunds=True)
+        return tuple(ledger[1].get(record_id, ()))
+
     def detail(self, record_id, *, limits=None):
-        history = self._ledger(limits)[1].get(record_id, ())
+        history = self._point_history(record_id, limits)
         return history[-1] if history else None
 
     def history(self, record_id, *, limits=None):
-        return tuple(self._ledger(limits)[1].get(record_id, ()))
+        return self._point_history(record_id, limits)
 
     def source(self, source_id):
         base = self._service

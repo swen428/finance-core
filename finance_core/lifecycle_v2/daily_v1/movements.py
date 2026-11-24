@@ -557,6 +557,15 @@ def _existing_receipt(service, conn, review_id, action_id, operation_id):
     return _receipt(fact)
 
 
+def _require_refund_compatible_review(conn, expected, values):
+    target = expected.target_bundle_ref
+    if target is not None:
+        from .refund_inventory_v1 import require_refund_compatible_expense_change
+
+        predecessor = _row_version(conn, target["record_id"], target["version"])
+        require_refund_compatible_expense_change(conn, predecessor, values)
+
+
 class DailyMovementServiceV1:
     def __init__(self, service):
         self._boundary = DailyAccountServiceV1(service)
@@ -859,6 +868,7 @@ class DailyMovementServiceV1:
                 review_id = _id("daily-review")
                 now = service._now()
                 require_accounts(conn, expected, values)
+                _require_refund_compatible_review(conn, expected, values)
                 dependency = selected_dependency(expected, values)
                 material = {
                     "format": REVIEW_FORMAT,
@@ -932,7 +942,9 @@ class DailyMovementServiceV1:
             else:
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
-                require_accounts(conn, expected, strict_json(row["values_json"]))
+                values = strict_json(row["values_json"])
+                require_accounts(conn, expected, values)
+                _require_refund_compatible_review(conn, expected, values)
                 conn.execute(
                     "INSERT INTO l2_deliveries VALUES(?,?,?)",
                     (review_id, delivery_evidence_id, canonical(asdict(actual))),

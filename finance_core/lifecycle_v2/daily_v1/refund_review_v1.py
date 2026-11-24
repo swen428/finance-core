@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from decimal import Decimal
 from typing import Any
 
 from ..contracts import LifecycleError, RuntimeBinding, VerifiedSource, canonical, digest
 from ._impacts_v1 import resolve_refund_effect_v1
 from .accounts import DailyAccountServiceV1, _audit, _fingerprint, _source_instruction
 from .contracts import BUNDLE_FORMATS, BundleFactRefV1, strict_json, text
-from .refund_allowance_v1 import _fact_at
-from .refund_dependencies_v1 import refund_posting_state_v1
+from .refund_allowance_v1 import RefundAllowanceV1, _fact_at
+from .refund_dependencies_v1 import RefundPostingStateV1, refund_posting_state_v1
 from .refund_evidence_v1 import verify_refund_evidence_v1
 from .refund_facts_v1 import project_refund_fact_v1
 from .transfer_review_v1 import _change_totals
@@ -35,6 +36,39 @@ def _resolved_credit(conn, values, fact_ref, before_seq):
     return [resolve_refund_effect_v1(conn, effect, fact_ref, account, before_seq)]
 
 
+def _allowance_summary(allowance: RefundAllowanceV1) -> dict[str, Any]:
+    return {
+        "expense": asdict(allowance.expense),
+        "allowance_sha256": allowance.allowance_sha256,
+        "allocation_count": len(allowance.active_refunds),
+        "refunded_original": allowance.refunded_original,
+        "remaining_original_before": allowance.remaining_original,
+    }
+
+
+def _compact_dependencies(state: RefundPostingStateV1) -> dict[str, Any]:
+    previous = state.previous_allocation
+    return {
+        **_allowance_summary(state.allowance_before),
+        "previous_allocation": (
+            {
+                **_allowance_summary(previous.allowance_before),
+                "remaining_original_after": previous.remaining_original_after,
+                "refund_lineage_sha256": previous.lineage_sha256,
+            }
+            if previous is not None
+            else None
+        ),
+        "remaining_original_after": state.remaining_original_after,
+        "available_if_pending": state.available_if_pending,
+        "refund_lineage_sha256": state.refund_lineage_sha256,
+        "replaced": asdict(state.replaced) if state.replaced is not None else None,
+        "credit_account_fact": (
+            asdict(state.credit_account_fact) if state.credit_account_fact is not None else None
+        ),
+    }
+
+
 def _refund_review_material(
     service,
     conn,
@@ -44,9 +78,12 @@ def _refund_review_material(
     replaced: BundleFactRefV1 | None,
     *,
     before_seq: int | None = None,
+    allow_pending: bool = False,
 ) -> dict[str, Any]:
     fingerprint = _fingerprint(conn)
-    dependencies = refund_posting_state_v1(conn, values, replaced, before_seq=before_seq)
+    dependencies = refund_posting_state_v1(
+        conn, values, replaced, before_seq=before_seq, allow_pending=allow_pending
+    )
     source = service._source(
         conn, source_id, allow_archived=before_seq is not None or replaced is not None
     )
@@ -67,6 +104,12 @@ def _refund_review_material(
     evidence = verify_refund_evidence_v1(service, conn, binding, instruction, values, replaced)
     after_effect = _resolved_credit(conn, values, None, before_seq)
     amount_changes = _change_totals(before_effect, after_effect)
+    if dependencies.previous_allocation is not None and any(
+        Decimal(row.recorded_change) != 0
+        or (row.balance_change is not None and Decimal(row.balance_change) != 0)
+        for row in amount_changes
+    ):
+        raise LifecycleError("Relinking a refund must preserve its effective account credit")
     # Each account reference is exact even when a reversal credits no account.
     # Null opening balance remains unknown while the recorded change is known.
     associations = [
@@ -82,7 +125,7 @@ def _refund_review_material(
         "source_sha256": source["source_sha256"],
         "before_values": before_values,
         "after_values": values,
-        "dependencies": asdict(dependencies),
+        "dependencies": _compact_dependencies(dependencies),
         "account_effects_before": associations[: len(before_effect)],
         "account_effects_after": associations[len(before_effect) :],
         "account_impact_changes": [asdict(change) for change in amount_changes],
@@ -105,4 +148,6 @@ def read_refund_review_v1(
         material = _refund_review_material(
             bound, conn, bound.binding, source_id, original, replaced
         )
-        return RefundReviewPreviewV1(canonical(material), digest(material))
+        raw = canonical(material)
+        strict_json(raw)
+        return RefundReviewPreviewV1(raw, digest(material))

@@ -278,6 +278,15 @@ class RefundAmountPreviewV1:
     projected_remaining_original: str
 
 
+class RefundAllowanceExceededV1(LifecycleError):
+    """A well-formed refund exceeds the original amount still available."""
+
+    def __init__(self, allowance: RefundAllowanceV1, available: str):
+        super().__init__("Refunds exceed the expense's original currency allowance")
+        self.allowance = allowance
+        self.available = available
+
+
 def preview_refund_amount_v1(
     expense: RefundExpenseV1,
     active_refunds: tuple[ActiveRefundAllocationV1, ...],
@@ -301,7 +310,9 @@ def preview_refund_amount_v1(
         available = Decimal(allowance.remaining_original) + Decimal(replaced_amount or "0")
         remaining = available - Decimal(terms.original_amount)
         if remaining < 0:
-            raise LifecycleError("Refunds exceed the expense's original currency allowance")
+            raise RefundAllowanceExceededV1(
+                allowance, canonical_money_str(available, expense.original_currency)
+            )
         return RefundAmountPreviewV1(
             allowance,
             terms,

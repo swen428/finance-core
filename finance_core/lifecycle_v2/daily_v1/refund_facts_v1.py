@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from ..contracts import LifecycleError, digest
+from ..contracts import LifecycleError, canonical, digest
 from .contracts import (
     AccountDefinitionRefV1,
     BundleFactRefV1,
@@ -59,17 +59,19 @@ def _require_credit_coverage(value: dict[str, Any]) -> OpeningRefV1 | None:
     if (
         (value["status"] == "ACTIVE" and instruction != value["instruction_ref"])
         or any(instruction[key] != value["instruction_ref"][key] for key in owner_keys)
-        or binding
-        != {
-            "received_date": value["received_date"],
-            "expense": value["expense"],
-            "original": value["original"],
-            "credit_account": credit["account_ref"],
-            "credit_currency": credit["currency"],
-            "credit_amount": credit["amount"],
-            "opening_ref": credit["opening_ref"],
-            "instruction_ref": instruction,
-        }
+        or canonical(binding)
+        != canonical(
+            {
+                "received_date": value["received_date"],
+                "expense": value["expense"],
+                "original": value["original"],
+                "credit_account": credit["account_ref"],
+                "credit_currency": credit["currency"],
+                "credit_amount": credit["amount"],
+                "opening_ref": credit["opening_ref"],
+                "instruction_ref": instruction,
+            }
+        )
         or digest(binding) != coverage["binding_sha256"]
     ):
         raise LifecycleError("Refund opening coverage differs from its exact credit")
@@ -186,15 +188,26 @@ def require_refund_predecessor_v1(before: dict[str, Any] | None, after: dict[str
     ):
         raise LifecycleError("A refund change requires a new instruction from its owner")
     old_ref, new_ref = previous.observed_expense, current.observed_expense
-    if (
-        previous.expense_economic_event_id != current.expense_economic_event_id
-        or previous.terms.original_currency != current.terms.original_currency
-        or old_ref.record_id != new_ref.record_id
-        or old_ref.version > new_ref.version
-        or (old_ref.version == new_ref.version and old_ref != new_ref)
-        or (old_ref.version < new_ref.version and old_ref.commit_seq >= new_ref.commit_seq)
+    same_record = old_ref.record_id == new_ref.record_id
+    same_event = previous.expense_economic_event_id == current.expense_economic_event_id
+    if same_record != same_event or (
+        same_record
+        and (
+            previous.terms.original_currency != current.terms.original_currency
+            or old_ref.version > new_ref.version
+            or (old_ref.version == new_ref.version and old_ref != new_ref)
+            or (old_ref.version < new_ref.version and old_ref.commit_seq >= new_ref.commit_seq)
+        )
     ):
         raise LifecycleError("The refund change must retain its original expense relationship")
+    if not same_record and (
+        after["transition"] != "refund_correct"
+        or before["received_date"] != after["received_date"]
+        or before["credit"]["account_ref"]["account_id"]
+        != after["credit"]["account_ref"]["account_id"]
+        or any(before["credit"][key] != after["credit"][key] for key in ("currency", "amount"))
+    ):
+        raise LifecycleError("Relinking a refund must preserve the same actual credit and date")
     if after["transition"] == "refund_void" and any(
         before[key] != after[key] for key in _BUSINESS_FIELDS
     ):

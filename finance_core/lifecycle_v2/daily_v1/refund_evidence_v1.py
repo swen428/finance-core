@@ -40,7 +40,7 @@ def _require_target(
     if type(retained) is not VerifiedRefundTargetV1:
         raise LifecycleError("Exact independently retained refund selection required")
     text(retained.evidence_id, "refund selection evidence")
-    selected = strict_json(retained.target_json)
+    strict_json(retained.target_json)
     reason = value["reason_ref"]
     span = None
     if reason is not None:
@@ -48,18 +48,15 @@ def _require_target(
         span = [start, end]
         if source.raw_input[start:end] != reason["quote"]:
             raise LifecycleError("Refund reason differs from the original instruction")
-    if (
-        retained.target_json != canonical(selected)
-        or selected
-        != {
-            "format": TARGET_FORMAT,
-            "transition": value["transition"],
-            "instruction_ref": value["instruction_ref"],
-            "original_expense": value["expense"],
-            "refund_predecessor": asdict(previous) if previous is not None else None,
-            "reason_span": span,
-        }
-    ):
+    target = {
+        "format": TARGET_FORMAT,
+        "transition": value["transition"],
+        "instruction_ref": value["instruction_ref"],
+        "original_expense": value["expense"],
+        "refund_predecessor": asdict(previous) if previous is not None else None,
+        "reason_span": span,
+    }
+    if retained.target_json != canonical(target):
         raise LifecycleError("Refund selection differs from the retained expense, target or reason")
 
 

@@ -301,3 +301,27 @@ snapshot. The receiving account reflects the actual credit. The original
 currency totals reflect the refund allocation. An opening adjustment binds
 refund inclusion by the exact fact and credit role. `refund_history_v1`
 returns the immutable versions, including separately confirmed reversals.
+
+Call `propose(source_id, values, observation_id, operation_id,
+expected_proposal_version=0, replaced=None)`. Pass the last two arguments
+by keyword. A valid request that exceeds the current original-currency
+allowance is retained as `pending_allowance`. Read the original target,
+available amount, requested amount, and active refund count with
+`proposal_state_v1`. A later proposal must be prepared against the current
+allowance before an eligible card can be issued.
+
+The evidence port implements `refund_target_v1(conn, instruction_id)` and
+`refund_opening_reply_v1(conn, reply_id)`. It independently reconstructs
+`VerifiedRefundTargetV1(evidence_id, target_json)` and
+`VerifiedRefundOpeningReplyV1(reply_evidence_id, question_json)` from the
+original retained evidence. The target binds the instruction, transition,
+original expense, refund predecessor, and reason span. The delivered
+question binds its delivery ID, time and exact credit digest. Both callbacks
+retain these identities across historical audit and snapshot readback.
+
+A correction can move a refund to a different expense. The card binds the
+two complete allowance inventories and keeps the original receiving account,
+actual credit, receipt date and current balance effect. After the correction,
+the former expense may be reversed if no effective refund still depends on
+it. A known conflict keeps the expense proposal pending and exposes its
+linked refund references before card delivery.

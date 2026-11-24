@@ -724,6 +724,17 @@ class LedgerService:
         ).fetchone()[0]
         if latest != expected_version:
             raise LifecycleError("Superseded proposal cannot be reviewed")
+        values = json.loads(proposal["values_json"])
+        if proposal["record_id"] is not None:
+            from .daily_v1.refund_inventory_v1 import require_refund_compatible_expense_change
+
+            predecessor = conn.execute(
+                "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
+                (proposal["record_id"],),
+            ).fetchone()
+            if predecessor is None or predecessor["version"] != proposal["expected_version"]:
+                raise LifecycleError("Correction target changed before review")
+            require_refund_compatible_expense_change(conn, predecessor, values)
         review_id = _id("review")
         material = {
             "binding": asdict(self.binding),
@@ -732,7 +743,7 @@ class LedgerService:
             "proposal_sha256": proposal["proposal_sha256"],
             "expected_version": proposal["expected_version"] if proposal["record_id"] else 0,
             "record_id": proposal["record_id"],
-            "values": json.loads(proposal["values_json"]),
+            "values": values,
             "created_at": self._now(),
             "expires_at": self._now() + 600,
             "before_values": json.loads(proposal["observation_json"])["expected"]["projection"][

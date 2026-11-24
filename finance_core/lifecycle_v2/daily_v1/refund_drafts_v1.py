@@ -35,7 +35,7 @@ from .accounts import (
 )
 from .contracts import BundleFactRefV1, exact, strict_json, text
 from .refund_allowance_v1 import _fact_at
-from .refund_facts_v1 import REFUND_FORMAT
+from .refund_facts_v1 import REFUND_FORMAT, project_refund_fact_v1
 from .refund_review_v1 import _refund_review_material
 from .transfer_drafts_v1 import _require_unused_capture, _verified_delivery
 
@@ -73,11 +73,22 @@ def _previous_proposal(conn, source_id, version, *, _rows=None):
 
 
 def _observation(expected, observation_id, material):
+    dependencies = material["dependencies"]
+    available = dependencies["available_if_pending"]
+    original = material["after_values"]["original"]
     return {
         "evidence_id": observation_id,
         "request_sha256": digest(asdict(expected)),
         "retained_material_sha256": digest(material),
         "retained_evidence": material["evidence"],
+        "eligibility": {
+            "status": "pending_allowance" if available is not None else "eligible",
+            "available_original": available,
+            "requested_original": original["amount"],
+            "currency": original["currency"],
+            "original_expense": dependencies["expense"]["current_fact"],
+            "active_refund_count": dependencies["allocation_count"],
+        },
     }
 
 
@@ -129,7 +140,14 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         _require_unused_capture(conn, expected.source_id, cutoff, _rows=_rows, label="Refund")
     values = strict_json(proposal["values_json"])
     material = _refund_review_material(
-        service, conn, expected.binding, expected.source_id, values, target, before_seq=cutoff
+        service,
+        conn,
+        expected.binding,
+        expected.source_id,
+        values,
+        target,
+        before_seq=cutoff,
+        allow_pending=True,
     )
     observed = _observation(expected, proposal["observation_id"], material)
     event = (
@@ -151,6 +169,9 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 
 def _review_material(service, conn, proposal, expected, review_id, created_at, cutoff=None):
+    observation = strict_json(proposal["observation_json"])["observation"]
+    if observation["eligibility"]["status"] != "eligible":
+        raise LifecycleError("Refund allowance is pending and requires a new eligible proposal")
     replaced = BundleFactRefV1(**expected.target_bundle_ref) if expected.target_bundle_ref else None
     refund = _refund_review_material(
         service,
@@ -297,6 +318,12 @@ def _refund_receipt(fact):
     )
 
 
+class RefundAlreadyReversedV1(LifecycleError):
+    def __init__(self, current: BundleFactRefV1):
+        super().__init__("Refund has already been reversed")
+        self.current = current
+
+
 class DailyRefundServiceV1:
     """Post authenticated linked refunds within the existing daily write boundary."""
 
@@ -322,6 +349,7 @@ class DailyRefundServiceV1:
         if replaced is not None and type(replaced) is not BundleFactRefV1:
             raise LifecycleError("Exact refund predecessor required")
         cleaned = strict_json(canonical(values))
+        project_refund_fact_v1(cleaned)
         target = asdict(replaced) if replaced is not None else None
         with self._boundary._write() as (service, conn):
             _audit(service, conn)
@@ -355,6 +383,12 @@ class DailyRefundServiceV1:
                 raise LifecycleError("complete_read_limit_exceeded")
             if replaced is None:
                 _require_unused_capture(conn, source_id, label="Refund")
+            elif cleaned.get("transition") == "refund_void":
+                latest = _fact_at(conn, replaced.record_id)
+                if latest is not None and latest["source_id"] == source_id:
+                    original = strict_json(latest["values_json"])
+                    if original.get("format") == REFUND_FORMAT and original["status"] == "VOID":
+                        raise RefundAlreadyReversedV1(bundle_ref(latest))
             expected = _ExpectedRefundDraft(
                 service.binding,
                 source_id,
@@ -365,7 +399,7 @@ class DailyRefundServiceV1:
             )
             _require_current(conn, expected)
             material = _refund_review_material(
-                service, conn, service.binding, source_id, cleaned, replaced
+                service, conn, service.binding, source_id, cleaned, replaced, allow_pending=True
             )
             observed = _observation(expected, observation_id, material)
             row = {
@@ -377,6 +411,8 @@ class DailyRefundServiceV1:
             hashed = _proposal_hash_material(row, observed, cleaned)
             sha = digest(hashed)
             sealed = {"format": DRAFT_FORMAT, "expected": asdict(expected), "observation": observed}
+            sealed_json = canonical(sealed)
+            strict_json(sealed_json)
             proposal_id = _id("daily-refund-proposal")
             conn.execute(
                 "INSERT INTO l2_proposals VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -388,13 +424,22 @@ class DailyRefundServiceV1:
                     row["expected_version"],
                     row["record_id"],
                     canonical(cleaned),
-                    canonical(sealed),
+                    sealed_json,
                     sha,
                     service._now(),
                 ),
             )
             _event(conn, operation_id, "propose", proposal_id, hashed)
             return ProposalRef(proposal_id, source_id, row["version"], sha)
+
+    def proposal_state_v1(self, proposal_id):
+        """Read the retained allowance status of a refund draft."""
+        text(proposal_id, "refund proposal id")
+        with self._boundary._read() as (service, conn):
+            _audit(service, conn)
+            proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
+            verify_proposal(service, conn, proposal)
+            return strict_json(proposal["observation_json"])["observation"]["eligibility"]
 
     def prepare_review(self, proposal_id, expected_proposal_version):
         text(proposal_id, "refund proposal id")
@@ -418,6 +463,8 @@ class DailyRefundServiceV1:
             review_id = _id("daily-refund-review")
             created_at = service._now()
             material = _review_material(service, conn, proposal, expected, review_id, created_at)
+            material_json = canonical(material)
+            strict_json(material_json)
             conn.execute(
                 "INSERT INTO l2_reviews VALUES(?,?,?,?,?,?,?,?)",
                 (
@@ -426,7 +473,7 @@ class DailyRefundServiceV1:
                     proposal["expected_version"],
                     expected.record_id,
                     proposal["values_json"],
-                    canonical(material),
+                    material_json,
                     digest(material),
                     created_at,
                 ),
