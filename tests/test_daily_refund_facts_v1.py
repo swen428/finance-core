@@ -25,6 +25,7 @@ from finance_core.lifecycle_v2.daily_v1.contracts import (
 )
 from finance_core.lifecycle_v2.daily_v1.ledger_reader import DailyLedgerReaderV1
 from finance_core.lifecycle_v2.daily_v1.movement_contracts import MOVEMENT_FORMAT
+from finance_core.lifecycle_v2.daily_v1.movements import DailyMovementServiceV1
 from finance_core.lifecycle_v2.daily_v1.refund_allowance_v1 import (
     ActiveRefundAllocationV1,
     RefundExpenseV1,
@@ -1127,6 +1128,69 @@ def test_original_expense_transfer_and_linked_refund_share_one_ledger(
         for item in original_only.summary().items
     ] == [("SGD", 1, "12.00")]
     assert json.loads(original_only.export_json())["facts"] == [asdict(detail)]
+
+    query = reader.collect_query_snapshot_v1()
+    assert query.format == "finance-daily-ledger-query-snapshot-v1"
+    assert query.collection == snapshot.collection
+    assert query.read_identity == snapshot.read_identity
+    assert query.refund_by_currency == snapshot.refund_by_currency
+    assert query.net_expense_by_currency == snapshot.net_expense_by_currency
+    assert query.collection.completeness_gaps == ("unassigned_personal_expense",)
+    histories = {item.record_id: item for item in query.transactions}
+    expected = (original, current_transfer, current_refund)
+    assert set(histories) == {item.record_id for item in expected}
+    for fact in expected:
+        history = histories[fact.record_id]
+        assert history.versions == (history.current,) == (fact,)
+    assert histories[original.record_id].current.values["merchant"] == detail.merchant
+    assert {
+        (item.kind, item.currency, item.amount, item.business_date, item.fact_ref)
+        for item in query.contributions
+    } == {
+        ("expense", "SGD", "12.00", "2026-10-24", original.fact_ref),
+        ("expense", "SGD", "1.00", "2026-11-22", current_transfer.fact_ref),
+        ("refund", "SGD", "4.00", "2026-11-24", current_refund.fact_ref),
+    }
+
+    api = DailyMovementServiceV1(ledger)
+    _, _, income = movement(
+        ledger,
+        port,
+        api,
+        receiving.account_id,
+        "mixed-income",
+        fields(receiving.account_id, amount="7.00", kind="income"),
+    )
+    income_id = income.receipt.record_id
+    before_void = reader.collect_query_snapshot_v1()
+    income_history = next(item for item in before_void.transactions if item.record_id == income_id)
+    assert before_void.read_identity != query.read_identity
+    assert before_void.collection.income_by_currency == (("MYR", "7.00"),)
+    assert {
+        (item.kind, item.currency, item.amount, item.business_date, item.fact_ref)
+        for item in before_void.contributions
+        if item.fact_ref.record_id == income_id
+    } == {("income", "MYR", "7.00", "2026-11-17", income_history.current.fact_ref)}
+
+    movement(
+        ledger,
+        port,
+        api,
+        receiving.account_id,
+        "void-mixed-income",
+        {},
+        target=income_history.current,
+        kind="movement_void",
+    )
+    after_void = reader.collect_query_snapshot_v1()
+    assert after_void.read_identity != before_void.read_identity
+    assert after_void.collection.income_by_currency == ()
+    assert after_void.collection.balances == query.collection.balances
+    assert after_void.contributions == query.contributions
+    voided_history = next(item for item in after_void.transactions if item.record_id == income_id)
+    assert voided_history.versions[0] == income_history.current
+    assert [view.fact_ref.version for view in voided_history.versions] == [1, 2]
+    assert voided_history.current.values["status"] == "VOID"
 
 
 @pytest.mark.parametrize("path", ["direct", "reselect", "both_pending"])

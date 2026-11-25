@@ -338,3 +338,30 @@ A later proposal keeps each retained selection and opening answer tied to the
 preparation it actually answered. Reuse the exact answer when its credit
 digest and reply ID remain the same. A superseded or expired undelivered
 card requires a fresh proposal before delivery.
+
+## Unified financial query snapshot
+
+`DailyLedgerReaderV1.collect_query_snapshot_v1(*, limits=None)` returns the
+complete financial query snapshot after one protected audit, applying the
+same read limits as the V3 reader. The result includes the daily collection
+with accounts, balances, gross totals and completeness gaps, along with
+original-currency refund and net expense totals. The snapshot and collection
+share one `read_identity`.
+
+`transactions` contains original personal expenses, daily income and
+expenses, transfers and linked refunds. Account bookkeeping remains in the
+account collection. Transaction versions are ordered oldest to newest, with
+`current` referring to the last version, including a confirmed reversal if
+present. The ledger's business fact material and references are intended for
+local trusted callers. Source evidence and original inputs use their own
+authorized reads.
+
+Each contribution names a current fact by exact reference and provides its
+kind, currency, amount and business date. A transfer contributes only its
+expense charges. A refund contributes its original-currency allocation on
+the received date. Its actual account credit is part of the refund fact and
+account balance calculation. A reversal keeps its history and removes its
+contributions. Legacy original expenses keep their original statistics and
+unassigned account status. Callers handle date and other filters, pagination,
+transport authorization and export using the audited material. Existing V1,
+V2, and V3 readers retain their scopes.

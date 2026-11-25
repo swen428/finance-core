@@ -12,12 +12,15 @@ from .contracts import (
     VerifiedDailyProposalV1,
 )
 from .ledger_reader import (
+    DailyLedgerQuerySnapshotV1,
     DailyLedgerWithContributionsV1,
     DailyLedgerWithEffectsV1,
     DailyLedgerWithRefundsV3,
     DailyLedgerWithTransfersV2,
+    DailyQueryContributionV1,
     DailyResolvedEffectV1,
     DailyStatisticContributionV1,
+    DailyTransactionHistoryV1,
 )
 from .opening_changes_v1 import DailyOpeningChangeServiceV1
 from .opening_contracts_v1 import (
@@ -104,6 +107,9 @@ __all__ += [
 
 __all__ += [
     "DailyLedgerWithRefundsV3",
+    "DailyLedgerQuerySnapshotV1",
+    "DailyQueryContributionV1",
+    "DailyTransactionHistoryV1",
     "DailyRefundServiceV1",
     "RefundAlreadyReversedV1",
     "LinkedRefundConflictV1",
