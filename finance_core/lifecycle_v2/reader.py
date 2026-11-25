@@ -136,6 +136,8 @@ def _audit_connection(conn, *, _rows=None):
             "finance-daily-review-v1",
             "finance-daily-movement-review-v1",
             "finance-daily-movement-review-v2",
+            "finance-daily-manual-receipt-review-v1",
+            "finance-daily-ocr-receipt-review-v1",
             "finance-daily-opening-review-v2",
             "finance-daily-opening-review-v3",
             "finance-daily-opening-review-v4",
@@ -450,7 +452,11 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
         from .daily_v1.refund_drafts_v1 import verify_proposal as verify_refund_proposal
 
         return verify_refund_proposal(service, conn, proposal, _rows=_rows)
-    if sealed.get("format") == "finance-daily-movement-observation-v1":
+    if sealed.get("format") in {
+        "finance-daily-movement-observation-v1",
+        "finance-daily-manual-receipt-observation-v1",
+        "finance-daily-ocr-receipt-observation-v1",
+    }:
         from .daily_v1.movements import verify_proposal as verify_movement_proposal
 
         return verify_movement_proposal(service, conn, proposal, _rows=_rows)
@@ -610,6 +616,8 @@ def verify_review(service, conn, review, *, _rows=None):
     if material.get("format") in {
         "finance-daily-movement-review-v1",
         "finance-daily-movement-review-v2",
+        "finance-daily-manual-receipt-review-v1",
+        "finance-daily-ocr-receipt-review-v1",
     }:
         from .daily_v1.movements import verify_review as verify_movement_review
 
@@ -688,6 +696,7 @@ def verify_review(service, conn, review, *, _rows=None):
 def verify_record(service, conn, record_id, *, _rows=None):
     from dataclasses import asdict
 
+    from . import receipt_posting_v1 as receipt_posting
     from .contracts import ExpectedAction
     from .daily_v1.movement_contracts import CORRECTION_OPENING_BASIS
     from .daily_v1.movements import reuses_target_selection_evidence
@@ -763,9 +772,16 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if review is None:
             raise LifecycleError("Record lacks original review")
         expected, delivery = verify_review(service, conn, review, _rows=_rows)
-        source = service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)
+        receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
+        source_key = (
+            expected.expense.history.source.source_key
+            if receipt
+            else service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)[
+                "source_key"
+            ]
+        )
         if fact["source_id"] != expected.source_id or (
-            version == 1 and fact["economic_event_id"] != source["source_key"]
+            version == 1 and fact["economic_event_id"] != source_key
         ):
             raise LifecycleError("Economic event differs from authenticated source identity")
         decision = (
@@ -784,15 +800,29 @@ def verify_record(service, conn, record_id, *, _rows=None):
             or (version > 1 and review["record_id"] != record_id)
         ):
             raise LifecycleError("Current record differs from confirmed review")
-        action = service.port.action(
-            conn,
-            decision["action_evidence_id"],
-            ExpectedAction(
-                expected.binding,
-                review["review_id"],
-                review["review_sha256"],
-                delivery["evidence_id"],
-            ),
+        payload = json.loads(event["payload_json"])
+        accepted_at = payload.get("accepted_at")
+        action = (
+            receipt_posting.read_action(
+                service,
+                conn,
+                expected,
+                review,
+                delivery,
+                decision["action_evidence_id"],
+                accepted_at,
+            )
+            if receipt
+            else service.port.action(
+                conn,
+                decision["action_evidence_id"],
+                ExpectedAction(
+                    expected.binding,
+                    review["review_id"],
+                    review["review_sha256"],
+                    delivery["evidence_id"],
+                ),
+            )
         )
         if (
             asdict(action) != json.loads(decision["material_json"])
@@ -825,8 +855,6 @@ def verify_record(service, conn, record_id, *, _rows=None):
             from .daily_v1.refund_drafts_v1 import verify_confirmed_refund
 
             verify_confirmed_refund(service, conn, fact, review, expected, action, _rows=_rows)
-        payload = json.loads(event["payload_json"])
-        accepted_at = payload.get("accepted_at")
         review_material = json.loads(review["material_json"])
         if (
             type(accepted_at) is not int
@@ -913,14 +941,20 @@ def audit_evidence_connection(
 
     from ._audit_rows_v1 import audit_rows
     from .daily_v1._opening_proposal_pages_v1 import preflight
+    from .receipt_posting_v1 import _has_receipt_proposals
+    from .receipt_snapshot_v1 import _receipt_snapshot_for
 
     preflight(conn)
 
-    if _witness_for(conn) is not None and _has_daily_values(conn):
+    witness = _witness_for(conn)
+    snapshot = _receipt_snapshot_for(conn, port, binding)
+    if witness is not None and _has_daily_values(conn):
         from .daily_v1.accounts import _EvidenceReadPort
 
         if type(port) is not _EvidenceReadPort:
             port = _EvidenceReadPort(port)
+    elif witness is None and snapshot is None and _has_receipt_proposals(conn):
+        raise LifecycleError("Exact historical receipt snapshot evidence required")
     # Raw immutable snapshot readback retains its independent SQL boundary.
     # An exact adapter alone is not admission; the selector proves its context.
     if daily_capacity is not None:

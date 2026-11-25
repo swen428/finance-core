@@ -282,8 +282,12 @@ def _actual_expected(service, conn, expected, *, proposal_version, proposal_seq,
 
 
 def verify_proposal(service, conn, proposal, *, _rows=None):
+    from .. import receipt_posting_v1 as receipt_posting
+
     fingerprint = _fingerprint(conn)
     sealed = strict_json(proposal["observation_json"])
+    if type(sealed) is dict and sealed.get("format") in receipt_posting.OBSERVATION_FORMATS:
+        return receipt_posting.verify_proposal(service, conn, proposal, sealed, _rows=_rows)
     exact(sealed, {"format", "expected", "observation"}, "daily observation envelope")
     if sealed["format"] != OBSERVATION_FORMAT:
         raise LifecycleError("Unsupported daily observation")
@@ -351,6 +355,10 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 def reuses_target_selection_evidence(service, conn, expected, action_evidence_id, *, _rows=None):
     """Keep the original target-selection messages distinct from a later confirmation."""
+    from .. import receipt_posting_v1 as receipt_posting
+
+    if type(expected) is receipt_posting._ReceiptExpectedMovementV1:
+        return False
     link = strict_json(expected.instruction_link["link_json"])
     if link["format"] == CORRECTION_OPENING_LINK:
         proposal_id = expected.current_proposal_id
@@ -376,6 +384,8 @@ def reuses_target_selection_evidence(service, conn, expected, action_evidence_id
 
 
 def verify_review(service, conn, review, *, _rows=None):
+    from .. import receipt_posting_v1 as receipt_posting
+
     fingerprint = _fingerprint(conn)
     proposal = (
         _rows.one(conn, "proposal", review["proposal_id"])
@@ -388,10 +398,23 @@ def verify_review(service, conn, review, *, _rows=None):
         raise LifecycleError("Daily review lacks proposal")
     expected = verify_proposal(service, conn, proposal, _rows=_rows)
     material = strict_json(review["material_json"])
-    v2 = material.get("format") == "finance-daily-movement-review-v2"
+    receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
+    v2 = (
+        "resolved_effects" in material
+        if receipt
+        else material.get("format") == "finance-daily-movement-review-v2"
+    )
+    review_format = (
+        expected.review_format
+        if receipt
+        else "finance-daily-movement-review-v2"
+        if v2
+        else REVIEW_FORMAT
+    )
     exact(
         material,
-        ({"resolved_effects"} if v2 else set())
+        ({"receipt"} if receipt else set())
+        | ({"resolved_effects"} if v2 else set())
         | {
             "format",
             "binding",
@@ -425,7 +448,7 @@ def verify_review(service, conn, review, *, _rows=None):
         require_accounts(conn, expected, values, events[0]["seq"], _rows=_rows)
     if (
         len(events) != 1
-        or material["format"] != ("finance-daily-movement-review-v2" if v2 else REVIEW_FORMAT)
+        or material["format"] != review_format
         or material["binding"] != asdict(expected.binding)
         or material["review_id"] != review["review_id"]
         or material["proposal_id"] != proposal["proposal_id"]
@@ -457,6 +480,11 @@ def verify_review(service, conn, review, *, _rows=None):
         or type(material["expires_at"]) is not int
         or not 0 < material["expires_at"] - material["created_at"] <= 600
         or material["created_at"] != review["created_at"]
+        or (
+            receipt
+            and material["receipt"]
+            != receipt_posting.receipt_card_material(expected, material["created_at"])
+        )
         or digest(material) != review["review_sha256"]
         or canonical(material) != events[0]["payload_json"]
     ):
@@ -472,10 +500,14 @@ def verify_review(service, conn, review, *, _rows=None):
         _require_prefix(
             conn, expected, proposal, "delivery", review_id=review["review_id"], _rows=_rows
         )
-        actual = service.port.delivery(
-            conn,
-            delivery["evidence_id"],
-            ExpectedDisplay(expected.binding, review["review_id"], review["review_sha256"]),
+        actual = (
+            receipt_posting.read_delivery(service, conn, expected, review, delivery["evidence_id"])
+            if receipt
+            else service.port.delivery(
+                conn,
+                delivery["evidence_id"],
+                ExpectedDisplay(expected.binding, review["review_id"], review["review_sha256"]),
+            )
         )
         if (
             asdict(actual) != strict_json(delivery["material_json"])
@@ -492,6 +524,8 @@ def verify_review(service, conn, review, *, _rows=None):
 
 
 def verify_fact(service, conn, fact, *, _rows=None):
+    from .. import receipt_posting_v1 as receipt_posting
+
     values = validate_movement(strict_json(fact["values_json"]))
     review = (
         _rows.one(conn, "review", fact["review_id"])
@@ -507,7 +541,12 @@ def verify_fact(service, conn, fact, *, _rows=None):
     )
     if proposal is None:
         raise LifecycleError("Missing l2_proposals identity")
-    expected = decode_expected(strict_json(proposal["observation_json"])["expected"])
+    sealed = strict_json(proposal["observation_json"])
+    expected = (
+        receipt_posting.verify_proposal(service, conn, proposal, sealed, _rows=_rows)
+        if sealed.get("format") in receipt_posting.OBSERVATION_FORMATS
+        else decode_expected(sealed["expected"])
+    )
     _require_prefix(
         conn,
         expected,
@@ -710,6 +749,8 @@ class DailyMovementServiceV1:
         ).fetchone()
         if existing:
             retained = verify_proposal(service, conn, existing)
+            if type(retained) is not ExpectedMovementInvocationV1:
+                raise LifecycleError("Receipt source requires the typed receipt entry point")
             event = conn.execute(
                 "SELECT * FROM l2_events WHERE operation_id=?", (operation_id,)
             ).fetchone()
@@ -845,11 +886,37 @@ class DailyMovementServiceV1:
             )
         return result
 
+    def propose_manual_receipt_expense(self, source_id, fields_reply, operation_id):
+        """Propose one expense from the current authenticated manual receipt history."""
+        from .. import receipt_posting_v1 as receipt_posting
+
+        with self._write() as (service, conn):
+            _audit(service, conn)
+            return receipt_posting.propose(service, conn, source_id, fields_reply, operation_id)
+
+    def propose_ocr_receipt_expense(self, source_id, fields_reply, operation_id):
+        """Propose an expense from its closed OCR bundle and authenticated receipt replies."""
+        from .. import receipt_posting_v1 as receipt_posting
+
+        with self._write() as (service, conn):
+            _audit(service, conn)
+            return receipt_posting.propose(
+                service,
+                conn,
+                source_id,
+                fields_reply,
+                operation_id,
+                observation_format=receipt_posting.OCR_OBSERVATION_FORMAT,
+            )
+
     def prepare_review(self, proposal_id, expected_proposal_version):
+        from .. import receipt_posting_v1 as receipt_posting
+
         with self._write() as (service, conn):
             _audit(service, conn)
             proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
             expected = verify_proposal(service, conn, proposal)
+            receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
             if proposal["version"] != expected_proposal_version:
                 raise LifecycleError("stale_proposal_version")
             values = strict_json(proposal["values_json"])
@@ -862,11 +929,16 @@ class DailyMovementServiceV1:
             if existing:
                 _, retained_delivery = verify_review(service, conn, existing)
                 if retained_delivery is None:
+                    if receipt:
+                        receipt_posting.require_current_receipt(service, conn, expected)
                     _require_current(conn, expected, proposal=proposal)
                     _require_refund_compatible_review(conn, expected, values)
                 result = _review_dto(conn, existing)
             else:
-                _require_current_authority(service, conn, expected)
+                if receipt:
+                    receipt_posting.require_current_receipt(service, conn, expected)
+                else:
+                    _require_current_authority(service, conn, expected)
                 _require_current(conn, expected, proposal=proposal)
                 review_id = _id("daily-review")
                 now = service._now()
@@ -895,6 +967,9 @@ class DailyMovementServiceV1:
                     material["format"] = "finance-daily-movement-review-v2"
                     material["account_impact_changes"] = changes
                     material["resolved_effects"] = effects
+                if receipt:
+                    material["format"] = expected.review_format
+                    material["receipt"] = receipt_posting.receipt_card_material(expected, now)
                 sha = digest(material)
                 conn.execute(
                     "INSERT INTO l2_reviews VALUES(?,?,?,?,?,?,?,?)",
@@ -914,17 +989,24 @@ class DailyMovementServiceV1:
         return result
 
     def record_delivery(self, review_id, delivery_evidence_id):
+        from .. import receipt_posting_v1 as receipt_posting
+
         with self._write() as (service, conn):
             _audit(service, conn)
             row = _row(conn, "l2_reviews", "review_id", review_id)
             expected, retained_delivery = verify_review(service, conn, row)
-            if retained_delivery is None:
+            receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
+            if retained_delivery is None and not receipt:
                 _require_current_authority(service, conn, expected)
             fingerprint = _fingerprint(conn)
-            actual = service.port.delivery(
-                conn,
-                delivery_evidence_id,
-                ExpectedDisplay(expected.binding, review_id, row["review_sha256"]),
+            actual = (
+                receipt_posting.read_delivery(service, conn, expected, row, delivery_evidence_id)
+                if receipt
+                else service.port.delivery(
+                    conn,
+                    delivery_evidence_id,
+                    ExpectedDisplay(expected.binding, review_id, row["review_sha256"]),
+                )
             )
             service._actor(actual)
             if (
@@ -943,6 +1025,8 @@ class DailyMovementServiceV1:
                 ] != canonical(asdict(actual)):
                     raise LifecycleError("Daily delivery replay mismatch")
             else:
+                if receipt:
+                    receipt_posting.require_current_receipt(service, conn, expected)
                 proposal = _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
                 _require_current(conn, expected, proposal=proposal)
                 values = strict_json(row["values_json"])
@@ -959,6 +1043,8 @@ class DailyMovementServiceV1:
         return result
 
     def confirm(self, review_id, action_evidence_id, operation_id):
+        from .. import receipt_posting_v1 as receipt_posting
+
         text(review_id, "review id")
         text(action_evidence_id, "action evidence id")
         text(operation_id, "operation id")
@@ -972,6 +1058,7 @@ class DailyMovementServiceV1:
                 _assert_unreserved(conn, review_id, action_evidence_id, operation_id)
                 row = _row(conn, "l2_reviews", "review_id", review_id)
                 expected, delivery = verify_review(service, conn, row)
+                receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
                 material = strict_json(row["material_json"])
                 values = validate_movement(strict_json(row["values_json"]))
                 now = service._now()
@@ -982,21 +1069,33 @@ class DailyMovementServiceV1:
                 ):
                     raise LifecycleError("Daily review lacks current delivery/binding/expiry")
                 fingerprint = _fingerprint(conn)
-                action = service.port.action(
-                    conn,
-                    action_evidence_id,
-                    ExpectedAction(
-                        service.binding, review_id, row["review_sha256"], delivery["evidence_id"]
-                    ),
+                action = (
+                    receipt_posting.read_action(
+                        service, conn, expected, row, delivery, action_evidence_id, now
+                    )
+                    if receipt
+                    else service.port.action(
+                        conn,
+                        action_evidence_id,
+                        ExpectedAction(
+                            service.binding,
+                            review_id,
+                            row["review_sha256"],
+                            delivery["evidence_id"],
+                        ),
+                    )
                 )
                 service._actor(action)
                 if (
                     action.evidence_id != action_evidence_id
-                    or action_evidence_id
-                    in {
-                        expected.instruction["evidence_id"],
-                        values["instruction_ref"]["evidence_id"],
-                    }
+                    or (
+                        not receipt
+                        and action_evidence_id
+                        in {
+                            expected.instruction["evidence_id"],
+                            values["instruction_ref"]["evidence_id"],
+                        }
+                    )
                     or reuses_target_selection_evidence(service, conn, expected, action_evidence_id)
                     or action.review_id != review_id
                     or action.review_sha256 != row["review_sha256"]
@@ -1015,9 +1114,14 @@ class DailyMovementServiceV1:
                 _require_fact_capacity(
                     conn, new_record=predecessor is None, daily_capacity=service.daily_capacity
                 )
-                source = service._source(
-                    conn, expected.source_id, allow_archived=predecessor is not None
-                )
+                if receipt:
+                    receipt_posting.require_current_receipt(service, conn, expected)
+                    source_key = expected.expense.history.source.source_key
+                else:
+                    source = service._source(
+                        conn, expected.source_id, allow_archived=predecessor is not None
+                    )
+                    source_key = source["source_key"]
                 # Source revalidation is an external callback too: recheck all
                 # optimistic state after it and before the only three appends.
                 if _fingerprint(conn) != fingerprint:
@@ -1028,7 +1132,7 @@ class DailyMovementServiceV1:
 
                 require_refund_compatible_expense_change(conn, predecessor, values)
                 version = expected.expected_version + 1
-                economic = predecessor["economic_event_id"] if predecessor else source["source_key"]
+                economic = predecessor["economic_event_id"] if predecessor else source_key
                 previous = predecessor["fact_sha256"] if predecessor else None
                 sha = digest(
                     _fact_material(

@@ -1431,6 +1431,17 @@ def _total_fields_from_verified(
     )
 
 
+def _read_retained_media_evidence(
+    evidence_root: str | Path, reference: MediaOcrReference
+) -> VerifiedMediaOcrEvidence:
+    _require_media_reference(reference)
+    root = publication.open_storage_root(evidence_root)
+    try:
+        return _read_verified_in_root(root, reference, ReceiptMediaProcessor._read_verified)
+    finally:
+        root.close()
+
+
 def read_retained_media_total_fields_v1(
     evidence_root: str | Path,
     reference: MediaOcrReference,
@@ -1441,12 +1452,8 @@ def read_retained_media_total_fields_v1(
     _require_media_reference(reference)
     if type(expected_original_size) is not int or not 0 < expected_original_size <= SOURCE_BYTES:
         raise ReceiptMediaError("Exact expected original size is required")
-    root = publication.open_storage_root(evidence_root)
-    try:
-        verified = _read_verified_in_root(root, reference, ReceiptMediaProcessor._read_verified)
-        return _total_fields_from_verified(verified, expected_original_size)
-    finally:
-        root.close()
+    verified = _read_retained_media_evidence(evidence_root, reference)
+    return _total_fields_from_verified(verified, expected_original_size)
 
 
 __all__ = [

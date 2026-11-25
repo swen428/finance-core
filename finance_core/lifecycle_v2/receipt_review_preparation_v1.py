@@ -40,6 +40,11 @@ if TYPE_CHECKING:
         ReceiptExpenseCandidateV1,
         ReceiptExpenseConfirmationPreviewV1,
     )
+    from .receipt_retained_manual_v1 import (
+        ReceiptJournalReplyRefV1,
+        RetainedManualReceiptExpenseV1,
+    )
+    from .receipt_retained_ocr_v1 import RetainedOcrReceiptExpenseV1
     from .service import LedgerService
 
 _DEBIT_AMOUNT = re.compile(r"(?:([A-Z]{3}) )?((?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,4})?)")
@@ -178,6 +183,19 @@ def _copy_account(account):
     )
 
 
+def _copy_payment(payment):
+    if type(payment) is not VerifiedReceiptPaymentV1:
+        raise LifecycleError("Exact authenticated receipt payment required")
+    payment = replace(payment)
+    return replace(
+        payment,
+        account=_copy_account(payment.account),
+        selection=replace(payment.selection),
+        debit=replace(payment.debit),
+        debit_question_account=_copy_account(payment.debit_question_account),
+    )
+
+
 def _receipt_payment(conn, port, source, draft):
     expected_source = replace(source)
     expected_draft = deepcopy(draft)
@@ -195,18 +213,14 @@ def _receipt_payment(conn, port, source, draft):
             raise LifecycleError("Receipt callback changed its expected draft or source")
         if payment is None:
             return None
-        if type(payment) is not VerifiedReceiptPaymentV1:
-            raise LifecycleError("Exact authenticated receipt payment required")
-        payment = replace(payment)
-        selection = replace(payment.selection)
-        debit = replace(payment.debit)
-        payment = replace(
-            payment,
-            account=_copy_account(payment.account),
-            selection=selection,
-            debit=debit,
-            debit_question_account=_copy_account(payment.debit_question_account),
-        )
+        payment = _copy_payment(payment)
+    return _require_payment(source, draft, payment)
+
+
+def _require_payment(source, draft, payment):
+    draft_sha256 = digest(asdict(draft))
+    source_sha256 = digest(asdict(source))
+    selection, debit = payment.selection, payment.debit
     manual = draft.manual if type(draft) is ReceiptWholeDraftV1 else draft
     last_fields = None
     if manual is not None:
@@ -255,8 +269,8 @@ def _receipt_payment(conn, port, source, draft):
     return payment
 
 
-def _current_account(conn, account):
-    for item in account_inventory(conn):
+def _account_at(conn, account, before_seq=None, *, _rows=None):
+    for item in account_inventory(conn, before_seq, _rows=_rows):
         values = item["values"]
         definition = values["account"]
         current = ReceiptPaymentAccountOptionV1(
@@ -302,7 +316,8 @@ class ReceiptReviewReaderV1:
             retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
-            preparation, _ = self._prepare(service, conn, source_id, recorded)
+            _audit(service, conn)
+            preparation, _ = self._prepare_on_connection(service, conn, source_id, recorded)
             return preparation
 
     def completed(
@@ -314,13 +329,6 @@ class ReceiptReviewReaderV1:
         retained_evidence_root: str | Path | None = None,
     ):
         """Read the separately observed review fields without creating a review or fact."""
-        from .receipt_review_fields_v1 import (
-            ReceiptReviewFieldsTargetV1,
-            VerifiedReceiptReviewFieldsReplyV1,
-            _complete_review_fields,
-            _copy_review_fields_target,
-        )
-
         recorded = _read_optional_recorded_fields(
             self._boundary._service.reader(),
             source_id,
@@ -329,32 +337,26 @@ class ReceiptReviewReaderV1:
             retained_evidence_root=retained_evidence_root,
         )
         with self._boundary._read() as (service, conn):
-            preparation, opening = self._prepare(service, conn, source_id, recorded)
-            if preparation is None:
+            _audit(service, conn)
+            return self._completed_on_connection(service, conn, source_id, recorded)
+
+    @classmethod
+    def _completed_on_connection(cls, service, conn, source_id, recorded):
+        """Compile verified review fields inside the caller's audited transaction."""
+        from .receipt_review_fields_v1 import _complete_review_fields, _copy_review_fields_reply
+
+        preparation, opening = cls._prepare_on_connection(service, conn, source_id, recorded)
+        if preparation is None:
+            return None
+        with _evidence_read_callback(conn):
+            verify = getattr(service.port._port, "receipt_review_fields_reply_v1", None)
+            if not callable(verify):
+                raise LifecycleError("Installed evidence port lacks receipt review fields reply")
+            evidence = verify(conn, preparation.source.evidence_id)
+            if evidence is None:
                 return None
-            with _evidence_read_callback(conn):
-                verify = getattr(service.port._port, "receipt_review_fields_reply_v1", None)
-                if not callable(verify):
-                    raise LifecycleError(
-                        "Installed evidence port lacks receipt review fields reply"
-                    )
-                evidence = verify(conn, preparation.source.evidence_id)
-                if evidence is None:
-                    return None
-                if (
-                    type(evidence) is not VerifiedReceiptReviewFieldsReplyV1
-                    or type(evidence.target) is not ReceiptReviewFieldsTargetV1
-                    or type(evidence.reply) is not VerifiedReceiptPaymentReplyV1
-                    or type(evidence.principal_id) is not str
-                    or type(evidence.client_id) is not str
-                ):
-                    raise LifecycleError("Exact authenticated receipt review reply required")
-                evidence = replace(
-                    evidence,
-                    target=_copy_review_fields_target(evidence.target),
-                    reply=replace(evidence.reply),
-                )
-            return _complete_review_fields(preparation, evidence, opening)
+            evidence = _copy_review_fields_reply(evidence)
+        return _complete_review_fields(preparation, evidence, opening)
 
     def expense_candidate(
         self,
@@ -399,9 +401,30 @@ class ReceiptReviewReaderV1:
             _compile_receipt_expense_candidate(fields), fields.preparation.payment.account
         )
 
+    def retained_manual_expense(
+        self, source_id: str, fields_reply: ReceiptJournalReplyRefV1
+    ) -> RetainedManualReceiptExpenseV1:
+        """Reconstruct an exact manual receipt reply on the current audited ledger cut."""
+        from .receipt_retained_manual_v1 import _reconstruct_manual_expense
+
+        with self._boundary._read() as (service, conn):
+            _audit(service, conn)
+            return _reconstruct_manual_expense(service, conn, source_id, fields_reply)
+
+    def retained_ocr_expense(
+        self, source_id: str, fields_reply: ReceiptJournalReplyRefV1
+    ) -> RetainedOcrReceiptExpenseV1:
+        """Rebuild an exact OCR receipt from its original custody and signed replies."""
+        from .receipt_retained_ocr_v1 import _reconstruct_ocr_expense
+
+        with self._boundary._read() as (service, conn):
+            _audit(service, conn)
+            return _reconstruct_ocr_expense(service, conn, source_id, fields_reply)
+
     @staticmethod
-    def _prepare(service, conn, source_id, recorded=None):
-        _audit(service, conn)
+    def _prepare_on_connection(service, conn, source_id, recorded):
+        if not conn.in_transaction:
+            raise LifecycleError("Receipt preparation requires a protected ledger transaction")
         source = service._receipt_source(conn, source_id, allow_archived=False)
         replies = service.port.receipt_manual_replies_v1(conn, source)
         draft = _project_payment_draft(source_id, source, replies, recorded)
@@ -410,35 +433,39 @@ class ReceiptReviewReaderV1:
         payment = _receipt_payment(conn, service.port._port, source, draft)
         if payment is None:
             return None, None
-        account, active_opening, opening = _current_account(conn, payment.account)
-        fields = {field.name: field.value for field in draft.fields}
-        original_currency = fields["currency"]
-        debit = _DEBIT_AMOUNT.fullmatch(payment.debit.raw_text.strip())
-        if (
-            original_currency not in SUPPORTED_CURRENCIES
-            or debit is None
-            or debit[1] not in {None, account.currency}
-        ):
-            raise LifecycleError("Receipt payment currency or debit reply differs")
-        try:
-            original_amount = _positive_money(fields["amount"], original_currency)
-            account_amount = _positive_money(debit[2], account.currency)
-        except MoneyValidationError:
-            raise LifecycleError("Receipt payment amount exceeds its currency precision") from None
-        # The receipt date does not establish funds time or coverage by an opening.
-        missing = ("category", "opening_coverage") if active_opening else ("category",)
-        preparation = ReceiptReviewPreparationV1(
-            service.binding,
-            source,
-            draft,
-            replace(payment, account=account),
-            _day(fields["date"]),
-            text(fields["merchant"], "description", 1024),
-            original_amount,
-            original_currency,
-            account_amount,
-            account.currency,
-            active_opening,
-            missing,
-        )
-        return preparation, opening
+        return _prepare_payment(service.binding, conn, source, draft, payment)
+
+
+def _prepare_payment(binding, conn, source, draft, payment, *, before_seq=None, _rows=None):
+    account, active_opening, opening = _account_at(conn, payment.account, before_seq, _rows=_rows)
+    fields = {field.name: field.value for field in draft.fields}
+    original_currency = fields["currency"]
+    debit = _DEBIT_AMOUNT.fullmatch(payment.debit.raw_text.strip())
+    if (
+        original_currency not in SUPPORTED_CURRENCIES
+        or debit is None
+        or debit[1] not in {None, account.currency}
+    ):
+        raise LifecycleError("Receipt payment currency or debit reply differs")
+    try:
+        original_amount = _positive_money(fields["amount"], original_currency)
+        account_amount = _positive_money(debit[2], account.currency)
+    except MoneyValidationError:
+        raise LifecycleError("Receipt payment amount exceeds its currency precision") from None
+    # The receipt date does not establish funds time or coverage by an opening.
+    missing = ("category", "opening_coverage") if active_opening else ("category",)
+    preparation = ReceiptReviewPreparationV1(
+        binding,
+        source,
+        draft,
+        replace(payment, account=account),
+        _day(fields["date"]),
+        text(fields["merchant"], "description", 1024),
+        original_amount,
+        original_currency,
+        account_amount,
+        account.currency,
+        active_opening,
+        missing,
+    )
+    return preparation, opening

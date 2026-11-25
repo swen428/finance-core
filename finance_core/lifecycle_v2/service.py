@@ -151,17 +151,22 @@ def _receipt_capture_material(payload):
         raise LifecycleError("Exact retained receipt evidence required") from exc
 
 
-def _original_receipt_evidence(port, conn, evidence_id):
+def _original_receipt_evidence(port, conn, binding, evidence_id):
     from finance_core.instance_admission.sessions import _witness_for
 
     from .daily_v1.accounts import _EvidenceReadPort
+    from .receipt_snapshot_v1 import _receipt_snapshot_for
 
-    if _witness_for(conn) is not None and type(port) is not _EvidenceReadPort:
-        port = _EvidenceReadPort(port)
-    read = getattr(port, "receipt_source_v1", None)
-    if not callable(read):
-        raise LifecycleError("Original receipt evidence port is unavailable")
-    value = read(conn, evidence_id)
+    scope = _receipt_snapshot_for(conn, port, binding)
+    if scope is not None:
+        value = scope.read("receipt_source_v1", evidence_id)
+    else:
+        if _witness_for(conn) is not None and type(port) is not _EvidenceReadPort:
+            port = _EvidenceReadPort(port)
+        read = getattr(port, "receipt_source_v1", None)
+        if not callable(read):
+            raise LifecycleError("Original receipt evidence port is unavailable")
+        value = read(conn, evidence_id)
     if type(value) is not VerifiedReceiptSourceV1 or value.evidence_id != evidence_id:
         raise LifecycleError("Exact original receipt evidence required")
     # Also check detached adapters that do not use the protected scalar-copy wrapper.
@@ -369,7 +374,7 @@ class LedgerService:
         retained = json.loads(payload)
         if type(retained) is not dict or retained.get("format") != _RECEIPT_CAPTURE:
             raise LifecycleError("Source is outside the typed receipt entry point")
-        actual = _original_receipt_evidence(self.port, conn, row["evidence_id"])
+        actual = _original_receipt_evidence(self.port, conn, self.binding, row["evidence_id"])
         self._actor(actual)
         if actual != _receipt_capture_material(retained):
             raise LifecycleError("Original receipt evidence changed")
@@ -383,7 +388,7 @@ class LedgerService:
     def capture_receipt_v1(self, source_evidence_id: str, operation_id: str) -> SourceRef:
         """Record an authenticated original receipt message before any financial proposal."""
         with self._write_operation() as conn:
-            evidence = _original_receipt_evidence(self.port, conn, source_evidence_id)
+            evidence = _original_receipt_evidence(self.port, conn, self.binding, source_evidence_id)
             self._actor(evidence)
             return self._capture_verified(conn, evidence, operation_id, _RECEIPT_CAPTURE)
 
@@ -968,7 +973,8 @@ class LedgerService:
             validate_application_database,
         )
 
-        from .reader import audit_evidence_connection
+        from .reader import audit_connection, audit_evidence_connection
+        from .receipt_posting_v1 import _has_receipt_proposals
         from .snapshot_io import _secure_snapshot_destination
 
         with self._runtime_scope():
@@ -983,13 +989,14 @@ class LedgerService:
                     core_identity = config.core_identity
                     source_binding_sha256 = config.binding_sha256
                     conn.execute("BEGIN")
-                    audit_evidence_connection(
+                    source_audit = audit_evidence_connection(
                         conn,
                         port,
                         binding,
                         self.legacy_verifier,
                         daily_capacity=self.daily_capacity,
                     )
+                    has_receipt_proposals = _has_receipt_proposals(conn)
                     sealed_ledger = ledger_sha256(conn)
                     validate_application_database(conn, migration, schema, sealed_ledger)
                     source_logical = _logical_database_digest(conn)
@@ -1010,16 +1017,23 @@ class LedgerService:
                     validate_application_database(readback, migration, schema, sealed_ledger)
                     _snapshot_integrity(readback)
                     readback.row_factory = sqlite3.Row
-                    audit_evidence_connection(
-                        readback,
-                        port,
-                        binding,
-                        self.legacy_verifier,
-                        daily_capacity=self.daily_capacity,
-                    )
-                    if _logical_database_digest(readback) != source_logical or _snapshot_inventory(
-                        readback
-                    ) != (facts, seq):
+                    if has_receipt_proposals:
+                        # Receipt callbacks require an admitted read. Authenticate them above
+                        # and verify the independent copy against that entire logical cut.
+                        copied_audit = audit_connection(readback)
+                    else:
+                        copied_audit = audit_evidence_connection(
+                            readback,
+                            port,
+                            binding,
+                            self.legacy_verifier,
+                            daily_capacity=self.daily_capacity,
+                        )
+                    if (
+                        copied_audit != source_audit
+                        or _logical_database_digest(readback) != source_logical
+                        or _snapshot_inventory(readback) != (facts, seq)
+                    ):
                         raise LifecycleError("Snapshot copy differs from source transaction")
                 finally:
                     readback.close()

@@ -323,6 +323,71 @@ Unknown fields remain pending. These reads prepare review inputs.
 Posting still requires a separate delivered confirmation card and guarded
 finalization.
 
+### Guarded posting for a complete manual receipt
+
+The admitted daily movement API starts a receipt expense with
+`propose_manual_receipt_expense(source_id, fields_reply, operation_id)`.
+The `ReceiptJournalReplyRefV1` selects the exact category and coverage reply
+by its journal sequence, response ID and hash, message ID and update ID.
+Core reads the original media source and the manual, account, debit and
+category evidence from `receipt_retained_manual_history_v1`. It derives the
+ordinary expense values and checks the account and opening at the ledger
+event immediately preceding the proposal event. The proposal binds that
+ledger position and the authenticated receipt history.
+
+The daily API prepares the complete card, records its delivery, and accepts
+a separate confirmation. The `receipt_card_delivery_v1` and
+`receipt_confirm_action_v1` callbacks resolve original transport evidence
+by immutable evidence ID. They authenticate the actor and client, the
+full card and its delivered message, and the human confirmation that quoted
+that message. The confirmation retains its own response, message and update
+identity and binds the quoted message to its original delivery response.
+`receipt_manual_fields_reply_at_v1` resolves the latest eligible complete
+manual revision at the exact confirmation update during historical readback.
+A current write also checks the latest revision and account dependency
+before the shared guarded movement finalization.
+
+The final fact uses the ordinary daily expense format and links to the typed
+receipt source. The reviewed receipt total and actual debit remain separate
+values. Same-generation reopen and exact operation replay return the original
+confirmation and fact. Receipt-origin corrections and reversals require a
+separate typed path.
+
+Snapshot sealing authenticates receipt evidence in the admitted source
+transaction and compares the complete logical database and lifecycle
+inventory with a separately opened immutable copy. Independent historical
+verification takes a `ReceiptSnapshotLookupV1` bound to the exact
+`SnapshotCut`. The application authenticates the original historical
+journal and attachment before supplying the lookup. Core verifies the
+cut and passes only evidence identities to the receipt lookup. Native
+detached recovery admission remains unavailable for typed receipts.
+
+### Guarded posting from retained OCR
+
+`ReceiptReviewReaderV1.retained_ocr_expense` rebuilds one original whole
+draft from a signed receipt registration and its timed reply history. The
+installed lookup authenticates the prepared and closed registration, binds
+their identical inventory to the signed payment question, and selects the
+private retained evidence root. Core reopens all six immutable members,
+checks the complete signed inventory, and parses the verified OCR blocks.
+The root path is independent of the expense identity. A verified archive can
+supply the same original members from its own read-only custody.
+
+The whole draft can contain only OCR fields, a combination of OCR fields
+and authenticated manual answers, or complete manual original fields when
+the successfully processed image has no text. Core preserves the origin
+of every field. The retained payment, actual debit, category and opening
+coverage still come from their separately authenticated original replies.
+
+The daily movement API starts the guarded path with
+`propose_ocr_receipt_expense(source_id, fields_reply, operation_id)`.
+The typed OCR proposal commits the exact registration and reply history.
+The OCR card requires an independently authenticated confirmation of the
+exact delivered message. Core rechecks the current account, opening and
+OCR draft before applying the ordinary expense fact. The historical
+`ReceiptOcrSnapshotLookupV1` also supplies the original OCR receipt history
+and the latest eligible OCR revision at the exact confirmation update.
+
 ## Primary decoder contracts
 
 The [libheif API](https://raw.githubusercontent.com/strukturag/libheif/v1.17.6/libheif/heif.h)

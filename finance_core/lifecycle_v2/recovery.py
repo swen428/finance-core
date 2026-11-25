@@ -852,15 +852,29 @@ def verify_snapshot_evidence(
     legacy_verifier=None,
     *,
     daily_capacity: DailyCapacityV2 | None = None,
+    receipt_snapshot_lookup=None,
 ):
+    """Verify a frozen cut with its independently authenticated evidence."""
     from .reader import audit_evidence_connection
+    from .receipt_snapshot_v1 import receipt_snapshot_evidence_scope
 
     database = Path(database).resolve(strict=True)
     if hashlib.sha256(database.read_bytes()).hexdigest() != cut.database_sha256:
         raise LifecycleError("Snapshot bytes differ from expected cut")
-    conn = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+    mode = "?mode=ro&immutable=1" if receipt_snapshot_lookup is not None else "?mode=ro"
+    conn = sqlite3.connect(database.as_uri() + mode, uri=True)
     conn.row_factory = sqlite3.Row
     try:
+        if receipt_snapshot_lookup is not None:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("BEGIN")
+            with receipt_snapshot_evidence_scope(
+                conn, port, binding, cut, receipt_snapshot_lookup
+            ) as qualified:
+                return audit_evidence_connection(
+                    conn, qualified, binding, legacy_verifier, daily_capacity=daily_capacity
+                )
         conn.execute("BEGIN")
         result = audit_evidence_connection(
             conn, port, binding, legacy_verifier, daily_capacity=daily_capacity
