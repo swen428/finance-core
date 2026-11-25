@@ -424,9 +424,33 @@ def test_receipt_snapshot_qualification_is_exact_and_read_only(live, tmp_path):
         with pytest.raises(LifecycleError, match="historical receipt snapshot evidence"):
             audit_evidence_connection(conn, bound, ledger.binding)
 
+    class UnadmittedLookup:
+        @property
+        def snapshot_cut(self):
+            pytest.fail("a refused connection must not access lookup properties")
+
     with ledger._write_operation() as conn:
         conn.execute("BEGIN IMMEDIATE")
         with pytest.raises(LifecycleError, match="exact admitted source read"):
-            with receipt_snapshot_evidence_scope(conn, port, ledger.binding, cut, lookup):
+            with receipt_snapshot_evidence_scope(
+                conn, port, ledger.binding, cut, UnadmittedLookup()
+            ):
                 pytest.fail("a write connection was qualified")
         conn.rollback()
+
+    with lifecycle_read_operation(ledger.owner) as conn:
+        conn.execute("BEGIN")
+        witness = _witness_for(conn)
+        resolved = set()
+
+        class GuardedLookup:
+            def __getattr__(self, name):
+                assert witness.evidence_callback_token is not None
+                resolved.add(name)
+                return getattr(lookup, name)
+
+        with receipt_snapshot_evidence_scope(
+            conn, port, ledger.binding, cut, GuardedLookup()
+        ) as bound:
+            assert audit_evidence_connection(conn, bound, ledger.binding)["fact_version_count"] == 1
+        assert {"snapshot_cut", "receipt_retained_manual_history_v1"} <= resolved

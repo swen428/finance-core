@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
@@ -76,6 +76,11 @@ class _ReceiptSnapshotScope:
         self.changes = conn.total_changes
         self.active = False
 
+    def _lookup_context(self):
+        if self.witness is None:
+            return nullcontext()
+        return _evidence_read_callback(self.connection)
+
     def check_transaction(self):
         conn = self.connection
         if (
@@ -84,9 +89,17 @@ class _ReceiptSnapshotScope:
             or conn.row_factory is not sqlite3.Row
             or _witness_for(conn) is not self.witness
             or (self.witness is None and conn.execute("PRAGMA query_only").fetchone()[0] != 1)
-            or self.lookup.snapshot_cut != self.cut
         ):
             raise LifecycleError("Receipt snapshot evidence transaction changed")
+        with self._lookup_context():
+            bound_cut = getattr(self.lookup, "snapshot_cut", None)
+            if type(bound_cut) is not SnapshotCut or bound_cut != self.cut:
+                raise LifecycleError("Exact historical receipt snapshot evidence required")
+
+    def check_lookup_methods(self):
+        with self._lookup_context():
+            if any(not callable(getattr(self.lookup, name, None)) for name in _LOOKUPS):
+                raise LifecycleError("Exact historical receipt snapshot evidence required")
 
     def require_issued(self):
         if not self.active or not any(scope is self for scope in _SCOPES.get()):
@@ -99,14 +112,11 @@ class _ReceiptSnapshotScope:
             name in _REVISION_LOOKUPS and args[-1] is None
         ):
             raise LifecycleError("Exact historical receipt lookup required")
-        read = getattr(self.lookup, name, None)
-        if not callable(read):
-            raise LifecycleError("Snapshot lookup lacks authenticated receipt evidence")
-        if self.witness is None:
+        with self._lookup_context():
+            read = getattr(self.lookup, name, None)
+            if not callable(read):
+                raise LifecycleError("Snapshot lookup lacks authenticated receipt evidence")
             actual = read(*args)
-        else:
-            with _evidence_read_callback(self.connection):
-                actual = read(*args)
         self.require_issued()
         return actual
 
@@ -154,9 +164,6 @@ def receipt_snapshot_evidence_scope(
         or type(binding) is not RuntimeBinding
         or type(cut) is not SnapshotCut
         or (binding.instance_id, binding.generation) != (cut.instance_id, cut.generation)
-        or type(getattr(lookup, "snapshot_cut", None)) is not SnapshotCut
-        or lookup.snapshot_cut != cut
-        or any(not callable(getattr(lookup, name, None)) for name in _LOOKUPS)
     ):
         raise LifecycleError("Exact historical receipt snapshot evidence required")
     if witness is not None:
@@ -173,6 +180,7 @@ def receipt_snapshot_evidence_scope(
         raise LifecycleError("Receipt snapshot evidence already scoped on this connection")
     scope = _ReceiptSnapshotScope(conn, port, replace(binding), replace(cut), lookup, witness)
     scope.check_transaction()
+    scope.check_lookup_methods()
     schemas = {row[1] for row in conn.execute("PRAGMA database_list")}
     if (
         "main" not in schemas
