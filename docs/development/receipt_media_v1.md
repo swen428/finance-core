@@ -157,8 +157,10 @@ A root owner lock serializes operation processing. Each `media_` operation ID
 first reserves an exclusive root-level `<operation_id>.claim.json`. Its
 canonical `receipt-media-operation-claim-v1` payload contains only the operation
 ID and intent SHA-256, without absolute paths or filesystem inode numbers.
-Creation uses `O_EXCL`/`O_NOFOLLOW`, 0600 writing, file fsync, 0400 sealing,
-another file fsync and root fsync before creating the operation directory.
+Creation uses `O_EXCL`/`O_NOFOLLOW`. The root is synced after reservation so
+the new name survives a failure while writing or closing the claim. The claim
+uses 0600 writing, file fsync, 0400 sealing, another file fsync and root fsync
+before creating the operation directory.
 The claim is read with a 4096-byte bound. Its held descriptor, canonical
 pathname, immutable bytes, owner/mode, device/inode and single link are
 reverified at processing custody checkpoints and before returns.
@@ -182,8 +184,23 @@ from silently retrying the operation ID. The trusted OS owner can intentionally
 delete both reservation and operation state; this contract does not claim
 protection against that deliberate deletion.
 
+Each writer is closed at most once. If its close fails and the caller cannot
+establish that the original descriptor closed, `process()` raises
+`MediaWriterCloseUnknown`. The exception retains the original write descriptor,
+operation custody and storage-root lock in the same process. The caller must
+retain this object in its held owner and suspend further work. Automatic
+cleanup, retry or lock reacquisition is unsafe in this state.
+
 Successful completion includes `normalized.png`, canonical `ocr.json` and a
-terminal `result.json`. The result records exact normalization metadata,
+terminal `result.json`. The terminal is reserved exclusively and written at
+0600. The processor holds a separate read-only descriptor to that exact file.
+After synchronizing the contents and directory and confirming that the writer
+closed successfully, it seals the same inode at 0400 through that descriptor,
+synchronizes the file and directory again, and checks the held terminal identity.
+A valid 0600 terminal stays incomplete on replay. Evidence readers require a
+fully verified 0400 terminal. A sync failure after sealing prevents the first
+call from succeeding. Later replay still has to verify the entire result and
+its evidence. The result records exact normalization metadata,
 derivative identity, normalization fingerprint, OCR identity/input
 fingerprint and OCR result digest.
 The completed OCR fingerprint includes its actual canonical result digest and

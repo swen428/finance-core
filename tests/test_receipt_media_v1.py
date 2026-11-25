@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import io
 import json
 import os
 import shutil
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -1108,6 +1111,285 @@ def test_actual_root_owner_lock_serializes_before_effects(seam, monkeypatch, tmp
         media.publication.release_storage_root_lock(root)
         root.close()
     assert processor.process(**request).status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("member", "earlier_failure"),
+    [
+        ("claim", None),
+        ("intent.json", None),
+        ("original.bin", None),
+        ("original.bin", "after_original"),
+        ("declaration.json", None),
+        ("normalized.png", None),
+        ("normalized.png", "decoder"),
+        ("ocr.json", None),
+        ("ocr.json", "probe-unavailable"),
+        ("ocr.json", "interrupt-before-close"),
+        ("ocr.json", "interrupt-close"),
+        ("ocr.json", "interrupt-probe"),
+        ("result.json", None),
+        ("result.json", "ocr"),
+    ],
+)
+def test_unknown_writer_close_retains_original_processing_custody(
+    seam, monkeypatch, member, earlier_failure
+):
+    processor, engine, request, _, evidence, raw, workers = seam
+    operation = request["operation_id"]
+    if member == "claim":
+        member = media._claim_name(operation)
+    if earlier_failure == "decoder":
+
+        def fail_decoder(*args, **kwargs):
+            raise RuntimeError("synthetic decoder exception")
+
+        monkeypatch.setattr(media, "_worker_run", fail_decoder)
+    if earlier_failure == "after_original":
+
+        def fail_original(stage):
+            if stage == earlier_failure:
+                raise RuntimeError("synthetic original interruption")
+
+        monkeypatch.setattr(media, "_inject", fail_original)
+    engine.fail = earlier_failure == "ocr"
+    ordinary_open, ordinary_close, ordinary_fstat, ordinary_sync = (
+        os.open,
+        os.close,
+        os.fstat,
+        os.fsync,
+    )
+    acquire = media.publication.acquire_storage_root_lock
+    release = media.publication.release_storage_root_lock
+    writers, attempts, roots, released = [], [], [], []
+    events, interruptions = [], []
+
+    def observe_open(name, flags, *args, **kwargs):
+        fd = ordinary_open(name, flags, *args, **kwargs)
+        if name == member and flags & os.O_EXCL:
+            writers.append((fd, kwargs["dir_fd"], os.fstat(fd)))
+        return fd
+
+    def fault_close(fd):
+        if writers and fd == writers[0][0]:
+            attempts.append(fd)
+            events.append("close")
+            if len(attempts) == 1:
+                if earlier_failure == "interrupt-close":
+                    raise KeyboardInterrupt
+                raise OSError(errno.EIO, "synthetic error with the writer still open")
+        ordinary_close(fd)
+
+    def fault_probe(fd):
+        if writers and fd == writers[0][0]:
+            if earlier_failure == "interrupt-before-close" and not interruptions:
+                interruptions.append(fd)
+                raise KeyboardInterrupt
+            if attempts and earlier_failure == "probe-unavailable":
+                raise OSError(errno.EIO, "synthetic error probing the writer")
+            if attempts and earlier_failure == "interrupt-probe":
+                raise KeyboardInterrupt
+        return ordinary_fstat(fd)
+
+    def observe_sync(fd):
+        ordinary_sync(fd)
+        if writers and fd == writers[0][1]:
+            events.append("directory-sync")
+
+    def observe_acquire(root, **kwargs):
+        acquire(root, **kwargs)
+        roots.append(root)
+
+    def observe_release(root):
+        released.append(root)
+        release(root)
+
+    with monkeypatch.context() as injection:
+        injection.setattr(os, "open", observe_open)
+        injection.setattr(os, "close", fault_close)
+        injection.setattr(os, "fstat", fault_probe)
+        injection.setattr(os, "fsync", observe_sync)
+        injection.setattr(media.publication, "acquire_storage_root_lock", observe_acquire)
+        injection.setattr(media.publication, "release_storage_root_lock", observe_release)
+        with pytest.raises(media.MediaWriterCloseUnknown) as caught:
+            processor.process(**request)
+    held = caught.value
+    writer_fd, directory, writer_identity = writers[0]
+    try:
+        assert held.operation_id == operation and held.member == member
+        assert held.writer_fd == writer_fd
+        if earlier_failure == "interrupt-before-close":
+            assert interruptions == [writer_fd] and not attempts
+        else:
+            assert attempts == [writer_fd]
+        if member.endswith(".claim.json"):
+            assert events == ["directory-sync", "close"]
+        assert os.path.samestat(os.fstat(writer_fd), writer_identity)
+        assert len(roots) == 1 and not released
+        assert os.path.samestat(os.fstat(roots[0].fd), evidence.stat())
+        writable_directory = evidence if member.endswith(".claim.json") else evidence / operation
+        assert os.path.samestat(os.fstat(directory), writable_directory.stat())
+        terminal = evidence / operation / "result.json"
+        if member == "result.json":
+            assert stat.S_IMODE(terminal.stat().st_mode) == 0o600
+        else:
+            assert not terminal.exists()
+        independent_fd = ordinary_open(evidence, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(independent_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            ordinary_close(independent_fd)
+    finally:
+        # Test-only simulation of the OS dropping process custody on exit.
+        ordinary_close(writer_fd)
+        assert held._custody is not None
+        held._custody.close()
+    assert released == roots
+    calls = (len(workers), engine.calls)
+    replay = processor.process(**request)
+    assert (replay.status, replay.outcome_code) == ("unknown", "incomplete_operation")
+    assert replay.persistence_idempotent and replay.reference is None
+    assert (len(workers), engine.calls) == calls
+    if member == "result.json" and earlier_failure is None:
+        bundle = evidence / operation
+        intent = json.loads((bundle / "intent.json").read_bytes())
+        terminal = (bundle / member).read_bytes()
+        reference = processor._reference(
+            intent, json.loads(terminal), hashlib.sha256(terminal).hexdigest()
+        )
+        with pytest.raises(media.MediaIntegrityError):
+            processor.read_verified(reference)
+        with pytest.raises(media.MediaIntegrityError):
+            media.read_retained_media_total_fields_v1(
+                evidence, reference, expected_original_size=len(raw)
+            )
+
+
+@pytest.mark.parametrize("reused", [False, True])
+def test_known_writer_close_error_never_retries_or_publishes_terminal(seam, monkeypatch, reused):
+    processor, engine, request, source, evidence, _, _ = seam
+    ordinary_open, ordinary_close = os.open, os.close
+    writers, replacement = [], []
+    problem = OSError(errno.EIO, "synthetic error after the writer closed")
+
+    def observe_open(name, flags, *args, **kwargs):
+        fd = ordinary_open(name, flags, *args, **kwargs)
+        if name == "result.json" and flags & os.O_EXCL:
+            writers.append(fd)
+        return fd
+
+    def fault_close(fd):
+        if writers == [fd]:
+            writers.append(fd)
+            ordinary_close(fd)
+            if reused:
+                other = ordinary_open(source / "capture.png", os.O_RDONLY)
+                try:
+                    if other != fd:
+                        os.dup2(other, fd)
+                finally:
+                    if other != fd:
+                        ordinary_close(other)
+                replacement.append(fd)
+            raise problem
+        ordinary_close(fd)
+
+    with monkeypatch.context() as injection:
+        injection.setattr(os, "open", observe_open)
+        injection.setattr(os, "close", fault_close)
+        with pytest.raises(OSError) as caught:
+            processor.process(**request)
+    try:
+        assert caught.value is problem
+        terminal = evidence / request["operation_id"] / "result.json"
+        assert stat.S_IMODE(terminal.stat().st_mode) == 0o600
+        if reused:
+            assert os.path.samestat(os.fstat(replacement[0]), (source / "capture.png").stat())
+        replay = processor.process(**request)
+        assert replay.status == "unknown" and engine.calls == 1
+    finally:
+        for fd in replacement:
+            ordinary_close(fd)
+
+
+def test_terminal_publication_never_replaces_an_existing_name(seam, monkeypatch):
+    processor, engine, request, _, evidence, _, _ = seam
+    bundle = evidence / request["operation_id"]
+    occupied = b"controlled existing terminal"
+
+    def occupy_terminal(stage):
+        if stage == "before_terminal":
+            (bundle / "result.json").write_bytes(occupied)
+            (bundle / "result.json").chmod(0o400)
+
+    monkeypatch.setattr(media, "_inject", occupy_terminal)
+    with pytest.raises(FileExistsError):
+        processor.process(**request)
+    assert (bundle / "result.json").read_bytes() == occupied
+    with pytest.raises(media.MediaIntegrityError):
+        processor.process(**request)
+    assert engine.calls == 1
+
+
+@pytest.mark.parametrize("checkpoint", ["before-seal", "after-seal-sync", "none"])
+@pytest.mark.parametrize("ocr_fails", [False, True])
+def test_terminal_seals_the_exact_read_only_descriptor_after_close(
+    seam, monkeypatch, checkpoint, ocr_fails
+):
+    processor, engine, request, _, evidence, _, _ = seam
+    terminal = evidence / request["operation_id"] / "result.json"
+    engine.fail = ocr_fails
+    ordinary_open, ordinary_close = os.open, os.close
+    ordinary_chmod, ordinary_sync = os.fchmod, os.fsync
+    writers, closed, sealed = [], [], []
+
+    def observe_open(name, flags, *args, **kwargs):
+        fd = ordinary_open(name, flags, *args, **kwargs)
+        if name == terminal.name and flags & os.O_EXCL:
+            writers.append((fd, os.fstat(fd)))
+        return fd
+
+    def observe_close(fd):
+        is_writer = (
+            writers and fd == writers[0][0] and os.path.samestat(os.fstat(fd), writers[0][1])
+        )
+        ordinary_close(fd)
+        if is_writer:
+            closed.append(fd)
+
+    def verify_seal(fd, mode):
+        if writers and os.path.samestat(os.fstat(fd), writers[0][1]):
+            assert mode == 0o400 and closed == [writers[0][0]]
+            assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+            assert os.path.samestat(os.fstat(fd), terminal.stat())
+            if checkpoint == "before-seal":
+                raise OSError(errno.EIO, "synthetic interruption before seal")
+            sealed.append(fd)
+        ordinary_chmod(fd, mode)
+
+    def sync(fd):
+        if checkpoint == "after-seal-sync" and sealed == [fd]:
+            raise OSError(errno.EIO, "synthetic failure synchronizing the sealed terminal")
+        ordinary_sync(fd)
+
+    expected = "engine_failed" if ocr_fails else "succeeded"
+    with monkeypatch.context() as injection:
+        injection.setattr(os, "open", observe_open)
+        injection.setattr(os, "close", observe_close)
+        injection.setattr(os, "fchmod", verify_seal)
+        injection.setattr(os, "fsync", sync)
+        if checkpoint == "none":
+            assert processor.process(**request).status == expected
+        else:
+            with pytest.raises(OSError, match="synthetic"):
+                processor.process(**request)
+
+    unsealed = checkpoint == "before-seal"
+    assert stat.S_IMODE(terminal.stat().st_mode) == (0o600 if unsealed else 0o400)
+    replay = processor.process(**request)
+    assert replay.status == ("unknown" if unsealed else expected)
+    assert replay.persistence_idempotent and engine.calls == 1
 
 
 def test_worker_wrapper_preserves_exact_absolute_deadline_and_fixed_limits(monkeypatch, tmp_path):
