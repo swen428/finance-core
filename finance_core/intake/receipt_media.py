@@ -236,10 +236,10 @@ def _read_member(directory: int, name: str, maximum: int) -> tuple[bytes, dict[s
 class _MediaWriter:
     """Own one exclusive writer and make at most one attempt to close its descriptor."""
 
-    def __init__(self, directory: int, name: str, access: int) -> None:
+    def __init__(self, directory: int, name: str, access: int, *, mode: int = 0o600) -> None:
         self.name = name
         self.fd = os.open(
-            name, access | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
+            name, access | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory
         )
 
     def close(self) -> None:
@@ -316,11 +316,8 @@ def _assert_terminal_identity(
     return opened
 
 
-def _terminal_incomplete(root: publication.StorageRootHandle, directory: int) -> bool:
-    try:
-        named = os.stat("result.json", dir_fd=directory, follow_symlinks=False)
-    except FileNotFoundError:
-        return True
+def _terminal_unsealed(root: publication.StorageRootHandle, directory: int) -> bool:
+    named = os.stat("result.json", dir_fd=directory, follow_symlinks=False)
     if stat.S_IMODE(named.st_mode) != 0o600:
         return False
     fd = os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
@@ -343,8 +340,11 @@ def _publish_terminal(
 ) -> int:
     if len(raw) > _MAX_JSON:
         raise MediaIntegrityError("Evidence JSON exceeded its bounded size")
-    writer = _MediaWriter(directory, "result.json", os.O_WRONLY)
+    # Creation must never have the sealed mode, regardless of the caller's umask.
+    writer = _MediaWriter(directory, "result.json", os.O_WRONLY, mode=0o200)
     try:
+        os.fchmod(writer.fd, 0o600)
+        _regular(writer.fd, mode=0o600, maximum=_MAX_JSON)
         _write_json(writer.fd, raw)
         os.fsync(writer.fd)
         os.fsync(directory)
@@ -837,12 +837,19 @@ class ReceiptMediaProcessor:
                 raw, _ = _read_member(operation_fd, "intent.json", _MAX_JSON)
                 if raw != _canonical(intent):
                     raise MediaOperationConflictError("Operation ID is already bound differently")
-                if _terminal_incomplete(evidence_root, operation_fd):
+                try:
+                    terminal, _ = _read_member(operation_fd, "result.json", _MAX_JSON)
+                except FileNotFoundError:
+                    terminal = None
+                except MediaIntegrityError:
+                    if not _terminal_unsealed(evidence_root, operation_fd):
+                        raise
+                    terminal = None
+                if terminal is None:
                     _assert_processing(evidence_root, operation_id, operation_fd, claim)
                     return MediaProcessingResult(
                         operation_id, "unknown", "incomplete_operation", None, True
                     )
-                terminal, _ = _read_member(operation_fd, "result.json", _MAX_JSON)
                 result = _checked_json(terminal)
                 self._verify_source(
                     source_fd,

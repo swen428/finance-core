@@ -1130,6 +1130,8 @@ def test_actual_root_owner_lock_serializes_before_effects(seam, monkeypatch, tmp
         ("ocr.json", "interrupt-probe"),
         ("result.json", None),
         ("result.json", "ocr"),
+        ("result.json", "masked-create"),
+        ("result.json", "masked-create-ocr"),
     ],
 )
 def test_unknown_writer_close_retains_original_processing_custody(
@@ -1152,7 +1154,7 @@ def test_unknown_writer_close_retains_original_processing_custody(
                 raise RuntimeError("synthetic original interruption")
 
         monkeypatch.setattr(media, "_inject", fail_original)
-    engine.fail = earlier_failure == "ocr"
+    engine.fail = earlier_failure in {"ocr", "masked-create-ocr"}
     ordinary_open, ordinary_close, ordinary_fstat, ordinary_sync = (
         os.open,
         os.close,
@@ -1165,7 +1167,19 @@ def test_unknown_writer_close_retains_original_processing_custody(
     events, interruptions = [], []
 
     def observe_open(name, flags, *args, **kwargs):
-        fd = ordinary_open(name, flags, *args, **kwargs)
+        if (
+            name == member
+            and flags & os.O_EXCL
+            and earlier_failure in {"masked-create", "masked-create-ocr"}
+        ):
+            old_umask = os.umask(0o200)
+            try:
+                fd = ordinary_open(name, flags, *args, **kwargs)
+            finally:
+                os.umask(old_umask)
+            assert stat.S_IMODE(os.fstat(fd).st_mode) == 0
+        else:
+            fd = ordinary_open(name, flags, *args, **kwargs)
         if name == member and flags & os.O_EXCL:
             writers.append((fd, kwargs["dir_fd"], os.fstat(fd)))
         return fd
@@ -1359,8 +1373,8 @@ def test_terminal_seals_the_exact_read_only_descriptor_after_close(
             closed.append(fd)
 
     def verify_seal(fd, mode):
-        if writers and os.path.samestat(os.fstat(fd), writers[0][1]):
-            assert mode == 0o400 and closed == [writers[0][0]]
+        if mode == 0o400 and writers and os.path.samestat(os.fstat(fd), writers[0][1]):
+            assert closed == [writers[0][0]]
             assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
             assert os.path.samestat(os.fstat(fd), terminal.stat())
             if checkpoint == "before-seal":

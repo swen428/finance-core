@@ -192,8 +192,9 @@ retain this object in its held owner and suspend further work. Automatic
 cleanup, retry or lock reacquisition is unsafe in this state.
 
 Successful completion includes `normalized.png`, canonical `ocr.json` and a
-terminal `result.json`. The terminal is reserved exclusively and written at
-0600. The processor holds a separate read-only descriptor to that exact file.
+terminal `result.json`. The processor reserves the name without read permission
+and sets 0600 explicitly before writing. The processor holds a separate
+read-only descriptor to that exact file.
 After synchronizing the contents and directory and confirming that the writer
 closed successfully, it seals the same inode at 0400 through that descriptor,
 synchronizes the file and directory again, and checks the held terminal identity.
