@@ -86,6 +86,22 @@ def _copy_review_fields_target(target):
     )
 
 
+def _copy_review_fields_reply(evidence):
+    if (
+        type(evidence) is not VerifiedReceiptReviewFieldsReplyV1
+        or type(evidence.target) is not ReceiptReviewFieldsTargetV1
+        or type(evidence.reply) is not VerifiedReceiptPaymentReplyV1
+        or type(evidence.principal_id) is not str
+        or type(evidence.client_id) is not str
+    ):
+        raise LifecycleError("Exact authenticated receipt review reply required")
+    return replace(
+        evidence,
+        target=_copy_review_fields_target(evidence.target),
+        reply=replace(evidence.reply),
+    )
+
+
 @dataclass(frozen=True)
 class ReceiptReviewFieldsV1:
     preparation: ReceiptReviewPreparationV1
