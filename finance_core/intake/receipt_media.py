@@ -6,6 +6,7 @@ Legacy receipt OCR attachment identity and fingerprints are untouched.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
@@ -96,6 +98,18 @@ class MediaOperationConflictError(ReceiptMediaError):
 
 class MediaUnsupportedPlatformError(ReceiptMediaError):
     """The bounded native worker requires single-threaded Linux composition."""
+
+
+class MediaWriterCloseUnknown(ReceiptMediaError):
+    """The original writer and processing custody must remain held in this process."""
+
+    def __init__(self, member: str, writer_fd: int, identity: os.stat_result | None) -> None:
+        super().__init__("Receipt media writer closure could not be established")
+        self.member = member
+        self.writer_fd = writer_fd
+        self.writer_identity = identity
+        self.operation_id: str | None = None
+        self._custody: ExitStack | None = None
 
 
 @dataclass(frozen=True)
@@ -219,33 +233,139 @@ def _read_member(directory: int, name: str, maximum: int) -> tuple[bytes, dict[s
         os.close(fd)
 
 
+class _MediaWriter:
+    """Own one exclusive writer and make at most one attempt to close its descriptor."""
+
+    def __init__(self, directory: int, name: str, access: int, *, mode: int = 0o600) -> None:
+        self.name = name
+        self.fd = os.open(
+            name, access | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=directory
+        )
+
+    def close(self) -> None:
+        fd = self.fd
+        if fd < 0:
+            return
+        before = None
+        try:
+            self.fd = -1
+            try:
+                before = os.fstat(fd)
+            except OSError:
+                pass
+            os.close(fd)
+        except BaseException as error:
+            self.fd = -1
+            try:
+                after = os.fstat(fd)
+            except BaseException as probe:
+                if isinstance(probe, OSError) and probe.errno == errno.EBADF:
+                    raise error from None
+            else:
+                if before is not None and not os.path.samestat(before, after):
+                    raise
+            raise MediaWriterCloseUnknown(self.name, fd, before) from error
+
+
+def _write_json(fd: int, raw: bytes) -> None:
+    view = memoryview(raw)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("Evidence write made no progress")
+        view = view[written:]
+
+
 def _write_member(directory: int, name: str, raw: bytes, *, claim: bool = False) -> dict[str, Any]:
     """Exclusive write: incomplete files are retained and never promoted on replay."""
     if len(raw) > _MAX_JSON:
         raise MediaIntegrityError("Evidence JSON exceeded its bounded size")
-    fd = os.open(
-        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
-    )
+    writer = _MediaWriter(directory, name, os.O_WRONLY)
+    fd = writer.fd
     try:
         if claim:
+            # Reserve the ID durably even if the initial claim writer cannot be closed.
+            os.fsync(directory)
             _inject("after_claim_create")
-        view = memoryview(raw)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("Evidence write made no progress")
-            view = view[written:]
+        _write_json(fd, raw)
         if claim:
             _inject("after_claim_write")
         os.fsync(fd)
         os.fchmod(fd, 0o400)
         os.fsync(fd)
     finally:
-        os.close(fd)
+        writer.close()
     os.fsync(directory)
     if claim:
         _inject("after_claim_seal")
     return {"name": name, "size_bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _assert_terminal_identity(
+    root: publication.StorageRootHandle, directory: int, fd: int, *, mode: int
+) -> os.stat_result:
+    opened = _regular(fd, mode=mode, maximum=_MAX_JSON)
+    named = os.stat("result.json", dir_fd=directory, follow_symlinks=False)
+    if (
+        opened.st_dev != root.device
+        or opened.st_nlink != 1
+        or named.st_nlink != 1
+        or _identity(opened) != _identity(named)
+    ):
+        raise MediaIntegrityError("Terminal evidence no longer matches its opened file")
+    return opened
+
+
+def _terminal_unsealed(root: publication.StorageRootHandle, directory: int) -> bool:
+    named = os.stat("result.json", dir_fd=directory, follow_symlinks=False)
+    if stat.S_IMODE(named.st_mode) != 0o600:
+        return False
+    fd = os.open("result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    try:
+        opened = _assert_terminal_identity(root, directory, fd, mode=0o600)
+        if not os.path.samestat(named, opened):
+            raise MediaIntegrityError("Unsealed terminal evidence changed while being opened")
+        return True
+    finally:
+        os.close(fd)
+
+
+def _publish_terminal(
+    root: publication.StorageRootHandle,
+    operation: str,
+    directory: int,
+    claim: _OperationClaim,
+    raw: bytes,
+    custody: ExitStack,
+) -> int:
+    if len(raw) > _MAX_JSON:
+        raise MediaIntegrityError("Evidence JSON exceeded its bounded size")
+    # Creation must never have the sealed mode, regardless of the caller's umask.
+    writer = _MediaWriter(directory, "result.json", os.O_WRONLY, mode=0o200)
+    try:
+        os.fchmod(writer.fd, 0o600)
+        _regular(writer.fd, mode=0o600, maximum=_MAX_JSON)
+        _write_json(writer.fd, raw)
+        os.fsync(writer.fd)
+        os.fsync(directory)
+        reader = os.open(
+            "result.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+        )
+        custody.callback(os.close, reader)
+        opened = _assert_terminal_identity(root, directory, reader, mode=0o600)
+        if not os.path.samestat(os.fstat(writer.fd), opened):
+            raise MediaIntegrityError("Terminal reader does not identify its writer")
+    finally:
+        writer.close()
+
+    _assert_processing(root, operation, directory, claim)
+    _assert_terminal_identity(root, directory, reader, mode=0o600)
+    # The original inode becomes consumable only after its writer closed successfully.
+    os.fchmod(reader, 0o400)
+    os.fsync(reader)
+    os.fsync(directory)
+    _assert_terminal_identity(root, directory, reader, mode=0o400)
+    return reader
 
 
 def _open_operation(root: publication.StorageRootHandle, operation: str) -> int:
@@ -643,25 +763,25 @@ class ReceiptMediaProcessor:
             original_filename,
             received_via,
         )
-        source_root = self._open_root(0)
-        try:
-            evidence_root = self._open_root(1)
-        except BaseException:
-            source_root.close()
-            raise
-        source_fd, operation_fd = -1, -1
-        claim: _OperationClaim | None = None
-        parents: list[int] = []
+        custody = ExitStack()
         reference: MediaOcrReference | None
         try:
+            source_root = self._open_root(0)
+            custody.callback(source_root.close)
+            evidence_root = self._open_root(1)
+            custody.callback(evidence_root.close)
             source_fd, parents, source_identity = self._source(
                 source_root, source_relative_path, expected_source_size, expected_source_sha256
             )
+            for parent in parents:
+                custody.callback(os.close, parent)
+            custody.callback(os.close, source_fd)
             self._verify_source_tree(source_root, source_relative_path, parents)
             deadline = time.monotonic() + NORMALIZATION_SECONDS
             publication.acquire_storage_root_lock(
                 evidence_root, deadline=deadline, clock=time.monotonic
             )
+            custody.callback(publication.release_storage_root_lock, evidence_root)
             try:
                 os.stat(_claim_name(operation_id), dir_fd=evidence_root.fd, follow_symlinks=False)
                 new = False
@@ -686,6 +806,7 @@ class ReceiptMediaProcessor:
                 )
                 new = True
             claim = _open_claim(evidence_root, operation_id, _digest(intent))
+            custody.callback(os.close, claim.fd)
             if new:
                 _assert_claim(evidence_root, operation_id, claim)
                 try:
@@ -711,6 +832,7 @@ class ReceiptMediaProcessor:
                 return MediaProcessingResult(
                     operation_id, "unknown", "incomplete_operation", None, True
                 )
+            custody.callback(os.close, operation_fd)
             if not new:
                 raw, _ = _read_member(operation_fd, "intent.json", _MAX_JSON)
                 if raw != _canonical(intent):
@@ -718,6 +840,12 @@ class ReceiptMediaProcessor:
                 try:
                     terminal, _ = _read_member(operation_fd, "result.json", _MAX_JSON)
                 except FileNotFoundError:
+                    terminal = None
+                except MediaIntegrityError:
+                    if not _terminal_unsealed(evidence_root, operation_fd):
+                        raise
+                    terminal = None
+                if terminal is None:
                     _assert_processing(evidence_root, operation_id, operation_fd, claim)
                     return MediaProcessingResult(
                         operation_id, "unknown", "incomplete_operation", None, True
@@ -747,12 +875,8 @@ class ReceiptMediaProcessor:
             _write_member(operation_fd, "intent.json", _canonical(intent))
             _inject("after_intent")
             _assert_processing(evidence_root, operation_id, operation_fd, claim)
-            original_fd = os.open(
-                "original.bin",
-                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o600,
-                dir_fd=operation_fd,
-            )
+            original_writer = _MediaWriter(operation_fd, "original.bin", os.O_RDWR)
+            original_fd = original_writer.fd
             try:
                 remaining = expected_source_size
                 while remaining:
@@ -785,13 +909,20 @@ class ReceiptMediaProcessor:
                 }
                 _inject("after_original")
                 _assert_processing(evidence_root, operation_id, operation_fd, claim)
-                os.close(original_fd)
-                original_fd = -1
+                original_writer.close()
                 original_fd = os.open(
                     "original.bin", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=operation_fd
                 )
+                custody.callback(os.close, original_fd)
                 result = self._execute(
-                    evidence_root, claim, operation_fd, intent, original, original_fd, deadline
+                    evidence_root,
+                    claim,
+                    operation_fd,
+                    intent,
+                    original,
+                    original_fd,
+                    deadline,
+                    custody,
                 )
                 self._verify_source(
                     source_fd,
@@ -806,7 +937,9 @@ class ReceiptMediaProcessor:
                 _inject("before_terminal")
                 _assert_processing(evidence_root, operation_id, operation_fd, claim)
                 terminal = _canonical(result)
-                _write_member(operation_fd, "result.json", terminal)
+                terminal_fd = _publish_terminal(
+                    evidence_root, operation_id, operation_fd, claim, terminal, custody
+                )
                 _inject("after_terminal")
                 if result["status"] == "succeeded":
                     reference = self._reference(
@@ -814,26 +947,23 @@ class ReceiptMediaProcessor:
                     )
                     self._read_verified(operation_fd, reference)
                 else:
+                    observed, _ = _read_member(operation_fd, "result.json", _MAX_JSON)
+                    if observed != terminal:
+                        raise MediaIntegrityError("Sealed terminal bytes changed")
                     reference = None
                 _assert_processing(evidence_root, operation_id, operation_fd, claim)
+                _assert_terminal_identity(evidence_root, operation_fd, terminal_fd, mode=0o400)
                 return MediaProcessingResult(
                     operation_id, result["status"], result["outcome_code"], reference, False
                 )
             finally:
-                if original_fd >= 0:
-                    os.close(original_fd)
+                original_writer.close()
+        except MediaWriterCloseUnknown as error:
+            error.operation_id = operation_id
+            error._custody = custody.pop_all()
+            raise
         finally:
-            if claim is not None:
-                os.close(claim.fd)
-            if operation_fd >= 0:
-                os.close(operation_fd)
-            if source_fd >= 0:
-                os.close(source_fd)
-            for parent in parents:
-                os.close(parent)
-            publication.release_storage_root_lock(evidence_root)
-            evidence_root.close()
-            source_root.close()
+            custody.close()
 
     def _execute(
         self,
@@ -844,6 +974,7 @@ class ReceiptMediaProcessor:
         original: dict[str, Any],
         original_fd: int,
         deadline: float,
+        custody: ExitStack,
     ) -> dict[str, Any]:
         base = {
             "contract": CONTRACT,
@@ -858,12 +989,9 @@ class ReceiptMediaProcessor:
         declaration_fd = os.open(
             "declaration.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
         )
-        png_fd = os.open(
-            "normalized.png",
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=directory,
-        )
+        custody.callback(os.close, declaration_fd)
+        png_writer = _MediaWriter(directory, "normalized.png", os.O_RDWR)
+        png_fd = png_writer.fd
         try:
             original_identity = _identity(_regular(original_fd, mode=0o400, maximum=SOURCE_BYTES))
             self._verify_source(
@@ -914,11 +1042,11 @@ class ReceiptMediaProcessor:
             os.fsync(directory)
             # The decoder had a write descriptor; OCR receives a newly opened
             # read-only descriptor after immutable publication.
-            os.close(png_fd)
-            png_fd = -1
+            png_writer.close()
             png_fd = os.open(
                 "normalized.png", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
             )
+            custody.callback(os.close, png_fd)
             raw, png = _read_member(directory, "normalized.png", PNG_BYTES)
             png_identity = _identity(_regular(png_fd, mode=0o400, maximum=PNG_BYTES))
             self._verify_source(png_fd, directory, "normalized.png", png_identity, png["sha256"])
@@ -1033,9 +1161,7 @@ class ReceiptMediaProcessor:
                 return self._failure(base, "engine_failed", "ocr_engine_failed")
             return {**base, "status": "succeeded", "outcome_code": "ok"}
         finally:
-            if png_fd >= 0:
-                os.close(png_fd)
-            os.close(declaration_fd)
+            png_writer.close()
 
     @staticmethod
     def _failure(base: dict[str, Any], status: Any, code: Any) -> dict[str, Any]:
@@ -1462,6 +1588,7 @@ __all__ = [
     "MediaIntegrityError",
     "MediaOperationConflictError",
     "MediaUnsupportedPlatformError",
+    "MediaWriterCloseUnknown",
     "MediaOcrReference",
     "MediaProcessingResult",
     "VerifiedMediaOcrEvidence",
