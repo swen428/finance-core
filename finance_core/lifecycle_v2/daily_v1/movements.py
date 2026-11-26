@@ -64,6 +64,7 @@ from .movement_contracts import (
     validate_movement,
     without_coverage,
 )
+from .review_history_scope_v1 import _movement_review_history_scope_v1
 
 
 def _movement_id(source_id):
@@ -913,7 +914,10 @@ class DailyMovementServiceV1:
         from .. import receipt_posting_v1 as receipt_posting
 
         with self._write() as (service, conn):
-            _audit(service, conn)
+            with _movement_review_history_scope_v1(
+                conn, service.port._port, service.owner, service.binding
+            ):
+                _audit(service, conn)
             proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
             expected = verify_proposal(service, conn, proposal)
             receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
