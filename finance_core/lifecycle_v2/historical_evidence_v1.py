@@ -223,11 +223,11 @@ class _HistoricalScope:
         return read
 
 
-_CLOSE_UNKNOWN: list[tuple[sqlite3.Connection, BinaryIO]] = []
+_CLOSE_UNKNOWN: list[tuple[sqlite3.Connection | None, BinaryIO]] = []
 
 
 class ArchiveCloseUnknownV1(LifecycleError):
-    """Physical SQLite closure is uncertain and archive custody remains held."""
+    """An archive resource may still be open, so custody remains held."""
 
 
 class _ArchiveCursor(sqlite3.Cursor):
@@ -491,7 +491,13 @@ def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
         require_unchanged()
     finally:
         if not retained:
-            body.close()
+            try:
+                body.close()
+            except BaseException as exc:
+                _CLOSE_UNKNOWN.append((None, body))
+                raise ArchiveCloseUnknownV1(
+                    "Actual archived database file close is uncertain"
+                ) from exc
 
 
 def _scope_for(conn):

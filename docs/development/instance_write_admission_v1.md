@@ -225,9 +225,10 @@ exact archive receipt lookups. The opener checks the archive database bytes
 before opening it read-only and retains control through actual SQLite close.
 Its connection exposes ordinary SQL reads and read-only diagnostics. Core
 retains control of callback registration, connection settings and extensions.
-If SQLite connection or cursor closure is uncertain, the opener raises
-`ArchiveCloseUnknownV1` and retains the archive resources. Callers that hold
-archive ownership must retain it when they receive this exception.
+If closure of the SQLite connection, a cursor, or the archive file is uncertain,
+the opener raises `ArchiveCloseUnknownV1` and retains the affected resources.
+Callers that hold archive ownership must retain it when they receive this
+exception.
 The current writer's archive producer can use `audit_runtime_archive_evidence_connection_v1`
 on its admitted read transaction for that cut. The Core audit checks original
 receipt and OCR evidence using those same scopes.
