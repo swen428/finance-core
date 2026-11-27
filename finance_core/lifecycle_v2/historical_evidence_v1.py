@@ -224,6 +224,10 @@ class _HistoricalScope:
 _CLOSE_UNKNOWN: list[tuple[sqlite3.Connection, BinaryIO]] = []
 
 
+class ArchiveCloseUnknownV1(LifecycleError):
+    """Physical SQLite closure is uncertain and archive custody remains held."""
+
+
 class _ArchiveCursor(sqlite3.Cursor):
     def close(self):
         conn = self.connection
@@ -232,12 +236,14 @@ class _ArchiveCursor(sqlite3.Cursor):
             _close_cursor_handle(self)
         except BaseException as exc:
             conn._retain_uncertain_close(exc)
-            raise LifecycleError("Archived SQLite cursor actual close unknown") from exc
+            raise ArchiveCloseUnknownV1("Archived SQLite cursor actual close unknown") from exc
         conn._archive_cursors.pop(id(self), None)
 
 
 class _ArchiveReadConnection(sqlite3.Connection):
     """Internal reader whose transaction and authorizer belong to Core."""
+
+    _archive_owner: _ArchiveTransaction | None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -246,6 +252,7 @@ class _ArchiveReadConnection(sqlite3.Connection):
         self._archive_cursors = WeakValueDictionary()
         self._archive_retained_cursors = ()
         self._archive_close_error = None
+        self._archive_owner = None
 
     def _retain_uncertain_close(self, exc):
         self._archive_close_error = exc
@@ -253,13 +260,13 @@ class _ArchiveReadConnection(sqlite3.Connection):
 
     def _require_reliable_close(self):
         if self._archive_close_error is not None:
-            raise LifecycleError(
+            raise ArchiveCloseUnknownV1(
                 "Archived SQLite actual close unknown"
             ) from self._archive_close_error
 
     def _require_idle_guard(self):
         self._require_reliable_close()
-        if _archive_transaction_for(self) is not None:
+        if self._archive_owner is not None and self._archive_owner.active:
             raise LifecycleError("Core owns the archive read transaction")
 
     def __setattr__(self, name, value):
@@ -317,7 +324,7 @@ def _close_archive_connection(conn, *, close_connection=None):
         (_close_sqlite_handle if close_connection is None else close_connection)(conn)
     except BaseException as exc:
         conn._retain_uncertain_close(exc)
-        raise
+        raise ArchiveCloseUnknownV1("Archived SQLite actual close unknown") from exc
 
 
 @dataclass
@@ -335,27 +342,29 @@ _ARCHIVE_TRANSACTIONS: ContextVar[tuple[_ArchiveTransaction, ...]] = ContextVar(
 
 
 def _archive_transaction_for(conn):
-    return next(
-        (
-            item
-            for item in _ARCHIVE_TRANSACTIONS.get()
-            if item.connection is conn and item.active and item.pid == os.getpid()
-        ),
-        None,
-    )
+    if type(conn) is _ArchiveReadConnection:
+        owner = conn._archive_owner
+        if (
+            owner is not None
+            and owner.connection is conn
+            and owner.active
+            and owner.pid == os.getpid()
+            and any(item is owner for item in _ARCHIVE_TRANSACTIONS.get())
+        ):
+            return owner
+    return None
 
 
 def is_archive_read_connection_v1(conn: sqlite3.Connection) -> bool:
-    """Report whether Core currently owns this original archive read."""
+    """Report whether the caller is in this Core-issued archive read context."""
     return _archive_transaction_for(conn) is not None
 
 
-def _require_archive_transaction(conn, database_sha256):
+def _require_archive_transaction(conn, database_sha256, *, original=None):
     witness = _archive_transaction_for(conn)
-    if witness is not None and witness.violated:
-        raise LifecycleError("Historical application audit violated its read-only scope")
     if (
         witness is None
+        or (original is not None and witness is not original)
         or conn._archive_close_error is not None
         or witness.database_sha256 != database_sha256
         or not conn.in_transaction
@@ -363,6 +372,9 @@ def _require_archive_transaction(conn, database_sha256):
         or conn.execute("PRAGMA query_only").fetchone()[0] != 1
     ):
         raise LifecycleError("Core-issued archive read transaction required")
+    if witness.violated:
+        raise LifecycleError("Historical application audit violated its read-only scope")
+    return witness
 
 
 @contextmanager
@@ -370,7 +382,7 @@ def _issued_archive_transaction(conn, database_sha256):
     """Pin one Core-opened immutable/held transaction through the proof callbacks."""
     if (
         type(conn) is not _ArchiveReadConnection
-        or _archive_transaction_for(conn) is not None
+        or conn._archive_owner is not None
         or not conn.in_transaction
         or conn.execute("PRAGMA query_only").fetchone()[0] != 1
     ):
@@ -392,22 +404,26 @@ def _issued_archive_transaction(conn, database_sha256):
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    sqlite3.Connection.set_authorizer(conn, authorize)
-    # Track the exact Core-issued handle and its original transaction, also
-    # during nested audit methods. The process-local scope is removed on exit.
+    conn._archive_owner = witness
+    # Evidence requires the issuing context. The connection owns its guards
+    # even when a caller uses the handle in a different logical context.
     token = _ARCHIVE_TRANSACTIONS.set((*_ARCHIVE_TRANSACTIONS.get(), witness))
     try:
+        sqlite3.Connection.set_authorizer(conn, authorize)
         yield
-        _require_archive_transaction(conn, database_sha256)
+        _require_archive_transaction(conn, database_sha256, original=witness)
     finally:
-        witness.active = False
-        _ARCHIVE_TRANSACTIONS.reset(token)
-        sqlite3.Connection.set_authorizer(conn, None)
+        try:
+            sqlite3.Connection.set_authorizer(conn, None)
+        finally:
+            witness.active = False
+            conn._archive_owner = None
+            _ARCHIVE_TRANSACTIONS.reset(token)
 
 
 @contextmanager
 def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
-    """Open the exact archive bytes in a Core-owned immutable read transaction."""
+    """Read exact archive bytes, retaining custody on ArchiveCloseUnknownV1."""
     if not _is_hash(database_sha256):
         raise LifecycleError("Exact archived database digest required")
     path = Path(path).resolve(strict=True)
@@ -457,7 +473,7 @@ def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
             except BaseException as exc:
                 retained = True
                 _CLOSE_UNKNOWN.append((conn, body))
-                raise LifecycleError("Actual archived SQLite close is uncertain") from exc
+                raise ArchiveCloseUnknownV1("Actual archived SQLite close is uncertain") from exc
         require_unchanged()
     finally:
         if not retained:
@@ -650,7 +666,7 @@ def audit_archive_evidence_connection_v1(
 
     if type(cut) is not SnapshotCut:
         raise LifecycleError("Exact archive cut required")
-    _require_archive_transaction(conn, cut.database_sha256)
+    witness = _require_archive_transaction(conn, cut.database_sha256)
     if historical_generations_sha256_v1(_generations(historical_evidence)) != parent_history_sha256:
         raise LifecycleError("Archived parent evidence differs from its protected commitment")
     _verify_cut_connection(conn, cut)
@@ -658,7 +674,8 @@ def audit_archive_evidence_connection_v1(
     with _archive_scope(conn, verifier, cut, historical_evidence, receipt_snapshot_lookup):
         result = audit_evidence_connection(conn, port, binding, legacy_verifier)
         _verify_cut_connection(conn, cut)
-        return result
+    _require_archive_transaction(conn, cut.database_sha256, original=witness)
+    return result
 
 
 def audit_runtime_archive_evidence_connection_v1(

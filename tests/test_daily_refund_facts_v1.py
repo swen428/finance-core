@@ -16,6 +16,10 @@ from finance_core.lifecycle_v2.contracts import (
     canonical,
     digest,
 )
+from finance_core.lifecycle_v2.core_archive_origin_v1 import (
+    core_archive_origin_approval_verifier_v1,
+    issue_core_archive_origin_v1,
+)
 from finance_core.lifecycle_v2.daily_v1.accounts import DailyAccountServiceV1
 from finance_core.lifecycle_v2.daily_v1.contracts import (
     BUNDLE_FORMAT,
@@ -60,8 +64,17 @@ from finance_core.lifecycle_v2.daily_v1.refund_review_v1 import (
     read_refund_review_v1,
 )
 from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1
-from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
+from finance_core.lifecycle_v2.historical_evidence_v1 import (
+    HistoricalEvidenceV1,
+    HistoricalGenerationV1,
+)
+from finance_core.lifecycle_v2.recovery import (
+    RecoveryAuthority,
+    promote_manual_single_host_restore_v1,
+    verify_snapshot_evidence,
+)
 from finance_core.lifecycle_v2.service import LedgerService
+from tests.daily_account_support_v1 import DailyPort
 from tests.test_daily_movements_lifecycle_v1 import fields, movement, prepare
 from tests.test_daily_opening_changes_v1 import (
     finish,
@@ -75,6 +88,7 @@ from tests.test_daily_transfer_facts_v1 import instruction
 from tests.test_daily_transfer_facts_v1 import transfer as transfer
 from tests.test_lifecycle_v2 import live as live
 from tests.test_lifecycle_v2 import response
+from tests.test_lifecycle_v2_round3_recovery import _cut, _fence, _manual_historical_target
 
 
 def _bind_opening(value):
@@ -1045,11 +1059,7 @@ def _refund_instruction(
     return source
 
 
-def test_original_expense_transfer_and_linked_refund_share_one_ledger(
-    mixed_expense_transfer, refund
-):
-    ledger, port, expense, posted_transfer = mixed_expense_transfer
-    reader = DailyLedgerReaderV1(ledger)
+def _mixed_refund_terms(reader, expense, refund):
     original = reader.detail(expense.record_id)
     receiving = next(
         account for account in reader.collect_accounts().accounts if account.currency == "MYR"
@@ -1068,6 +1078,77 @@ def test_original_expense_transfer_and_linked_refund_share_one_ledger(
     refund["credit"]["coverage"].update(
         treatment="excluded", basis="strictly_later", reply_ref=None
     )
+    return original, receiving
+
+
+def test_restored_refund_draft_state_uses_original_proof_without_authorizing_review(
+    mixed_expense_transfer, refund, tmp_path, monkeypatch
+):
+    ledger, old_port, expense, _ = mixed_expense_transfer
+    _mixed_refund_terms(DailyLedgerReaderV1(ledger), expense, refund)
+    selections = {}
+    old_port.refund_target_v1 = lambda conn, identity: selections[identity]
+    source = _refund_instruction(old_port, ledger, refund, selections, "archived-refund")
+    captured = ledger.capture(source.evidence_id, "capture-archived-refund")
+    old_refunds = DailyRefundServiceV1(ledger)
+    draft = old_refunds.propose(
+        captured.source_id, refund, "archived-observation", "propose-archived-refund"
+    )
+    original_state = old_refunds.proposal_state_v1(draft.proposal_id)
+    assert original_state["status"] == "eligible"
+    audit = ledger.reader().full_audit()
+    cut, snapshot = _cut(ledger, tmp_path)
+    signing = RecoveryAuthority("refund-archive-test", b"independent synthetic refund signing root")
+    verify_origin = core_archive_origin_approval_verifier_v1(signing)
+
+    def approve(reference, action, checksum):
+        if action == "core_archive_origin_v1":
+            return verify_origin(reference, action, checksum)
+        return reference == "approved"
+
+    archive = HistoricalGenerationV1(ledger.binding, cut, None, audit["audit_sha256"])
+    origin = issue_core_archive_origin_v1(ledger, cut, signing, snapshot_path=snapshot)
+    owner = ledger.owner
+    _fence(owner.config, owner)
+    target, held, grants = _manual_historical_target(
+        tmp_path,
+        monkeypatch,
+        owner.config,
+        cut,
+        snapshot,
+        "refund-successor",
+        1792937020,
+        verifier=approve,
+    )
+    evidence = (HistoricalEvidenceV1(archive, old_port),)
+    with target:
+        assert (
+            promote_manual_single_host_restore_v1(
+                held, **grants, core_archive_origin=origin, historical_evidence=evidence
+            )["state"]
+            == "ACTIVE"
+        )
+        with acquire_production_owner(target) as current_owner:
+            current = LedgerService(
+                current_owner,
+                DailyPort(),
+                grants["binding"],
+                runtime_admission=grants["runtime_admission"],
+                historical_evidence=evidence,
+            )
+            refunds = DailyRefundServiceV1(current)
+            assert refunds.proposal_state_v1(draft.proposal_id) == original_state
+            with pytest.raises(LifecycleError, match="Retained refund proposal identity differs"):
+                refunds.prepare_review(draft.proposal_id, draft.version)
+            assert current.reader().full_audit() == audit
+
+
+def test_original_expense_transfer_and_linked_refund_share_one_ledger(
+    mixed_expense_transfer, refund
+):
+    ledger, port, expense, posted_transfer = mixed_expense_transfer
+    reader = DailyLedgerReaderV1(ledger)
+    original, receiving = _mixed_refund_terms(reader, expense, refund)
     targets = {}
     port.refund_target_v1 = lambda conn, identity: targets[identity]
     source = _refund_instruction(port, ledger, refund, targets, "mixed-refund")

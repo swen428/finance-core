@@ -18,6 +18,7 @@ from .contracts import (
     VerifiedReceiptSourceV1,
     VerifiedSource,
 )
+from .historical_evidence_v1 import ArchiveCloseUnknownV1
 from .reader import LedgerReader
 from .receipt_fields_v1 import (
     ReceiptWholeDraftFieldV1,
@@ -28,6 +29,7 @@ from .receipt_fields_v1 import (
 from .service import LedgerService
 
 __all__ = [
+    "ArchiveCloseUnknownV1",
     "CommitReceipt",
     "EvidencePort",
     "ExpectedAction",

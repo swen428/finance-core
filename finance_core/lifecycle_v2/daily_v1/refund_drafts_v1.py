@@ -480,12 +480,18 @@ class DailyRefundServiceV1:
 
     def proposal_state_v1(self, proposal_id):
         """Read the retained allowance status of a refund draft."""
+        from ..historical_evidence_v1 import _active_scope
+        from ..reader import verify_proposal as verify_retained_proposal
+
         text(proposal_id, "refund proposal id")
-        with self._boundary._read() as (service, conn):
+        with self._boundary._read() as (service, conn), _active_scope(conn, service):
             _audit(service, conn)
             proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
-            verify_proposal(service, conn, proposal)
-            return strict_json(proposal["observation_json"])["observation"]["eligibility"]
+            sealed = strict_json(proposal["observation_json"])
+            if type(sealed) is not dict or sealed.get("format") != DRAFT_FORMAT:
+                raise LifecycleError("Exact refund proposal required")
+            verify_retained_proposal(service, conn, proposal)
+            return sealed["observation"]["eligibility"]
 
     def prepare_review(self, proposal_id, expected_proposal_version):
         text(proposal_id, "refund proposal id")

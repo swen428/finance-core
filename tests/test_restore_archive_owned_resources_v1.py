@@ -3,13 +3,14 @@
 import sqlite3
 import subprocess
 import sys
+from contextvars import Context
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from finance_core.lifecycle_v2 import LifecycleError, recovery
 from finance_core.lifecycle_v2 import historical_evidence_v1 as history
-from finance_core.lifecycle_v2 import recovery
 from tests.test_lifecycle_v2 import ready
 from tests.test_lifecycle_v2_round3_recovery import _cut, _fence, _manual_historical_target
 from tests.test_lifecycle_v2_round3_recovery import original as original
@@ -40,6 +41,44 @@ def test_detached_opener_finalizes_retained_ordinary_select_cursors(original, tm
     for cursor in (direct, regular):
         with pytest.raises(sqlite3.ProgrammingError):
             cursor.fetchone()
+
+
+def test_detached_owner_guards_connection_settings_in_a_separate_context(original, tmp_path):
+    _, _, service, _ = original
+    cut, path = _cut(service, tmp_path)
+    with history.open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn:
+        separate = Context()
+        assert separate.run(lambda: conn.execute("SELECT 1").fetchone()[0]) == 1
+        with pytest.raises(LifecycleError, match="Core owns the archive read transaction"):
+            separate.run(setattr, conn, "row_factory", sqlite3.Row)
+
+
+def test_detached_audit_rechecks_the_witness_after_the_final_cut(original, tmp_path):
+    _, _, service, port = original
+    cut, path = _cut(service, tmp_path)
+    verify_cut = recovery._verify_cut_connection
+    checks = []
+
+    def observe_cut(conn, cut):
+        verify_cut(conn, cut)
+        checks.append(cut)
+        if len(checks) == 2:
+            history._archive_transaction_for(conn).violated = True
+
+    with (
+        patch.object(recovery, "_verify_cut_connection", observe_cut),
+        pytest.raises(LifecycleError, match="violated its read-only scope"),
+        history.open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn,
+    ):
+        with pytest.raises(LifecycleError, match="violated its read-only scope"):
+            history.audit_archive_evidence_connection_v1(
+                conn,
+                port,
+                service.binding,
+                cut,
+                parent_history_sha256=history.historical_generations_sha256_v1(()),
+            )
+    assert checks == [cut, cut]
 
 
 def test_port_only_manual_promotion_and_retry_keep_owned_read_until_close(
@@ -192,7 +231,8 @@ print("CLOSE_UNKNOWN_RETAINED")
     assert "CLOSE_UNKNOWN_RETAINED" in result.stdout
 
 
-def test_detached_cursor_close_unknown_retains_the_archive_and_never_retries(original, tmp_path):
+@pytest.mark.parametrize("handle", ["cursor", "connection"])
+def test_detached_close_unknown_retains_the_archive_and_never_retries(original, tmp_path, handle):
     _, _, service, _ = original
     ready(service)
     cut, path = _cut(service, tmp_path)
@@ -202,39 +242,44 @@ import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
-from finance_core.lifecycle_v2 import LifecycleError, historical_evidence_v1 as history
+from finance_core.lifecycle_v2 import ArchiveCloseUnknownV1, historical_evidence_v1 as history
 
 path = Path(sys.argv[1])
+handle = sys.argv[3]
 calls = []
 
-def fail_close(cursor):
-    calls.append(cursor)
-    raise OSError("synthetic detached cursor close uncertain")
+def fail_close(resource):
+    calls.append(resource)
+    raise OSError("synthetic detached close uncertain")
 
-with patch.object(history, "_close_cursor_handle", fail_close):
+close_hook = "_close_cursor_handle" if handle == "cursor" else "_close_sqlite_handle"
+with patch.object(history, close_hook, fail_close):
     try:
         with history.open_archive_read_connection_v1(path, database_sha256=sys.argv[2]) as conn:
             cursor = conn.execute("SELECT seq FROM l2_events ORDER BY seq")
             assert cursor.fetchone()[0] == 1
-            try:
-                cursor.close()
-            except LifecycleError as exc:
-                assert "actual close unknown" in str(exc)
-            else:
-                raise AssertionError("Expected cursor close failure")
-    except LifecycleError as exc:
+            if handle == "cursor":
+                try:
+                    cursor.close()
+                except ArchiveCloseUnknownV1 as exc:
+                    assert "actual close unknown" in str(exc)
+                else:
+                    raise AssertionError("Expected cursor close failure")
+    except ArchiveCloseUnknownV1 as exc:
         assert "close is uncertain" in str(exc)
     else:
         raise AssertionError("Expected owner close uncertainty")
 
-assert calls == [cursor]
+assert calls == [cursor if handle == "cursor" else conn]
 owned_conn, retained_archive = history._CLOSE_UNKNOWN[-1]
-assert owned_conn is conn and cursor in owned_conn._archive_retained_cursors
+assert owned_conn is conn
+if handle == "cursor":
+    assert cursor in owned_conn._archive_retained_cursors
 assert os.fstat(retained_archive.fileno()).st_ino == path.stat().st_ino
 print("DETACHED_CLOSE_UNKNOWN_RETAINED")
 """
     result = subprocess.run(
-        [sys.executable, "-c", script, str(path), cut.database_sha256],
+        [sys.executable, "-c", script, str(path), cut.database_sha256, handle],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
