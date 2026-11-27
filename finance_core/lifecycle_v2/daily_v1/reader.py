@@ -159,6 +159,7 @@ class DailyAccountReaderV1:
                     service.binding,
                     service.legacy_verifier,
                     daily_capacity=service.daily_capacity,
+                    _service=service,
                 )
                 current = {}
                 history = {}

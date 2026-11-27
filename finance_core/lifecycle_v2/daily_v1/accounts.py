@@ -741,6 +741,7 @@ class _BoundService(SnapshotEvidenceVerifier):
         )
         self.owner = base.owner
         self.runtime_admission = base.runtime_admission
+        self.historical_evidence = base.historical_evidence
         self.clock = base.clock
 
     def _now(self):
@@ -763,6 +764,7 @@ def _audit(service, conn):
         service.binding,
         service.legacy_verifier,
         daily_capacity=service.daily_capacity,
+        _service=service,
     )
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Evidence callback changed protected state")

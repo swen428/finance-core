@@ -207,10 +207,14 @@ def receipt_snapshot_evidence_scope(
 def _receipt_lookup(port, conn, binding):
     """Keep live receipt callbacks on the admitted connection and copy lookups detached."""
     from .daily_v1.accounts import _EvidenceReadPort
+    from .historical_evidence_v1 import _historical_receipt_lookup
 
-    scope = _receipt_snapshot_for(conn, port, binding)
-    if scope is not None:
-        yield scope.read
+    read_archive = _historical_receipt_lookup(conn, port, binding)
+    if read_archive is None:
+        scope = _receipt_snapshot_for(conn, port, binding)
+        read_archive = scope.read if scope is not None else None
+    if read_archive is not None:
+        yield read_archive
         return
     if type(port) is not _EvidenceReadPort:
         raise LifecycleError("Receipt history requires a protected ledger or exact snapshot cut")

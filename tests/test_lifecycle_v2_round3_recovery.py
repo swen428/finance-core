@@ -1774,3 +1774,214 @@ def test_manual_restore_requires_generation_absent_from_archived_sources(
             )
         assert authority._state(config) == before
         assert inspect_instance_admission(config)["state"] == "RESTORE_HELD"
+
+
+def _manual_historical_target(tmp_path, monkeypatch, source_config, cut, path, name, clock):
+    from finance_core.lifecycle_v2.recovery import (
+        HostIsolationV1,
+        prepare_manual_single_host_restore_v1,
+    )
+    from finance_core.lifecycle_v2.single_host_runtime_v1 import admit_single_host_runtime_v1
+
+    root = tmp_path / name
+    root.mkdir(mode=0o700)
+    target = synthetic_config(
+        root, monkeypatch, instance_id=name, application_schema=source_config.application_schema
+    )
+    binding = RuntimeBinding(
+        target.instance_id, name + "-generation", "user", "chat", "single-host-synthetic"
+    )
+    held = prepare_manual_single_host_restore_v1(
+        target, path, cut, new_binding=binding, operation_id="prepare", approval_ref="approved"
+    )
+    admission = admit_single_host_runtime_v1(
+        target, binding, operation_id="registration", approval_ref="approved"
+    )
+    isolation = HostIsolationV1(
+        "synthetic",
+        "old-host",
+        cut.instance_id,
+        cut.source_binding_sha256,
+        clock,
+        "record",
+        "c" * 64,
+        "stopped",
+        "restart disabled",
+        "keep disabled",
+    )
+    kwargs = dict(
+        isolation=isolation,
+        runtime_admission=admission,
+        cut_observed_at=clock,
+        accept_loss_through=clock,
+        operation_id="activation",
+        approval_ref="approved",
+        port=None,
+        binding=binding,
+    )
+    return target, held, kwargs
+
+
+@pytest.mark.parametrize("original", [True], indirect=True)
+def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
+    original, tmp_path, monkeypatch
+):
+    from finance_core.lifecycle_v2.daily_v1 import DailyAccountReaderV1, DailyAccountServiceV1
+    from finance_core.lifecycle_v2.recovery import promote_manual_single_host_restore_v1
+    from tests.daily_account_support_v1 import NOW, DailyPort
+    from tests.test_daily_accounts_lifecycle_v1 import create
+
+    old, old_owner, source, _ = original
+    old_port = source.port = DailyPort()
+    source.clock = lambda: NOW
+    _, _, old_review, old_fact = create(source, old_port, DailyAccountServiceV1(source))
+    audit = source.reader().full_audit()
+    cut, path = _cut(source, tmp_path)
+    _fence(old, old_owner)
+    target, held, kwargs = _manual_historical_target(
+        tmp_path, monkeypatch, old, cut, path, "restored-history", NOW
+    )
+    binding, admission = kwargs["binding"], kwargs["runtime_admission"]
+    history_hash = authority._digest([])
+
+    def audit_application(connection, exact_cut, audit_core):
+        assert exact_cut == cut
+        assert connection.in_transaction
+        assert audit_core(old_port, source.binding) == audit
+        return history_hash
+
+    from finance_core.lifecycle_v2.historical_evidence_v1 import (
+        HistoricalEvidenceV1,
+        HistoricalGenerationV1,
+    )
+
+    archived = HistoricalGenerationV1(source.binding, cut, history_hash, audit["audit_sha256"])
+    kwargs.update(
+        application_history_sha256=history_hash, audit_application_history=audit_application
+    )
+    with pytest.raises(LifecycleError, match="event"):
+        promote_manual_single_host_restore_v1(
+            held, historical_generations=(replace(archived, event_sha256="f" * 64),), **kwargs
+        )
+
+    def commits_during_held_audit(connection, exact_cut, audit_core):
+        with pytest.raises(sqlite3.DatabaseError):
+            connection.commit()
+        return audit_application(connection, exact_cut, audit_core)
+
+    with pytest.raises(LifecycleError, match="read-only scope"):
+        promote_manual_single_host_restore_v1(
+            held,
+            historical_generations=(archived,),
+            **(kwargs | {"audit_application_history": commits_during_held_audit}),
+        )
+    assert inspect_instance_admission(target)["state"] == "RESTORE_HELD"
+    assert (
+        promote_manual_single_host_restore_v1(held, historical_generations=(archived,), **kwargs)[
+            "state"
+        ]
+        == "ACTIVE"
+    )
+    new_port = DailyPort()
+    new_port.sources.clear()
+    new_port.add_source("source2", "Create another MYR bank account")
+    with acquire_production_owner(target) as owner:
+
+        def service(historical_generation=archived, historical_port=old_port):
+            return LedgerService(
+                owner,
+                new_port,
+                binding,
+                clock=lambda: NOW,
+                runtime_admission=admission,
+                historical_evidence=(HistoricalEvidenceV1(historical_generation, historical_port),),
+            )
+
+        with pytest.raises(LifecycleError, match="commitment"):
+            service(replace(archived, application_history_sha256="0" * 64)).reader().full_audit()
+        restored = service()
+        daily = DailyAccountServiceV1(restored)
+        reader = DailyAccountReaderV1(restored)
+        account = old_fact.account_ref.account_id
+        assert reader.get_account(account).opening_amount == "12.30"
+        with pytest.raises(LifecycleError):
+            daily.confirm(old_review.review_id, "action1", "confirm1")
+        _, _, fresh_review, fresh = create(restored, new_port, daily, suffix="2")
+        assert fresh_review.material["binding"] == asdict(binding)
+        assert reader.get_account(fresh.account_ref.account_id).opening_amount == "12.30"
+        current_audit = restored.reader().full_audit()
+        assert current_audit["fact_version_count"] == 2
+        second_path = tmp_path / "second-archive.sqlite"
+        second_cut = restored.seal_snapshot(second_path)
+        from finance_core.instance_admission.sessions import lifecycle_read_operation
+        from finance_core.lifecycle_v2.historical_evidence_v1 import (
+            audit_runtime_archive_evidence_connection_v1,
+        )
+
+        with lifecycle_read_operation(owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                assert (
+                    audit_runtime_archive_evidence_connection_v1(
+                        conn, restored, new_port, binding, second_cut
+                    )
+                    == current_audit
+                )
+            finally:
+                conn.rollback()
+        fence_production_instance(target, operation_id="fence", approval_ref="approved")
+
+    second, held_again, again_kwargs = _manual_historical_target(
+        tmp_path, monkeypatch, target, second_cut, second_path, "second-restored-history", NOW
+    )
+    from finance_core.lifecycle_v2.historical_evidence_v1 import historical_generations_sha256_v1
+
+    first_evidence = HistoricalEvidenceV1(archived, old_port)
+    parent = historical_generations_sha256_v1((archived,))
+    second_history_hash = authority._digest(["new signed history"])
+    second_archived = HistoricalGenerationV1(
+        binding, second_cut, second_history_hash, current_audit["audit_sha256"]
+    )
+
+    def audit_again(connection, exact_cut, audit_core, proof):
+        assert exact_cut == second_cut
+        assert (
+            audit_core(
+                new_port,
+                binding,
+                historical_evidence=(first_evidence,),
+                parent_history_sha256=proof,
+            )
+            == current_audit
+        )
+        return second_history_hash
+
+    again_kwargs["application_history_sha256"] = second_history_hash
+    ancestry = (archived, second_archived)
+    with pytest.raises(LifecycleError, match="omitted approved ancestry"):
+        promote_manual_single_host_restore_v1(
+            held_again,
+            historical_generations=ancestry,
+            audit_application_history=lambda c, cut, audit: audit_again(c, cut, audit, None),
+            **again_kwargs,
+        )
+    assert (
+        promote_manual_single_host_restore_v1(
+            held_again,
+            historical_generations=ancestry,
+            audit_application_history=lambda c, cut, audit: audit_again(c, cut, audit, parent),
+            **again_kwargs,
+        )["state"]
+        == "ACTIVE"
+    )
+    with acquire_production_owner(second) as owner:
+        third = LedgerService(
+            owner,
+            DailyPort(),
+            again_kwargs["binding"],
+            runtime_admission=again_kwargs["runtime_admission"],
+            historical_evidence=(first_evidence, HistoricalEvidenceV1(second_archived, new_port)),
+        )
+        assert third.reader().full_audit() == current_audit
+    second.close()
+    target.close()

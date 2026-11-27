@@ -206,11 +206,16 @@ def _ledger_prefix(conn, source_id, ledger_cut, *, _rows=None):
 def _receipt_history_origin(service, conn, source_id, fields_reply, ledger_cut, *, _rows=None):
     """Resolve the original receipt and exact account history cut without a nested audit."""
     from .daily_v1.accounts import _EvidenceReadPort
+    from .historical_evidence_v1 import _historical_receipt_lookup
 
-    scope = _receipt_snapshot_for(conn, service.port, service.binding)
-    if not conn.in_transaction or (scope is None and type(service.port) is not _EvidenceReadPort):
+    historical = _historical_receipt_lookup(conn, service.port, service.binding)
+    snapshot = (
+        historical is not None
+        or _receipt_snapshot_for(conn, service.port, service.binding) is not None
+    )
+    if not conn.in_transaction or (not snapshot and type(service.port) is not _EvidenceReadPort):
         raise LifecycleError("Receipt history requires a protected ledger or exact snapshot cut")
-    if scope is not None and ledger_cut is None:
+    if snapshot and ledger_cut is None:
         raise LifecycleError("Receipt snapshot requires the original ledger event predecessor")
     text(source_id, "original receipt source id", 512)
     lookup = _copy_position(fields_reply)

@@ -10,7 +10,7 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from finance_core.instance_admission import TrustedInstanceConfig, prepare_production_profile
 from finance_core.instance_admission.authority import (
@@ -55,9 +55,31 @@ from .contracts import (
     cut_ref,
     digest,
 )
+from .historical_evidence_v1 import (
+    HistoricalEvidenceV1,
+    HistoricalGenerationV1,
+    _generations,
+    _require_immediate,
+    _verify_event_anchors,
+    audit_archive_evidence_connection_v1,
+    historical_generations_sha256_v1,
+)
+from .receipt_snapshot_v1 import ReceiptSnapshotLookupV1
 from .single_host_runtime_v1 import SingleHostRuntimeAdmissionV1, _require_runtime_admission
 
-HistoricalCoreAuditV1 = Callable[[EvidencePort, RuntimeBinding], dict[str, Any]]
+
+class HistoricalCoreAuditV1(Protocol):
+    def __call__(
+        self,
+        port: EvidencePort,
+        binding: RuntimeBinding,
+        *,
+        historical_evidence: tuple[HistoricalEvidenceV1, ...] = (),
+        receipt_snapshot_lookup: ReceiptSnapshotLookupV1 | None = None,
+        parent_history_sha256: str | None = None,
+    ) -> dict[str, Any]: ...
+
+
 ApplicationRestoreAuditV1 = Callable[[sqlite3.Connection, SnapshotCut, HistoricalCoreAuditV1], str]
 
 # Keep uncertain SQLite and every cooperative lease live until process exit.
@@ -329,6 +351,37 @@ def prepare_restored_profile(
     result = RestoredProfile(config, cut, new_binding, operation_id, prepare["entry_sha256"])
     _held_description(result)
     return result
+
+
+@contextmanager
+def _archive_read_authorizer(conn):
+    """Keep transaction and schema ownership with the held recovery coordinator."""
+    violation = False
+
+    def authorize(action, first, second, _database, _source):
+        nonlocal violation
+        if action in {
+            sqlite3.SQLITE_ATTACH,
+            sqlite3.SQLITE_DETACH,
+            sqlite3.SQLITE_SAVEPOINT,
+            sqlite3.SQLITE_TRANSACTION,
+        } or (
+            action == sqlite3.SQLITE_PRAGMA
+            and first in {"query_only", "writable_schema", "foreign_keys"}
+            and second is not None
+        ):
+            violation = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    conn.set_authorizer(authorize)
+
+    try:
+        yield
+        if violation:
+            raise LifecycleError("Historical application audit violated its read-only scope")
+    finally:
+        conn.set_authorizer(None)
 
 
 def _protected_database_transition(
@@ -971,6 +1024,7 @@ def _promote_context(
     binding,
     legacy_verifier,
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
+    historical_generations: tuple[HistoricalGenerationV1, ...] = (),
 ):
     from .reader import audit_connection
 
@@ -1075,7 +1129,14 @@ def _promote_context(
 
                     core_verified = False
 
-                    def audit_core(historical_port, historical_binding):
+                    def audit_core(
+                        historical_port,
+                        historical_binding,
+                        *,
+                        historical_evidence=(),
+                        receipt_snapshot_lookup=None,
+                        parent_history_sha256=None,
+                    ):
                         nonlocal core_verified
                         if (
                             core_verified
@@ -1086,13 +1147,47 @@ def _promote_context(
                             raise LifecycleError(
                                 "Manual restore needs exact historical Core evidence"
                             )
-                        result = audit_evidence_connection(
-                            conn, historical_port, historical_binding, legacy_verifier
-                        )
+                        if historical_generations:
+                            _verify_event_anchors(conn, historical_generations)
+                            if (
+                                _generations(historical_evidence) != historical_generations[:-1]
+                                or historical_binding != historical_generations[-1].binding
+                                or (
+                                    (
+                                        len(historical_generations) > 1
+                                        or parent_history_sha256 is not None
+                                    )
+                                    and parent_history_sha256
+                                    != historical_generations_sha256_v1(historical_generations[:-1])
+                                )
+                            ):
+                                raise LifecycleError(
+                                    "Application verifier omitted approved ancestry"
+                                )
+                        elif historical_evidence:
+                            raise LifecycleError("Unapproved historical archive ancestry")
+                        if historical_generations or receipt_snapshot_lookup is not None:
+                            result = audit_archive_evidence_connection_v1(
+                                conn,
+                                historical_port,
+                                historical_binding,
+                                restored.cut,
+                                legacy_verifier=legacy_verifier,
+                                historical_evidence=historical_evidence,
+                                parent_history_sha256=historical_generations_sha256_v1(
+                                    historical_generations[:-1]
+                                ),
+                                receipt_snapshot_lookup=receipt_snapshot_lookup,
+                            )
+                        else:
+                            result = audit_evidence_connection(
+                                conn, historical_port, historical_binding, legacy_verifier
+                            )
                         core_verified = True
                         return result
 
-                    history_sha256 = audit_application_history(conn, restored.cut, audit_core)
+                    with _archive_read_authorizer(conn):
+                        history_sha256 = audit_application_history(conn, restored.cut, audit_core)
                     if not core_verified:
                         raise LifecycleError(
                             "Held application verifier omitted Core evidence audit"
@@ -1233,6 +1328,7 @@ def manual_single_host_promotion_context_v1(
     cut_observed_at: int,
     accept_loss_through: int,
     application_history_sha256: str | None = None,
+    historical_generations: tuple[HistoricalGenerationV1, ...] = (),
 ) -> dict[str, Any]:
     """Describe the exact evidence and target that the trusted approver must verify."""
     if (
@@ -1268,6 +1364,16 @@ def manual_single_host_promotion_context_v1(
             "accept_loss_through": accept_loss_through,
             "application_history_sha256": application_history_sha256,
         }
+        if historical_generations:
+            _require_immediate(
+                historical_generations,
+                runtime_admission.binding,
+                restored.cut,
+                application_history_sha256,
+            )
+            context["historical_generations_sha256"] = historical_generations_sha256_v1(
+                historical_generations
+            )
         _validate_manual_restore_context(context)
         if record["state"] == "RESTORE_HELD":
             _validate_manual_restore_history(context, state, config.binding_sha256)
@@ -1288,6 +1394,7 @@ def promote_manual_single_host_restore_v1(
     legacy_verifier=None,
     application_history_sha256: str | None = None,
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
+    historical_generations: tuple[HistoricalGenerationV1, ...] = (),
 ) -> dict[str, Any]:
     """Publish one approved successor, or resume its exact interrupted operation.
 
@@ -1309,6 +1416,7 @@ def promote_manual_single_host_restore_v1(
         cut_observed_at=cut_observed_at,
         accept_loss_through=accept_loss_through,
         application_history_sha256=application_history_sha256,
+        historical_generations=historical_generations,
     )
     if binding != runtime_admission.binding:
         raise LifecycleError("Manual restore write binding differs from registration")
@@ -1325,6 +1433,7 @@ def promote_manual_single_host_restore_v1(
         binding=restored.new_binding,
         legacy_verifier=legacy_verifier,
         audit_application_history=audit_application_history,
+        historical_generations=historical_generations,
     )
 
 

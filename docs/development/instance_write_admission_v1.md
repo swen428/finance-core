@@ -187,6 +187,31 @@ interrupted publication. `reopen_manual_single_host_restore_v1` reconstructs
 the original preparation from protected history. Reobserving a completed
 operation does not re-promote a target or overwrite later postings.
 
+For a restored application that will serve historical records, supply
+`HistoricalGenerationV1` descriptors from oldest through the immediate source
+to both manual promotion calls. An individual descriptor binds one runtime,
+snapshot cut, application-history digest and Core event-chain anchor. The
+protected promotion stores a commitment to the complete ancestry. During
+held admission the trusted archive audit must authenticate the source's
+protected parent commitment and provide the ancestor evidence ports to the
+Core callback. Core compares the approved descriptors and independently checks
+the archive cut and event anchors on the held database. For a first restore the
+ancestor list is empty.
+
+On the admitted target, construct `LedgerService` with the matching installed
+`HistoricalEvidenceV1` ports in that ancestry order. Core verifies the current
+owner and protected promotion and checks their anchors on the actual ledger
+transaction. Retained capture, proposal, review, delivery and confirmation
+evidence is checked under its original runtime and archive. Historical live
+ports receive the original guarded SQLite connection for read callbacks.
+Detached archive tools can use `audit_archive_evidence_connection_v1` with
+a verified parent commitment and exact archive receipt lookups. The current
+writer's archive producer can use `audit_runtime_archive_evidence_connection_v1`
+on its admitted read transaction for that cut. The Core audit checks original
+receipt and OCR evidence using those same scopes.
+Historical evidence carries no write or confirmation authority. New service
+operations continue to use the current registered runtime.
+
 Application intake owns the new receiving boundary, fresh credentials and
 policy, and the exclusion of historical cards, messages and external claims
 from execution. The existing live designation and signed v3 receipt routes

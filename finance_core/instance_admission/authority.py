@@ -557,7 +557,14 @@ def _validate_manual_restore_context(context: dict[str, Any]) -> None:
         "application_history_sha256",
     }
     if (
-        set(context) != fields
+        set(context) not in (fields, fields | {"historical_generations_sha256"})
+        or (
+            "historical_generations_sha256" in context
+            and (
+                not _recovery_hash(context["historical_generations_sha256"])
+                or context["application_history_sha256"] is None
+            )
+        )
         or not _recovery_cut_ref(context["cut_ref"])
         or (
             context["application_history_sha256"] is not None

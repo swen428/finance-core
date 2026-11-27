@@ -40,16 +40,18 @@ from finance_core.lifecycle_v2.receipt_snapshot_v1 import receipt_snapshot_evide
 from finance_core.lifecycle_v2.recovery import verify_snapshot_evidence
 from tests.daily_account_support_v1 import NOW, command, unknown_time
 from tests.test_daily_accounts_lifecycle_v1 import create
-from tests.test_lifecycle_v2 import live as live
+from tests.test_lifecycle_v2_round3_recovery import _fence, _manual_historical_target
+from tests.test_lifecycle_v2_round3_recovery import original as original
 from tests.test_manual_receipt_posting_v1 import _position, _SnapshotReceiptLookup
 from tests.test_receipt_media_v1 import _complete_ocr_result
 from tests.test_receipt_media_v1 import seam as seam
 from tests.test_receipt_review_preparation_v1 import PaymentPort, payment_for_handoff
 
 
+@pytest.mark.parametrize("original", [True], indirect=True)
 @pytest.mark.parametrize("case", ["complete", "partial", "no_text"])
 def test_retained_ocr_expense_rebuilds_exact_fields_with_optional_manual_replies(
-    seam, live, monkeypatch, case, tmp_path
+    seam, original, monkeypatch, case, tmp_path
 ):
     from finance_core.lifecycle_v2.receipt_retained_ocr_v1 import (
         ReceiptOcrMemberIdentityV1,
@@ -59,7 +61,7 @@ def test_retained_ocr_expense_rebuilds_exact_fields_with_optional_manual_replies
         _reconstruct_ocr_expense,
     )
 
-    processor, engine, request, input_root, live_root, original, worker_calls = seam
+    processor, engine, request, input_root, live_root, receipt_bytes, worker_calls = seam
     if case == "no_text":
         monkeypatch.setattr(
             engine,
@@ -75,12 +77,12 @@ def test_retained_ocr_expense_rebuilds_exact_fields_with_optional_manual_replies
             "extract",
             partial(_complete_ocr_result, merchant=merchant, total="TOTAL SGD 8.00"),
         )
-    ledger, _, _ = live
+    original_config, original_owner, ledger, _ = original
     port = ledger.port = PaymentPort()
     port.receipt = replace(
         port.receipt,
-        original_sha256=sha256(original).hexdigest(),
-        original_size_bytes=len(original),
+        original_sha256=sha256(receipt_bytes).hexdigest(),
+        original_size_bytes=len(receipt_bytes),
     )
     port.replies = ()
     ledger.clock = lambda: NOW + 10
@@ -254,7 +256,98 @@ def test_retained_ocr_expense_rebuilds_exact_fields_with_optional_manual_replies
         with pytest.raises(EffectiveReadError) as refused:
             EffectiveLedgerReaderV1.for_daily_ledger(ledger).collect()
         assert refused.value.code == "fact_evidence_invalid"
+        original_file.chmod(0o600)
+        original_file.write_bytes(receipt_bytes)
+        original_file.chmod(0o400)
+        _fence(original_config, original_owner)
+        _verify_activated_receipt(
+            tmp_path,
+            monkeypatch,
+            original_config,
+            ledger,
+            port,
+            snapshot,
+            cut,
+            audit,
+            lookup,
+            source.source_id,
+            action,
+        )
     assert len(worker_calls) == 1
+
+
+def _verify_activated_receipt(
+    tmp_path,
+    monkeypatch,
+    config,
+    ledger,
+    port,
+    snapshot,
+    cut,
+    audit,
+    lookup,
+    source_id,
+    action,
+):
+    from finance_core.instance_admission import InstanceAdmissionError, acquire_production_owner
+    from finance_core.lifecycle_v2.historical_evidence_v1 import (
+        HistoricalEvidenceV1,
+        HistoricalGenerationV1,
+    )
+    from finance_core.lifecycle_v2.recovery import promote_manual_single_host_restore_v1
+    from finance_core.lifecycle_v2.service import LedgerService
+
+    target, held, options = _manual_historical_target(
+        tmp_path, monkeypatch, config, cut, snapshot, "restored-ocr", NOW + 10
+    )
+    history = digest(["verified OCR members and original transport"])
+    archived = HistoricalGenerationV1(ledger.binding, cut, history, audit["audit_sha256"])
+
+    def audit_application(connection, exact_cut, audit_core):
+        assert connection.in_transaction and exact_cut == cut
+        assert audit_core(port, ledger.binding, receipt_snapshot_lookup=lookup) == audit
+        return history
+
+    assert (
+        promote_manual_single_host_restore_v1(
+            held,
+            historical_generations=(archived,),
+            application_history_sha256=history,
+            audit_application_history=audit_application,
+            **options,
+        )["state"]
+        == "ACTIVE"
+    )
+    with acquire_production_owner(target) as owner:
+        restored = LedgerService(
+            owner,
+            PaymentPort(),
+            options["binding"],
+            runtime_admission=options["runtime_admission"],
+            historical_evidence=(HistoricalEvidenceV1(archived, port),),
+        )
+        original_read = port.receipt_retained_ocr_history_v1
+        assert restored.reader().receipt_source_v1(source_id) == port.receipt
+        assert restored.reader().full_audit() == audit
+        view = DailyLedgerReaderV1(restored).collect()
+        assert view.movements[0].values["account_amount"] == "7.50"
+        with pytest.raises(LifecycleError):
+            DailyMovementServiceV1(restored).confirm(
+                action.review_id, action.evidence_id, "confirm-ocr-receipt"
+            )
+
+        def attempted_commit(conn, identity, fields_reply):
+            assert _witness_for(conn).owner is owner
+            with pytest.raises(InstanceAdmissionError):
+                conn.commit()
+            return original_read(conn, identity, fields_reply)
+
+        port.receipt_retained_ocr_history_v1 = attempted_commit
+        with pytest.raises(InstanceAdmissionError, match="read-only scope"):
+            restored.reader().full_audit()
+        port.receipt_retained_ocr_history_v1 = original_read
+
+    target.close()
 
 
 def _post_ocr_receipt(ledger, port, source_id, fields_reply):
