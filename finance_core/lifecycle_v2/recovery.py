@@ -7,10 +7,10 @@ import hashlib
 import hmac
 import os
 import sqlite3
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from finance_core.instance_admission import TrustedInstanceConfig, prepare_production_profile
 from finance_core.instance_admission.authority import (
@@ -59,8 +59,10 @@ from .historical_evidence_v1 import (
     HistoricalEvidenceV1,
     HistoricalGenerationV1,
     _ArchiveReadConnection,
+    _close_archive_connection,
     _generations,
     _issued_archive_transaction,
+    _require_archive_transaction,
     _require_immediate,
     _verify_event_anchors,
     audit_archive_evidence_connection_v1,
@@ -68,6 +70,9 @@ from .historical_evidence_v1 import (
 )
 from .receipt_snapshot_v1 import ReceiptSnapshotLookupV1
 from .single_host_runtime_v1 import SingleHostRuntimeAdmissionV1, _require_runtime_admission
+
+if TYPE_CHECKING:
+    from .core_archive_origin_v1 import CoreArchiveOriginV1
 
 
 class HistoricalCoreAuditV1(Protocol):
@@ -364,10 +369,11 @@ def _protected_database_transition(
     write: bool,
     build: Callable[[sqlite3.Connection], dict[str, Any]],
     publish: bool = True,
-    query_only: bool = False,
+    archive_read_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Hold owner/control/profile/gate through actual SQLite close and publish."""
-    if not publish and write:
+    query_only = archive_read_sha256 is not None
+    if write and (not publish or query_only):
         raise LifecycleError("Unpublished recovery verification must be read-only")
     profile = None
     gate = None
@@ -377,6 +383,15 @@ def _protected_database_transition(
     unknown = False
     previous_runtime = None
     runtime_switched = False
+
+    def close_database():
+        if query_only:
+            _close_archive_connection(conn, close_connection=_close_sqlite_handle)
+        else:
+            if conn.in_transaction:
+                conn.rollback()
+            _close_sqlite_handle(conn)
+
     try:
         _MANAGED_SQLITE_LIFETIME_LOCK.__enter__()
         lifetime = True
@@ -408,10 +423,13 @@ def _protected_database_transition(
             config.application_schema,
             record["ledger_sha256"],
         )
-        journal = build(conn)
+        archive_read = (
+            _issued_archive_transaction(conn, archive_read_sha256) if query_only else nullcontext()
+        )
+        with archive_read:
+            journal = build(conn)
         try:
-            conn.rollback()
-            _close_sqlite_handle(conn)
+            close_database()
             conn = None
         except BaseException as exc:
             unknown = True
@@ -432,9 +450,7 @@ def _protected_database_transition(
         if not unknown:
             if conn is not None:
                 try:
-                    if conn.in_transaction:
-                        conn.rollback()
-                    _close_sqlite_handle(conn)
+                    close_database()
                 except BaseException as exc:
                     owner._retain = control._retain = True
                     if profile is not None:
@@ -999,6 +1015,7 @@ def _promote_context(
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
     historical_generations: tuple[HistoricalGenerationV1, ...] = (),
     core_history: tuple[HistoricalEvidenceV1, ...] = (),
+    core_archive_origin: CoreArchiveOriginV1 | None = None,
 ):
     from .reader import audit_connection
 
@@ -1059,6 +1076,7 @@ def _promote_context(
                         write=False,
                         build=verify_completed,
                         publish=False,
+                        archive_read_sha256=restored.cut.database_sha256 if manual else None,
                     )
                     return _decode(_canonical(_record(config, state)))
                 before = state
@@ -1096,21 +1114,27 @@ def _promote_context(
                         "Manual restore generation occurs in archived ledger history"
                     )
                 if core_history:
+                    from .core_archive_origin_v1 import verify_core_archive_origin_v1
+
+                    if (
+                        core_archive_origin is None
+                        or core_archive_origin.seal_sha256
+                        != context.get("core_archive_origin_sha256")
+                    ):
+                        raise LifecycleError("Core-only source ancestry differs from approval")
+                    verify_core_archive_origin_v1(core_archive_origin, restored.cut, config)
                     archived = core_history[-1]
-                    with _issued_archive_transaction(conn, restored.cut.database_sha256):
-                        _verify_event_anchors(conn, historical_generations)
-                        audit_archive_evidence_connection_v1(
-                            conn,
-                            archived.port,
-                            archived.generation.binding,
-                            restored.cut,
-                            legacy_verifier=legacy_verifier,
-                            historical_evidence=core_history[:-1],
-                            parent_history_sha256=historical_generations_sha256_v1(
-                                historical_generations[:-1]
-                            ),
-                            receipt_snapshot_lookup=archived.receipt_snapshot_lookup,
-                        )
+                    _verify_event_anchors(conn, historical_generations)
+                    audit_archive_evidence_connection_v1(
+                        conn,
+                        archived.port,
+                        archived.generation.binding,
+                        restored.cut,
+                        legacy_verifier=legacy_verifier,
+                        historical_evidence=core_history[:-1],
+                        parent_history_sha256=core_archive_origin.parent_history_sha256,
+                        receipt_snapshot_lookup=archived.receipt_snapshot_lookup,
+                    )
                 elif audit_application_history is None:
                     _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
                 else:
@@ -1176,8 +1200,7 @@ def _promote_context(
                         core_verified = True
                         return result
 
-                    with _issued_archive_transaction(conn, restored.cut.database_sha256):
-                        history_sha256 = audit_application_history(conn, restored.cut, audit_core)
+                    history_sha256 = audit_application_history(conn, restored.cut, audit_core)
                     if not core_verified:
                         raise LifecycleError(
                             "Held application verifier omitted Core evidence audit"
@@ -1192,6 +1215,8 @@ def _promote_context(
                             "Held application history differs from approved archive"
                         )
                     _verify_cut_connection(conn, restored.cut)
+                if manual:
+                    _require_archive_transaction(conn, restored.cut.database_sha256)
                 if pending is not None:
                     return pending
                 after = _decode(_canonical(before))
@@ -1215,7 +1240,13 @@ def _promote_context(
                 )
 
             published = _protected_database_transition(
-                config, owner, control, record, write=not manual, build=build, query_only=manual
+                config,
+                owner,
+                control,
+                record,
+                write=not manual,
+                build=build,
+                archive_read_sha256=restored.cut.database_sha256 if manual else None,
             )
             return _decode(_canonical(_record(config, published)))
     finally:
@@ -1319,6 +1350,7 @@ def manual_single_host_promotion_context_v1(
     accept_loss_through: int,
     application_history_sha256: str | None = None,
     historical_generations: tuple[HistoricalGenerationV1, ...] = (),
+    core_archive_origin: CoreArchiveOriginV1 | None = None,
 ) -> dict[str, Any]:
     """Describe the exact evidence and target that the trusted approver must verify."""
     if (
@@ -1330,6 +1362,19 @@ def manual_single_host_promotion_context_v1(
     _require_manual_cut_identity(config, restored.cut)
     if (config.application_schema is not None) != (application_history_sha256 is not None):
         raise LifecycleError("Manual restore needs the exact application history identity")
+    needs_origin = config.application_schema is None and bool(historical_generations)
+    if needs_origin != (core_archive_origin is not None):
+        raise LifecycleError("Core-only history requires its independently signed source cut")
+    if core_archive_origin is not None:
+        from .core_archive_origin_v1 import verify_core_archive_origin_v1
+
+        verify_core_archive_origin_v1(core_archive_origin, restored.cut, config)
+        if core_archive_origin.source_binding != historical_generations[
+            -1
+        ].binding or core_archive_origin.parent_history_sha256 != historical_generations_sha256_v1(
+            historical_generations[:-1]
+        ):
+            raise LifecycleError("Core-only ancestors differ from the independently signed source")
     with _control(config, shared=True):
         state = _manual_restore_state(config)
         target, record = _target_from_state(restored, state, allow_completed=True)
@@ -1364,6 +1409,8 @@ def manual_single_host_promotion_context_v1(
             context["historical_generations_sha256"] = historical_generations_sha256_v1(
                 historical_generations
             )
+        if core_archive_origin is not None:
+            context["core_archive_origin_sha256"] = core_archive_origin.seal_sha256
         _validate_manual_restore_context(context)
         if record["state"] == "RESTORE_HELD":
             _validate_manual_restore_history(context, state, config.binding_sha256)
@@ -1385,6 +1432,7 @@ def promote_manual_single_host_restore_v1(
     application_history_sha256: str | None = None,
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
     historical_generations: tuple[HistoricalGenerationV1, ...] = (),
+    core_archive_origin: CoreArchiveOriginV1 | None = None,
     historical_evidence: tuple[HistoricalEvidenceV1, ...] = (),
 ) -> dict[str, Any]:
     """Publish one approved successor, or resume its exact interrupted operation.
@@ -1423,6 +1471,7 @@ def promote_manual_single_host_restore_v1(
         accept_loss_through=accept_loss_through,
         application_history_sha256=application_history_sha256,
         historical_generations=historical_generations,
+        core_archive_origin=core_archive_origin,
     )
     if binding != runtime_admission.binding:
         raise LifecycleError("Manual restore write binding differs from registration")
@@ -1441,6 +1490,7 @@ def promote_manual_single_host_restore_v1(
         audit_application_history=audit_application_history,
         historical_generations=historical_generations,
         core_history=historical_evidence,
+        core_archive_origin=core_archive_origin,
     )
 
 

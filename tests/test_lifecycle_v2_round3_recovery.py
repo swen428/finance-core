@@ -1776,7 +1776,9 @@ def test_manual_restore_requires_generation_absent_from_archived_sources(
         assert inspect_instance_admission(config)["state"] == "RESTORE_HELD"
 
 
-def _manual_historical_target(tmp_path, monkeypatch, source_config, cut, path, name, clock):
+def _manual_historical_target(
+    tmp_path, monkeypatch, source_config, cut, path, name, clock, *, verifier=None
+):
     from finance_core.lifecycle_v2.recovery import (
         HostIsolationV1,
         prepare_manual_single_host_restore_v1,
@@ -1786,7 +1788,11 @@ def _manual_historical_target(tmp_path, monkeypatch, source_config, cut, path, n
     root = tmp_path / name
     root.mkdir(mode=0o700)
     target = synthetic_config(
-        root, monkeypatch, instance_id=name, application_schema=source_config.application_schema
+        root,
+        monkeypatch,
+        instance_id=name,
+        application_schema=source_config.application_schema,
+        verifier=verifier,
     )
     binding = RuntimeBinding(
         target.instance_id, name + "-generation", "user", "chat", "single-host-synthetic"

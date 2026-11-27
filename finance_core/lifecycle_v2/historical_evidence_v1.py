@@ -11,7 +11,8 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, BinaryIO
+from weakref import WeakValueDictionary
 
 from finance_core.instance_admission.authority import (
     _MANUAL_RESTORE_FORMAT,
@@ -20,8 +21,10 @@ from finance_core.instance_admission.authority import (
     _state,
 )
 from finance_core.instance_admission.sessions import (
+    _close_cursor_handle,
     _evidence_read_callback,
     _require_runtime_scope,
+    _rollback_sqlite_handle,
     _witness_for,
 )
 
@@ -218,13 +221,44 @@ class _HistoricalScope:
         return read
 
 
-_CLOSE_UNKNOWN: list[sqlite3.Connection] = []
+_CLOSE_UNKNOWN: list[tuple[sqlite3.Connection, BinaryIO]] = []
+
+
+class _ArchiveCursor(sqlite3.Cursor):
+    def close(self):
+        conn = self.connection
+        conn._require_reliable_close()
+        try:
+            _close_cursor_handle(self)
+        except BaseException as exc:
+            conn._retain_uncertain_close(exc)
+            raise LifecycleError("Archived SQLite cursor actual close unknown") from exc
+        conn._archive_cursors.pop(id(self), None)
 
 
 class _ArchiveReadConnection(sqlite3.Connection):
     """Internal reader whose transaction and authorizer belong to Core."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Forgotten temporary cursors finalize normally; track every still-live
+        # statement, including cursors deliberately retained by the caller.
+        self._archive_cursors = WeakValueDictionary()
+        self._archive_retained_cursors = ()
+        self._archive_close_error = None
+
+    def _retain_uncertain_close(self, exc):
+        self._archive_close_error = exc
+        self._archive_retained_cursors = tuple(self._archive_cursors.values())
+
+    def _require_reliable_close(self):
+        if self._archive_close_error is not None:
+            raise LifecycleError(
+                "Archived SQLite actual close unknown"
+            ) from self._archive_close_error
+
     def _require_idle_guard(self):
+        self._require_reliable_close()
         if _archive_transaction_for(self) is not None:
             raise LifecycleError("Core owns the archive read transaction")
 
@@ -237,9 +271,30 @@ class _ArchiveReadConnection(sqlite3.Connection):
         self._require_idle_guard()
         return super().set_authorizer(callback)
 
+    def cursor(self, factory=None):
+        self._require_reliable_close()
+        if factory is not None and factory is not _ArchiveCursor:
+            raise LifecycleError("Archive cursor factory must retain Core ownership")
+        cursor = super().cursor(_ArchiveCursor)
+        self._archive_cursors[id(cursor)] = cursor
+        return cursor
+
+    def execute(self, sql, parameters=(), /):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters, /):
+        self._require_idle_guard()
+        return self.cursor().executemany(sql, seq_of_parameters)
+
     def close(self):
         self._require_idle_guard()
-        return super().close()
+        _close_archive_connection(self)
+
+    def blobopen(self, *args, **kwargs):
+        raise LifecycleError("Archive read supports only owned SQL result cursors")
+
+    def iterdump(self, *args, **kwargs):
+        raise LifecycleError("Archive read supports only owned SQL result cursors")
 
     def executescript(self, script):
         self._require_idle_guard()
@@ -250,12 +305,28 @@ class _ArchiveReadConnection(sqlite3.Connection):
         return super().deserialize(data, name=name)
 
 
+def _close_archive_connection(conn, *, close_connection=None):
+    """Finalize each pending statement while its SQLite handle is still live."""
+    conn._require_reliable_close()
+    try:
+        if conn.in_transaction:
+            _rollback_sqlite_handle(conn)
+        for cursor in tuple(conn._archive_cursors.values()):
+            _close_cursor_handle(cursor)
+            conn._archive_cursors.pop(id(cursor), None)
+        (_close_sqlite_handle if close_connection is None else close_connection)(conn)
+    except BaseException as exc:
+        conn._retain_uncertain_close(exc)
+        raise
+
+
 @dataclass
 class _ArchiveTransaction:
     connection: _ArchiveReadConnection
     database_sha256: str
     pid: int
     active: bool = True
+    violated: bool = False
 
 
 _ARCHIVE_TRANSACTIONS: ContextVar[tuple[_ArchiveTransaction, ...]] = ContextVar(
@@ -281,8 +352,11 @@ def is_archive_read_connection_v1(conn: sqlite3.Connection) -> bool:
 
 def _require_archive_transaction(conn, database_sha256):
     witness = _archive_transaction_for(conn)
+    if witness is not None and witness.violated:
+        raise LifecycleError("Historical application audit violated its read-only scope")
     if (
         witness is None
+        or conn._archive_close_error is not None
         or witness.database_sha256 != database_sha256
         or not conn.in_transaction
         or conn.row_factory is not sqlite3.Row
@@ -301,10 +375,9 @@ def _issued_archive_transaction(conn, database_sha256):
         or conn.execute("PRAGMA query_only").fetchone()[0] != 1
     ):
         raise LifecycleError("Core archive read transaction required")
-    violation = False
+    witness = _ArchiveTransaction(conn, database_sha256, os.getpid())
 
     def authorize(action, first, second, _database, _source):
-        nonlocal violation
         if action in {
             sqlite3.SQLITE_ATTACH,
             sqlite3.SQLITE_DETACH,
@@ -315,19 +388,16 @@ def _issued_archive_transaction(conn, database_sha256):
             and first in {"query_only", "writable_schema", "foreign_keys"}
             and second is not None
         ):
-            violation = True
+            witness.violated = True
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
     sqlite3.Connection.set_authorizer(conn, authorize)
     # Track the exact Core-issued handle and its original transaction, also
     # during nested audit methods. The process-local scope is removed on exit.
-    witness = _ArchiveTransaction(conn, database_sha256, os.getpid())
     token = _ARCHIVE_TRANSACTIONS.set((*_ARCHIVE_TRANSACTIONS.get(), witness))
     try:
         yield
-        if violation:
-            raise LifecycleError("Historical application audit violated its read-only scope")
         _require_archive_transaction(conn, database_sha256)
     finally:
         witness.active = False
@@ -341,7 +411,9 @@ def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
     if not _is_hash(database_sha256):
         raise LifecycleError("Exact archived database digest required")
     path = Path(path).resolve(strict=True)
-    with path.open("rb") as body:
+    body = path.open("rb")
+    retained = False
+    try:
 
         def identity(details):
             return (
@@ -381,11 +453,15 @@ def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
                 yield conn
         finally:
             try:
-                _close_sqlite_handle(conn)
+                _close_archive_connection(conn)
             except BaseException as exc:
-                _CLOSE_UNKNOWN.append(conn)
+                retained = True
+                _CLOSE_UNKNOWN.append((conn, body))
                 raise LifecycleError("Actual archived SQLite close is uncertain") from exc
         require_unchanged()
+    finally:
+        if not retained:
+            body.close()
 
 
 def _scope_for(conn):

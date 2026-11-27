@@ -199,10 +199,18 @@ the archive cut and event anchors on the held database. For a first restore the
 ancestor list is empty.
 
 For a Core-only profile the descriptor's application-history digest is `None`.
-Pass the ordered `HistoricalEvidenceV1` tuple to the promotion's
-`historical_evidence` parameter. Core checks the archived bindings and event
-anchors inside the same held read transaction, including the evidence from
-prior promotions when restoring a successor's own backup.
+At backup time, use `issue_core_archive_origin_v1` with the original service,
+its sealed file and a separately held recovery authority. The source receipt
+binds the exact cut and the parent commitment from that service's protected
+admission. An original admission signs the empty ancestry. A successor signs
+the ancestry retained by its own verified promotion, including an earlier
+generation that recorded no events. Keep the receipt with the backup. Configure
+the target's operator verifier independently to validate this class of receipts.
+
+Supply that receipt in `core_archive_origin` and the ordered `HistoricalEvidenceV1`
+tuple in `historical_evidence` when promoting the replacement. Core checks the
+signed parent commitment, archived bindings and event anchors in its held read.
+The legacy port-only route carries no ancestry commitment of its own.
 
 On the admitted target, construct `LedgerService` with the matching installed
 `HistoricalEvidenceV1` ports in that ancestry order. Core verifies the current
