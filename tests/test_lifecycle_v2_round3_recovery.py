@@ -1862,6 +1862,31 @@ def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
     )
 
     archived = HistoricalGenerationV1(source.binding, cut, history_hash, audit["audit_sha256"])
+    read_held = recovery_module.read_held_daily_query_snapshot_v1
+    held_options = dict(application_history_sha256=history_hash, historical_generations=(archived,))
+    before = inspect_instance_admission(target)
+    target_database = Path(target._binding["profile_root"]) / "runtime/database/finance.db"
+    database_hash = hashlib.sha256(target_database.read_bytes()).hexdigest()
+    snapshot = read_held(held, audit_application, **held_options)
+    assert snapshot.read_identity.source_binding_sha256 == target.binding_sha256
+    assert snapshot.read_identity.audit_sha256 == audit["audit_sha256"]
+    assert snapshot.read_identity.logical_database_sha256 == cut.logical_database_sha256
+    assert snapshot.collection.accounts[0].account_id == old_fact.account_ref.account_id
+    assert snapshot.collection.accounts[0].opening_amount == "12.30"
+    assert snapshot.transactions == ()
+    with pytest.raises(LifecycleError, match="omitted Core evidence audit"):
+        read_held(held, lambda *_args: history_hash, **held_options)
+    with pytest.raises(LifecycleError, match="event"):
+        read_held(
+            held,
+            audit_application,
+            **(
+                held_options
+                | {"historical_generations": (replace(archived, event_sha256="f" * 64),)}
+            ),
+        )
+    assert inspect_instance_admission(target) == before
+    assert hashlib.sha256(target_database.read_bytes()).hexdigest() == database_hash
     kwargs.update(
         application_history_sha256=history_hash, audit_application_history=audit_application
     )
@@ -1888,6 +1913,8 @@ def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
         ]
         == "ACTIVE"
     )
+    with pytest.raises(LifecycleError, match="exact held"):
+        read_held(held, audit_application, **held_options)
     new_port = DailyPort()
     new_port.sources.clear()
     new_port.add_source("source2", "Create another MYR bank account")

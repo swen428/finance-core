@@ -189,6 +189,237 @@ def _resolve_current_transfer(values, fact_ref, accounts, *, conn=None):
     return projection.expenses_by_currency, resolved
 
 
+def _collect_ledger(
+    conn,
+    *,
+    binding,
+    source_binding_sha256,
+    audit,
+    max_records,
+    max_versions,
+    include_contributions,
+    include_transfers,
+    include_refunds,
+    include_refund_contributions,
+):
+    """Project one already-authenticated daily ledger transaction."""
+    rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
+    if len(rows) > max_versions or len({r["record_id"] for r in rows}) > max_records:
+        raise LifecycleError("complete_read_limit_exceeded")
+    current, history = {}, {}
+    for row in rows:
+        view = DailyMovementViewV1(
+            row["record_id"],
+            row["economic_event_id"],
+            row["source_id"],
+            bundle_ref(row),
+            row["values_json"],
+        )
+        current[row["record_id"]] = view
+        history.setdefault(row["record_id"], []).append(view)
+    accounts, movements, transfers, refunds, legacy = {}, [], [], [], []
+    for identity in sorted(current):
+        view = current[identity]
+        values = view.values
+        if values.get("format") in BUNDLE_FORMATS:
+            accounts[identity] = _view(
+                next(r for r in reversed(rows) if r["record_id"] == identity), values
+            )
+        elif values.get("format") == MOVEMENT_FORMAT:
+            movements.append(view)
+        elif values.get("format") == TRANSFER_FORMAT:
+            if not include_transfers:
+                raise LifecycleError("unsupported_record_format: use the transfer ledger")
+            transfers.append(view)
+        elif values.get("format") == REFUND_FORMAT:
+            if not include_refunds:
+                raise LifecycleError("unsupported_record_format: use the refund ledger")
+            refunds.append(view)
+        else:
+            legacy.append(view)
+    income, expense, refunded = {}, {}, {}
+    resolved_effects = []
+    contributions = []
+    refund_contributions = []
+    net = {k: Decimal(0) for k in accounts}
+    delta = dict(net)
+    with localcontext(Context(prec=256, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999)):
+
+        def add_total(kind, currency, amount, business_date, fact_ref):
+            totals = expense if kind == "expense" else income
+            value = Decimal(amount)
+            totals[currency] = totals.get(currency, Decimal(0)) + value
+            if include_contributions:
+                contributions.append(
+                    DailyStatisticContributionV1(kind, currency, amount, business_date, fact_ref)
+                )
+
+        for view in movements:
+            values = view.values
+            impact = effect(values)
+            if impact:
+                account = accounts.get(impact["account_id"])
+                if account is None:
+                    raise LifecycleError("Movement refers to absent account")
+                resolved = resolve_effect_v1(conn, values, asdict(view.fact_ref), account.values)
+                resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
+                net[account.account_id] += Decimal(impact["amount"])
+                delta[account.account_id] += Decimal(resolved["balance_impact"])
+                add_total(
+                    values["kind"],
+                    values["original_currency"],
+                    values["original_amount"],
+                    values["business_date"],
+                    view.fact_ref,
+                )
+        for view in transfers:
+            values = view.values
+            charges, effects = _resolve_current_transfer(values, view.fact_ref, accounts, conn=conn)
+            for impact in effects:
+                key = impact["account_id"]
+                net[key] += Decimal(impact["recorded_change"])
+                delta[key] += Decimal(impact["balance_impact"])
+                resolved_effects.append(DailyResolvedEffectV1(canonical(impact)))
+            business_date = values["business_date"]
+            for currency, amount in charges:
+                add_total("expense", currency, amount, business_date, view.fact_ref)
+        for view in refunds:
+            values = view.values
+            projection = project_refund_fact_v1(values)
+            credit = projection.credit_effect
+            if credit is None:
+                continue
+            account_id = credit["account_id"]
+            account = accounts.get(account_id)
+            if account is None:
+                raise LifecycleError("Refund credit refers to an absent account")
+            resolved = resolve_refund_effect_v1(conn, credit, asdict(view.fact_ref), account.values)
+            net[account_id] += Decimal(resolved["recorded_change"])
+            delta[account_id] += Decimal(resolved["balance_impact"])
+            resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
+            currency = projection.terms.original_currency
+            amount = projection.terms.original_amount
+            refunded[currency] = refunded.get(currency, Decimal(0)) + Decimal(amount)
+            if include_refund_contributions:
+                refund_contributions.append(
+                    DailyQueryContributionV1(
+                        "refund",
+                        currency,
+                        amount,
+                        values["received_date"],
+                        view.fact_ref,
+                    )
+                )
+
+        from ..effective_v1 import _business_fields
+
+        for view in legacy:
+            old = _business_fields(view.values_json)
+            add_total(
+                "expense",
+                old["currency"],
+                old["amount"],
+                old["transaction_date"],
+                view.fact_ref,
+            )
+        balances = []
+        for key, account in accounts.items():
+            balance = (
+                Decimal(account.opening_amount) + delta[key]
+                if account.opening_amount is not None
+                else None
+            )
+
+            def fmt(v):
+                return canonical_money_str(v, account.currency)
+
+            card = account.account_type == "credit_card"
+            balances.append(
+                DailyBalanceV1(
+                    key,
+                    account.currency,
+                    balance is not None,
+                    fmt(net[key]),
+                    fmt(delta[key]),
+                    fmt(balance) if balance is not None else None,
+                    fmt(max(-balance, Decimal(0))) if card and balance is not None else None,
+                    fmt(max(balance, Decimal(0))) if card and balance is not None else None,
+                )
+            )
+
+        def totals(values):
+            return tuple((k, canonical_money_str(v, k)) for k, v in sorted(values.items()))
+
+        pending = conn.execute(
+            "SELECT count(*) FROM l2_proposals p WHERE p.version=(SELECT max(version) "
+            "FROM l2_proposals WHERE source_id=p.source_id) AND NOT EXISTS "
+            "(SELECT 1 FROM l2_reviews r JOIN l2_decisions d "
+            "ON d.review_id=r.review_id "
+            "WHERE r.proposal_id=p.proposal_id)"
+        ).fetchone()[0]
+        identity = DailyReadIdentityV1(
+            digest(asdict(binding)),
+            source_binding_sha256,
+            audit["event_count"],
+            audit["audit_sha256"],
+            _logical_database_digest(conn),
+        )
+        gaps = (("unassigned_personal_expense",) if legacy else ()) + (
+            ("unknown_opening",) if any(a.opening_amount is None for a in accounts.values()) else ()
+        )
+        scope = "registered-account-opening-income-expense-v1"
+        if include_refunds:
+            scope = "registered-account-opening-income-expense-transfer-refund-v3"
+        elif include_transfers:
+            scope = "registered-account-opening-income-expense-transfer-v2"
+        net_expenses = {
+            currency: expense.get(currency, Decimal(0)) - refunded.get(currency, Decimal(0))
+            for currency in expense.keys() | refunded.keys()
+        }
+        refund_amounts, net_amounts = totals(refunded), totals(net_expenses)
+        collection = DailyLedgerCollectionV1(
+            tuple(accounts.values()),
+            tuple(movements),
+            tuple(balances),
+            totals(income),
+            totals(expense),
+            identity,
+            len(legacy),
+            pending,
+            gaps,
+            len(rows),
+            scope=scope,
+        )
+    return (
+        collection,
+        history,
+        tuple(resolved_effects),
+        tuple(contributions),
+        tuple(transfers),
+        (tuple(refunds), refund_amounts, net_amounts, tuple(refund_contributions)),
+    )
+
+
+def _query_snapshot(collection, history, steps, refund_data):
+    _, refunded, net, refund_contributions = refund_data
+    account_records = {account.bundle_ref.record_id for account in collection.accounts}
+    transactions = tuple(
+        DailyTransactionHistoryV1(record_id, tuple(versions))
+        for record_id, versions in history.items()
+        if record_id not in account_records
+    )
+    contributions = (
+        tuple(
+            DailyQueryContributionV1(
+                item.kind, item.currency, item.amount, item.business_date, item.fact_ref
+            )
+            for item in steps
+        )
+        + refund_contributions
+    )
+    return DailyLedgerQuerySnapshotV1(collection, transactions, contributions, refunded, net)
+
+
 class DailyLedgerReaderV1(DailyAccountReaderV1):
     def _ledger(
         self,
@@ -207,221 +438,17 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
             conn.execute("BEGIN")
             try:
                 audit = _audit(service, conn)
-                rows = conn.execute("SELECT * FROM l2_facts ORDER BY record_id,version").fetchall()
-                if len(rows) > max_versions or len({r["record_id"] for r in rows}) > max_records:
-                    raise LifecycleError("complete_read_limit_exceeded")
-                current, history = {}, {}
-                for row in rows:
-                    view = DailyMovementViewV1(
-                        row["record_id"],
-                        row["economic_event_id"],
-                        row["source_id"],
-                        bundle_ref(row),
-                        row["values_json"],
-                    )
-                    current[row["record_id"]] = view
-                    history.setdefault(row["record_id"], []).append(view)
-                accounts, movements, transfers, refunds, legacy = {}, [], [], [], []
-                for identity in sorted(current):
-                    view = current[identity]
-                    values = view.values
-                    if values.get("format") in BUNDLE_FORMATS:
-                        accounts[identity] = _view(
-                            next(r for r in reversed(rows) if r["record_id"] == identity), values
-                        )
-                    elif values.get("format") == MOVEMENT_FORMAT:
-                        movements.append(view)
-                    elif values.get("format") == TRANSFER_FORMAT:
-                        if not include_transfers:
-                            raise LifecycleError(
-                                "unsupported_record_format: use the transfer ledger"
-                            )
-                        transfers.append(view)
-                    elif values.get("format") == REFUND_FORMAT:
-                        if not include_refunds:
-                            raise LifecycleError("unsupported_record_format: use the refund ledger")
-                        refunds.append(view)
-                    else:
-                        legacy.append(view)
-                income, expense, refunded = {}, {}, {}
-                resolved_effects = []
-                contributions = []
-                refund_contributions = []
-                net = {k: Decimal(0) for k in accounts}
-                delta = dict(net)
-                with localcontext(
-                    Context(prec=256, rounding=ROUND_HALF_EVEN, Emin=-999999, Emax=999999)
-                ):
-
-                    def add_total(kind, currency, amount, business_date, fact_ref):
-                        totals = expense if kind == "expense" else income
-                        value = Decimal(amount)
-                        totals[currency] = totals.get(currency, Decimal(0)) + value
-                        if include_contributions:
-                            contributions.append(
-                                DailyStatisticContributionV1(
-                                    kind, currency, amount, business_date, fact_ref
-                                )
-                            )
-
-                    for view in movements:
-                        values = view.values
-                        impact = effect(values)
-                        if impact:
-                            account = accounts.get(impact["account_id"])
-                            if account is None:
-                                raise LifecycleError("Movement refers to absent account")
-                            resolved = resolve_effect_v1(
-                                conn, values, asdict(view.fact_ref), account.values
-                            )
-                            resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
-                            net[account.account_id] += Decimal(impact["amount"])
-                            delta[account.account_id] += Decimal(resolved["balance_impact"])
-                            add_total(
-                                values["kind"],
-                                values["original_currency"],
-                                values["original_amount"],
-                                values["business_date"],
-                                view.fact_ref,
-                            )
-                    for view in transfers:
-                        values = view.values
-                        charges, effects = _resolve_current_transfer(
-                            values, view.fact_ref, accounts, conn=conn
-                        )
-                        for impact in effects:
-                            key = impact["account_id"]
-                            net[key] += Decimal(impact["recorded_change"])
-                            delta[key] += Decimal(impact["balance_impact"])
-                            resolved_effects.append(DailyResolvedEffectV1(canonical(impact)))
-                        business_date = values["business_date"]
-                        for currency, amount in charges:
-                            add_total("expense", currency, amount, business_date, view.fact_ref)
-                    for view in refunds:
-                        values = view.values
-                        projection = project_refund_fact_v1(values)
-                        credit = projection.credit_effect
-                        if credit is None:
-                            continue
-                        account_id = credit["account_id"]
-                        account = accounts.get(account_id)
-                        if account is None:
-                            raise LifecycleError("Refund credit refers to an absent account")
-                        resolved = resolve_refund_effect_v1(
-                            conn, credit, asdict(view.fact_ref), account.values
-                        )
-                        net[account_id] += Decimal(resolved["recorded_change"])
-                        delta[account_id] += Decimal(resolved["balance_impact"])
-                        resolved_effects.append(DailyResolvedEffectV1(canonical(resolved)))
-                        currency = projection.terms.original_currency
-                        amount = projection.terms.original_amount
-                        refunded[currency] = refunded.get(currency, Decimal(0)) + Decimal(amount)
-                        if include_refund_contributions:
-                            refund_contributions.append(
-                                DailyQueryContributionV1(
-                                    "refund",
-                                    currency,
-                                    amount,
-                                    values["received_date"],
-                                    view.fact_ref,
-                                )
-                            )
-
-                    from ..effective_v1 import _business_fields
-
-                    for view in legacy:
-                        old = _business_fields(view.values_json)
-                        add_total(
-                            "expense",
-                            old["currency"],
-                            old["amount"],
-                            old["transaction_date"],
-                            view.fact_ref,
-                        )
-                    balances = []
-                    for key, account in accounts.items():
-                        balance = (
-                            Decimal(account.opening_amount) + delta[key]
-                            if account.opening_amount is not None
-                            else None
-                        )
-
-                        def fmt(v):
-                            return canonical_money_str(v, account.currency)
-
-                        card = account.account_type == "credit_card"
-                        balances.append(
-                            DailyBalanceV1(
-                                key,
-                                account.currency,
-                                balance is not None,
-                                fmt(net[key]),
-                                fmt(delta[key]),
-                                fmt(balance) if balance is not None else None,
-                                fmt(max(-balance, Decimal(0)))
-                                if card and balance is not None
-                                else None,
-                                fmt(max(balance, Decimal(0)))
-                                if card and balance is not None
-                                else None,
-                            )
-                        )
-
-                    def totals(values):
-                        return tuple(
-                            (k, canonical_money_str(v, k)) for k, v in sorted(values.items())
-                        )
-
-                    pending = conn.execute(
-                        "SELECT count(*) FROM l2_proposals p WHERE p.version=(SELECT max(version) "
-                        "FROM l2_proposals WHERE source_id=p.source_id) AND NOT EXISTS "
-                        "(SELECT 1 FROM l2_reviews r JOIN l2_decisions d "
-                        "ON d.review_id=r.review_id "
-                        "WHERE r.proposal_id=p.proposal_id)"
-                    ).fetchone()[0]
-                    identity = DailyReadIdentityV1(
-                        digest(asdict(service.binding)),
-                        service.owner.config.binding_sha256,
-                        audit["event_count"],
-                        audit["audit_sha256"],
-                        _logical_database_digest(conn),
-                    )
-                    gaps = (("unassigned_personal_expense",) if legacy else ()) + (
-                        ("unknown_opening",)
-                        if any(a.opening_amount is None for a in accounts.values())
-                        else ()
-                    )
-                    scope = "registered-account-opening-income-expense-v1"
-                    if include_refunds:
-                        scope = "registered-account-opening-income-expense-transfer-refund-v3"
-                    elif include_transfers:
-                        scope = "registered-account-opening-income-expense-transfer-v2"
-                    net_expenses = {
-                        currency: expense.get(currency, Decimal(0))
-                        - refunded.get(currency, Decimal(0))
-                        for currency in expense.keys() | refunded.keys()
-                    }
-                    refund_amounts, net_amounts = totals(refunded), totals(net_expenses)
-                    collection = DailyLedgerCollectionV1(
-                        tuple(accounts.values()),
-                        tuple(movements),
-                        tuple(balances),
-                        totals(income),
-                        totals(expense),
-                        identity,
-                        len(legacy),
-                        pending,
-                        gaps,
-                        len(rows),
-                        scope=scope,
-                    )
-                return (
-                    collection,
-                    history,
-                    tuple(resolved_effects),
-                    tuple(contributions),
-                    tuple(transfers),
-                    (tuple(refunds), refund_amounts, net_amounts, tuple(refund_contributions)),
+                return _collect_ledger(
+                    conn,
+                    binding=service.binding,
+                    source_binding_sha256=base.owner.config.binding_sha256,
+                    audit=audit,
+                    max_records=max_records,
+                    max_versions=max_versions,
+                    include_contributions=include_contributions,
+                    include_transfers=include_transfers,
+                    include_refunds=include_refunds,
+                    include_refund_contributions=include_refund_contributions,
                 )
             finally:
                 conn.rollback()
@@ -465,23 +492,7 @@ class DailyLedgerReaderV1(DailyAccountReaderV1):
             include_refunds=True,
             include_refund_contributions=True,
         )
-        _, refunded, net, refund_contributions = refund_data
-        account_records = {account.bundle_ref.record_id for account in collection.accounts}
-        transactions = tuple(
-            DailyTransactionHistoryV1(record_id, tuple(versions))
-            for record_id, versions in history.items()
-            if record_id not in account_records
-        )
-        contributions = (
-            tuple(
-                DailyQueryContributionV1(
-                    item.kind, item.currency, item.amount, item.business_date, item.fact_ref
-                )
-                for item in steps
-            )
-            + refund_contributions
-        )
-        return DailyLedgerQuerySnapshotV1(collection, transactions, contributions, refunded, net)
+        return _query_snapshot(collection, history, steps, refund_data)
 
     def refund_history_v1(self, record_id, *, limits=None):
         """Read the complete verified version history of one linked refund."""

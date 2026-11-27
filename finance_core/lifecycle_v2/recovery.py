@@ -10,7 +10,7 @@ import sqlite3
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, TypeVar, cast
 
 from finance_core.instance_admission import TrustedInstanceConfig, prepare_production_profile
 from finance_core.instance_admission.authority import (
@@ -73,6 +73,8 @@ from .single_host_runtime_v1 import SingleHostRuntimeAdmissionV1, _require_runti
 
 if TYPE_CHECKING:
     from .core_archive_origin_v1 import CoreArchiveOriginV1
+    from .daily_v1.ledger_reader import DailyLedgerQuerySnapshotV1
+    from .daily_v1.reader import DailyReadLimitsV1
 
 
 class HistoricalCoreAuditV1(Protocol):
@@ -88,6 +90,7 @@ class HistoricalCoreAuditV1(Protocol):
 
 
 ApplicationRestoreAuditV1 = Callable[[sqlite3.Connection, SnapshotCut, HistoricalCoreAuditV1], str]
+_ProtectedReadResult = TypeVar("_ProtectedReadResult")
 
 # Keep uncertain SQLite and every cooperative lease live until process exit.
 _RECOVERY_CLOSE_UNKNOWN: list[tuple[object, ...]] = []
@@ -367,10 +370,10 @@ def _protected_database_transition(
     record: dict[str, Any],
     *,
     write: bool,
-    build: Callable[[sqlite3.Connection], dict[str, Any]],
+    build: Callable[[sqlite3.Connection], _ProtectedReadResult],
     publish: bool = True,
     archive_read_sha256: str | None = None,
-) -> dict[str, Any]:
+) -> _ProtectedReadResult:
     """Hold owner/control/profile/gate through actual SQLite close and publish."""
     query_only = archive_read_sha256 is not None
     if write and (not publish or query_only):
@@ -445,7 +448,9 @@ def _protected_database_transition(
         gate.assert_valid()
         control._assert_file_valid()
         owner._assert_file_valid()
-        return _publish(config, journal) if publish else journal
+        if publish:
+            return cast(_ProtectedReadResult, _publish(config, cast(dict[str, Any], journal)))
+        return journal
     finally:
         if not unknown:
             if conn is not None:
@@ -1138,83 +1143,14 @@ def _promote_context(
                 elif audit_application_history is None:
                     _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
                 else:
-                    _verify_cut_connection(conn, restored.cut)
-                    from .reader import audit_evidence_connection
-
-                    core_verified = False
-
-                    def audit_core(
-                        historical_port,
-                        historical_binding,
-                        *,
-                        historical_evidence=(),
-                        receipt_snapshot_lookup=None,
-                        parent_history_sha256=None,
-                    ):
-                        nonlocal core_verified
-                        if (
-                            core_verified
-                            or type(historical_binding) is not RuntimeBinding
-                            or (historical_binding.instance_id, historical_binding.generation)
-                            != (restored.cut.instance_id, restored.cut.generation)
-                        ):
-                            raise LifecycleError(
-                                "Manual restore needs exact historical Core evidence"
-                            )
-                        if historical_generations:
-                            _verify_event_anchors(conn, historical_generations)
-                            if (
-                                _generations(historical_evidence) != historical_generations[:-1]
-                                or historical_binding != historical_generations[-1].binding
-                                or (
-                                    (
-                                        len(historical_generations) > 1
-                                        or parent_history_sha256 is not None
-                                    )
-                                    and parent_history_sha256
-                                    != historical_generations_sha256_v1(historical_generations[:-1])
-                                )
-                            ):
-                                raise LifecycleError(
-                                    "Application verifier omitted approved ancestry"
-                                )
-                        elif historical_evidence:
-                            raise LifecycleError("Unapproved historical archive ancestry")
-                        if historical_generations or receipt_snapshot_lookup is not None:
-                            result = audit_archive_evidence_connection_v1(
-                                conn,
-                                historical_port,
-                                historical_binding,
-                                restored.cut,
-                                legacy_verifier=legacy_verifier,
-                                historical_evidence=historical_evidence,
-                                parent_history_sha256=historical_generations_sha256_v1(
-                                    historical_generations[:-1]
-                                ),
-                                receipt_snapshot_lookup=receipt_snapshot_lookup,
-                            )
-                        else:
-                            result = audit_evidence_connection(
-                                conn, historical_port, historical_binding, legacy_verifier
-                            )
-                        core_verified = True
-                        return result
-
-                    history_sha256 = audit_application_history(conn, restored.cut, audit_core)
-                    if not core_verified:
-                        raise LifecycleError(
-                            "Held application verifier omitted Core evidence audit"
-                        )
-                    if (
-                        type(history_sha256) is not str
-                        or history_sha256 != context["application_history_sha256"]
-                        or not conn.in_transaction
-                        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
-                    ):
-                        raise LifecycleError(
-                            "Held application history differs from approved archive"
-                        )
-                    _verify_cut_connection(conn, restored.cut)
+                    _audit_held_application_history(
+                        conn,
+                        restored,
+                        audit_application_history,
+                        context["application_history_sha256"],
+                        historical_generations,
+                        legacy_verifier=legacy_verifier,
+                    )
                 if manual:
                     _require_archive_transaction(conn, restored.cut.database_sha256)
                 if pending is not None:
@@ -1249,6 +1185,163 @@ def _promote_context(
                 archive_read_sha256=restored.cut.database_sha256 if manual else None,
             )
             return _decode(_canonical(_record(config, published)))
+    finally:
+        owner.close()
+
+
+def _audit_held_application_history(
+    conn,
+    restored,
+    audit_application_history,
+    application_history_sha256,
+    historical_generations,
+    *,
+    legacy_verifier=None,
+) -> dict[str, Any]:
+    """Validate the held application and Core evidence in the guarded target read."""
+    from .reader import audit_evidence_connection
+
+    _verify_cut_connection(conn, restored.cut)
+    core_audit: dict[str, Any] | None = None
+
+    def audit_core(
+        historical_port,
+        historical_binding,
+        *,
+        historical_evidence=(),
+        receipt_snapshot_lookup=None,
+        parent_history_sha256=None,
+    ):
+        nonlocal core_audit
+        if (
+            core_audit is not None
+            or type(historical_binding) is not RuntimeBinding
+            or (historical_binding.instance_id, historical_binding.generation)
+            != (restored.cut.instance_id, restored.cut.generation)
+        ):
+            raise LifecycleError("Manual restore needs exact historical Core evidence")
+        if historical_generations:
+            _verify_event_anchors(conn, historical_generations)
+            if (
+                _generations(historical_evidence) != historical_generations[:-1]
+                or historical_binding != historical_generations[-1].binding
+                or (
+                    (len(historical_generations) > 1 or parent_history_sha256 is not None)
+                    and parent_history_sha256
+                    != historical_generations_sha256_v1(historical_generations[:-1])
+                )
+            ):
+                raise LifecycleError("Application verifier omitted approved ancestry")
+        elif historical_evidence:
+            raise LifecycleError("Unapproved historical archive ancestry")
+        if historical_generations or receipt_snapshot_lookup is not None:
+            result = audit_archive_evidence_connection_v1(
+                conn,
+                historical_port,
+                historical_binding,
+                restored.cut,
+                legacy_verifier=legacy_verifier,
+                historical_evidence=historical_evidence,
+                parent_history_sha256=historical_generations_sha256_v1(historical_generations[:-1]),
+                receipt_snapshot_lookup=receipt_snapshot_lookup,
+            )
+        else:
+            result = audit_evidence_connection(
+                conn, historical_port, historical_binding, legacy_verifier
+            )
+        core_audit = dict(result)
+        return result
+
+    history_sha256 = audit_application_history(conn, restored.cut, audit_core)
+    if core_audit is None:
+        raise LifecycleError("Held application verifier omitted Core evidence audit")
+    if (
+        type(history_sha256) is not str
+        or history_sha256 != application_history_sha256
+        or not conn.in_transaction
+        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
+    ):
+        raise LifecycleError("Held application history differs from approved archive")
+    _verify_cut_connection(conn, restored.cut)
+    return core_audit
+
+
+def read_held_daily_query_snapshot_v1(
+    restored: RestoredProfile,
+    audit_application_history: ApplicationRestoreAuditV1,
+    *,
+    application_history_sha256: str,
+    historical_generations: tuple[HistoricalGenerationV1, ...],
+    limits: DailyReadLimitsV1 | None = None,
+) -> DailyLedgerQuerySnapshotV1:
+    """Read the actual prepared synthetic target without granting admission.
+
+    The installed application must independently authenticate the exact archive
+    history and its evidence ports before supplying this diagnostic verifier.
+    """
+    from .daily_v1.accounts import _require_daily_ledger_scope
+    from .daily_v1.ledger_reader import _collect_ledger, _query_snapshot
+    from .daily_v1.reader import _read_limits
+
+    config = restored.config
+    _require_manual_cut_identity(config, restored.cut)
+    if (
+        config.application_schema is None
+        or restored.new_binding.environment != "offline-synthetic"
+        or not callable(audit_application_history)
+    ):
+        raise LifecycleError("Held daily read requires an exact application restore")
+    _require_immediate(
+        historical_generations, restored.new_binding, restored.cut, application_history_sha256
+    )
+    if historical_generations[-1].binding.environment not in {
+        "offline-synthetic",
+        "single-host-synthetic",
+    }:
+        raise LifecycleError("Held daily read requires synthetic source evidence")
+    max_records, max_versions = _read_limits(limits, None)
+
+    def collect(conn):
+        _require_daily_ledger_scope(conn)
+        audit = _audit_held_application_history(
+            conn,
+            restored,
+            audit_application_history,
+            application_history_sha256,
+            historical_generations,
+        )
+        collection, history, _, steps, _, refund_data = _collect_ledger(
+            conn,
+            binding=restored.new_binding,
+            source_binding_sha256=config.binding_sha256,
+            audit=audit,
+            max_records=max_records,
+            max_versions=max_versions,
+            include_contributions=True,
+            include_transfers=True,
+            include_refunds=True,
+            include_refund_contributions=True,
+        )
+        return _query_snapshot(collection, history, steps, refund_data)
+
+    owner = _Lock(config, OWNER_LOCK_FILENAME)
+    try:
+        owner.acquire(fcntl.LOCK_SH, 0)
+        with _control(config, shared=True) as control:
+            state = _state(config)
+            _, record = _target_from_state(restored, state)
+            prepare = _entry(state, restored.restore_prepare_operation_id, "restore_prepare")
+            _verify_recovery_entry_approval(config, state, prepare)
+            return _protected_database_transition(
+                config,
+                owner,
+                control,
+                record,
+                write=False,
+                build=collect,
+                publish=False,
+                archive_read_sha256=restored.cut.database_sha256,
+            )
     finally:
         owner.close()
 
