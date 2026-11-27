@@ -8,12 +8,13 @@ import hmac
 import os
 import sqlite3
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
 from finance_core.instance_admission import TrustedInstanceConfig, prepare_production_profile
 from finance_core.instance_admission.authority import (
+    _MANUAL_RESTORE_FORMAT,
     OWNER_LOCK_FILENAME,
     PENDING_FILENAME,
     STATE_FILENAME,
@@ -34,6 +35,8 @@ from finance_core.instance_admission.authority import (
     _recovery_designation,
     _state,
     _transition,
+    _validate_manual_restore_context,
+    _validate_manual_restore_history,
     _validate_state,
 )
 from finance_core.instance_admission.schema_contract import validate_application_database
@@ -44,6 +47,7 @@ from finance_core.sqlite_connection import configure_sqlite_connection
 
 from .contracts import (
     DailyCapacityV2,
+    EvidencePort,
     LifecycleError,
     RuntimeBinding,
     SnapshotCut,
@@ -51,6 +55,7 @@ from .contracts import (
     cut_ref,
     digest,
 )
+from .single_host_runtime_v1 import SingleHostRuntimeAdmissionV1, _require_runtime_admission
 
 # Keep uncertain SQLite and every cooperative lease live until process exit.
 _RECOVERY_CLOSE_UNKNOWN: list[tuple[object, ...]] = []
@@ -78,6 +83,22 @@ class RestoreDesignation:
 class OldWriterIsolationReceipt:
     material_json: str
     signature: str
+
+
+@dataclass(frozen=True)
+class HostIsolationV1:
+    """Observed evidence for trusted operator approval of a stopped old host."""
+
+    provider: str
+    host_id: str
+    source_instance_id: str
+    source_binding_sha256: str
+    stopped_observed_at: int
+    evidence_ref: str
+    evidence_sha256: str
+    stopped_record: str
+    restart_disabled_record: str
+    keep_disabled_instruction: str
 
 
 def _entry(state: dict[str, Any], operation_id: str, action: str) -> dict[str, Any]:
@@ -316,6 +337,7 @@ def _protected_database_transition(
     write: bool,
     build: Callable[[sqlite3.Connection], dict[str, Any]],
     publish: bool = True,
+    query_only: bool = False,
 ) -> dict[str, Any]:
     """Hold owner/control/profile/gate through actual SQLite close and publish."""
     if not publish and write:
@@ -348,6 +370,8 @@ def _protected_database_transition(
         )
         configure_sqlite_connection(conn)
         conn.row_factory = sqlite3.Row
+        if query_only:
+            conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
         validate_application_database(
             conn,
@@ -921,7 +945,33 @@ def _promote(
         or designation.material["old_binding_sha256"] != restored.cut.source_binding_sha256
     ):
         raise LifecycleError("Designation does not bind the exact target")
-    context = _promotion_context(restored, target, designation, receipt_sha256)
+    return _promote_context(
+        restored,
+        target,
+        _promotion_context(restored, target, designation, receipt_sha256),
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        port=port,
+        binding=binding,
+        legacy_verifier=legacy_verifier,
+    )
+
+
+def _promote_context(
+    restored,
+    target,
+    context,
+    *,
+    operation_id,
+    approval_ref,
+    port,
+    binding,
+    legacy_verifier,
+    audit_application_history: Callable[[sqlite3.Connection, SnapshotCut], str] | None = None,
+):
+    from .reader import audit_connection
+
+    manual = context["format"] == _MANUAL_RESTORE_FORMAT
     config = restored.config
     owner = _Lock(config, OWNER_LOCK_FILENAME)
     try:
@@ -943,12 +993,17 @@ def _promote(
                         entry["approval_ref"] != approval_ref
                         or entry.get("recovery_context") != context
                         or binding != restored.new_binding
-                        or config.approval_verifier(
-                            approval_ref, "restore_admit", entry["approval_digest"]
+                        or (
+                            not manual
+                            and config.approval_verifier(
+                                approval_ref, "restore_admit", entry["approval_digest"]
+                            )
+                            is not True
                         )
-                        is not True
                     ):
                         raise LifecycleError("Completed restore admission context differs")
+                    if manual:
+                        _verify_recovery_entry_approval(config, state, entry)
 
                     def verify_completed(conn):
                         from ._finalization_journal_v1 import _verify_journal
@@ -957,7 +1012,12 @@ def _promote(
                             raise LifecycleError("Pending exact finalization keeps recovery held")
                         from .reader import audit_evidence_connection
 
-                        audit_evidence_connection(conn, port, binding, legacy_verifier)
+                        if audit_application_history is None:
+                            audit_evidence_connection(conn, port, binding, legacy_verifier)
+                        else:
+                            # This is an observation of a published operation. New
+                            # postings can legitimately differ from the old archive cut.
+                            audit_connection(conn)
                         return state
 
                     _protected_database_transition(
@@ -986,7 +1046,6 @@ def _promote(
                 raise LifecycleError("Target changed before protected recovery admission")
             if record["state"] != "RESTORE_HELD" or record["maintenance"] is not None:
                 raise LifecycleError("Only exact held target can become active")
-            from .reader import audit_connection
 
             def build(conn):
                 from ._finalization_journal_v1 import _verify_journal
@@ -995,7 +1054,21 @@ def _promote(
                 if any(entry.outcome is None for entry in journal.values()):
                     raise LifecycleError("Pending exact finalization keeps recovery held")
                 audit_connection(conn)
-                _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
+                if audit_application_history is None:
+                    _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
+                else:
+                    _verify_cut_connection(conn, restored.cut)
+                    history_sha256 = audit_application_history(conn, restored.cut)
+                    if (
+                        type(history_sha256) is not str
+                        or history_sha256 != context["application_history_sha256"]
+                        or not conn.in_transaction
+                        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
+                    ):
+                        raise LifecycleError(
+                            "Held application history differs from approved archive"
+                        )
+                    _verify_cut_connection(conn, restored.cut)
                 if pending is not None:
                     return pending
                 after = _decode(_canonical(before))
@@ -1019,11 +1092,192 @@ def _promote(
                 )
 
             published = _protected_database_transition(
-                config, owner, control, record, write=True, build=build
+                config, owner, control, record, write=not manual, build=build, query_only=manual
             )
             return _decode(_canonical(_record(config, published)))
     finally:
         owner.close()
+
+
+def prepare_manual_single_host_restore_v1(
+    config: TrustedInstanceConfig,
+    database: Path,
+    cut: SnapshotCut,
+    *,
+    new_binding: RuntimeBinding,
+    operation_id: str,
+    approval_ref: str,
+) -> RestoredProfile:
+    """Prepare an offline-held profile for a separately registered new runtime."""
+    if type(new_binding) is not RuntimeBinding or new_binding.environment not in {
+        "single-host-synthetic",
+        "single-host-real",
+    }:
+        raise LifecycleError("Manual restore needs an exact single-host target binding")
+    if type(cut) is not SnapshotCut or config.core_identity != cut.core_identity:
+        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    return prepare_restored_profile(
+        config,
+        database,
+        cut,
+        new_binding=replace(new_binding, environment="offline-synthetic"),
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+    )
+
+
+def _manual_restore_state(config: TrustedInstanceConfig) -> dict[str, Any]:
+    if not _exists(config, PENDING_FILENAME):
+        return _state(config)
+    journal = _read(config, PENDING_FILENAME)
+    context = journal.get("context")
+    if (
+        journal.get("action") != "restore_admit"
+        or type(context) is not dict
+        or context.get("format") != _MANUAL_RESTORE_FORMAT
+        or journal.get("binding") != config.binding_sha256
+    ):
+        raise LifecycleError("Only the exact pending manual restore may resume")
+    before, _, _ = _validate_recovery_pending(
+        config,
+        journal,
+        action="restore_admit",
+        operation_id=journal["operation_id"],
+        approval_ref=journal["approval_ref"],
+        context=context,
+    )
+    return before
+
+
+def reopen_manual_single_host_restore_v1(
+    config: TrustedInstanceConfig,
+    cut: SnapshotCut,
+    new_binding: RuntimeBinding,
+    *,
+    prepare_operation_id: str,
+) -> RestoredProfile:
+    """Reconstruct the exact held target from its protected history after a restart."""
+    if type(new_binding) is not RuntimeBinding or new_binding.environment not in {
+        "single-host-synthetic",
+        "single-host-real",
+    }:
+        raise LifecycleError("Manual restore needs an exact single-host target binding")
+    if type(cut) is not SnapshotCut or config.core_identity != cut.core_identity:
+        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    with _control(config, shared=True):
+        state = _manual_restore_state(config)
+        prepare = _entry(state, prepare_operation_id, "restore_prepare")
+        _verify_recovery_entry_approval(config, state, prepare)
+        restored = RestoredProfile(
+            config,
+            cut,
+            replace(new_binding, environment="offline-synthetic"),
+            prepare_operation_id,
+            prepare["entry_sha256"],
+        )
+        _target_from_state(restored, state, allow_completed=True)
+        return restored
+
+
+def manual_single_host_promotion_context_v1(
+    restored: RestoredProfile,
+    *,
+    isolation: HostIsolationV1,
+    runtime_admission: SingleHostRuntimeAdmissionV1,
+    cut_observed_at: int,
+    accept_loss_through: int,
+    application_history_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Describe the exact evidence and target that the trusted approver must verify."""
+    if (
+        type(isolation) is not HostIsolationV1
+        or isolation.source_instance_id != restored.cut.instance_id
+    ):
+        raise LifecycleError("Manual restore evidence belongs to a different old instance")
+    config = restored.config
+    if config.core_identity != restored.cut.core_identity:
+        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    if (config.application_schema is not None) != (application_history_sha256 is not None):
+        raise LifecycleError("Manual restore needs the exact application history identity")
+    with _control(config, shared=True):
+        state = _manual_restore_state(config)
+        target, record = _target_from_state(restored, state, allow_completed=True)
+        registration = _require_runtime_admission(state, config, runtime_admission)
+        if registration is None:
+            raise InstanceAdmissionError("Manual restore requires protected runtime registration")
+        if (
+            replace(runtime_admission.binding, environment="offline-synthetic")
+            != restored.new_binding
+            or registration["version"]
+            <= _entry(state, restored.restore_prepare_operation_id, "restore_prepare")["version"]
+        ):
+            raise LifecycleError("Manual restore runtime differs from its held target")
+        context = {
+            "format": _MANUAL_RESTORE_FORMAT,
+            "cut_ref": cut_ref(restored.cut),
+            "target_sha256": digest(target),
+            "prepare_entry_sha256": restored.restore_prepare_entry_sha256,
+            "runtime_entry_sha256": registration["entry_sha256"],
+            "isolation": asdict(isolation),
+            "cut_observed_at": cut_observed_at,
+            "accept_loss_through": accept_loss_through,
+            "application_history_sha256": application_history_sha256,
+        }
+        _validate_manual_restore_context(context)
+        if record["state"] == "RESTORE_HELD":
+            _validate_manual_restore_history(context, state, config.binding_sha256)
+        return context
+
+
+def promote_manual_single_host_restore_v1(
+    restored: RestoredProfile,
+    *,
+    isolation: HostIsolationV1,
+    runtime_admission: SingleHostRuntimeAdmissionV1,
+    cut_observed_at: int,
+    accept_loss_through: int,
+    operation_id: str,
+    approval_ref: str,
+    port: EvidencePort,
+    binding: RuntimeBinding,
+    legacy_verifier=None,
+    application_history_sha256: str | None = None,
+    audit_application_history: Callable[[sqlite3.Connection, SnapshotCut], str] | None = None,
+) -> dict[str, Any]:
+    """Publish one approved successor, or resume its exact interrupted operation.
+
+    A trusted application composition must authenticate its full archived
+    history, including Core evidence, and return the approved history digest
+    from the actual held read transaction before the writer can change.
+    """
+    if (application_history_sha256 is None and audit_application_history is not None) or (
+        application_history_sha256 is not None and not callable(audit_application_history)
+    ):
+        raise LifecycleError("Manual restore needs the installed application history verifier")
+    context = manual_single_host_promotion_context_v1(
+        restored,
+        isolation=isolation,
+        runtime_admission=runtime_admission,
+        cut_observed_at=cut_observed_at,
+        accept_loss_through=accept_loss_through,
+        application_history_sha256=application_history_sha256,
+    )
+    if binding != runtime_admission.binding:
+        raise LifecycleError("Manual restore write binding differs from registration")
+    target, _ = _held_description(restored, allow_pending=True, allow_completed=True)
+    if context["target_sha256"] != digest(target):
+        raise LifecycleError("Manual restore target changed before promotion")
+    return _promote_context(
+        restored,
+        target,
+        context,
+        operation_id=operation_id,
+        approval_ref=approval_ref,
+        port=port,
+        binding=restored.new_binding,
+        legacy_verifier=legacy_verifier,
+        audit_application_history=audit_application_history,
+    )
 
 
 def promote_restored_profile(

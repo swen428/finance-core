@@ -148,6 +148,45 @@ lease. Service identity remains fixed during the operation. Read-only historical
 inspection retains the existing forensic rules. See the
 [lifecycle contract](lifecycle_v2_contract.md) for service and old-format scope.
 
+## Manual single-host restore
+
+Use the manual recovery route when the predecessor's control root is unavailable.
+The composing operator independently authenticates the archive and verifies that
+the provider stopped the exact old host, disabled automatic restart, and will
+keep it disabled. Core treats the configured approval verifier as the trust
+boundary for that external observation. The isolation record carries the
+provider, host, source instance and binding, observation time, evidence reference
+and digest, and records for shutdown and continued disablement.
+
+`prepare_manual_single_host_restore_v1` verifies the snapshot and prepares a
+fresh target with the exact archived Core identity. The held profile records an
+offline audit binding. The target also needs an independently authorized
+single-host runtime registration for the same instance, generation and actor.
+Registration alone leaves the target unable to acquire a writer.
+
+`manual_single_host_promotion_context_v1` reports the material to approve. The
+approval binds the exact cut, prepared and registered target, old-host evidence,
+accepted loss interval and application history digest where required. The
+protected approval also binds the operation and predecessor authority state. A
+local authority lineage with a current or prior current writer uses the
+existing fenced-designation route instead.
+
+`promote_manual_single_host_restore_v1` holds the owner, control and profile
+leases, rechecks the cut through a read-only SQLite handle, and publishes the
+writer transition only after that handle closes. A trusted application verifier
+runs in the same held read and returns the approved digest for authenticated
+Core and complete application history. Core independently rechecks the logical
+cut and structural ledger. A changed digest or an unavailable audit keeps the
+target held. The operator must supply the exact original request after an
+interrupted publication. `reopen_manual_single_host_restore_v1` reconstructs
+the original preparation from protected history. Reobserving a completed
+operation does not re-promote a target or overwrite later postings.
+
+Application intake owns the new receiving boundary, fresh credentials and
+policy, and the exclusion of historical cards, messages and external claims
+from execution. The existing live designation and signed v3 receipt routes
+retain their scope.
+
 ## Owner, operation, and connection lifetime
 
 Only one process may hold the production owner lease for an instance. A write

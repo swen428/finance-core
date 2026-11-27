@@ -47,8 +47,18 @@ from finance_core.lifecycle_v2.recovery import (
 
 
 @pytest.fixture
-def original(tmp_path, monkeypatch):
-    config = synthetic_config(tmp_path, monkeypatch)
+def original(tmp_path, monkeypatch, request):
+    from finance_core.instance_admission.schema_contract import ApplicationSchemaContract
+
+    schema = (
+        ApplicationSchemaContract(
+            "manual-restore-evidence-tests",
+            ("CREATE TABLE manual_app_evidence (reference TEXT PRIMARY KEY)",),
+        )
+        if getattr(request, "param", False)
+        else None
+    )
+    config = synthetic_config(tmp_path, monkeypatch, application_schema=schema)
     prepare_production_profile(
         config, operation_id="prepare-original", approval_ref="approved"
     ).close()
@@ -1490,3 +1500,190 @@ old.close()
         )
     new.close()
     other_config.close()
+
+
+@pytest.mark.parametrize("original", [False, True], indirect=True, ids=["core", "application"])
+def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
+    original, tmp_path, monkeypatch
+):
+    from test_lifecycle_v2 import TEXT, VerifiedSource, ready
+
+    from finance_core.lifecycle_v2.recovery import (
+        HostIsolationV1,
+        manual_single_host_promotion_context_v1,
+        prepare_manual_single_host_restore_v1,
+        promote_manual_single_host_restore_v1,
+        reopen_manual_single_host_restore_v1,
+    )
+    from finance_core.lifecycle_v2.single_host_runtime_v1 import admit_single_host_runtime_v1
+
+    old, old_owner, old_service, port = original
+    _, _, old_review = ready(old_service)
+    old_fact = old_service.confirm(old_review.review_id, "old-action", "old-confirm")
+    cut, path = _cut(old_service, tmp_path)
+    root = tmp_path / "manual-single-host"
+    root.mkdir(mode=0o700)
+    approved = {}
+
+    def verifier(reference, action, request_digest):
+        if action != "restore_admit":
+            return reference == "approved"
+        return approved.get(reference) == request_digest
+
+    target = synthetic_config(
+        root,
+        monkeypatch,
+        instance_id="manual-target",
+        verifier=verifier,
+        application_schema=old.application_schema,
+    )
+    binding = RuntimeBinding(
+        target.instance_id, "new-generation", "user", "chat", "single-host-synthetic"
+    )
+    held = prepare_manual_single_host_restore_v1(
+        target,
+        path,
+        cut,
+        new_binding=binding,
+        operation_id="prepare-manual",
+        approval_ref="approved",
+    )
+    registration = admit_single_host_runtime_v1(
+        target, binding, operation_id="register-manual", approval_ref="approved"
+    )
+    isolation = HostIsolationV1(
+        provider="synthetic-operator",
+        host_id="old-host",
+        source_instance_id=cut.instance_id,
+        source_binding_sha256=cut.source_binding_sha256,
+        stopped_observed_at=1792800200,
+        evidence_ref="manual-stop-record",
+        evidence_sha256=hashlib.sha256(b"synthetic stop evidence").hexdigest(),
+        stopped_record="Shutdown verified after the writer closed",
+        restart_disabled_record="Automatic restart disabled",
+        keep_disabled_instruction="Keep old host and its runtime disabled",
+    )
+    options = dict(
+        isolation=isolation,
+        runtime_admission=registration,
+        cut_observed_at=1792800000,
+        accept_loss_through=1792800100,
+    )
+
+    def audit_application(connection, exact_cut):
+        from finance_core.lifecycle_v2.reader import audit_evidence_connection
+
+        assert exact_cut == cut
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("INSERT INTO manual_app_evidence VALUES ('forbidden')")
+        audit_evidence_connection(connection, port, old_service.binding)
+        return authority._digest(
+            [
+                list(r)
+                for r in connection.execute(
+                    "SELECT reference FROM manual_app_evidence ORDER BY reference"
+                )
+            ]
+        )
+
+    application_options = {}
+    if old.application_schema is not None:
+        options["application_history_sha256"] = authority._digest([])
+        application_options["audit_application_history"] = audit_application
+
+    def promote(**overrides):
+        return promote_manual_single_host_restore_v1(
+            held,
+            operation_id="activate-manual",
+            approval_ref="manual-approval",
+            port=port,
+            binding=binding,
+            **(options | application_options | overrides),
+        )
+
+    if old.application_schema is not None:
+        with pytest.raises(LifecycleError, match="application history verifier"):
+            promote(audit_application_history=None)
+        with pytest.raises(LifecycleError, match="history differs"):
+            promote(audit_application_history=lambda connection, cut: "c" * 64)
+
+    with pytest.raises(InstanceAdmissionError, match="approval"):
+        promote()
+    with pytest.raises(InstanceAdmissionError, match="Owner requires"):
+        acquire_production_owner(target)
+
+    # Exercise real local writer closure/fencing as the synthetic provider action.
+    # The manual target has an independent, empty authority lineage.
+    with monkeypatch.context() as old_runtime:
+        old_runtime.setenv(
+            "FINANCE_RUNTIME_ROOT", str(Path(old._binding["profile_root"]) / "runtime")
+        )
+        _fence(old, old_owner)
+    context = manual_single_host_promotion_context_v1(held, **options)
+    approved["manual-approval"] = authority._digest(
+        {
+            "binding": target._binding,
+            "action": "restore_admit",
+            "context": {
+                "operation_id": "activate-manual",
+                "before_sha256": authority._digest(authority._state(target)),
+                "context": context,
+            },
+        }
+    )
+    before = authority._state(target)
+    with pytest.raises(InstanceAdmissionError, match="approval"):
+        promote(isolation=replace(isolation, evidence_sha256="f" * 64))
+    with pytest.raises(InstanceAdmissionError, match="approval"):
+        promote(accept_loss_through=1792800150)
+    with pytest.raises(InstanceAdmissionError, match="registration"):
+        promote(runtime_admission=replace(registration, registration_entry_sha256="b" * 64))
+    assert authority._state(target) == before
+
+    with patch.object(recovery_module, "_publish", side_effect=OSError("interrupted publication")):
+        with pytest.raises(OSError, match="interrupted publication"):
+            promote()
+    assert (target.control_root / PENDING_FILENAME).exists()
+    with pytest.raises(InstanceAdmissionError):
+        acquire_production_owner(target)
+    reopened = reopen_manual_single_host_restore_v1(
+        target, cut, binding, prepare_operation_id="prepare-manual"
+    )
+    assert reopened == held
+    held = reopened
+    with pytest.raises((LifecycleError, InstanceAdmissionError)):
+        promote(isolation=replace(isolation, evidence_sha256="f" * 64))
+    assert promote()["state"] == "ACTIVE"
+    assert promote()["state"] == "ACTIVE"
+    assert authority._state(target)["version"] == before["version"] + 1
+
+    with acquire_production_owner(target) as owner:
+        restored = LedgerService(
+            owner, port, binding, runtime_admission=registration, clock=lambda: 1792800300
+        )
+        assert restored.reader().get(old_fact.record_id)["values"]["amount"] == "12.00"
+        with pytest.raises(LifecycleError):
+            restored.confirm(old_review.review_id, "old-action", "old-confirm")
+        port.sources["fresh-source"] = VerifiedSource(
+            "fresh-source",
+            "user",
+            "chat",
+            "fresh-message",
+            TEXT,
+            hashlib.sha256(TEXT.encode()).hexdigest(),
+            1792800300,
+        )
+        source = restored.capture("fresh-source", "new-capture")
+        proposal = restored.propose(source.source_id, "new-observation", 0, "new-propose")
+        review = restored.prepare_review(proposal.proposal_id, proposal.version)
+        restored.record_delivery(review.review_id, "new-delivery")
+        receipt = restored.confirm(review.review_id, "new-action", "new-confirm")
+        assert restored.reader().get(receipt.record_id)["values"]["amount"] == "12.00"
+    assert promote()["state"] == "ACTIVE"
+    monkeypatch.setenv("FINANCE_RUNTIME_ROOT", str(Path(old._binding["profile_root"]) / "runtime"))
+    with acquire_production_owner(old) as owner:
+        still_old = LedgerService(owner, port, old_service.binding, clock=lambda: 1792800300)
+        with pytest.raises(InstanceAdmissionError):
+            still_old.capture("fresh-source", "old-capture")
+    target.close()

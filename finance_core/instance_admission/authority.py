@@ -541,7 +541,147 @@ def _recovery_designation(value: object) -> bool:
     )
 
 
+_MANUAL_RESTORE_FORMAT = "manual-single-host-restore-admit-v1"
+
+
+def _validate_manual_restore_context(context: dict[str, Any]) -> None:
+    fields = {
+        "format",
+        "cut_ref",
+        "target_sha256",
+        "prepare_entry_sha256",
+        "runtime_entry_sha256",
+        "isolation",
+        "cut_observed_at",
+        "accept_loss_through",
+        "application_history_sha256",
+    }
+    if (
+        set(context) != fields
+        or not _recovery_cut_ref(context["cut_ref"])
+        or (
+            context["application_history_sha256"] is not None
+            and not _recovery_hash(context["application_history_sha256"])
+        )
+        or not all(
+            _recovery_hash(context[key])
+            for key in (
+                "target_sha256",
+                "prepare_entry_sha256",
+                "runtime_entry_sha256",
+            )
+        )
+    ):
+        raise InstanceAdmissionError("Manual restore admission lacks exact cut and target")
+    isolation = context["isolation"]
+    text_fields = {
+        "provider",
+        "host_id",
+        "source_instance_id",
+        "evidence_ref",
+        "stopped_record",
+        "restart_disabled_record",
+        "keep_disabled_instruction",
+    }
+    if (
+        type(isolation) is not dict
+        or set(isolation)
+        != text_fields
+        | {
+            "source_binding_sha256",
+            "stopped_observed_at",
+            "evidence_sha256",
+        }
+        or any(
+            type(isolation[key]) is not str
+            or not isolation[key].strip()
+            or len(isolation[key]) > 1024
+            for key in text_fields
+        )
+        or isolation["source_binding_sha256"] != context["cut_ref"]["source_binding_sha256"]
+        or not _recovery_hash(isolation["evidence_sha256"])
+    ):
+        raise InstanceAdmissionError("Manual restore lacks exact old-host isolation evidence")
+    times = (
+        context["cut_observed_at"],
+        context["accept_loss_through"],
+        isolation["stopped_observed_at"],
+    )
+    if any(type(at) is not int or not 0 < at < 2**63 for at in times) or not (
+        times[0] <= times[1] <= times[2]
+    ):
+        raise InstanceAdmissionError("Manual restore loss interval differs from isolation evidence")
+
+
+def _validate_manual_restore_history(
+    context: dict[str, Any], replay: dict[str, Any], key: str
+) -> None:
+    prepare = next(
+        (
+            entry
+            for entry in replay["history"]
+            if entry["entry_sha256"] == context["prepare_entry_sha256"]
+        ),
+        None,
+    )
+    registration = next(
+        (
+            entry
+            for entry in replay["history"]
+            if entry["entry_sha256"] == context["runtime_entry_sha256"]
+        ),
+        None,
+    )
+    if (
+        replay["current"] is not None
+        or prepare is None
+        or prepare["action"] != "restore_prepare"
+        or prepare["binding"] != key
+        or registration is None
+        or registration["action"] != _RUNTIME_ACTION
+        or registration["binding"] != key
+        or registration["version"] <= prepare["version"]
+    ):
+        raise InstanceAdmissionError(
+            "Manual restore requires fresh lineage and exact runtime registration"
+        )
+    preparation = prepare.get("recovery_context")
+    target = replay["instances"][key]
+    runtime = registration["runtime_context"]["runtime_binding"]
+    if (
+        preparation is None
+        or preparation["cut_ref"] != context["cut_ref"]
+        or preparation["runtime_binding"] != (runtime | {"environment": "offline-synthetic"})
+        or context["isolation"]["source_instance_id"] == runtime["instance_id"]
+        or context["cut_ref"]["source_binding_sha256"] == key
+        or (target["binding"]["application_schema"]["schema_id"] is not None)
+        != (context["application_history_sha256"] is not None)
+        or _digest(
+            {
+                "binding": target["binding"],
+                "binding_sha256": key,
+                "runtime_binding": preparation["runtime_binding"],
+                "db_identity": target["db_identity"],
+                "restore_prepare_operation_id": prepare["operation_id"],
+                "restore_prepare_entry_sha256": prepare["entry_sha256"],
+                "record_identity": prepare["record_identity"],
+            }
+        )
+        != context["target_sha256"]
+    ):
+        raise InstanceAdmissionError(
+            "Manual restore history does not bind its prepared and registered target"
+        )
+
+
 def _validate_recovery_context(action: str, context: object) -> None:
+    if (
+        action == "restore_admit"
+        and type(context) is dict
+        and context.get("format") == _MANUAL_RESTORE_FORMAT
+    ):
+        _validate_manual_restore_context(context)
+        return
     fields = {
         "restore_prepare": {"format", "cut_ref", "runtime_binding", "target_binding_sha256"},
         "recovery_designate": {"format", "designation"},
@@ -758,6 +898,13 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
                 raise InstanceAdmissionError("Runtime registration requires one unfenced config")
             runtime_registered.add(key)
         elif action in {"admit", "restore_admit"}:
+            admission_context = entry.get("recovery_context")
+            if (
+                action == "restore_admit"
+                and admission_context is not None
+                and admission_context["format"] == _MANUAL_RESTORE_FORMAT
+            ):
+                _validate_manual_restore_history(admission_context, replay, key)
             if action == "restore_admit" and replay["current"] in designated:
                 old_designation = next(
                     prior
@@ -766,7 +913,6 @@ def _validate_state(state: dict[str, Any], *, prefix_version: int | None = None)
                     and prior["binding"] == replay["current"]
                 )
                 material = old_designation["recovery_context"]["designation"]
-                admission_context = entry.get("recovery_context")
                 if (
                     admission_context is None
                     or material["target"]["binding_sha256"] != key
