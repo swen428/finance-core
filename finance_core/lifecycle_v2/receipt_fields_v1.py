@@ -153,11 +153,12 @@ def _read_optional_recorded_fields(
     reference: MediaOcrReference | None,
     *,
     retained_evidence_root: str | Path | None = None,
+    verified_source: VerifiedReceiptSourceV1 | None = None,
 ) -> tuple[VerifiedReceiptSourceV1, RecordedReceiptFieldsV1] | None:
     if retained_evidence_root is not None:
         if processor is not None or reference is None:
             raise LifecycleError("Supply only the retained receipt evidence and exact reference")
-        source = reader.receipt_source_v1(source_id)
+        source = verified_source or reader.receipt_source_v1(source_id)
         return source, _read_retained_recorded_fields(
             source_id, source, retained_evidence_root, reference
         )
@@ -165,8 +166,7 @@ def _read_optional_recorded_fields(
         raise LifecycleError("Supply the exact receipt media processor and reference together")
     if processor is None or reference is None:
         return None
-    # Verify the immutable OCR member without holding the ledger transaction.
-    source = reader.receipt_source_v1(source_id)
+    source = verified_source or reader.receipt_source_v1(source_id)
     return source, _read_recorded_fields(source_id, source, processor, reference)
 
 

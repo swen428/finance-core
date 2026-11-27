@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 from finance_core.instance_admission.sessions import (
@@ -21,6 +21,7 @@ from .contracts import (
     digest,
     validate_daily_capacity,
 )
+from .historical_evidence_v1 import _active_scope, _event_service, _scope_for, _source_service
 from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 if TYPE_CHECKING:
@@ -50,7 +51,8 @@ def audit_connection(conn, *, _rows=None):
     return _audit_connection(conn, _rows=_rows)
 
 
-def _audit_connection(conn, *, _rows=None):
+def _audit_event_chain(conn, *, _rows=None, anchors=None):
+    anchors = {} if anchors is None else dict(anchors)
     previous = None
     expected_seq = 1
     for row in (
@@ -69,7 +71,16 @@ def _audit_connection(conn, *, _rows=None):
         ):
             raise LifecycleError("Audit event chain invalid")
         previous = row["event_sha256"]
+        if row["seq"] in anchors and anchors.pop(row["seq"]) != previous:
+            raise LifecycleError("Historical archive event anchor differs from current ledger")
         expected_seq += 1
+    if anchors:
+        raise LifecycleError("Historical archive event anchor is absent from current ledger")
+    return expected_seq - 1, previous
+
+
+def _audit_connection(conn, *, _rows=None):
+    event_count, previous = _audit_event_chain(conn, _rows=_rows)
     audit_owned_inventory(conn, _rows=_rows)
     count = 0
     for row in (
@@ -152,7 +163,7 @@ def _audit_connection(conn, *, _rows=None):
             or canonical(material[values_key]) != row["values_json"]
         ):
             raise LifecycleError("Review hash invalid")
-    return {"event_count": expected_seq - 1, "fact_version_count": count, "audit_sha256": previous}
+    return {"event_count": event_count, "fact_version_count": count, "audit_sha256": previous}
 
 
 class LedgerReader:
@@ -174,8 +185,21 @@ class LedgerReader:
             "status": "LOCAL_POSTED",
         }
 
+    @contextmanager
+    def _evidence_read(self):
+        from .daily_v1.accounts import _BoundService
+
+        service = self.service
+        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                with _active_scope(conn, service, _BoundService(service)):
+                    yield conn
+            finally:
+                conn.rollback()
+
     def get(self, record_id):
-        with lifecycle_read_operation(self.service.owner) as conn:
+        with self._evidence_read() as conn:
             row = conn.execute(
                 "SELECT * FROM l2_facts WHERE record_id=? ORDER BY version DESC LIMIT 1",
                 (record_id,),
@@ -189,7 +213,7 @@ class LedgerReader:
 
     def source(self, source_id: str) -> VerifiedSource:
         """Read authenticated original evidence without reviving archived rights."""
-        with lifecycle_read_operation(self.service.owner) as conn:
+        with self._evidence_read() as conn:
             row = self.service._source(conn, source_id, allow_archived=True)
             evidence = VerifiedSource(
                 row["evidence_id"],
@@ -208,12 +232,8 @@ class LedgerReader:
 
     def receipt_source_v1(self, source_id: str):
         """Read the original receipt identity through its typed evidence port."""
-        with lifecycle_read_operation(self.service.owner) as conn:
-            conn.execute("BEGIN")
-            try:
-                return self.service._receipt_source(conn, source_id, allow_archived=True)
-            finally:
-                conn.rollback()
+        with self._evidence_read() as conn:
+            return self.service._receipt_source(conn, source_id, allow_archived=True)
 
     def receipt_fields_v1(self, source_id, processor, reference):
         """Read original-linked OCR suggestions; this read grants no posting authority."""
@@ -233,18 +253,10 @@ class LedgerReader:
 
     def receipt_manual_draft_v1(self, source_id):
         """Project a draft from exact source and manual reply on one read snapshot."""
-        from .daily_v1.accounts import _BoundService
         from .receipt_draft_v1 import _project_manual_draft
 
-        base = self.service
-        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
-            service = _BoundService(base)
-            conn.execute("BEGIN")
-            try:
-                source, replies = self._receipt_reply_snapshot_v1(service, conn, source_id)
-                return _project_manual_draft(source_id, source, replies) if replies else None
-            finally:
-                conn.rollback()
+        source, replies = self._read_receipt_draft_evidence_v1(source_id)
+        return _project_manual_draft(source_id, source, replies) if replies else None
 
     def receipt_whole_draft_v1(
         self,
@@ -281,19 +293,17 @@ class LedgerReader:
     def _read_receipt_draft_evidence_v1(self, source_id):
         from .daily_v1.accounts import _BoundService
 
-        base = self.service
-        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
-            service = _BoundService(base)
-            conn.execute("BEGIN")
-            try:
-                return self._receipt_reply_snapshot_v1(service, conn, source_id)
-            finally:
-                conn.rollback()
+        with self._evidence_read() as conn:
+            return self._receipt_reply_snapshot_v1(_BoundService(self.service), conn, source_id)
 
     @staticmethod
     def _receipt_reply_snapshot_v1(service, conn, source_id):
-        source = service._receipt_source(conn, source_id, allow_archived=True)
-        return source, service.port.receipt_manual_replies_v1(conn, source)
+        from .service import _row
+
+        row = _row(conn, "l2_sources", "source_id", source_id)
+        evidence = _source_service(conn, service, row)
+        source = evidence._receipt_source(conn, source_id, allow_archived=True)
+        return source, evidence.port.receipt_manual_replies_v1(conn, source)
 
     def receipt_payment_handoff_v1(
         self,
@@ -313,35 +323,35 @@ class LedgerReader:
         from .receipt_fields_v1 import _project_payment_draft, _read_optional_recorded_fields
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
-        recorded = _read_optional_recorded_fields(
-            self, source_id, processor, reference, retained_evidence_root=retained_evidence_root
-        )
-        service = self.service
-        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
-            bound = _BoundService(service)
+        with self._evidence_read() as conn:
+            bound = _BoundService(self.service)
             _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
-            conn.execute("BEGIN")
-            try:
-                source, replies = self._receipt_reply_snapshot_v1(bound, conn, source_id)
-                draft = _project_payment_draft(source_id, source, replies, recorded)
-                if draft is None or draft.missing_receipt_fields:
-                    return None
-                audit = _audit(bound, conn)
-                read_identity = DailyReadIdentityV1(
-                    digest(asdict(bound.binding)),
-                    bound.owner.config.binding_sha256,
-                    audit["event_count"],
-                    audit["audit_sha256"],
-                    _logical_database_digest(conn),
-                )
-                return _receipt_payment_handoff(conn, draft, read_identity)
-            finally:
-                conn.rollback()
+            source, replies = self._receipt_reply_snapshot_v1(bound, conn, source_id)
+            recorded = _read_optional_recorded_fields(
+                self,
+                source_id,
+                processor,
+                reference,
+                retained_evidence_root=retained_evidence_root,
+                verified_source=source,
+            )
+            draft = _project_payment_draft(source_id, source, replies, recorded)
+            if draft is None or draft.missing_receipt_fields:
+                return None
+            audit = _audit(bound, conn)
+            read_identity = DailyReadIdentityV1(
+                digest(asdict(bound.binding)),
+                bound.owner.config.binding_sha256,
+                audit["event_count"],
+                audit["audit_sha256"],
+                _logical_database_digest(conn),
+            )
+            return _receipt_payment_handoff(conn, draft, read_identity)
 
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
             raise LifecycleError("Bounded page size required")
-        with lifecycle_read_operation(self.service.owner) as conn:
+        with self._evidence_read() as conn:
             rows = conn.execute(
                 "SELECT * FROM l2_facts f WHERE version=(SELECT max(version) "
                 "FROM l2_facts WHERE record_id=f.record_id) ORDER BY commit_seq DESC LIMIT ?",
@@ -355,7 +365,7 @@ class LedgerReader:
     def pending(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
             raise LifecycleError("Bounded page size required")
-        with lifecycle_read_operation(self.service.owner) as conn:
+        with self._evidence_read() as conn:
             rows = conn.execute(
                 "SELECT r.* FROM l2_reviews r JOIN l2_proposals p ON p.proposal_id=r.proposal_id "
                 "WHERE NOT EXISTS(SELECT 1 FROM l2_decisions d WHERE d.review_id=r.review_id) "
@@ -370,49 +380,30 @@ class LedgerReader:
 
     def full_audit(self):
         service = self.service
-        capacity = service.daily_capacity
-        scope = service._runtime_scope() if capacity is not None else nullcontext()
-        with scope, lifecycle_read_operation(service.owner) as conn:
-            if capacity is not None:
-                _require_runtime_scope(conn, service.binding, service.runtime_admission)
-            if capacity is not None or _has_daily_values(conn):
-                # New opt-in formats require an operation-local evidence port.
-                # The historical expense-only read path keeps its contract.
-                conn.execute("BEGIN")
-                try:
-                    return audit_evidence_connection(
-                        conn,
-                        service.port,
-                        service.binding,
-                        service.legacy_verifier,
-                        daily_capacity=capacity,
-                    )
-                finally:
-                    conn.rollback()
-            result = audit_connection(conn)
-            if (
-                conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
-                or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
-                or conn.execute(
-                    "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
-                ).fetchone()
-            ):
-                from .legacy import verify_import_archives
-
-                verify_import_archives(conn, self.service.legacy_verifier)
-            for source in conn.execute("SELECT source_id FROM l2_sources"):
-                self.service._source(conn, source[0], allow_archived=True)
-            for proposal in conn.execute("SELECT * FROM l2_proposals"):
-                verify_proposal(self.service, conn, proposal)
-            for review in conn.execute("SELECT * FROM l2_reviews"):
-                verify_review(self.service, conn, review)
-            for record in conn.execute("SELECT DISTINCT record_id FROM l2_facts"):
-                verify_record(self.service, conn, record[0])
-            return result
+        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                if service.daily_capacity is not None:
+                    _require_runtime_scope(conn, service.binding, service.runtime_admission)
+                return audit_evidence_connection(
+                    conn,
+                    service.port,
+                    service.binding,
+                    service.legacy_verifier,
+                    daily_capacity=service.daily_capacity,
+                    _service=service,
+                )
+            finally:
+                conn.rollback()
 
 
 def verify_proposal(service, conn, proposal, *, _rows=None):
-    """Verify the actual retained provider request/output, not its DB self-hash."""
+    """Verify retained provider request and output against independent evidence."""
+    with _active_scope(conn, service):
+        return _verify_proposal(service, conn, proposal, _rows=_rows)
+
+
+def _verify_proposal(service, conn, proposal, *, _rows=None):
     from dataclasses import asdict
 
     from finance_core.parser_proposals.independent_ai_v2 import validate_response_v2
@@ -420,6 +411,13 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
     from .contracts import ExpectedInvocation
 
     sealed = json.loads(proposal["observation_json"])
+    if _scope_for(conn) is not None:
+        retained = sealed.get("expected") if type(sealed) is dict else None
+        if type(retained) is not dict:
+            raise LifecycleError("Exact retained proposal required for historical verification")
+        service = _event_service(
+            conn, service, "propose", proposal["proposal_id"], retained.get("binding"), _rows=_rows
+        )
     capacity = getattr(service, "daily_capacity", None)
     if capacity is not None:
         # Successful verification below also authenticates this expected request.
@@ -593,7 +591,27 @@ def verify_proposal(service, conn, proposal, *, _rows=None):
 
 
 def verify_review(service, conn, review, *, _rows=None):
+    with _active_scope(conn, service):
+        return _verify_review(service, conn, review, _rows=_rows)
+
+
+def _verify_review(service, conn, review, *, _rows=None):
     material = json.loads(review["material_json"])
+    if _scope_for(conn) is not None:
+        service = _event_service(
+            conn, service, "review", review["review_id"], material.get("binding"), _rows=_rows
+        )
+        delivery_row = (
+            _rows.one(conn, "delivery", review["review_id"])
+            if _rows is not None
+            else conn.execute(
+                "SELECT 1 FROM l2_deliveries WHERE review_id=?", (review["review_id"],)
+            ).fetchone()
+        )
+        if delivery_row:
+            _event_service(
+                conn, service, "delivery", review["review_id"], material.get("binding"), _rows=_rows
+            )
     if material.get("format") == "finance-daily-refund-review-v1":
         from .daily_v1.refund_drafts_v1 import verify_review as verify_refund_review
 
@@ -694,6 +712,11 @@ def verify_review(service, conn, review, *, _rows=None):
 
 
 def verify_record(service, conn, record_id, *, _rows=None):
+    with _active_scope(conn, service):
+        return _verify_record(service, conn, record_id, _rows=_rows)
+
+
+def _verify_record(service, conn, record_id, *, _rows=None):
     from dataclasses import asdict
 
     from . import receipt_posting_v1 as receipt_posting
@@ -714,17 +737,6 @@ def verify_record(service, conn, record_id, *, _rows=None):
     ):
         version += 1
         values = _registered_values(json.loads(fact["values_json"]))
-        if values.get("format") in {
-            "finance-daily-account-bundle-v1",
-            "finance-daily-account-bundle-v2",
-        }:
-            from .daily_v1.accounts import verify_fact
-
-            verify_fact(service, conn, fact, _rows=_rows)
-        elif values.get("format") == "finance-daily-movement-v1":
-            from .daily_v1.movements import verify_fact as verify_movement_fact
-
-            verify_movement_fact(service, conn, fact, _rows=_rows)
         if (
             fact["version"] != version
             or fact["predecessor_sha256"] != previous
@@ -771,12 +783,31 @@ def verify_record(service, conn, record_id, *, _rows=None):
         )
         if review is None:
             raise LifecycleError("Record lacks original review")
-        expected, delivery = verify_review(service, conn, review, _rows=_rows)
+        fact_service = service
+        scope = _scope_for(conn)
+        if scope is not None:
+            binding = json.loads(review["material_json"])["binding"]
+            fact_service = _event_service(
+                conn, service, "review", review["review_id"], binding, _rows=_rows
+            )
+            scope.at(fact["commit_seq"], binding=fact_service.binding)
+        if values.get("format") in {
+            "finance-daily-account-bundle-v1",
+            "finance-daily-account-bundle-v2",
+        }:
+            from .daily_v1.accounts import verify_fact
+
+            verify_fact(fact_service, conn, fact, _rows=_rows)
+        elif values.get("format") == "finance-daily-movement-v1":
+            from .daily_v1.movements import verify_fact as verify_movement_fact
+
+            verify_movement_fact(fact_service, conn, fact, _rows=_rows)
+        expected, delivery = verify_review(fact_service, conn, review, _rows=_rows)
         receipt = type(expected) is receipt_posting._ReceiptExpectedMovementV1
         source_key = (
             expected.expense.history.source.source_key
             if receipt
-            else service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)[
+            else fact_service._source(conn, expected.source_id, allow_archived=True, _rows=_rows)[
                 "source_key"
             ]
         )
@@ -804,7 +835,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         accepted_at = payload.get("accepted_at")
         action = (
             receipt_posting.read_action(
-                service,
+                fact_service,
                 conn,
                 expected,
                 review,
@@ -813,7 +844,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
                 accepted_at,
             )
             if receipt
-            else service.port.action(
+            else fact_service.port.action(
                 conn,
                 decision["action_evidence_id"],
                 ExpectedAction(
@@ -844,7 +875,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         ):
             raise LifecycleError("Correction opening evidence cannot be its confirmation")
         if values.get("format") == "finance-daily-movement-v1" and reuses_target_selection_evidence(
-            service, conn, expected, action.evidence_id, _rows=_rows
+            fact_service, conn, expected, action.evidence_id, _rows=_rows
         ):
             raise LifecycleError("Target selection evidence cannot be its confirmation")
         if values.get("format") == "finance-daily-transfer-v1":
@@ -854,7 +885,7 @@ def verify_record(service, conn, record_id, *, _rows=None):
         if values.get("format") == "finance-daily-refund-v1":
             from .daily_v1.refund_drafts_v1 import verify_confirmed_refund
 
-            verify_confirmed_refund(service, conn, fact, review, expected, action, _rows=_rows)
+            verify_confirmed_refund(fact_service, conn, fact, review, expected, action, _rows=_rows)
         review_material = json.loads(review["material_json"])
         if (
             type(accepted_at) is not int
@@ -934,7 +965,13 @@ def _has_daily_values(conn):
 
 
 def audit_evidence_connection(
-    conn, port, binding, legacy_verifier=None, *, daily_capacity: DailyCapacityV2 | None = None
+    conn,
+    port,
+    binding,
+    legacy_verifier=None,
+    *,
+    daily_capacity: DailyCapacityV2 | None = None,
+    _service=None,
 ):
     """Authenticate every signed source/provider/display/action and dormant archive."""
     from finance_core.instance_admission.sessions import _witness_for
@@ -953,7 +990,12 @@ def audit_evidence_connection(
 
         if type(port) is not _EvidenceReadPort:
             port = _EvidenceReadPort(port)
-    elif witness is None and snapshot is None and _has_receipt_proposals(conn):
+    elif (
+        witness is None
+        and snapshot is None
+        and _scope_for(conn) is None
+        and _has_receipt_proposals(conn)
+    ):
         raise LifecycleError("Exact historical receipt snapshot evidence required")
     # Raw immutable snapshot readback retains its independent SQL boundary.
     # An exact adapter alone is not admission; the selector proves its context.
@@ -962,18 +1004,28 @@ def audit_evidence_connection(
 
         validate_daily_capacity(binding, daily_capacity)
         _limits(conn, daily_capacity=daily_capacity)
-    with audit_rows(conn, port) as rows:
+    verifier = SnapshotEvidenceVerifier(
+        port, binding, legacy_verifier, daily_capacity=daily_capacity
+    )
+    scope = _active_scope(conn, _service, verifier) if _service is not None else nullcontext()
+    with scope, audit_rows(conn, port) as rows:
         return _audit_evidence_connection(
-            conn, port, binding, legacy_verifier, _rows=rows, daily_capacity=daily_capacity
+            conn,
+            port,
+            binding,
+            legacy_verifier,
+            _rows=rows,
+            daily_capacity=daily_capacity,
+            _verifier=verifier,
         )
 
 
 def _audit_evidence_connection(
-    conn, port, binding, legacy_verifier=None, *, _rows=None, daily_capacity=None
+    conn, port, binding, legacy_verifier=None, *, _rows=None, daily_capacity=None, _verifier=None
 ):
     """Original SQL reference with optional private, audit-local raw lookups."""
     result = _audit_connection(conn, _rows=_rows)
-    verifier = SnapshotEvidenceVerifier(
+    verifier = _verifier or SnapshotEvidenceVerifier(
         port, binding, legacy_verifier, daily_capacity=daily_capacity
     )
     if (

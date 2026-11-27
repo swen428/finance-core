@@ -741,19 +741,24 @@ class _BoundService(SnapshotEvidenceVerifier):
         )
         self.owner = base.owner
         self.runtime_admission = base.runtime_admission
+        self.historical_evidence = base.historical_evidence
         self.clock = base.clock
 
     def _now(self):
         return int(self.clock())
 
 
-def _audit(service, conn):
-    _limits(conn, daily_capacity=service.daily_capacity)
+def _require_daily_ledger_scope(conn, *, daily_capacity=None):
+    _limits(conn, daily_capacity=daily_capacity)
     if (
         conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
         or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
     ):
         raise LifecycleError("unsupported_ledger_scope")
+
+
+def _audit(service, conn):
+    _require_daily_ledger_scope(conn, daily_capacity=service.daily_capacity)
     from ..reader import audit_evidence_connection
 
     fingerprint = _fingerprint(conn)
@@ -763,6 +768,7 @@ def _audit(service, conn):
         service.binding,
         service.legacy_verifier,
         daily_capacity=service.daily_capacity,
+        _service=service,
     )
     if _fingerprint(conn) != fingerprint:
         raise LifecycleError("Evidence callback changed protected state")

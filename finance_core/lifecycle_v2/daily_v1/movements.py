@@ -374,7 +374,9 @@ def reuses_target_selection_evidence(service, conn, expected, action_evidence_id
             or prior["version"] != expected.expected_proposal_version
         ):
             raise LifecycleError("Opening supplement lacks its original correction proposal")
-        original = verify_proposal(service, conn, prior, _rows=_rows)
+        from ..reader import verify_proposal as verify_original_proposal
+
+        original = verify_original_proposal(service, conn, prior, _rows=_rows)
         link = strict_json(original.instruction_link["link_json"])
     return link["format"] == TARGET_SELECTION_LINK and action_evidence_id in {
         link["target"]["instruction_ref"]["evidence_id"],

@@ -148,6 +148,98 @@ lease. Service identity remains fixed during the operation. Read-only historical
 inspection retains the existing forensic rules. See the
 [lifecycle contract](lifecycle_v2_contract.md) for service and old-format scope.
 
+## Manual single-host restore
+
+Use the manual recovery route when the predecessor's control root is unavailable.
+The composing operator independently authenticates the archive and verifies that
+the provider stopped the exact old host, disabled automatic restart, and will
+keep it disabled. Core treats the configured approval verifier as the trust
+boundary for that external observation. The isolation record carries the
+provider, host, source instance and binding, observation time, evidence reference
+and digest, and records for shutdown and continued disablement.
+
+`prepare_manual_single_host_restore_v1` verifies the snapshot and prepares a
+fresh target with the exact archived Core identity. The held profile records an
+offline audit binding. The target also needs an independently authorized
+single-host runtime registration for the same instance, generation and actor.
+Registration alone leaves the target unable to acquire a writer.
+
+`manual_single_host_promotion_context_v1` reports the material to approve. The
+approval binds the exact cut, prepared and registered target, old-host evidence,
+accepted loss interval and application history digest where required. The
+protected approval also binds the operation and predecessor authority state. The accepted loss interval
+must extend through the verified stop observation. The trusted operator must
+durably reserve one successor for the source binding across all independent
+control roots before approving publication. Each local root can enforce only
+its own writer exclusivity. A
+local authority lineage with a current or prior current writer uses the
+existing fenced-designation route instead.
+
+`promote_manual_single_host_restore_v1` holds the owner, control and profile
+leases, rechecks the cut through a read-only SQLite handle, and publishes the
+writer transition only after that handle closes. A trusted application verifier
+runs in the same held read, invokes the scoped Core evidence audit and returns
+the approved digest of complete application history. Core independently
+rechecks the logical cut and structural ledger and refuses a generation found
+in the archived sources. A changed digest or an unavailable audit keeps the
+target held. The operator must supply the exact original request after an
+interrupted publication. `reopen_manual_single_host_restore_v1` reconstructs
+the original preparation from protected history. Reobserving a completed
+operation does not re-promote a target or overwrite later postings.
+
+For a restored application that will serve historical records, supply
+`HistoricalGenerationV1` descriptors from oldest through the immediate source
+to both manual promotion calls. An individual descriptor binds one runtime,
+snapshot cut, application-history digest and Core event-chain anchor. The
+protected promotion stores a commitment to the complete ancestry. During
+held admission the trusted archive audit must authenticate the source's
+protected parent commitment and provide the ancestor evidence ports to the
+Core callback. Core compares the approved descriptors and independently checks
+the archive cut and event anchors on the held database. For a first restore the
+ancestor list is empty.
+
+For a Core-only profile the descriptor's application-history digest is `None`.
+At backup time, use `issue_core_archive_origin_v1` with the original service,
+its sealed file and a separately held recovery authority. The source receipt
+binds the exact cut and the parent commitment from that service's protected
+admission. An original admission signs the empty ancestry. A successor signs
+the ancestry retained by its own verified promotion, including an earlier
+generation that recorded no events. Keep the receipt with the backup. Configure
+the target's operator verifier independently to validate this class of receipts.
+
+Supply that receipt in `core_archive_origin` and the ordered `HistoricalEvidenceV1`
+tuple in `historical_evidence` when promoting the replacement. Core checks the
+signed parent commitment, archived bindings and event anchors in its held read.
+The legacy port-only route carries no ancestry commitment of its own.
+
+On the admitted target, construct `LedgerService` with the matching installed
+`HistoricalEvidenceV1` ports in that ancestry order. Core verifies the current
+owner and protected promotion and checks their anchors on the actual ledger
+transaction. Retained capture, proposal, review, delivery and confirmation
+evidence is checked under its original runtime and archive. Historical live
+ports receive the original guarded SQLite connection for read callbacks.
+Detached archive tools open the database with
+`open_archive_read_connection_v1` and call `audit_archive_evidence_connection_v1`
+on that Core-owned read transaction with the verified parent commitment and
+exact archive receipt lookups. The opener checks the archive database bytes
+before opening it read-only and retains control through actual SQLite close.
+Its connection exposes ordinary SQL reads and read-only diagnostics. Core
+retains control of callback registration, connection settings and extensions.
+If closure of the SQLite connection, a cursor, or the archive file is uncertain,
+the opener raises `ArchiveCloseUnknownV1` and retains the affected resources.
+Callers that hold archive ownership must retain it when they receive this
+exception.
+The current writer's archive producer can use `audit_runtime_archive_evidence_connection_v1`
+on its admitted read transaction for that cut. The Core audit checks original
+receipt and OCR evidence using those same scopes.
+Historical evidence carries no write or confirmation authority. New service
+operations continue to use the current registered runtime.
+
+Application intake owns the new receiving boundary, fresh credentials and
+policy, and the exclusion of historical cards, messages and external claims
+from execution. The existing live designation and signed v3 receipt routes
+retain their scope.
+
 ## Owner, operation, and connection lifetime
 
 Only one process may hold the production owner lease for an instance. A write

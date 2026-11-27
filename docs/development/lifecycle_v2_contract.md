@@ -254,6 +254,15 @@ database inode and exact preparation history entry. Ordinary admission and
 current owners cannot open a held instance. A Python object or a successful
 `verify_held_profile_evidence` diagnostic grants no future admission right.
 
+`finance_core.lifecycle_v2.recovery.read_held_daily_query_snapshot_v1` reads
+the actual prepared synthetic application database and returns the normal Core
+daily query snapshot. The installed application supplies independently
+authenticated application history and complete generation ancestry. Every
+ancestor must come from a synthetic runtime. Core checks the exact prepared
+identity, the full cut, and the original Core evidence inside one Core-owned
+read-only transaction. The result is available only after the transaction
+closes and grants no runtime registration or admission.
+
 After the old writer is fenced and has actually released its lifetime owner,
 `designate_restore_successor` compares the entire source cut against the actual
 old database and records one exact successor for that old authority binding.

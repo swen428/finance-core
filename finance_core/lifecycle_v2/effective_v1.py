@@ -438,7 +438,11 @@ class EffectiveLedgerReaderV1:
                         _audit(service, conn)
                         if daily_ledger
                         else audit_evidence_connection(
-                            conn, service.port, service.binding, service.legacy_verifier
+                            conn,
+                            service.port,
+                            service.binding,
+                            service.legacy_verifier,
+                            _service=service,
                         )
                     )
                 if daily_ledger:
