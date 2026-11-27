@@ -2552,6 +2552,20 @@ def test_detached_opener_finalizes_retained_ordinary_select_cursors(original, tm
             cursor.fetchone()
 
 
+@pytest.mark.parametrize("handle_type", ["connection", "cursor"])
+def test_detached_archive_refuses_scripts_on_retained_handles(original, tmp_path, handle_type):
+    _, _, service, _ = original
+    cut, path = _cut(service, tmp_path)
+    with history.open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn:
+        handle = conn if handle_type == "connection" else conn.cursor()
+        with pytest.raises(LifecycleError, match="executescript is unsupported"):
+            handle.executescript("SELECT 1;")
+        assert handle.execute("SELECT ?", (1,)).fetchone()[0] == 1
+
+    with pytest.raises(LifecycleError, match="executescript is unsupported"):
+        handle.executescript("SELECT 1;")
+
+
 def test_detached_owner_guards_connection_settings_in_a_separate_context(original, tmp_path):
     _, _, service, _ = original
     cut, path = _cut(service, tmp_path)

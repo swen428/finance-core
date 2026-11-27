@@ -664,6 +664,12 @@ class _RestrictedSQLiteConnection(sqlite3.Connection):
     def iterdump(self, *args, **kwargs):
         self._unsupported("iterdump")
 
+    def _refuse_script_execution(self, sql_script, /):
+        self._unsupported("executescript")
+
+    # Native script execution can implicitly commit even a read transaction.
+    executescript = _refuse_script_execution
+
     def create_function(self, *args, **kwargs):
         self._unsupported("create_function")
 

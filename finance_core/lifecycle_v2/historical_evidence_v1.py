@@ -231,6 +231,11 @@ class ArchiveCloseUnknownV1(LifecycleError):
 
 
 class _ArchiveCursor(sqlite3.Cursor):
+    def _refuse_script_execution(self, sql_script, /):
+        self.connection._unsupported("executescript")
+
+    executescript = _refuse_script_execution
+
     def close(self):
         conn = self.connection
         conn._require_reliable_close()
@@ -302,10 +307,6 @@ class _ArchiveReadConnection(_RestrictedSQLiteConnection):
     def close(self):
         self._require_idle_guard()
         _close_archive_connection(self)
-
-    def executescript(self, script):
-        self._require_idle_guard()
-        return super().executescript(script)
 
     def interrupt(self) -> None:
         self._unsupported("interrupt")
