@@ -53,6 +53,48 @@ def test_detached_owner_guards_connection_settings_in_a_separate_context(origina
             separate.run(setattr, conn, "row_factory", sqlite3.Row)
 
 
+def test_detached_archive_guards_sqlite_callback_and_configuration_apis(original, tmp_path):
+    _, _, service, _ = original
+    cut, path = _cut(service, tmp_path)
+    with history.open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn:
+        limit = sqlite3.SQLITE_LIMIT_LENGTH
+        config = sqlite3.SQLITE_DBCONFIG_DQS_DML
+        previous_limit = conn.getlimit(limit)
+        previous_config = conn.getconfig(config)
+        calls = (
+            ("create_function", "unused_archive_callback", 0, lambda: 1),
+            ("create_aggregate", "unused_archive_aggregate", 1, None),
+            ("create_window_function", "unused_archive_window", 1, None),
+            ("create_collation", "unused_archive_collation", None),
+            ("set_trace_callback", None),
+            ("set_progress_handler", None, 0),
+            ("enable_load_extension", False),
+            ("setconfig", config, previous_config),
+            ("setlimit", limit, previous_limit),
+            ("interrupt",),
+        )
+        for method, *arguments in calls:
+            with pytest.raises(LifecycleError, match=method):
+                Context().run(getattr(conn, method), *arguments)
+        assert conn.getlimit(limit) == previous_limit
+        assert conn.getconfig(config) == previous_config
+        assert conn.execute("SELECT 1").fetchone()[0] == 1
+
+
+def test_detached_archive_permits_pragma_reads_but_refuses_pragma_settings(original, tmp_path):
+    _, _, service, _ = original
+    cut, path = _cut(service, tmp_path)
+    with (
+        pytest.raises(LifecycleError, match="violated its read-only scope"),
+        history.open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn,
+    ):
+        assert conn.execute("PRAGMA integrity_check(1)").fetchone()[0] == "ok"
+        assert conn.execute("PRAGMA table_xinfo(l2_events)").fetchone() is not None
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+            conn.execute(f"PRAGMA busy_timeout={timeout}")
+
+
 def test_detached_audit_rechecks_the_witness_after_the_final_cut(original, tmp_path):
     _, _, service, port = original
     cut, path = _cut(service, tmp_path)

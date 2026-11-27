@@ -21,9 +21,11 @@ from finance_core.instance_admission.authority import (
     _state,
 )
 from finance_core.instance_admission.sessions import (
+    _SQL_METADATA_PRAGMAS,
     _close_cursor_handle,
     _evidence_read_callback,
     _require_runtime_scope,
+    _RestrictedSQLiteConnection,
     _rollback_sqlite_handle,
     _witness_for,
 )
@@ -240,7 +242,7 @@ class _ArchiveCursor(sqlite3.Cursor):
         conn._archive_cursors.pop(id(self), None)
 
 
-class _ArchiveReadConnection(sqlite3.Connection):
+class _ArchiveReadConnection(_RestrictedSQLiteConnection):
     """Internal reader whose transaction and authorizer belong to Core."""
 
     _archive_owner: _ArchiveTransaction | None
@@ -269,6 +271,10 @@ class _ArchiveReadConnection(sqlite3.Connection):
         if self._archive_owner is not None and self._archive_owner.active:
             raise LifecycleError("Core owns the archive read transaction")
 
+    def _unsupported(self, name: str) -> None:
+        self._require_reliable_close()
+        raise LifecycleError(f"Archive read {name} is unsupported")
+
     def __setattr__(self, name, value):
         if name in {"row_factory", "text_factory", "autocommit", "isolation_level"}:
             self._require_idle_guard()
@@ -276,7 +282,7 @@ class _ArchiveReadConnection(sqlite3.Connection):
 
     def set_authorizer(self, callback):
         self._require_idle_guard()
-        return super().set_authorizer(callback)
+        return sqlite3.Connection.set_authorizer(self, callback)
 
     def cursor(self, factory=None):
         self._require_reliable_close()
@@ -297,19 +303,12 @@ class _ArchiveReadConnection(sqlite3.Connection):
         self._require_idle_guard()
         _close_archive_connection(self)
 
-    def blobopen(self, *args, **kwargs):
-        raise LifecycleError("Archive read supports only owned SQL result cursors")
-
-    def iterdump(self, *args, **kwargs):
-        raise LifecycleError("Archive read supports only owned SQL result cursors")
-
     def executescript(self, script):
         self._require_idle_guard()
         return super().executescript(script)
 
-    def deserialize(self, data, /, *, name="main"):
-        self._require_idle_guard()
-        return super().deserialize(data, name=name)
+    def interrupt(self) -> None:
+        self._unsupported("interrupt")
 
 
 def _close_archive_connection(conn, *, close_connection=None):
@@ -338,6 +337,17 @@ class _ArchiveTransaction:
 
 _ARCHIVE_TRANSACTIONS: ContextVar[tuple[_ArchiveTransaction, ...]] = ContextVar(
     "finance_archive_read_transactions", default=()
+)
+_ARCHIVE_DIAGNOSTIC_PRAGMAS = _SQL_METADATA_PRAGMAS | {"integrity_check", "quick_check"}
+_ARCHIVE_SETTING_READS = frozenset(
+    {
+        "application_id",
+        "busy_timeout",
+        "database_list",
+        "foreign_keys",
+        "query_only",
+        "user_version",
+    }
 )
 
 
@@ -390,16 +400,20 @@ def _issued_archive_transaction(conn, database_sha256):
     witness = _ArchiveTransaction(conn, database_sha256, os.getpid())
 
     def authorize(action, first, second, _database, _source):
+        if action == sqlite3.SQLITE_PRAGMA:
+            name = first.lower() if type(first) is str else ""
+            if name in _ARCHIVE_DIAGNOSTIC_PRAGMAS or (
+                name in _ARCHIVE_SETTING_READS and second is None
+            ):
+                return sqlite3.SQLITE_OK
+            witness.violated = True
+            return sqlite3.SQLITE_DENY
         if action in {
             sqlite3.SQLITE_ATTACH,
             sqlite3.SQLITE_DETACH,
             sqlite3.SQLITE_SAVEPOINT,
             sqlite3.SQLITE_TRANSACTION,
-        } or (
-            action == sqlite3.SQLITE_PRAGMA
-            and first in {"query_only", "writable_schema", "foreign_keys"}
-            and second is not None
-        ):
+        }:
             witness.violated = True
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK

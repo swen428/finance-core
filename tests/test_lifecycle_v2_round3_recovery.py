@@ -1874,6 +1874,29 @@ def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
     assert snapshot.collection.accounts[0].account_id == old_fact.account_ref.account_id
     assert snapshot.collection.accounts[0].opening_amount == "12.30"
     assert snapshot.transactions == ()
+    real_binding = replace(
+        archived.binding,
+        instance_id="earlier-instance",
+        generation="earlier-generation",
+        environment="single-host-real",
+    )
+    real_ancestor = replace(
+        archived,
+        binding=real_binding,
+        cut=replace(
+            cut,
+            instance_id=real_binding.instance_id,
+            generation=real_binding.generation,
+            source_binding_sha256="e" * 64,
+        ),
+    )
+    with pytest.raises(LifecycleError, match="synthetic source evidence"):
+        read_held(
+            held,
+            audit_application,
+            application_history_sha256=history_hash,
+            historical_generations=(real_ancestor, archived),
+        )
     with pytest.raises(LifecycleError, match="omitted Core evidence audit"):
         read_held(held, lambda *_args: history_hash, **held_options)
     with pytest.raises(LifecycleError, match="event"):

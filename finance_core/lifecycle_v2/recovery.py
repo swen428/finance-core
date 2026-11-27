@@ -1294,10 +1294,10 @@ def read_held_daily_query_snapshot_v1(
     _require_immediate(
         historical_generations, restored.new_binding, restored.cut, application_history_sha256
     )
-    if historical_generations[-1].binding.environment not in {
-        "offline-synthetic",
-        "single-host-synthetic",
-    }:
+    if any(
+        item.binding.environment not in {"offline-synthetic", "single-host-synthetic"}
+        for item in historical_generations
+    ):
         raise LifecycleError("Held daily read requires synthetic source evidence")
     max_records, max_versions = _read_limits(limits, None)
 

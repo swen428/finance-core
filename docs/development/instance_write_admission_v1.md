@@ -223,6 +223,8 @@ Detached archive tools open the database with
 on that Core-owned read transaction with the verified parent commitment and
 exact archive receipt lookups. The opener checks the archive database bytes
 before opening it read-only and retains control through actual SQLite close.
+Its connection exposes ordinary SQL reads and read-only diagnostics. Core
+retains control of callback registration, connection settings and extensions.
 If SQLite connection or cursor closure is uncertain, the opener raises
 `ArchiveCloseUnknownV1` and retains the archive resources. Callers that hold
 archive ownership must retain it when they receive this exception.

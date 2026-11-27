@@ -643,15 +643,11 @@ class _ProductionCursor(sqlite3.Cursor):
         return super().setoutputsize(size, column)
 
 
-class _ProductionConnection(sqlite3.Connection):
-    """Guarded SQL/cursor session; callback and administrative APIs are unsupported."""
-
-    # CPython's cursor execution needs the inherited __call__ compiler seam.
-    # Direct caller borrowing of native Statement objects is outside this API.
+class _RestrictedSQLiteConnection(sqlite3.Connection):
+    """Callback and administrative operations shared by Core's guarded handles."""
 
     def _unsupported(self, name: str) -> None:
-        _evidence_forbid(_preflight(self), name)
-        raise InstanceAdmissionError(f"Production {name} is unsupported")
+        raise NotImplementedError
 
     def blobopen(self, *args, **kwargs):
         self._unsupported("blobopen")
@@ -700,6 +696,17 @@ class _ProductionConnection(sqlite3.Connection):
 
     def setlimit(self, *args, **kwargs):
         self._unsupported("setlimit")
+
+
+class _ProductionConnection(_RestrictedSQLiteConnection):
+    """Guarded SQL/cursor session; callback and administrative APIs are unsupported."""
+
+    # CPython's cursor execution needs the inherited __call__ compiler seam.
+    # Direct caller borrowing of native Statement objects is outside this API.
+
+    def _unsupported(self, name: str) -> None:
+        _evidence_forbid(_preflight(self), name)
+        raise InstanceAdmissionError(f"Production {name} is unsupported")
 
     def getconfig(self, op, /):
         _preflight(self)
