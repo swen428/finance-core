@@ -272,6 +272,7 @@ def test_retained_ocr_expense_rebuilds_exact_fields_with_optional_manual_replies
             lookup,
             source.source_id,
             action,
+            archived,
         )
     assert len(worker_calls) == 1
 
@@ -288,6 +289,7 @@ def _verify_activated_receipt(
     lookup,
     source_id,
     action,
+    retained_root,
 ):
     from finance_core.instance_admission import InstanceAdmissionError, acquire_production_owner
     from finance_core.lifecycle_v2.historical_evidence_v1 import (
@@ -319,22 +321,52 @@ def _verify_activated_receipt(
         == "ACTIVE"
     )
     with acquire_production_owner(target) as owner:
+        active_port = PaymentPort()
+        active_port.receipt_source_v1 = lambda *_: pytest.fail("Current source port used")
+        active_port.receipt_manual_replies_v1 = lambda *_: pytest.fail("Current reply port used")
         restored = LedgerService(
             owner,
-            PaymentPort(),
+            active_port,
             options["binding"],
             runtime_admission=options["runtime_admission"],
             historical_evidence=(HistoricalEvidenceV1(archived, port),),
         )
         original_read = port.receipt_retained_ocr_history_v1
-        assert restored.reader().receipt_source_v1(source_id) == port.receipt
-        assert restored.reader().full_audit() == audit
+        reader = restored.reader()
+        assert reader.receipt_source_v1(source_id) == port.receipt
+        manual_reader = port.receipt_manual_replies_v1
+        seen = []
+
+        def original_manual_replies(conn, source):
+            witness = _witness_for(conn)
+            assert witness.owner is owner and witness.evidence_callback_token is not None
+            assert conn.in_transaction
+            seen.append(source.evidence_id)
+            return manual_reader(conn, source)
+
+        port.receipt_manual_replies_v1 = original_manual_replies
+        assert reader.receipt_manual_draft_v1(source_id) is None
+        assert reader.receipt_whole_draft_v1(source_id).missing_receipt_fields
+        historical_reference = lookup._history.registration.reference
+        assert not reader.receipt_retained_whole_draft_v1(
+            source_id, retained_root, historical_reference
+        ).missing_receipt_fields
+        handoff = reader.receipt_payment_handoff_v1(
+            source_id, retained_evidence_root=retained_root, reference=historical_reference
+        )
+        assert handoff is not None and handoff.account_options
+        assert seen == [port.receipt.evidence_id] * 4
+
+        assert reader.full_audit() == audit
         view = DailyLedgerReaderV1(restored).collect()
         assert view.movements[0].values["account_amount"] == "7.50"
+        daily = DailyMovementServiceV1(restored)
         with pytest.raises(LifecycleError):
-            DailyMovementServiceV1(restored).confirm(
-                action.review_id, action.evidence_id, "confirm-ocr-receipt"
+            daily.propose_ocr_receipt_expense(
+                source_id, lookup._history.reply_positions[-1], "try-stale-ocr"
             )
+        with pytest.raises(LifecycleError):
+            daily.confirm(action.review_id, action.evidence_id, "confirm-ocr-receipt")
 
         def attempted_commit(conn, identity, fields_reply):
             assert _witness_for(conn).owner is owner

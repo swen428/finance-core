@@ -906,3 +906,98 @@ def test_authenticated_import_union_allows_dedup_and_new_native_versions(
             (record_id,),
         ).fetchone()
         assert json.loads(latest[0])["amount"] == "19.25"
+
+
+def test_manual_restore_retains_signed_import_and_native_source(
+    legacy_connection, tmp_path, monkeypatch
+):
+    from instance_admission_support_v1 import synthetic_config
+    from test_lifecycle_v2 import Port, ready
+    from test_lifecycle_v2_round3_recovery import _manual_historical_target
+
+    from finance_core.instance_admission import (
+        acquire_production_owner,
+        admit_production_instance,
+        fence_production_instance,
+        prepare_production_profile,
+    )
+    from finance_core.instance_admission.schema_contract import ApplicationSchemaContract
+    from finance_core.lifecycle_v2 import LedgerService, RuntimeBinding
+    from finance_core.lifecycle_v2.contracts import digest
+    from finance_core.lifecycle_v2.historical_evidence_v1 import (
+        HistoricalEvidenceV1,
+        HistoricalGenerationV1,
+    )
+    from finance_core.lifecycle_v2.recovery import promote_manual_single_host_restore_v1
+    from finance_core.reconciliation import migrations
+
+    adapter, *_ = _subject(legacy_connection)
+    exported = adapter.verify_export()
+    monkeypatch.setattr(migrations, "TEMP_DB_MIGRATION_PATHS", NEW_MIGRATION_PATHS)
+    source_root = tmp_path / "before-restore"
+    source_root.mkdir(mode=0o700)
+    schema = ApplicationSchemaContract(
+        "import-history-test", ("CREATE TABLE app_evidence (id TEXT PRIMARY KEY)",)
+    )
+    verifier = _export_verifier()
+    port = Port()
+    path = tmp_path / "mixed.sqlite"
+    with synthetic_config(source_root, monkeypatch, application_schema=schema) as source:
+        binding = RuntimeBinding(source.instance_id, "first-generation", "user", "chat")
+        prepare_production_profile(
+            source, operation_id="prepare-source", approval_ref="approved"
+        ).close()
+        admit_production_instance(source, operation_id="admit-source", approval_ref="approved")
+        with acquire_production_owner(source) as owner:
+            original = LedgerService(owner, port, binding, legacy_verifier=verifier)
+            imported = original.import_verified(exported)[0]
+            _, _, review = ready(original)
+            native = original.confirm(review.review_id, "native-action", "native-confirm")
+            audit = original.reader().full_audit()
+            old_record = original.reader().get(imported.record_id)
+            cut = original.seal_snapshot(path)
+            fence_production_instance(source, operation_id="fence-source", approval_ref="approved")
+        target, held, kwargs = _manual_historical_target(
+            tmp_path, monkeypatch, source, cut, path, "mixed-target", 1792800000
+        )
+        with target:
+            history_hash = digest([])
+
+            def verify_history(conn, exact_cut, audit_core):
+                assert exact_cut == cut and conn.in_transaction
+                assert conn.execute("SELECT id FROM app_evidence").fetchall() == []
+                assert audit_core(port, binding) == audit
+                return history_hash
+
+            old = HistoricalGenerationV1(binding, cut, history_hash, audit["audit_sha256"])
+            promote_manual_single_host_restore_v1(
+                held,
+                **kwargs,
+                legacy_verifier=verifier,
+                application_history_sha256=history_hash,
+                audit_application_history=verify_history,
+                historical_generations=(old,),
+            )
+            with acquire_production_owner(target) as successor:
+                arguments = dict(
+                    runtime_admission=kwargs["runtime_admission"],
+                    historical_evidence=(HistoricalEvidenceV1(old, port),),
+                )
+                restored = LedgerService(
+                    successor, Port(), kwargs["binding"], legacy_verifier=verifier, **arguments
+                )
+                reader = restored.reader()
+                assert reader.full_audit() == audit
+                assert reader.get(imported.record_id) == old_record
+                assert reader.source(old_record["source_id"]).source_key.startswith("legacy:")
+                assert reader.get(native.record_id)["values"]["amount"] == "12.00"
+                with pytest.raises(LegacyExportError):
+                    LedgerService(
+                        successor,
+                        Port(),
+                        kwargs["binding"],
+                        legacy_verifier=_export_verifier(
+                            key=b"different independent synthetic signing key"
+                        ),
+                        **arguments,
+                    ).reader().full_audit()

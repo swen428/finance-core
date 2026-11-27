@@ -370,9 +370,6 @@ class LedgerService:
         )
         if row is None:
             raise LifecycleError("Missing l2_sources identity")
-        from .historical_evidence_v1 import _source_service
-
-        evidence_service = _source_service(conn, self, row, _rows=_rows)
         if row["source_key"].startswith("legacy:"):
             from .legacy import verify_imported_source
 
@@ -386,6 +383,9 @@ class LedgerService:
             capture = json.loads(_capture_payload(conn, source_id))
             if capture.get("format") == _RECEIPT_CAPTURE:
                 raise LifecycleError("Receipt source requires the typed receipt entry point")
+        from .historical_evidence_v1 import _source_service
+
+        evidence_service = _source_service(conn, self, row, _rows=_rows)
         evidence = evidence_service.port.source(conn, row["evidence_id"])
         evidence_service._actor(evidence)
         material = asdict(evidence)
@@ -429,6 +429,9 @@ class LedgerService:
             raise LifecycleError("Source is outside the typed receipt entry point")
         from .historical_evidence_v1 import _source_service
 
+        generation = _capture_generation(row, payload)
+        if not allow_archived and generation != self.binding.generation:
+            raise LifecycleError("Source belongs to archived generation")
         evidence_service = _source_service(conn, self, row)
         actual = _original_receipt_evidence(
             evidence_service.port, conn, evidence_service.binding, row["evidence_id"]
@@ -438,9 +441,6 @@ class LedgerService:
             raise LifecycleError("Original receipt evidence changed")
         if _capture_payload(conn, source_id) != payload:
             raise LifecycleError("Original receipt capture changed during verification")
-        generation = _capture_generation(row, payload)
-        if not allow_archived and generation != self.binding.generation:
-            raise LifecycleError("Source belongs to archived generation")
         return actual
 
     def capture_receipt_v1(self, source_evidence_id: str, operation_id: str) -> SourceRef:
@@ -552,11 +552,23 @@ class LedgerService:
         correction_reason=None,
     ):
         """Build exact request context before provider dispatch; no authority is granted."""
+        from .historical_evidence_v1 import _active_scope
+
         with self._runtime_scope(), lifecycle_read_operation(self.owner) as conn:
             _require_runtime_scope(conn, self.binding, self.runtime_admission)
-            return self._expected(
-                conn, source_id, expected_version, record_id, reply_evidence_id, correction_reason
-            )
+            conn.execute("BEGIN")
+            try:
+                with _active_scope(conn, self):
+                    return self._expected(
+                        conn,
+                        source_id,
+                        expected_version,
+                        record_id,
+                        reply_evidence_id,
+                        correction_reason,
+                    )
+            finally:
+                conn.rollback()
 
     def _expected(
         self,
@@ -779,22 +791,44 @@ class LedgerService:
         values = json.loads(row["values_json"])
         require_refund_compatible_expense_change(conn, predecessor, values)
 
-    def _review(self, conn, proposal_id, expected_version):
-        proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
-        if "format" in json.loads(proposal["observation_json"]):
+    def _require_current_native_proposal(self, conn, proposal):
+        retained = json.loads(proposal["observation_json"])
+        if "format" in retained:
             raise LifecycleError("unsupported_record_format: use the explicit daily API")
-        from .reader import verify_proposal
+        try:
+            binding = RuntimeBinding(**retained["expected"]["binding"])
+        except (KeyError, TypeError, LifecycleError) as exc:
+            raise LifecycleError("Exact native proposal binding required") from exc
+        if binding != self.binding:
+            if proposal["record_id"] is None:
+                source_id = proposal["source_id"]
+                source = _row(conn, "l2_sources", "source_id", source_id)
+                if _capture_generation(source, _capture_payload(conn, source_id)) is None:
+                    raise LifecycleError("Historical capture lacks original generation authority")
+            raise LifecycleError("Native proposal belongs to an archived generation")
 
-        verify_proposal(self, conn, proposal)
-        self._source(conn, proposal["source_id"], allow_archived=proposal["record_id"] is not None)
-        if proposal["version"] != expected_version:
-            raise LifecycleError("Review proposal version mismatch")
+    def _require_current_native_review(self, review):
+        material = json.loads(review["material_json"])
+        if "format" in material:
+            raise LifecycleError("unsupported_record_format: use the explicit daily API")
+        if material.get("binding") != asdict(self.binding):
+            raise LifecycleError("Native review belongs to an archived generation")
+
+    def _review(self, conn, proposal_id, expected_version):
+        from .reader import verify_proposal, verify_review
+
+        proposal = _row(conn, "l2_proposals", "proposal_id", proposal_id)
+        self._require_current_native_proposal(conn, proposal)
         existing = conn.execute(
             "SELECT * FROM l2_reviews WHERE proposal_id=?", (proposal_id,)
         ).fetchone()
         if existing:
-            from .reader import verify_review
-
+            self._require_current_native_review(existing)
+        verify_proposal(self, conn, proposal)
+        self._source(conn, proposal["source_id"], allow_archived=proposal["record_id"] is not None)
+        if proposal["version"] != expected_version:
+            raise LifecycleError("Review proposal version mismatch")
+        if existing:
             verify_review(self, conn, existing)
             if not conn.execute(
                 "SELECT 1 FROM l2_deliveries WHERE review_id=?", (existing["review_id"],)
@@ -878,12 +912,17 @@ class LedgerService:
             return result
 
     def record_delivery(self, review_id, delivery_evidence_id):
+        from .daily_v1.accounts import _EvidenceReadPort
+
         with self._write_operation() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = _row(conn, "l2_reviews", "review_id", review_id)
-            if "format" in json.loads(row["material_json"]):
-                raise LifecycleError("unsupported_record_format: use the explicit daily API")
+            self._require_current_native_review(row)
+            self._require_current_native_proposal(
+                conn, _row(conn, "l2_proposals", "proposal_id", row["proposal_id"])
+            )
             expected = ExpectedDisplay(self.binding, review_id, row["review_sha256"])
-            delivery = self.port.delivery(conn, delivery_evidence_id, expected)
+            delivery = _EvidenceReadPort(self.port).delivery(conn, delivery_evidence_id, expected)
             self._actor(delivery)
             if (
                 delivery.evidence_id != delivery_evidence_id
@@ -899,8 +938,8 @@ class LedgerService:
                     "material_json"
                 ] != canonical(asdict(delivery)):
                     raise LifecycleError("Delivery replay mismatch")
+                conn.rollback()
                 return self._review_dto(conn, row)
-            conn.execute("BEGIN IMMEDIATE")
             self._require_native_refund_compatibility(conn, row)
             conn.execute(
                 "INSERT INTO l2_deliveries VALUES(?,?,?)",

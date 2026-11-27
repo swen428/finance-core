@@ -156,11 +156,12 @@ def receipt_snapshot_evidence_scope(
     only. The result has no source admission, write or restore authority.
     """
     from .daily_v1.accounts import _EvidenceReadPort
+    from .historical_evidence_v1 import _ArchiveReadConnection
     from .recovery import _verify_cut_connection
 
     witness = _witness_for(conn)
     if (
-        (witness is None and type(conn) is not sqlite3.Connection)
+        (witness is None and type(conn) not in {sqlite3.Connection, _ArchiveReadConnection})
         or type(binding) is not RuntimeBinding
         or type(cut) is not SnapshotCut
         or (binding.instance_id, binding.generation) != (cut.instance_id, cut.generation)

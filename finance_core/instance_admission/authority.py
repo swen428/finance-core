@@ -560,10 +560,7 @@ def _validate_manual_restore_context(context: dict[str, Any]) -> None:
         set(context) not in (fields, fields | {"historical_generations_sha256"})
         or (
             "historical_generations_sha256" in context
-            and (
-                not _recovery_hash(context["historical_generations_sha256"])
-                or context["application_history_sha256"] is None
-            )
+            and not _recovery_hash(context["historical_generations_sha256"])
         )
         or not _recovery_cut_ref(context["cut_ref"])
         or (
@@ -1660,6 +1657,12 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
     ]
     without_rowid = {row[1]: bool(row[4]) for row in read("PRAGMA main.table_list")}
     previous_factory = conn.text_factory
+
+    def set_text_factory(factory) -> None:
+        # This internal scan invokes no evidence adapter. The issued
+        # connection's authorizer and owning transaction remain active.
+        sqlite3.Connection.__setattr__(conn, "text_factory", factory)
+
     try:
         for table in tables:
             columns = [row[1] for row in read(f"PRAGMA table_xinfo({quoted(table)})")]
@@ -1684,7 +1687,7 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
             ordering = ",".join(
                 f"typeof({column}) COLLATE BINARY,{column} COLLATE BINARY" for column in expressions
             )
-            conn.text_factory = bytes
+            set_text_factory(bytes)
             for row in read(f"SELECT {selection} FROM {quoted(table)} ORDER BY {ordering}"):
                 frame(b"row")
                 for index in range(0, len(row), 2):
@@ -1701,10 +1704,10 @@ def _logical_database_digest(conn: sqlite3.Connection) -> str:
                     else:
                         raise InstanceAdmissionError("Unsupported protected SQLite storage type")
                     frame(encoded)
-            conn.text_factory = previous_factory
+            set_text_factory(previous_factory)
             frame(b"end-table")
     finally:
-        conn.text_factory = previous_factory
+        set_text_factory(previous_factory)
     return digest.hexdigest()
 
 

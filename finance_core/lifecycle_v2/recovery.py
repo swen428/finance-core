@@ -58,7 +58,9 @@ from .contracts import (
 from .historical_evidence_v1 import (
     HistoricalEvidenceV1,
     HistoricalGenerationV1,
+    _ArchiveReadConnection,
     _generations,
+    _issued_archive_transaction,
     _require_immediate,
     _verify_event_anchors,
     audit_archive_evidence_connection_v1,
@@ -353,37 +355,6 @@ def prepare_restored_profile(
     return result
 
 
-@contextmanager
-def _archive_read_authorizer(conn):
-    """Keep transaction and schema ownership with the held recovery coordinator."""
-    violation = False
-
-    def authorize(action, first, second, _database, _source):
-        nonlocal violation
-        if action in {
-            sqlite3.SQLITE_ATTACH,
-            sqlite3.SQLITE_DETACH,
-            sqlite3.SQLITE_SAVEPOINT,
-            sqlite3.SQLITE_TRANSACTION,
-        } or (
-            action == sqlite3.SQLITE_PRAGMA
-            and first in {"query_only", "writable_schema", "foreign_keys"}
-            and second is not None
-        ):
-            violation = True
-            return sqlite3.SQLITE_DENY
-        return sqlite3.SQLITE_OK
-
-    conn.set_authorizer(authorize)
-
-    try:
-        yield
-        if violation:
-            raise LifecycleError("Historical application audit violated its read-only scope")
-    finally:
-        conn.set_authorizer(None)
-
-
 def _protected_database_transition(
     config: TrustedInstanceConfig,
     owner: _Lock,
@@ -422,7 +393,9 @@ def _protected_database_transition(
         _MANAGED_SQLITE_LIFETIME_LOCK.begin_sqlite()
         sqlite_began = True
         conn = sqlite3.connect(
-            profile.live_database.as_uri() + ("?mode=rw" if write else "?mode=ro"), uri=True
+            profile.live_database.as_uri() + ("?mode=rw" if write else "?mode=ro"),
+            uri=True,
+            factory=_ArchiveReadConnection if query_only else sqlite3.Connection,
         )
         configure_sqlite_connection(conn)
         conn.row_factory = sqlite3.Row
@@ -1025,6 +998,7 @@ def _promote_context(
     legacy_verifier,
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
     historical_generations: tuple[HistoricalGenerationV1, ...] = (),
+    core_history: tuple[HistoricalEvidenceV1, ...] = (),
 ):
     from .reader import audit_connection
 
@@ -1069,7 +1043,7 @@ def _promote_context(
                             raise LifecycleError("Pending exact finalization keeps recovery held")
                         from .reader import audit_evidence_connection
 
-                        if audit_application_history is None:
+                        if audit_application_history is None and not core_history:
                             audit_evidence_connection(conn, port, binding, legacy_verifier)
                         else:
                             # This is an observation of a published operation. New
@@ -1121,7 +1095,23 @@ def _promote_context(
                     raise LifecycleError(
                         "Manual restore generation occurs in archived ledger history"
                     )
-                if audit_application_history is None:
+                if core_history:
+                    archived = core_history[-1]
+                    with _issued_archive_transaction(conn, restored.cut.database_sha256):
+                        _verify_event_anchors(conn, historical_generations)
+                        audit_archive_evidence_connection_v1(
+                            conn,
+                            archived.port,
+                            archived.generation.binding,
+                            restored.cut,
+                            legacy_verifier=legacy_verifier,
+                            historical_evidence=core_history[:-1],
+                            parent_history_sha256=historical_generations_sha256_v1(
+                                historical_generations[:-1]
+                            ),
+                            receipt_snapshot_lookup=archived.receipt_snapshot_lookup,
+                        )
+                elif audit_application_history is None:
                     _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
                 else:
                     _verify_cut_connection(conn, restored.cut)
@@ -1186,7 +1176,7 @@ def _promote_context(
                         core_verified = True
                         return result
 
-                    with _archive_read_authorizer(conn):
+                    with _issued_archive_transaction(conn, restored.cut.database_sha256):
                         history_sha256 = audit_application_history(conn, restored.cut, audit_core)
                     if not core_verified:
                         raise LifecycleError(
@@ -1395,6 +1385,7 @@ def promote_manual_single_host_restore_v1(
     application_history_sha256: str | None = None,
     audit_application_history: ApplicationRestoreAuditV1 | None = None,
     historical_generations: tuple[HistoricalGenerationV1, ...] = (),
+    historical_evidence: tuple[HistoricalEvidenceV1, ...] = (),
 ) -> dict[str, Any]:
     """Publish one approved successor, or resume its exact interrupted operation.
 
@@ -1407,7 +1398,22 @@ def promote_manual_single_host_restore_v1(
         application_history_sha256 is not None and not callable(audit_application_history)
     ):
         raise LifecycleError("Manual restore needs the installed application history verifier")
-    if audit_application_history is None and port is None:
+    # Core-only snapshots authenticate the original sets of independent evidence
+    # directly. Application snapshots use their installed full-history verifier.
+    generations = _generations(historical_evidence)
+    if generations:
+        if (
+            restored.config.application_schema is not None
+            or (historical_generations and historical_generations != generations)
+            or (port is not None and port is not historical_evidence[-1].port)
+        ):
+            raise LifecycleError("Core-only restore evidence differs from the selected archive")
+        historical_generations = generations
+    elif audit_application_history is None and historical_generations:
+        if len(historical_generations) != 1 or port is None:
+            raise LifecycleError("Core-only restore requires the evidence for every generation")
+        historical_evidence = (HistoricalEvidenceV1(historical_generations[0], port),)
+    if audit_application_history is None and port is None and not historical_evidence:
         raise LifecycleError("Manual restore needs historical Core evidence")
     context = manual_single_host_promotion_context_v1(
         restored,
@@ -1434,6 +1440,7 @@ def promote_manual_single_host_restore_v1(
         legacy_verifier=legacy_verifier,
         audit_application_history=audit_application_history,
         historical_generations=historical_generations,
+        core_history=historical_evidence,
     )
 
 

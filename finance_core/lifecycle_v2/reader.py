@@ -21,7 +21,7 @@ from .contracts import (
     digest,
     validate_daily_capacity,
 )
-from .historical_evidence_v1 import _active_scope, _event_service, _scope_for
+from .historical_evidence_v1 import _active_scope, _event_service, _scope_for, _source_service
 from .service import _capture_generation, _fact_material, _receipt_capture_ids
 
 if TYPE_CHECKING:
@@ -253,18 +253,10 @@ class LedgerReader:
 
     def receipt_manual_draft_v1(self, source_id):
         """Project a draft from exact source and manual reply on one read snapshot."""
-        from .daily_v1.accounts import _BoundService
         from .receipt_draft_v1 import _project_manual_draft
 
-        base = self.service
-        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
-            service = _BoundService(base)
-            conn.execute("BEGIN")
-            try:
-                source, replies = self._receipt_reply_snapshot_v1(service, conn, source_id)
-                return _project_manual_draft(source_id, source, replies) if replies else None
-            finally:
-                conn.rollback()
+        source, replies = self._read_receipt_draft_evidence_v1(source_id)
+        return _project_manual_draft(source_id, source, replies) if replies else None
 
     def receipt_whole_draft_v1(
         self,
@@ -301,19 +293,17 @@ class LedgerReader:
     def _read_receipt_draft_evidence_v1(self, source_id):
         from .daily_v1.accounts import _BoundService
 
-        base = self.service
-        with base._runtime_scope(), lifecycle_read_operation(base.owner) as conn:
-            service = _BoundService(base)
-            conn.execute("BEGIN")
-            try:
-                return self._receipt_reply_snapshot_v1(service, conn, source_id)
-            finally:
-                conn.rollback()
+        with self._evidence_read() as conn:
+            return self._receipt_reply_snapshot_v1(_BoundService(self.service), conn, source_id)
 
     @staticmethod
     def _receipt_reply_snapshot_v1(service, conn, source_id):
-        source = service._receipt_source(conn, source_id, allow_archived=True)
-        return source, service.port.receipt_manual_replies_v1(conn, source)
+        from .service import _row
+
+        row = _row(conn, "l2_sources", "source_id", source_id)
+        evidence = _source_service(conn, service, row)
+        source = evidence._receipt_source(conn, source_id, allow_archived=True)
+        return source, evidence.port.receipt_manual_replies_v1(conn, source)
 
     def receipt_payment_handoff_v1(
         self,
@@ -333,30 +323,30 @@ class LedgerReader:
         from .receipt_fields_v1 import _project_payment_draft, _read_optional_recorded_fields
         from .receipt_payment_handoff_v1 import _receipt_payment_handoff
 
-        recorded = _read_optional_recorded_fields(
-            self, source_id, processor, reference, retained_evidence_root=retained_evidence_root
-        )
-        service = self.service
-        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
-            bound = _BoundService(service)
+        with self._evidence_read() as conn:
+            bound = _BoundService(self.service)
             _require_runtime_scope(conn, bound.binding, bound.runtime_admission)
-            conn.execute("BEGIN")
-            try:
-                source, replies = self._receipt_reply_snapshot_v1(bound, conn, source_id)
-                draft = _project_payment_draft(source_id, source, replies, recorded)
-                if draft is None or draft.missing_receipt_fields:
-                    return None
-                audit = _audit(bound, conn)
-                read_identity = DailyReadIdentityV1(
-                    digest(asdict(bound.binding)),
-                    bound.owner.config.binding_sha256,
-                    audit["event_count"],
-                    audit["audit_sha256"],
-                    _logical_database_digest(conn),
-                )
-                return _receipt_payment_handoff(conn, draft, read_identity)
-            finally:
-                conn.rollback()
+            source, replies = self._receipt_reply_snapshot_v1(bound, conn, source_id)
+            recorded = _read_optional_recorded_fields(
+                self,
+                source_id,
+                processor,
+                reference,
+                retained_evidence_root=retained_evidence_root,
+                verified_source=source,
+            )
+            draft = _project_payment_draft(source_id, source, replies, recorded)
+            if draft is None or draft.missing_receipt_fields:
+                return None
+            audit = _audit(bound, conn)
+            read_identity = DailyReadIdentityV1(
+                digest(asdict(bound.binding)),
+                bound.owner.config.binding_sha256,
+                audit["event_count"],
+                audit["audit_sha256"],
+                _logical_database_digest(conn),
+            )
+            return _receipt_payment_handoff(conn, draft, read_identity)
 
     def recent(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -390,50 +380,21 @@ class LedgerReader:
 
     def full_audit(self):
         service = self.service
-        capacity = service.daily_capacity
-        scope = service._runtime_scope() if capacity is not None else nullcontext()
-        with scope, lifecycle_read_operation(service.owner) as conn:
-            if capacity is not None:
-                _require_runtime_scope(conn, service.binding, service.runtime_admission)
-            if (
-                service.runtime_admission is not None
-                or capacity is not None
-                or _has_daily_values(conn)
-            ):
-                # New opt-in formats require an operation-local evidence port.
-                # The historical expense-only read path keeps its contract.
-                conn.execute("BEGIN")
-                try:
-                    return audit_evidence_connection(
-                        conn,
-                        service.port,
-                        service.binding,
-                        service.legacy_verifier,
-                        daily_capacity=capacity,
-                        _service=service,
-                    )
-                finally:
-                    conn.rollback()
-            result = audit_connection(conn)
-            if (
-                conn.execute("SELECT 1 FROM l2_imports LIMIT 1").fetchone()
-                or conn.execute("SELECT 1 FROM l2_archives LIMIT 1").fetchone()
-                or conn.execute(
-                    "SELECT 1 FROM l2_events WHERE kind IN ('import','legacy_archive') LIMIT 1"
-                ).fetchone()
-            ):
-                from .legacy import verify_import_archives
-
-                verify_import_archives(conn, self.service.legacy_verifier)
-            for source in conn.execute("SELECT source_id FROM l2_sources"):
-                self.service._source(conn, source[0], allow_archived=True)
-            for proposal in conn.execute("SELECT * FROM l2_proposals"):
-                verify_proposal(self.service, conn, proposal)
-            for review in conn.execute("SELECT * FROM l2_reviews"):
-                verify_review(self.service, conn, review)
-            for record in conn.execute("SELECT DISTINCT record_id FROM l2_facts"):
-                verify_record(self.service, conn, record[0])
-            return result
+        with service._runtime_scope(), lifecycle_read_operation(service.owner) as conn:
+            conn.execute("BEGIN")
+            try:
+                if service.daily_capacity is not None:
+                    _require_runtime_scope(conn, service.binding, service.runtime_admission)
+                return audit_evidence_connection(
+                    conn,
+                    service.port,
+                    service.binding,
+                    service.legacy_verifier,
+                    daily_capacity=service.daily_capacity,
+                    _service=service,
+                )
+            finally:
+                conn.rollback()
 
 
 def verify_proposal(service, conn, proposal, *, _rows=None):

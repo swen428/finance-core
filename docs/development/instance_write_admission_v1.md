@@ -198,15 +198,24 @@ Core callback. Core compares the approved descriptors and independently checks
 the archive cut and event anchors on the held database. For a first restore the
 ancestor list is empty.
 
+For a Core-only profile the descriptor's application-history digest is `None`.
+Pass the ordered `HistoricalEvidenceV1` tuple to the promotion's
+`historical_evidence` parameter. Core checks the archived bindings and event
+anchors inside the same held read transaction, including the evidence from
+prior promotions when restoring a successor's own backup.
+
 On the admitted target, construct `LedgerService` with the matching installed
 `HistoricalEvidenceV1` ports in that ancestry order. Core verifies the current
 owner and protected promotion and checks their anchors on the actual ledger
 transaction. Retained capture, proposal, review, delivery and confirmation
 evidence is checked under its original runtime and archive. Historical live
 ports receive the original guarded SQLite connection for read callbacks.
-Detached archive tools can use `audit_archive_evidence_connection_v1` with
-a verified parent commitment and exact archive receipt lookups. The current
-writer's archive producer can use `audit_runtime_archive_evidence_connection_v1`
+Detached archive tools open the database with
+`open_archive_read_connection_v1` and call `audit_archive_evidence_connection_v1`
+on that Core-owned read transaction with the verified parent commitment and
+exact archive receipt lookups. The opener checks the archive database bytes
+before opening it read-only and retains control through actual SQLite close.
+The current writer's archive producer can use `audit_runtime_archive_evidence_connection_v1`
 on its admitted read transaction for that cut. The Core audit checks original
 receipt and OCR evidence using those same scopes.
 Historical evidence carries no write or confirmation authority. New service

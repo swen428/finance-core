@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import sqlite3
+import stat
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from finance_core.instance_admission.authority import _MANUAL_RESTORE_FORMAT, _record, _state
+from finance_core.instance_admission.authority import (
+    _MANUAL_RESTORE_FORMAT,
+    _close_sqlite_handle,
+    _record,
+    _state,
+)
 from finance_core.instance_admission.sessions import (
     _evidence_read_callback,
     _require_runtime_scope,
@@ -29,7 +38,7 @@ class HistoricalGenerationV1:
 
     binding: RuntimeBinding
     cut: SnapshotCut
-    application_history_sha256: str
+    application_history_sha256: str | None
     event_sha256: str | None
 
     def __post_init__(self) -> None:
@@ -38,7 +47,10 @@ class HistoricalGenerationV1:
             or type(self.cut) is not SnapshotCut
             or (self.binding.instance_id, self.binding.generation)
             != (self.cut.instance_id, self.cut.generation)
-            or not _is_hash(self.application_history_sha256)
+            or (
+                self.application_history_sha256 is not None
+                and not _is_hash(self.application_history_sha256)
+            )
             or (
                 not _is_hash(self.event_sha256)
                 if self.cut.commit_seq
@@ -95,7 +107,8 @@ def _require_immediate(generations, current, cut, history_sha256):
         or generations[-1].cut != cut
         or generations[-1].application_history_sha256 != history_sha256
         or any(
-            item.binding.instance_id == current.instance_id
+            (item.application_history_sha256 is None) != (history_sha256 is None)
+            or item.binding.instance_id == current.instance_id
             or item.binding.generation == current.generation
             or (item.binding.principal_id, item.binding.client_id)
             != (current.principal_id, current.client_id)
@@ -205,6 +218,176 @@ class _HistoricalScope:
         return read
 
 
+_CLOSE_UNKNOWN: list[sqlite3.Connection] = []
+
+
+class _ArchiveReadConnection(sqlite3.Connection):
+    """Internal reader whose transaction and authorizer belong to Core."""
+
+    def _require_idle_guard(self):
+        if _archive_transaction_for(self) is not None:
+            raise LifecycleError("Core owns the archive read transaction")
+
+    def __setattr__(self, name, value):
+        if name in {"row_factory", "text_factory", "autocommit", "isolation_level"}:
+            self._require_idle_guard()
+        super().__setattr__(name, value)
+
+    def set_authorizer(self, callback):
+        self._require_idle_guard()
+        return super().set_authorizer(callback)
+
+    def close(self):
+        self._require_idle_guard()
+        return super().close()
+
+    def executescript(self, script):
+        self._require_idle_guard()
+        return super().executescript(script)
+
+    def deserialize(self, data, /, *, name="main"):
+        self._require_idle_guard()
+        return super().deserialize(data, name=name)
+
+
+@dataclass
+class _ArchiveTransaction:
+    connection: _ArchiveReadConnection
+    database_sha256: str
+    pid: int
+    active: bool = True
+
+
+_ARCHIVE_TRANSACTIONS: ContextVar[tuple[_ArchiveTransaction, ...]] = ContextVar(
+    "finance_archive_read_transactions", default=()
+)
+
+
+def _archive_transaction_for(conn):
+    return next(
+        (
+            item
+            for item in _ARCHIVE_TRANSACTIONS.get()
+            if item.connection is conn and item.active and item.pid == os.getpid()
+        ),
+        None,
+    )
+
+
+def is_archive_read_connection_v1(conn: sqlite3.Connection) -> bool:
+    """Report whether Core currently owns this original archive read."""
+    return _archive_transaction_for(conn) is not None
+
+
+def _require_archive_transaction(conn, database_sha256):
+    witness = _archive_transaction_for(conn)
+    if (
+        witness is None
+        or witness.database_sha256 != database_sha256
+        or not conn.in_transaction
+        or conn.row_factory is not sqlite3.Row
+        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
+    ):
+        raise LifecycleError("Core-issued archive read transaction required")
+
+
+@contextmanager
+def _issued_archive_transaction(conn, database_sha256):
+    """Pin one Core-opened immutable/held transaction through the proof callbacks."""
+    if (
+        type(conn) is not _ArchiveReadConnection
+        or _archive_transaction_for(conn) is not None
+        or not conn.in_transaction
+        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
+    ):
+        raise LifecycleError("Core archive read transaction required")
+    violation = False
+
+    def authorize(action, first, second, _database, _source):
+        nonlocal violation
+        if action in {
+            sqlite3.SQLITE_ATTACH,
+            sqlite3.SQLITE_DETACH,
+            sqlite3.SQLITE_SAVEPOINT,
+            sqlite3.SQLITE_TRANSACTION,
+        } or (
+            action == sqlite3.SQLITE_PRAGMA
+            and first in {"query_only", "writable_schema", "foreign_keys"}
+            and second is not None
+        ):
+            violation = True
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    sqlite3.Connection.set_authorizer(conn, authorize)
+    # Track the exact Core-issued handle and its original transaction, also
+    # during nested audit methods. The process-local scope is removed on exit.
+    witness = _ArchiveTransaction(conn, database_sha256, os.getpid())
+    token = _ARCHIVE_TRANSACTIONS.set((*_ARCHIVE_TRANSACTIONS.get(), witness))
+    try:
+        yield
+        if violation:
+            raise LifecycleError("Historical application audit violated its read-only scope")
+        _require_archive_transaction(conn, database_sha256)
+    finally:
+        witness.active = False
+        _ARCHIVE_TRANSACTIONS.reset(token)
+        sqlite3.Connection.set_authorizer(conn, None)
+
+
+@contextmanager
+def open_archive_read_connection_v1(path: Path, *, database_sha256: str):
+    """Open the exact archive bytes in a Core-owned immutable read transaction."""
+    if not _is_hash(database_sha256):
+        raise LifecycleError("Exact archived database digest required")
+    path = Path(path).resolve(strict=True)
+    with path.open("rb") as body:
+
+        def identity(details):
+            return (
+                details.st_dev,
+                details.st_ino,
+                details.st_size,
+                details.st_mtime_ns,
+                details.st_ctime_ns,
+            )
+
+        original = os.fstat(body.fileno())
+
+        def require_unchanged():
+            if identity(original) != identity(path.stat()) or (
+                identity(original) != identity(os.fstat(body.fileno()))
+            ):
+                raise LifecycleError("Archived database changed during protected read")
+
+        if not stat.S_ISREG(original.st_mode):
+            raise LifecycleError("Exact regular archived database required")
+        if hashlib.file_digest(body, "sha256").hexdigest() != database_sha256:
+            raise LifecycleError("Archive file differs from its database digest")
+        require_unchanged()
+        conn = sqlite3.connect(
+            path.as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+            timeout=0,
+            factory=_ArchiveReadConnection,
+        )
+        try:
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
+            require_unchanged()
+            with _issued_archive_transaction(conn, database_sha256):
+                yield conn
+        finally:
+            try:
+                _close_sqlite_handle(conn)
+            except BaseException as exc:
+                _CLOSE_UNKNOWN.append(conn)
+                raise LifecycleError("Actual archived SQLite close is uncertain") from exc
+        require_unchanged()
+
+
 def _scope_for(conn):
     return next((scope for scope in _SCOPES.get() if scope.conn is conn), None)
 
@@ -238,9 +421,6 @@ def _protected_history(conn, service, *, active_only=False):
         return None
     if witness.owner is not owner:
         raise LifecycleError("Historical evidence requires its matching production owner")
-    if not active_only and getattr(service, "runtime_admission", None) is None and not evidence:
-        # The protected launch registration remains mandatory for current use.
-        return None
     config = owner.config
     state = _state(config, _proof=witness if witness.immutable_migration_digest else None)
     record = _record(config, state)
@@ -262,8 +442,10 @@ def _protected_history(conn, service, *, active_only=False):
     _require_runtime_scope(conn, service.binding, service.runtime_admission)
     generations = _generations(evidence)
     if (
-        record["state"] not in {"ACTIVE", "FENCED"}
-        or state["current"] != config.binding_sha256
+        not (
+            (record["state"] == "ACTIVE" and state["current"] == config.binding_sha256)
+            or (record["state"] == "FENCED" and witness.read_only)
+        )
         or entry is None
         or entry["action"] != "restore_admit"
         or context.get("format") != _MANUAL_RESTORE_FORMAT
@@ -296,28 +478,23 @@ def _active_scope(conn, service, verifier=None):
 
 @contextmanager
 def _archive_scope(conn, service, cut, evidence, receipt_lookup):
+    _require_archive_transaction(conn, cut.database_sha256)
     generations = _generations(evidence)
-    if (
-        not conn.in_transaction
-        or conn.execute("PRAGMA query_only").fetchone()[0] != 1
-        or (service.binding.instance_id, service.binding.generation)
-        != (cut.instance_id, cut.generation)
-        or any(
-            item.cut.commit_seq > cut.commit_seq
-            or item.binding.instance_id == service.binding.instance_id
-            or item.binding.generation == service.binding.generation
-            or (item.binding.principal_id, item.binding.client_id)
-            != (service.binding.principal_id, service.binding.client_id)
-            for item in generations
-        )
+    if (service.binding.instance_id, service.binding.generation) != (
+        cut.instance_id,
+        cut.generation,
+    ) or any(
+        item.cut.commit_seq > cut.commit_seq
+        or item.binding.instance_id == service.binding.instance_id
+        or item.binding.generation == service.binding.generation
+        or (item.binding.principal_id, item.binding.client_id)
+        != (service.binding.principal_id, service.binding.client_id)
+        for item in generations
     ):
         raise LifecycleError("Historical archive evidence requires its exact read transaction")
     schemas = {row[1] for row in conn.execute("PRAGMA database_list")}
     if (
-        _witness_for(conn) is not None
-        or type(conn) is not sqlite3.Connection
-        or conn.row_factory is not sqlite3.Row
-        or "main" not in schemas
+        "main" not in schemas
         or schemas - {"main", "temp"}
         or conn.execute(
             "SELECT 1 FROM sqlite_temp_master WHERE name NOT GLOB 'sqlite_*' LIMIT 1"
@@ -395,6 +572,9 @@ def audit_archive_evidence_connection_v1(
     from .reader import SnapshotEvidenceVerifier, audit_evidence_connection
     from .recovery import _verify_cut_connection
 
+    if type(cut) is not SnapshotCut:
+        raise LifecycleError("Exact archive cut required")
+    _require_archive_transaction(conn, cut.database_sha256)
     if historical_generations_sha256_v1(_generations(historical_evidence)) != parent_history_sha256:
         raise LifecycleError("Archived parent evidence differs from its protected commitment")
     _verify_cut_connection(conn, cut)

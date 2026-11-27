@@ -1931,6 +1931,38 @@ def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
                 conn.rollback()
         fence_production_instance(target, operation_id="fence", approval_ref="approved")
 
+    # A later active record in the same authority root changes the current
+    # pointer. The fenced restored owner still holds its own forensic rights.
+    with monkeypatch.context() as another_runtime:
+        replacement_root = tmp_path / "replacement-in-source-lineage"
+        replacement_root.mkdir(mode=0o700)
+        replacement = synthetic_config(
+            replacement_root,
+            another_runtime,
+            instance_id="replacement-in-source-lineage",
+            control_root=target.control_root,
+        )
+        prepare_production_profile(
+            replacement, operation_id="replacement-prepare", approval_ref="approved"
+        ).close()
+        admit_production_instance(
+            replacement, operation_id="replacement-admit", approval_ref="approved"
+        )
+        assert authority._state(replacement)["current"] == replacement.binding_sha256
+        replacement.close()
+
+    with acquire_production_owner(target) as fenced_owner:
+        forensic = LedgerService(
+            fenced_owner,
+            new_port,
+            binding,
+            runtime_admission=admission,
+            historical_evidence=(HistoricalEvidenceV1(archived, old_port),),
+        )
+        assert forensic.reader().full_audit() == current_audit
+        with pytest.raises(InstanceAdmissionError):
+            forensic.capture("source2", "no-fenced-write")
+
     second, held_again, again_kwargs = _manual_historical_target(
         tmp_path, monkeypatch, target, second_cut, second_path, "second-restored-history", NOW
     )
@@ -1985,3 +2017,151 @@ def test_manual_recovery_reads_original_accounts_and_posts_with_new_generation(
         assert third.reader().full_audit() == current_audit
     second.close()
     target.close()
+
+
+@pytest.mark.parametrize("original", [True], indirect=True)
+def test_manual_restore_reads_old_pending_but_cannot_review_or_deliver_it(
+    original, tmp_path, monkeypatch
+):
+    from test_lifecycle_v2 import TEXT, VerifiedSource, ready, response
+
+    from finance_core.lifecycle_v2.effective_v1 import EffectiveLedgerReaderV1, EffectiveReadError
+    from finance_core.lifecycle_v2.historical_evidence_v1 import (
+        HistoricalEvidenceV1,
+        HistoricalGenerationV1,
+    )
+    from finance_core.lifecycle_v2.recovery import promote_manual_single_host_restore_v1
+
+    config, owner, old, old_port = original
+    now = 1792800000
+
+    def source(port, evidence_id, body):
+        port.sources[evidence_id] = VerifiedSource(
+            evidence_id,
+            "user",
+            "chat",
+            "message-" + evidence_id,
+            body,
+            hashlib.sha256(body.encode()).hexdigest(),
+            now,
+        )
+
+    posted_source, _, review = ready(old)
+    fact = old.confirm(review.review_id, "confirmed-action", "confirmed")
+    source(old_port, "pending", TEXT)
+    pending_source = old.capture("pending", "capture-pending")
+    pending = old.propose(pending_source.source_id, "pending-observation", 0, "propose-pending")
+    pending_card = old.prepare_review(pending.proposal_id, pending.version)
+
+    reply = "Change to SGD 15.00; reason: correction"
+    source(old_port, "old-reply", reply)
+    old_port.raw = response(reply, "reply", {"amount": "15.00", "currency": "SGD"})
+    with old._write_operation() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        old_correction = old._propose(
+            conn,
+            posted_source.source_id,
+            "old-correction",
+            fact.version,
+            "propose-old-correction",
+            record_id=fact.record_id,
+            reply_evidence_id="old-reply",
+            correction_reason="correction",
+        )
+        conn.commit()
+    old_audit = old.reader().full_audit()
+    cut, path = _cut(old, tmp_path)
+    _fence(config, owner)
+    target, held, kwargs = _manual_historical_target(
+        tmp_path, monkeypatch, config, cut, path, "restored-native-pending", now
+    )
+    history_hash = authority._digest(["historical native"])
+    archived = HistoricalGenerationV1(old.binding, cut, history_hash, old_audit["audit_sha256"])
+
+    def audit_application(connection, exact_cut, audit_core):
+        assert connection.in_transaction and exact_cut == cut
+        assert audit_core(old_port, old.binding) == old_audit
+        return history_hash
+
+    assert (
+        promote_manual_single_host_restore_v1(
+            held,
+            historical_generations=(archived,),
+            application_history_sha256=history_hash,
+            audit_application_history=audit_application,
+            **kwargs,
+        )["state"]
+        == "ACTIVE"
+    )
+    with acquire_production_owner(target) as current_owner:
+        unqualified = LedgerService(current_owner, old_port, kwargs["binding"])
+        with pytest.raises(InstanceAdmissionError, match="runtime admission"):
+            unqualified.reader().full_audit()
+        with pytest.raises(InstanceAdmissionError, match="runtime admission"):
+            unqualified.reader().get(fact.record_id)
+        with pytest.raises((EffectiveReadError, InstanceAdmissionError)):
+            EffectiveLedgerReaderV1(unqualified).collect()
+
+        current_port = Port()
+        current_port.sources.clear()
+        source(current_port, "fresh-reply", reply)
+        current_port.raw = old_port.raw
+        current = LedgerService(
+            current_owner,
+            current_port,
+            kwargs["binding"],
+            clock=lambda: now,
+            runtime_admission=kwargs["runtime_admission"],
+            historical_evidence=(HistoricalEvidenceV1(archived, old_port),),
+        )
+        assert current.reader().pending()[0].review_id == pending_card.review_id
+        with patch.object(current_port, "delivery", side_effect=AssertionError("delivery invoked")):
+            with pytest.raises(LifecycleError, match="archived generation"):
+                current.record_delivery(pending_card.review_id, "late-delivery")
+        with patch.object(old_port, "provider", side_effect=AssertionError("provider invoked")):
+            with pytest.raises(LifecycleError, match="archived generation"):
+                current.prepare_review(old_correction.proposal_id, old_correction.version)
+        assert current.reader().full_audit() == old_audit
+
+        expected = current.expected_invocation(
+            posted_source.source_id, fact.version, fact.record_id, "fresh-reply", "correction"
+        )
+        assert expected.binding == kwargs["binding"]
+        assert expected.projection["current_values"]["amount"] == "12.00"
+        corrected = current.prepare_correction(
+            fact.record_id,
+            fact.version,
+            "fresh-obs",
+            "propose-fresh-correction",
+            "fresh-reply",
+            "correction",
+        )
+        current.record_delivery(corrected.review_id, "fresh-delivery")
+        current.confirm(corrected.review_id, "fresh-action", "confirm-fresh-correction")
+        assert current.reader().get(fact.record_id)["values"]["amount"] == "15.00"
+    target.close()
+
+
+def test_detached_historical_audit_requires_core_owned_exact_read(original, tmp_path):
+    from finance_core.lifecycle_v2.historical_evidence_v1 import (
+        audit_archive_evidence_connection_v1,
+        historical_generations_sha256_v1,
+        open_archive_read_connection_v1,
+    )
+
+    _, _, service, port = original
+    cut, path = _cut(service, tmp_path)
+    kwargs = {"parent_history_sha256": historical_generations_sha256_v1(())}
+    with open_archive_read_connection_v1(path, database_sha256=cut.database_sha256) as conn:
+        assert conn.in_transaction and conn.row_factory is sqlite3.Row
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert (
+            audit_archive_evidence_connection_v1(conn, port, service.binding, cut, **kwargs)
+            == service.reader().full_audit()
+        )
+
+    with pytest.raises(LifecycleError, match="Core-issued"):
+        audit_archive_evidence_connection_v1(conn, port, service.binding, cut, **kwargs)
+    with pytest.raises(LifecycleError, match="database digest"):
+        with open_archive_read_connection_v1(path, database_sha256="e" * 64):
+            pytest.fail("Opened archive at the wrong digest")
