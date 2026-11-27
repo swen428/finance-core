@@ -57,6 +57,9 @@ from .contracts import (
 )
 from .single_host_runtime_v1 import SingleHostRuntimeAdmissionV1, _require_runtime_admission
 
+HistoricalCoreAuditV1 = Callable[[EvidencePort, RuntimeBinding], dict[str, Any]]
+ApplicationRestoreAuditV1 = Callable[[sqlite3.Connection, SnapshotCut, HistoricalCoreAuditV1], str]
+
 # Keep uncertain SQLite and every cooperative lease live until process exit.
 _RECOVERY_CLOSE_UNKNOWN: list[tuple[object, ...]] = []
 
@@ -967,7 +970,7 @@ def _promote_context(
     port,
     binding,
     legacy_verifier,
-    audit_application_history: Callable[[sqlite3.Connection, SnapshotCut], str] | None = None,
+    audit_application_history: ApplicationRestoreAuditV1 | None = None,
 ):
     from .reader import audit_connection
 
@@ -1054,11 +1057,46 @@ def _promote_context(
                 if any(entry.outcome is None for entry in journal.values()):
                     raise LifecycleError("Pending exact finalization keeps recovery held")
                 audit_connection(conn)
+                if (
+                    manual
+                    and conn.execute(
+                        "SELECT 1 FROM l2_sources WHERE generation=? LIMIT 1",
+                        (restored.new_binding.generation,),
+                    ).fetchone()
+                ):
+                    raise LifecycleError(
+                        "Manual restore generation occurs in archived ledger history"
+                    )
                 if audit_application_history is None:
                     _verify_held_evidence(conn, restored, port, binding, legacy_verifier)
                 else:
                     _verify_cut_connection(conn, restored.cut)
-                    history_sha256 = audit_application_history(conn, restored.cut)
+                    from .reader import audit_evidence_connection
+
+                    core_verified = False
+
+                    def audit_core(historical_port, historical_binding):
+                        nonlocal core_verified
+                        if (
+                            core_verified
+                            or type(historical_binding) is not RuntimeBinding
+                            or (historical_binding.instance_id, historical_binding.generation)
+                            != (restored.cut.instance_id, restored.cut.generation)
+                        ):
+                            raise LifecycleError(
+                                "Manual restore needs exact historical Core evidence"
+                            )
+                        result = audit_evidence_connection(
+                            conn, historical_port, historical_binding, legacy_verifier
+                        )
+                        core_verified = True
+                        return result
+
+                    history_sha256 = audit_application_history(conn, restored.cut, audit_core)
+                    if not core_verified:
+                        raise LifecycleError(
+                            "Held application verifier omitted Core evidence audit"
+                        )
                     if (
                         type(history_sha256) is not str
                         or history_sha256 != context["application_history_sha256"]
@@ -1099,6 +1137,16 @@ def _promote_context(
         owner.close()
 
 
+def _require_manual_cut_identity(config: TrustedInstanceConfig, cut: SnapshotCut) -> None:
+    if (
+        type(cut) is not SnapshotCut
+        or config.core_identity != cut.core_identity
+        or config._binding["migration_identity"] != cut.migration_identity
+        or digest(config._binding["application_schema"]) != cut.application_schema_digest
+    ):
+        raise LifecycleError("Manual restore requires exact archived Core, migration and schema")
+
+
 def prepare_manual_single_host_restore_v1(
     config: TrustedInstanceConfig,
     database: Path,
@@ -1114,8 +1162,7 @@ def prepare_manual_single_host_restore_v1(
         "single-host-real",
     }:
         raise LifecycleError("Manual restore needs an exact single-host target binding")
-    if type(cut) is not SnapshotCut or config.core_identity != cut.core_identity:
-        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    _require_manual_cut_identity(config, cut)
     return prepare_restored_profile(
         config,
         database,
@@ -1162,8 +1209,7 @@ def reopen_manual_single_host_restore_v1(
         "single-host-real",
     }:
         raise LifecycleError("Manual restore needs an exact single-host target binding")
-    if type(cut) is not SnapshotCut or config.core_identity != cut.core_identity:
-        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    _require_manual_cut_identity(config, cut)
     with _control(config, shared=True):
         state = _manual_restore_state(config)
         prepare = _entry(state, prepare_operation_id, "restore_prepare")
@@ -1195,8 +1241,7 @@ def manual_single_host_promotion_context_v1(
     ):
         raise LifecycleError("Manual restore evidence belongs to a different old instance")
     config = restored.config
-    if config.core_identity != restored.cut.core_identity:
-        raise LifecycleError("Manual restore requires the exact archived Core identity")
+    _require_manual_cut_identity(config, restored.cut)
     if (config.application_schema is not None) != (application_history_sha256 is not None):
         raise LifecycleError("Manual restore needs the exact application history identity")
     with _control(config, shared=True):
@@ -1242,13 +1287,14 @@ def promote_manual_single_host_restore_v1(
     binding: RuntimeBinding,
     legacy_verifier=None,
     application_history_sha256: str | None = None,
-    audit_application_history: Callable[[sqlite3.Connection, SnapshotCut], str] | None = None,
+    audit_application_history: ApplicationRestoreAuditV1 | None = None,
 ) -> dict[str, Any]:
     """Publish one approved successor, or resume its exact interrupted operation.
 
-    A trusted application composition must authenticate its full archived
-    history, including Core evidence, and return the approved history digest
-    from the actual held read transaction before the writer can change.
+    The trusted verifier must reserve one exact successor for the predecessor
+    across all control roots before accepting the promotion approval. A
+    trusted application composition authenticates its full archived history and
+    invokes the scoped Core auditor once in the same held read transaction.
     """
     if (application_history_sha256 is None and audit_application_history is not None) or (
         application_history_sha256 is not None and not callable(audit_application_history)

@@ -167,16 +167,21 @@ Registration alone leaves the target unable to acquire a writer.
 `manual_single_host_promotion_context_v1` reports the material to approve. The
 approval binds the exact cut, prepared and registered target, old-host evidence,
 accepted loss interval and application history digest where required. The
-protected approval also binds the operation and predecessor authority state. A
+protected approval also binds the operation and predecessor authority state. The accepted loss interval
+must extend through the verified stop observation. The trusted operator must
+durably reserve one successor for the source binding across all independent
+control roots before approving publication. Each local root can enforce only
+its own writer exclusivity. A
 local authority lineage with a current or prior current writer uses the
 existing fenced-designation route instead.
 
 `promote_manual_single_host_restore_v1` holds the owner, control and profile
 leases, rechecks the cut through a read-only SQLite handle, and publishes the
 writer transition only after that handle closes. A trusted application verifier
-runs in the same held read and returns the approved digest for authenticated
-Core and complete application history. Core independently rechecks the logical
-cut and structural ledger. A changed digest or an unavailable audit keeps the
+runs in the same held read, invokes the scoped Core evidence audit and returns
+the approved digest of complete application history. Core independently
+rechecks the logical cut and structural ledger and refuses a generation found
+in the archived sources. A changed digest or an unavailable audit keeps the
 target held. The operator must supply the exact original request after an
 interrupted publication. `reopen_manual_single_host_restore_v1` reconstructs
 the original preparation from protected history. Reobserving a completed

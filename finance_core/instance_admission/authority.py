@@ -608,7 +608,7 @@ def _validate_manual_restore_context(context: dict[str, Any]) -> None:
         isolation["stopped_observed_at"],
     )
     if any(type(at) is not int or not 0 < at < 2**63 for at in times) or not (
-        times[0] <= times[1] <= times[2]
+        times[0] <= times[2] <= times[1]
     ):
         raise InstanceAdmissionError("Manual restore loss interval differs from isolation evidence")
 

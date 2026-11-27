@@ -1540,6 +1540,19 @@ def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
     binding = RuntimeBinding(
         target.instance_id, "new-generation", "user", "chat", "single-host-synthetic"
     )
+    for changed_cut in (
+        replace(cut, migration_identity="different-migration"),
+        replace(cut, application_schema_digest="f" * 64),
+    ):
+        with pytest.raises(LifecycleError, match="migration and schema"):
+            prepare_manual_single_host_restore_v1(
+                target,
+                path,
+                changed_cut,
+                new_binding=binding,
+                operation_id="wrong-prepare",
+                approval_ref="approved",
+            )
     held = prepare_manual_single_host_restore_v1(
         target,
         path,
@@ -1567,17 +1580,15 @@ def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
         isolation=isolation,
         runtime_admission=registration,
         cut_observed_at=1792800000,
-        accept_loss_through=1792800100,
+        accept_loss_through=1792800200,
     )
 
-    def audit_application(connection, exact_cut):
-        from finance_core.lifecycle_v2.reader import audit_evidence_connection
-
+    def audit_application(connection, exact_cut, audit_core):
         assert exact_cut == cut
         assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             connection.execute("INSERT INTO manual_app_evidence VALUES ('forbidden')")
-        audit_evidence_connection(connection, port, old_service.binding)
+        audit_core(port, old_service.binding)
         return authority._digest(
             [
                 list(r)
@@ -1605,8 +1616,8 @@ def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
     if old.application_schema is not None:
         with pytest.raises(LifecycleError, match="application history verifier"):
             promote(audit_application_history=None)
-        with pytest.raises(LifecycleError, match="history differs"):
-            promote(audit_application_history=lambda connection, cut: "c" * 64)
+        with pytest.raises(LifecycleError, match="omitted Core evidence"):
+            promote(audit_application_history=lambda connection, cut, audit: authority._digest([]))
 
     with pytest.raises(InstanceAdmissionError, match="approval"):
         promote()
@@ -1633,10 +1644,20 @@ def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
         }
     )
     before = authority._state(target)
+    if old.application_schema is not None:
+
+        def changed_history(connection, exact_cut, audit_core):
+            audit_application(connection, exact_cut, audit_core)
+            return "c" * 64
+
+        with pytest.raises(LifecycleError, match="history differs"):
+            promote(audit_application_history=changed_history)
     with pytest.raises(InstanceAdmissionError, match="approval"):
         promote(isolation=replace(isolation, evidence_sha256="f" * 64))
-    with pytest.raises(InstanceAdmissionError, match="approval"):
+    with pytest.raises(InstanceAdmissionError, match="loss interval"):
         promote(accept_loss_through=1792800150)
+    with pytest.raises(InstanceAdmissionError, match="approval"):
+        promote(accept_loss_through=1792800250)
     with pytest.raises(InstanceAdmissionError, match="registration"):
         promote(runtime_admission=replace(registration, registration_entry_sha256="b" * 64))
     assert authority._state(target) == before
@@ -1687,3 +1708,69 @@ def test_manual_single_host_recovery_binds_isolation_and_only_new_writer(
         with pytest.raises(InstanceAdmissionError):
             still_old.capture("fresh-source", "old-capture")
     target.close()
+
+
+def test_manual_restore_requires_generation_absent_from_archived_sources(
+    original, tmp_path, monkeypatch
+):
+    from test_lifecycle_v2 import ready
+
+    from finance_core.lifecycle_v2.recovery import (
+        HostIsolationV1,
+        prepare_manual_single_host_restore_v1,
+        promote_manual_single_host_restore_v1,
+    )
+    from finance_core.lifecycle_v2.single_host_runtime_v1 import admit_single_host_runtime_v1
+
+    old, owner, archived_service, port = original
+    ready(archived_service)
+    newer_binding = replace(archived_service.binding, generation="latest-source-generation")
+    newer_service = LedgerService(owner, port, newer_binding, clock=lambda: 1792800000)
+    cut, path = _cut(newer_service, tmp_path)
+    _fence(old, owner)
+
+    root = tmp_path / "history-generation"
+    root.mkdir(mode=0o700)
+    config = synthetic_config(root, monkeypatch, instance_id="history-generation")
+    binding = RuntimeBinding(
+        config.instance_id,
+        archived_service.binding.generation,
+        "user",
+        "chat",
+        "single-host-synthetic",
+    )
+    with config:
+        restored = prepare_manual_single_host_restore_v1(
+            config, path, cut, new_binding=binding, operation_id="prepare", approval_ref="approved"
+        )
+        registered = admit_single_host_runtime_v1(
+            config, binding, operation_id="register", approval_ref="approved"
+        )
+        observed_stop = 1792800200
+        isolation = HostIsolationV1(
+            "fixture-provider",
+            "fixture-old-host",
+            cut.instance_id,
+            cut.source_binding_sha256,
+            observed_stop,
+            "fixture-stop",
+            "a" * 64,
+            "Stopped",
+            "Restart disabled",
+            "Keep the old host disabled",
+        )
+        before = authority._state(config)
+        with pytest.raises(LifecycleError, match="generation occurs in archived ledger history"):
+            promote_manual_single_host_restore_v1(
+                restored,
+                isolation=isolation,
+                runtime_admission=registered,
+                cut_observed_at=1792800000,
+                accept_loss_through=observed_stop,
+                operation_id="activate",
+                approval_ref="approved",
+                port=port,
+                binding=binding,
+            )
+        assert authority._state(config) == before
+        assert inspect_instance_admission(config)["state"] == "RESTORE_HELD"
