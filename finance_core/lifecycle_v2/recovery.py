@@ -1283,7 +1283,7 @@ def promote_manual_single_host_restore_v1(
     accept_loss_through: int,
     operation_id: str,
     approval_ref: str,
-    port: EvidencePort,
+    port: EvidencePort | None,
     binding: RuntimeBinding,
     legacy_verifier=None,
     application_history_sha256: str | None = None,
@@ -1300,6 +1300,8 @@ def promote_manual_single_host_restore_v1(
         application_history_sha256 is not None and not callable(audit_application_history)
     ):
         raise LifecycleError("Manual restore needs the installed application history verifier")
+    if audit_application_history is None and port is None:
+        raise LifecycleError("Manual restore needs historical Core evidence")
     context = manual_single_host_promotion_context_v1(
         restored,
         isolation=isolation,
